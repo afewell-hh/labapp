@@ -86,8 +86,16 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Use TCG (software emulation) since GitHub runners don't support KVM
-          packer build -var "version=${VERSION}" -var "accelerator=tcg" packer/standard-build.pkr.hcl
+          # GitHub runners limitations:
+          # - No KVM support (use TCG software emulation)
+          # - ~7GB RAM available (reduce from 16GB default)
+          # - 2 CPU cores (reduce from 8 cores default)
+          packer build \
+            -var "version=${VERSION}" \
+            -var "accelerator=tcg" \
+            -var "memory=4096" \
+            -var "cpus=2" \
+            packer/standard-build.pkr.hcl
 
       - name: List build outputs
         run: |
@@ -120,26 +128,37 @@ jobs:
             **First boot:** 15-20 minutes (one-time initialization)
             **Use case:** Self-paced online learning
 
-            ### ⚠️ Large File Distribution
+            ### ⚠️ Important Notes
+
+            **1. OVA File Not Included**
 
             Due to GitHub's file size limits (2GB for releases), the OVA file is **not** attached to this release.
 
+            **2. CI Build Configuration**
+
+            The GitHub Actions build uses reduced resources (4GB RAM, 2 CPUs, TCG emulation) for validation purposes only.
+            **This build is NOT recommended for production use** as it may have performance limitations.
+
             **Download Options:**
 
-            1. **Build Locally** (Recommended):
+            1. **Build Locally** (Recommended for Production):
                ```bash
                git clone https://github.com/${{ github.repository }}.git
                cd labapp
                make build-standard VERSION=${{ steps.version.outputs.version }}
                ```
+               - Uses full resources (16GB RAM, 8 CPUs, KVM acceleration)
+               - Build time: 45-60 minutes
+               - Production-ready OVA output
 
             2. **External Storage** (Coming Soon):
                - Cloud storage link will be provided separately
                - Check repository README for download links
 
-            3. **Self-Hosted Runners**:
-               - Organizations can use self-hosted runners with sufficient storage
+            3. **Self-Hosted Runners** (For Organizations):
+               - Use runners with KVM support and sufficient storage
                - Configure external artifact storage (S3, GCS, Azure Blob, etc.)
+               - Build with full resource allocation
 
             ### Installation
 

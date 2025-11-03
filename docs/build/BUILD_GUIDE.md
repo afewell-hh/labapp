@@ -316,10 +316,18 @@ See `.github/workflows/build-standard.yml` for automated builds on:
    - Solution: Workflow uses `accelerator=tcg` (software emulation)
    - Impact: Build time increases to 2-4 hours vs. 45-60 minutes with KVM
 
-2. **File Size Limits**:
+2. **Limited Resources**: `ubuntu-latest` runners have constraints
+   - Available: ~7GB RAM, 2 CPU cores
+   - Required for full build: 16GB RAM, 8 CPU cores
+   - Solution: Workflow uses reduced allocation (`memory=4096`, `cpus=2`)
+   - Impact: CI builds are for validation only, not production use
+
+3. **File Size Limits**:
    - GitHub Artifacts: 5GB per file (OVA is 15-20GB)
    - GitHub Releases: 2GB per file
    - Solution: Only checksums are uploaded; users build locally or use external storage
+
+**⚠️ Important**: GitHub Actions builds use reduced resources and are **not recommended for production**. Always build locally with full resources for production deployments.
 
 **Recommended Alternatives:**
 
