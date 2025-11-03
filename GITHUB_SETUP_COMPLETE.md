@@ -92,26 +92,21 @@
 
 ---
 
-## ⚠️ Manual Steps Still Required
+### 7. GitHub Project Board
+- ✅ **Project created:** "Hedgehog Lab Development"
+- ✅ **URL:** https://github.com/users/afewell-hh/projects/5
+- ✅ Linked to repository
+- ✅ All 23 issues added to board
+- ✅ Ready to organize with custom views
 
-### 1. Create GitHub Project Board
-The GitHub Projects v2 API is not fully accessible via CLI/API yet.
+---
 
-**Action Required:**
-1. Go to https://github.com/afewell-hh/labapp/projects
-2. Click "New project"
-3. Choose "Team planning" template
-4. Name: `Hedgehog Lab Development`
-5. Add custom views:
-   - **Backlog** - Filter: `no:milestone`
-   - **Sprint 1** - Filter: `milestone:"v0.1.0" label:sprint-1`
-   - **Current Sprint** - Board view
-   - **Roadmap** - Timeline view
+## ⚠️ Manual Steps Still Required (Optional)
 
-### 2. Set Up Discussion Welcome Post
-Discussions require manual setup or GraphQL with proper scopes.
+### 1. Set Up Discussion Welcome Post (Optional)
+Discussions welcome post is recommended but not required to start development.
 
-**Action Required:**
+**Optional Action:**
 1. Go to https://github.com/afewell-hh/labapp/discussions
 2. Click "New discussion"
 3. Category: General
@@ -164,10 +159,10 @@ All issues are created and ready to assign:
 ## 📊 Quick Links
 
 - **Repository:** https://github.com/afewell-hh/labapp
+- **Project Board:** https://github.com/users/afewell-hh/projects/5 ⭐
 - **Issues:** https://github.com/afewell-hh/labapp/issues
 - **Milestones:** https://github.com/afewell-hh/labapp/milestones
 - **Labels:** https://github.com/afewell-hh/labapp/labels
-- **Projects:** https://github.com/afewell-hh/labapp/projects
 - **Discussions:** https://github.com/afewell-hh/labapp/discussions
 - **Actions:** https://github.com/afewell-hh/labapp/actions
 
@@ -175,9 +170,9 @@ All issues are created and ready to assign:
 
 ## 🚀 Next Steps
 
-1. **Assign Sprint 1 Issues** - Tag team members to issues #1, #2, #3, #5
-2. **Create Project Board** (manual) - Follow instructions above
-3. **Create Welcome Discussion** (manual) - Follow instructions above
+1. **View Project Board** - https://github.com/users/afewell-hh/projects/5
+2. **Assign Sprint 1 Issues** - Tag team members to issues #1, #2, #3, #5
+3. **Customize Project Views** - Add Sprint, Epic, and Roadmap views
 4. **Start Development!** - Create feature branches and begin work
 5. **First PR** - Submit PR for Issue #1 with `Closes #1`
 
