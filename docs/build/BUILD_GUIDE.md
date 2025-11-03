@@ -159,7 +159,7 @@ packer build \
 | `iso_url` | (Ubuntu URL) | ISO download URL |
 | `iso_checksum` | (SHA256) | ISO checksum for verification |
 | `vm_name` | hedgehog-lab-standard | Output VM name |
-| `disk_size` | 100G | Virtual disk size |
+| `disk_size` | 100000M | Virtual disk size (in QEMU format with unit) |
 | `memory` | 16384 | RAM in MB |
 | `cpus` | 8 | Number of virtual CPUs |
 | `ssh_username` | hhlab | SSH username |
