@@ -38,4 +38,3 @@ secrets/
 # Test outputs
 test-results/
 coverage/
-.env
