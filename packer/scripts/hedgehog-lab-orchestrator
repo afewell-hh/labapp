@@ -74,10 +74,30 @@ if [ "$BUILD_TYPE" = "standard" ]; then
 
     # Step 1: Wait for network
     log "Step 1/5: Waiting for network connectivity..."
-    while ! ping -c 1 -W 1 8.8.8.8 &>/dev/null; do
+
+    # Wait for network with timeout (max 5 minutes)
+    NETWORK_TIMEOUT=300
+    NETWORK_ELAPSED=0
+    NETWORK_READY=false
+
+    while [ $NETWORK_ELAPSED -lt $NETWORK_TIMEOUT ]; do
+        # Try multiple connectivity checks
+        if ping -c 1 -W 1 8.8.8.8 &>/dev/null || \
+           ping -c 1 -W 1 1.1.1.1 &>/dev/null || \
+           systemctl is-active --quiet network-online.target; then
+            NETWORK_READY=true
+            break
+        fi
         sleep 2
+        NETWORK_ELAPSED=$((NETWORK_ELAPSED + 2))
     done
-    log "Network is up"
+
+    if [ "$NETWORK_READY" = true ]; then
+        log "Network is up"
+    else
+        log "WARNING: Network connectivity check timed out after ${NETWORK_TIMEOUT}s"
+        log "Proceeding with initialization (some steps may fail without network)"
+    fi
 
     # Step 2: Initialize k3d cluster (placeholder)
     log "Step 2/5: Initializing k3d cluster..."

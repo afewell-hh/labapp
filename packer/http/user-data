@@ -24,8 +24,8 @@ autoinstall:
   identity:
     hostname: hedgehog-lab
     username: hhlab
-    password: "$6$rounds=4096$aQ7qKZ8r$xKfJvOqJ9yN5VqN7mQJ5L5.L5K5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L"
-    # Password: hhlab (encrypted with mkpasswd -m sha-512)
+    password: "$6$zekBnFoOMUC4ehNU$WHGkkd1xQxNlIdWia6DS6eO2qhYxHnAQyLh.O0M9Y1BwIuyCTe1TNs8b5fe.ORRTF/1wpPJJEM.vlmQvq.Orr/"
+    # Password: hhlab (encrypted with SHA-512)
 
   # SSH configuration
   ssh:
