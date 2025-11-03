@@ -16,12 +16,20 @@ jobs:
       - name: Shellcheck
         run: |
           sudo apt-get install -y shellcheck
-          find scripts -name "*.sh" -exec shellcheck {} \; || true
+          if [ -d packer/scripts ]; then
+            find packer/scripts -name "*.sh" -exec shellcheck {} \;
+          fi
+          if [ -d scripts ]; then
+            find scripts -name "*.sh" -exec shellcheck {} \;
+          fi
 
       - name: YAML Lint
         run: |
           pip install yamllint
-          yamllint configs/ || true
+          if [ -d configs ]; then
+            yamllint configs/ || true
+          fi
+          yamllint .github/workflows/
 
   validate:
     name: Validate Packer
@@ -32,22 +40,37 @@ jobs:
       - name: Setup Packer
         uses: hashicorp/setup-packer@main
         with:
-          version: '1.10.0'
+          version: '1.11.2'
+
+      - name: Initialize Packer
+        run: |
+          if [ -f packer/standard-build.pkr.hcl ]; then
+            packer init packer/standard-build.pkr.hcl
+          fi
 
       - name: Validate standard build
         run: |
           if [ -f packer/standard-build.pkr.hcl ]; then
             packer validate packer/standard-build.pkr.hcl
+            echo "✓ Standard build template is valid"
           else
             echo "Packer file not yet created, skipping validation"
+          fi
+
+      - name: Format check
+        run: |
+          if [ -f packer/standard-build.pkr.hcl ]; then
+            packer fmt -check packer/standard-build.pkr.hcl
           fi
 
       - name: Validate pre-warmed build
         run: |
           if [ -f packer/prewarmed-build.pkr.hcl ]; then
+            packer init packer/prewarmed-build.pkr.hcl
             packer validate packer/prewarmed-build.pkr.hcl
+            echo "✓ Pre-warmed build template is valid"
           else
-            echo "Packer file not yet created, skipping validation"
+            echo "Pre-warmed build not yet implemented, skipping validation"
           fi
 
   test:
