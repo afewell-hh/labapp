@@ -1,0 +1,57 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  # Locale and keyboard
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # Network configuration
+  network:
+    network:
+      version: 2
+      ethernets:
+        ens3:
+          dhcp4: true
+
+  # Storage configuration
+  storage:
+    layout:
+      name: lvm
+
+  # Identity
+  identity:
+    hostname: hedgehog-lab
+    username: hhlab
+    password: "$6$rounds=4096$aQ7qKZ8r$xKfJvOqJ9yN5VqN7mQJ5L5.L5K5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L5L"
+    # Password: hhlab (encrypted with mkpasswd -m sha-512)
+
+  # SSH configuration
+  ssh:
+    install-server: yes
+    allow-pw: yes
+
+  # Packages to install
+  packages:
+    - openssh-server
+    - cloud-init
+    - qemu-guest-agent
+    - curl
+    - wget
+    - git
+    - vim
+    - net-tools
+    - build-essential
+
+  # Late commands
+  late-commands:
+    - echo 'hhlab ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/hhlab
+    - chmod 440 /target/etc/sudoers.d/hhlab
+    - curtin in-target --target=/target -- systemctl enable ssh
+
+  # User data - disable auto-updates during provisioning
+  user-data:
+    disable_root: false
+    package_update: true
+    package_upgrade: false
