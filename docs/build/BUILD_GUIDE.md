@@ -110,9 +110,14 @@ export VERSION="0.1.0"
 # Validate template
 packer validate packer/standard-build.pkr.hcl
 
-# Build
+# Build with KVM (local development - fastest)
 packer build -var "version=$VERSION" packer/standard-build.pkr.hcl
+
+# Build without KVM (CI/CD or systems without virtualization)
+packer build -var "version=$VERSION" -var "accelerator=tcg" packer/standard-build.pkr.hcl
 ```
+
+**Note:** Builds without KVM (using TCG software emulation) will be significantly slower (2-4x build time).
 
 ### Using Make
 
@@ -159,6 +164,9 @@ packer build \
 | `cpus` | 8 | Number of virtual CPUs |
 | `ssh_username` | hhlab | SSH username |
 | `ssh_password` | hhlab | SSH password (sensitive) |
+| `accelerator` | kvm | QEMU accelerator (kvm, tcg, or none) |
+
+**Important:** Use `accelerator=tcg` for environments without KVM support (GitHub Actions, some cloud VMs).
 
 ### Provisioning Scripts
 
@@ -301,6 +309,34 @@ packer build -parallel-builds=2 packer/standard-build.pkr.hcl
 See `.github/workflows/build-standard.yml` for automated builds on:
 - Tag pushes (e.g., `v0.1.0`)
 - Manual workflow dispatch
+
+**GitHub Actions Limitations:**
+
+1. **No KVM Support**: GitHub-hosted runners don't support nested virtualization
+   - Solution: Workflow uses `accelerator=tcg` (software emulation)
+   - Impact: Build time increases to 2-4 hours vs. 45-60 minutes with KVM
+
+2. **File Size Limits**:
+   - GitHub Artifacts: 5GB per file (OVA is 15-20GB)
+   - GitHub Releases: 2GB per file
+   - Solution: Only checksums are uploaded; users build locally or use external storage
+
+**Recommended Alternatives:**
+
+1. **Self-Hosted Runners**:
+   - Install on bare-metal with KVM support
+   - Configure external storage (S3, GCS, Azure Blob)
+   - Fast builds with artifact distribution
+
+2. **Local Builds**:
+   - Best for development and testing
+   - Full KVM acceleration
+   - Complete control over output
+
+3. **External CI/CD**:
+   - GitLab CI with KVM runners
+   - Jenkins with KVM support
+   - CircleCI with machine executor
 
 ## Build Output
 

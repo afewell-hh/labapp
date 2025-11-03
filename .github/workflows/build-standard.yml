@@ -86,27 +86,28 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          packer build -var "version=${VERSION}" packer/standard-build.pkr.hcl
+          # Use TCG (software emulation) since GitHub runners don't support KVM
+          packer build -var "version=${VERSION}" -var "accelerator=tcg" packer/standard-build.pkr.hcl
 
       - name: List build outputs
         run: |
           ls -lh output-hedgehog-lab-standard/
+          echo "Build artifacts:"
+          du -sh output-hedgehog-lab-standard/*
 
-      - name: Upload OVA artifact
+      - name: Upload checksum only
         uses: actions/upload-artifact@v4
         with:
-          name: hedgehog-lab-standard-${{ steps.version.outputs.version }}
+          name: hedgehog-lab-standard-${{ steps.version.outputs.version }}-checksums
           path: |
-            output-hedgehog-lab-standard/*.ova
             output-hedgehog-lab-standard/*.sha256
-          retention-days: 30
+          retention-days: 90
 
       - name: Create Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            output-hedgehog-lab-standard/*.ova
             output-hedgehog-lab-standard/*.sha256
           body: |
             # Hedgehog Lab Appliance v${{ steps.version.outputs.version }}
@@ -119,9 +120,30 @@ jobs:
             **First boot:** 15-20 minutes (one-time initialization)
             **Use case:** Self-paced online learning
 
+            ### ⚠️ Large File Distribution
+
+            Due to GitHub's file size limits (2GB for releases), the OVA file is **not** attached to this release.
+
+            **Download Options:**
+
+            1. **Build Locally** (Recommended):
+               ```bash
+               git clone https://github.com/${{ github.repository }}.git
+               cd labapp
+               make build-standard VERSION=${{ steps.version.outputs.version }}
+               ```
+
+            2. **External Storage** (Coming Soon):
+               - Cloud storage link will be provided separately
+               - Check repository README for download links
+
+            3. **Self-Hosted Runners**:
+               - Organizations can use self-hosted runners with sufficient storage
+               - Configure external artifact storage (S3, GCS, Azure Blob, etc.)
+
             ### Installation
 
-            1. Download the OVA file
+            1. Download or build the OVA file
             2. Import into VMware Workstation/Player or VirtualBox
             3. Start the VM
             4. Wait for initialization to complete

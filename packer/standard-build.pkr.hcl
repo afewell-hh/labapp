@@ -54,6 +54,12 @@ variable "ssh_password" {
   sensitive = true
 }
 
+variable "accelerator" {
+  type    = string
+  default = "kvm"
+  description = "QEMU accelerator (kvm, tcg, or none). Use 'tcg' for GitHub Actions or environments without KVM support."
+}
+
 # Locals
 locals {
   output_name = "${var.vm_name}-${var.version}"
@@ -75,7 +81,7 @@ source "qemu" "ubuntu" {
   memory      = var.memory
   disk_size   = var.disk_size
   format      = "qcow2"
-  accelerator = "kvm"
+  accelerator = var.accelerator
 
   # QEMU settings
   qemu_binary      = "qemu-system-x86_64"
