@@ -198,26 +198,26 @@ wait_for_cluster_ready() {
 add_helm_repositories() {
     log_info "Adding Helm repositories..."
 
-    # Add Prometheus Community repo
-    if ! helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >> "$LOG_FILE" 2>&1; then
+    # Add Prometheus Community repo (use --force-update for idempotency)
+    if ! helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update >> "$LOG_FILE" 2>&1; then
         log_error "Failed to add prometheus-community Helm repository"
         return 1
     fi
-    log_info "Added prometheus-community Helm repository"
+    log_info "Added/updated prometheus-community Helm repository"
 
-    # Add ArgoCD repo
-    if ! helm repo add argo https://argoproj.github.io/argo-helm >> "$LOG_FILE" 2>&1; then
+    # Add ArgoCD repo (use --force-update for idempotency)
+    if ! helm repo add argo https://argoproj.github.io/argo-helm --force-update >> "$LOG_FILE" 2>&1; then
         log_error "Failed to add argo Helm repository"
         return 1
     fi
-    log_info "Added argo Helm repository"
+    log_info "Added/updated argo Helm repository"
 
-    # Add Gitea repo
-    if ! helm repo add gitea-charts https://dl.gitea.com/charts/ >> "$LOG_FILE" 2>&1; then
+    # Add Gitea repo (use --force-update for idempotency)
+    if ! helm repo add gitea-charts https://dl.gitea.com/charts/ --force-update >> "$LOG_FILE" 2>&1; then
         log_error "Failed to add gitea-charts Helm repository"
         return 1
     fi
-    log_info "Added gitea-charts Helm repository"
+    log_info "Added/updated gitea-charts Helm repository"
 
     # Update repositories
     if ! helm repo update >> "$LOG_FILE" 2>&1; then
@@ -297,21 +297,22 @@ prometheusOperator:
   enabled: true
 EOF
 
-    # Install chart
-    log_info "Installing kube-prometheus-stack chart (version: ${PROMETHEUS_STACK_CHART_VERSION})..."
-    if ! helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+    # Install/upgrade chart (idempotent)
+    log_info "Installing/upgrading kube-prometheus-stack chart (version: ${PROMETHEUS_STACK_CHART_VERSION})..."
+    if ! helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace "$PROMETHEUS_NAMESPACE" \
+        --create-namespace \
         --version "$PROMETHEUS_STACK_CHART_VERSION" \
         --values /tmp/prometheus-values.yaml \
         --wait \
         --timeout 10m >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to install kube-prometheus-stack"
+        log_error "Failed to install/upgrade kube-prometheus-stack"
         rm -f /tmp/prometheus-values.yaml
         return 1
     fi
 
     rm -f /tmp/prometheus-values.yaml
-    log_info "kube-prometheus-stack installed successfully"
+    log_info "kube-prometheus-stack installed/upgraded successfully"
     return 0
 }
 
@@ -373,21 +374,22 @@ repoServer:
       memory: 1Gi
 EOF
 
-    # Install chart
-    log_info "Installing ArgoCD chart (version: ${ARGOCD_CHART_VERSION})..."
-    if ! helm install argocd argo/argo-cd \
+    # Install/upgrade chart (idempotent)
+    log_info "Installing/upgrading ArgoCD chart (version: ${ARGOCD_CHART_VERSION})..."
+    if ! helm upgrade --install argocd argo/argo-cd \
         --namespace "$ARGOCD_NAMESPACE" \
+        --create-namespace \
         --version "$ARGOCD_CHART_VERSION" \
         --values /tmp/argocd-values.yaml \
         --wait \
         --timeout 10m >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to install ArgoCD"
+        log_error "Failed to install/upgrade ArgoCD"
         rm -f /tmp/argocd-values.yaml
         return 1
     fi
 
     rm -f /tmp/argocd-values.yaml
-    log_info "ArgoCD installed successfully"
+    log_info "ArgoCD installed/upgraded successfully"
 
     # Get initial admin password
     log_info "Retrieving ArgoCD admin password..."
@@ -469,21 +471,22 @@ postgresql:
   enabled: false
 EOF
 
-    # Install chart
-    log_info "Installing Gitea chart (version: ${GITEA_CHART_VERSION})..."
-    if ! helm install gitea gitea-charts/gitea \
+    # Install/upgrade chart (idempotent)
+    log_info "Installing/upgrading Gitea chart (version: ${GITEA_CHART_VERSION})..."
+    if ! helm upgrade --install gitea gitea-charts/gitea \
         --namespace "$GITEA_NAMESPACE" \
+        --create-namespace \
         --version "$GITEA_CHART_VERSION" \
         --values /tmp/gitea-values.yaml \
         --wait \
         --timeout 10m >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to install Gitea"
+        log_error "Failed to install/upgrade Gitea"
         rm -f /tmp/gitea-values.yaml
         return 1
     fi
 
     rm -f /tmp/gitea-values.yaml
-    log_info "Gitea installed successfully"
+    log_info "Gitea installed/upgraded successfully"
     log_info "Gitea admin username: gitea_admin"
     log_info "Gitea admin password: admin123"
 
