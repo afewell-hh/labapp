@@ -18,7 +18,8 @@ packer/
     ├── 04-install-tools.sh     # Kubernetes/cloud-native tools
     ├── 99-cleanup.sh           # Cleanup and optimization
     ├── create-ova.sh           # Convert VMDK to OVA
-    └── hedgehog-lab-orchestrator # Main orchestrator script
+    ├── hedgehog-lab-orchestrator # Main orchestrator script
+    └── hedgehog-lab-init.service # Systemd service unit
 ```
 
 ## Templates
@@ -145,11 +146,19 @@ Scripts run in numerical order during the build process. All scripts are idempot
 
 ### hedgehog-lab-orchestrator
 
-**Purpose:** Main orchestrator that runs on first boot
+**Purpose:** Main orchestrator that runs automatically on first boot via systemd
+
+**Systemd Integration:**
+- Installed as systemd service: `hedgehog-lab-init.service`
+- Enabled automatically during build
+- Runs after `network-online.target`
+- Condition: Only runs if `/var/lib/hedgehog-lab/initialized` doesn't exist
+- Logs to systemd journal: `journalctl -u hedgehog-lab-init`
 
 **Current Functionality:**
 - Detects build type (standard vs pre-warmed)
 - Creates lockfile to prevent concurrent runs
+- Waits for network with timeout (5 minutes max)
 - Logs initialization steps
 - Marks appliance as initialized
 
@@ -158,6 +167,18 @@ Scripts run in numerical order during the build process. All scripts are idempot
 - Initialize Hedgehog VLAB
 - Deploy GitOps stack (ArgoCD, Gitea)
 - Deploy observability stack (Prometheus, Grafana, Loki)
+
+### hedgehog-lab-init.service
+
+**Purpose:** Systemd service unit for orchestrator
+
+**Configuration:**
+- **Type:** oneshot (runs once on boot)
+- **After:** network-online.target
+- **Condition:** ConditionPathExists=!/var/lib/hedgehog-lab/initialized
+- **Enabled:** Automatically via systemctl enable
+
+**Runtime:** Runs once on first boot only
 
 ## Customization
 

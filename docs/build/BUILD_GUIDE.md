@@ -210,10 +210,28 @@ Scripts are located in `packer/scripts/` and run in order:
 
 ### Orchestrator
 
-The orchestrator (`packer/scripts/hedgehog-lab-orchestrator`) is installed to `/usr/local/bin/` and will run on first boot to initialize the lab environment.
+The orchestrator (`packer/scripts/hedgehog-lab-orchestrator`) is installed to `/usr/local/bin/` and runs automatically on first boot via systemd service.
+
+**Systemd Service:**
+- **Unit file:** `/etc/systemd/system/hedgehog-lab-init.service`
+- **Enabled:** Runs automatically on boot
+- **Condition:** Only runs if not already initialized
+- **Logs:** Available via `journalctl -u hedgehog-lab-init`
 
 **Current implementation:** Placeholder that logs initialization steps
 **Future implementation:** Will initialize k3d, VLAB, GitOps, and observability stacks
+
+**Manual control:**
+```bash
+# Check status
+systemctl status hedgehog-lab-init
+
+# View logs
+journalctl -u hedgehog-lab-init -f
+
+# Manually run (if needed)
+sudo systemctl start hedgehog-lab-init
+```
 
 ## Troubleshooting
 

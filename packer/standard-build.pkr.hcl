@@ -150,11 +150,20 @@ build {
     destination = "/tmp/hedgehog-lab-orchestrator"
   }
 
+  provisioner "file" {
+    source      = "packer/scripts/hedgehog-lab-init.service"
+    destination = "/tmp/hedgehog-lab-init.service"
+  }
+
   provisioner "shell" {
     inline = [
-      "sudo mkdir -p /usr/local/bin /etc/hedgehog-lab",
+      "sudo mkdir -p /usr/local/bin /etc/hedgehog-lab /var/lib/hedgehog-lab /var/log/hedgehog-lab",
       "sudo mv /tmp/hedgehog-lab-orchestrator /usr/local/bin/",
       "sudo chmod +x /usr/local/bin/hedgehog-lab-orchestrator",
+      "sudo mv /tmp/hedgehog-lab-init.service /etc/systemd/system/",
+      "sudo chmod 644 /etc/systemd/system/hedgehog-lab-init.service",
+      "sudo systemctl daemon-reload",
+      "sudo systemctl enable hedgehog-lab-init.service",
       "echo 'standard' | sudo tee /etc/hedgehog-lab/build-type"
     ]
     execute_command = "echo '${var.ssh_password}' | sudo -S bash -c '{{ .Vars }} {{ .Path }}'"

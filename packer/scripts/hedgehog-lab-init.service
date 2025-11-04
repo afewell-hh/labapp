@@ -1,0 +1,25 @@
+[Unit]
+Description=Hedgehog Lab Appliance Initialization
+Documentation=https://github.com/afewell-hh/labapp
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/hedgehog-lab/initialized
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hedgehog-lab-orchestrator
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=0
+
+# Run as root for system initialization
+User=root
+Group=root
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
