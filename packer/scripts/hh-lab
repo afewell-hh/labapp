@@ -149,13 +149,17 @@ get_vlab_resources() {
     fi
 
     # Count switches and VPCs from wiring diagram
-    # Switches are in the "Switches:" section
-    local switch_count
-    switch_count=$(grep -A 1000 "^  Switches:" "$vlab_dir/wiring.yaml" 2>/dev/null | grep -E "^    [a-zA-Z]" | grep -v "^  VPCs:" | wc -l || echo "0")
+    # The wiring.yaml uses Kubernetes-style YAML with kind: Switch and kind: VPC
+    # We need to count unique switch and VPC resources
 
-    # VPCs are in the "VPCs:" section
+    # Count Switch resources (kind: Switch)
+    local switch_count
+    switch_count=$(grep -c "^kind: Switch$" "$vlab_dir/wiring.yaml" 2>/dev/null || echo "0")
+
+    # Count VPC resources (kind: VPC)
+    # Note: VPCs may not exist in all wiring diagrams
     local vpc_count
-    vpc_count=$(grep -A 1000 "^  VPCs:" "$vlab_dir/wiring.yaml" 2>/dev/null | grep -E "^    [a-zA-Z]" | wc -l || echo "0")
+    vpc_count=$(grep -c "^kind: VPC$" "$vlab_dir/wiring.yaml" 2>/dev/null || echo "0")
 
     echo "$switch_count $vpc_count"
 }
