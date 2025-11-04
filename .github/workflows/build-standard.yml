@@ -5,6 +5,11 @@ name: Build Standard Appliance
   push:
     tags:
       - 'v*.*.*'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packer/**'
+      - '.github/workflows/build-standard.yml'
   workflow_dispatch:
     inputs:
       version:
@@ -83,6 +88,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "version=pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
           else
             echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
           fi
@@ -103,10 +110,58 @@ jobs:
             packer/standard-build.pkr.hcl
 
       - name: List build outputs
+        id: list_outputs
         run: |
           ls -lh output-hedgehog-lab-standard/
           echo "Build artifacts:"
-          du -sh output-hedgehog-lab-standard/*
+          du -sh output-hedgehog-lab-standard/* | tee build-artifacts.txt
+
+      - name: Post build status to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let artifactsList = 'Build output information not available';
+            try {
+              artifactsList = fs.readFileSync('build-artifacts.txt', 'utf8').trim();
+            } catch (e) {
+              artifactsList = 'Unable to read artifact details';
+            }
+
+            const buildOutput = `## ✅ Standard Build Complete
+
+            **Version:** ${{ steps.version.outputs.version }}
+            **Build Time:** ${new Date().toISOString()}
+            **Workflow Run:** [View Details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ### Build Artifacts
+
+            The build completed successfully with the following artifacts:
+
+            \`\`\`
+            ${artifactsList}
+            \`\`\`
+
+            ### ⚠️ CI Build Configuration
+
+            This build uses reduced resources (4GB RAM, 2 CPUs, TCG emulation) for validation purposes only.
+            **Not recommended for production use.**
+
+            ### Next Steps
+
+            - ✅ Packer template validation passed
+            - ✅ Standard OVA build completed
+            - 📦 Artifacts available in workflow run (checksums only)
+
+            For full production builds, merge this PR and create a release tag.`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: buildOutput
+            });
 
       - name: Upload checksum only
         uses: actions/upload-artifact@v4
