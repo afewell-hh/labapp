@@ -227,8 +227,25 @@ cmd_status() {
     # k3d cluster
     echo -n "  k3d cluster: "
     if command -v k3d &> /dev/null; then
-        if k3d cluster list 2>/dev/null | grep -q "k3d-observability.*running"; then
-            print_status_ok
+        # Check if k3d-observability cluster exists and servers are running
+        # Note: The actual cluster name may be "k3d-observability" or "observability"
+        # depending on how it was created. We check for both possibilities.
+        local cluster_line
+        cluster_line=$(k3d cluster list 2>/dev/null | grep -E "^(k3d-observability|observability)")
+        if [ -n "$cluster_line" ]; then
+            # Extract servers running/total (second column, format: X/Y)
+            local servers_info
+            servers_info=$(echo "$cluster_line" | awk '{print $2}')
+            local servers_running
+            servers_running=$(echo "$servers_info" | cut -d/ -f1)
+            local servers_total
+            servers_total=$(echo "$servers_info" | cut -d/ -f2)
+            # Check if all servers are running (X/X where X > 0)
+            if [ "$servers_running" = "$servers_total" ] && [ "$servers_total" != "0" ] && [ "$servers_total" != "" ]; then
+                print_status_ok
+            else
+                print_status_pending
+            fi
         else
             print_status_pending
         fi
