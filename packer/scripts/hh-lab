@@ -1,0 +1,481 @@
+#!/bin/bash
+# hh-lab
+# Command-line tool for Hedgehog Lab Appliance management
+# Provides status, logs, and info commands for lab management
+
+set -euo pipefail
+
+# Version
+VERSION="0.1.0"
+
+# Configuration paths
+STATE_FILE="/var/lib/hedgehog-lab/state.json"
+STAMP_FILE="/var/lib/hedgehog-lab/initialized"
+BUILD_TYPE_FILE="/etc/hedgehog-lab/build-type"
+LOG_FILE="/var/log/hedgehog-lab-init.log"
+MODULE_LOG_DIR="/var/log/hedgehog-lab/modules"
+
+# ANSI color codes for colored output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# Color output functions
+print_header() {
+    echo -e "${BOLD}${BLUE}$*${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $*"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $*"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $*"
+}
+
+print_info() {
+    echo -e "${CYAN}ℹ${NC} $*"
+}
+
+print_label() {
+    echo -e "${DIM}$1:${NC} $2"
+}
+
+print_status_ok() {
+    echo -e "[${GREEN}OK${NC}]"
+}
+
+print_status_fail() {
+    echo -e "[${RED}FAIL${NC}]"
+}
+
+print_status_pending() {
+    echo -e "[${YELLOW}PENDING${NC}]"
+}
+
+# Check if running with appropriate permissions
+check_permissions() {
+    if [ ! -r "$STATE_FILE" ] 2>/dev/null && [ -f "$STATE_FILE" ]; then
+        print_error "Permission denied. Some commands may require sudo."
+        return 1
+    fi
+    return 0
+}
+
+# Parse JSON fields from state file
+get_state_field() {
+    local field="$1"
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "unknown"
+        return
+    fi
+    # Simple JSON parsing using grep and sed (avoids jq dependency)
+    grep "\"$field\"" "$STATE_FILE" | sed 's/.*: "\?\([^",]*\)"\?,\?/\1/' | tr -d ' '
+}
+
+# Get array length from JSON
+get_array_length() {
+    local field="$1"
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "0"
+        return
+    fi
+    grep "\"$field\"" "$STATE_FILE" -A 1 | grep -o "\"[^\"]*\"" | wc -l
+}
+
+# status command - show lab initialization status
+cmd_status() {
+    print_header "Hedgehog Lab Status"
+    echo ""
+
+    # Check if initialized
+    if [ -f "$STAMP_FILE" ]; then
+        print_success "Lab is initialized and ready"
+
+        # Read stamp file info
+        if [ -r "$STAMP_FILE" ]; then
+            local init_time=$(grep "initialized_at" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/')
+            local build_type=$(grep "build_type" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/')
+            echo ""
+            print_label "  Initialized" "$init_time"
+            print_label "  Build Type" "$build_type"
+        fi
+    else
+        print_warning "Lab is not yet initialized"
+
+        # Check if initialization is in progress
+        if [ -f "$STATE_FILE" ]; then
+            local status=$(get_state_field "status")
+            local current_module=$(get_state_field "current_module")
+
+            echo ""
+            print_label "  Status" "$status"
+            print_label "  Current Module" "$current_module"
+
+            if [ "$status" = "failed" ]; then
+                print_error "Initialization failed. Check logs for details."
+            elif [ "$status" = "in_progress" ] || [ "$status" = "running" ]; then
+                print_info "Initialization in progress..."
+            fi
+        else
+            print_info "Initialization has not started"
+        fi
+    fi
+
+    echo ""
+
+    # Check key services
+    print_header "Services Status"
+    echo ""
+
+    # Check if k3d cluster exists
+    if command -v k3d &> /dev/null; then
+        if k3d cluster list 2>/dev/null | grep -q "hedgehog-lab"; then
+            echo -ne "  k3d cluster (hedgehog-lab): "
+            print_status_ok
+        else
+            echo -ne "  k3d cluster (hedgehog-lab): "
+            print_status_pending
+        fi
+    fi
+
+    # Check if kubectl is configured
+    if command -v kubectl &> /dev/null; then
+        if kubectl cluster-info &> /dev/null; then
+            echo -ne "  Kubernetes API: "
+            print_status_ok
+        else
+            echo -ne "  Kubernetes API: "
+            print_status_fail
+        fi
+    fi
+
+    # Check for hhfab
+    if command -v hhfab &> /dev/null; then
+        echo -ne "  hhfab CLI: "
+        print_status_ok
+    else
+        echo -ne "  hhfab CLI: "
+        print_status_pending
+    fi
+
+    echo ""
+    print_info "Run '${BOLD}hh-lab logs${NC}' to view initialization logs"
+    print_info "Run '${BOLD}hh-lab info${NC}' for detailed system information"
+    echo ""
+}
+
+# logs command - view initialization logs
+cmd_logs() {
+    local lines=50
+    local follow=false
+    local module=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow)
+                follow=true
+                shift
+                ;;
+            -n|--lines)
+                lines="$2"
+                shift 2
+                ;;
+            -m|--module)
+                module="$2"
+                shift 2
+                ;;
+            -*)
+                print_error "Unknown option: $1"
+                echo ""
+                echo "Usage: hh-lab logs [-f|--follow] [-n|--lines <num>] [-m|--module <name>] [lines]"
+                return 2
+                ;;
+            *)
+                # Positional argument for line count
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    lines="$1"
+                else
+                    print_error "Invalid line count: $1 (must be a number)"
+                    return 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Determine which log to show
+    local log_to_show="$LOG_FILE"
+    if [ -n "$module" ]; then
+        log_to_show="$MODULE_LOG_DIR/${module}.log"
+        if [ ! -f "$log_to_show" ]; then
+            print_error "Module log not found: $log_to_show"
+            echo ""
+            print_info "Available modules:"
+            if [ -d "$MODULE_LOG_DIR" ]; then
+                for log in "$MODULE_LOG_DIR"/*.log; do
+                    if [ -f "$log" ]; then
+                        echo "  - $(basename "$log" .log)"
+                    fi
+                done
+            else
+                echo "  No module logs available"
+            fi
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$log_to_show" ]; then
+        print_warning "Log file not found: $log_to_show"
+        return 1
+    fi
+
+    print_header "Hedgehog Lab Logs"
+    if [ -n "$module" ]; then
+        echo -e "${DIM}Module: $module${NC}"
+    fi
+    echo -e "${DIM}Log file: $log_to_show${NC}"
+    echo -e "${DIM}$(echo "─────────────────────────────────────────────────────────────" | head -c $(tput cols))${NC}"
+    echo ""
+
+    if [ "$follow" = true ]; then
+        tail -f -n "$lines" "$log_to_show"
+    else
+        tail -n "$lines" "$log_to_show"
+    fi
+}
+
+# info command - show detailed system information
+cmd_info() {
+    print_header "Hedgehog Lab Appliance Information"
+    echo ""
+
+    # Version info
+    print_header "Version"
+    print_label "  hh-lab CLI" "$VERSION"
+    if [ -f "$STAMP_FILE" ] && [ -r "$STAMP_FILE" ]; then
+        local version=$(grep "version" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
+        print_label "  Appliance" "$version"
+    fi
+    echo ""
+
+    # Build information
+    print_header "Build Information"
+    if [ -f "$BUILD_TYPE_FILE" ]; then
+        local build_type=$(cat "$BUILD_TYPE_FILE")
+        print_label "  Build Type" "$build_type"
+    else
+        print_label "  Build Type" "unknown"
+    fi
+
+    if [ -f "$STAMP_FILE" ] && [ -r "$STAMP_FILE" ]; then
+        local init_time=$(grep "initialized_at" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
+        print_label "  Initialized" "$init_time"
+    fi
+    echo ""
+
+    # System information
+    print_header "System Information"
+    print_label "  Hostname" "$(hostname)"
+    print_label "  OS" "$(lsb_release -ds 2>/dev/null || echo "unknown")"
+    print_label "  Kernel" "$(uname -r)"
+    print_label "  Architecture" "$(uname -m)"
+    echo ""
+
+    # Resource usage
+    print_header "Resource Usage"
+    local mem_total=$(free -h | awk '/^Mem:/ {print $2}')
+    local mem_used=$(free -h | awk '/^Mem:/ {print $3}')
+    local disk_usage=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
+    print_label "  Memory" "$mem_used / $mem_total"
+    print_label "  Disk (/)" "$disk_usage"
+    echo ""
+
+    # Installed tools
+    print_header "Installed Tools"
+    local tools=("docker" "k3d" "kubectl" "helm" "argocd" "hhfab" "k9s" "stern")
+    for tool in "${tools[@]}"; do
+        if command -v "$tool" &> /dev/null; then
+            local version=$($tool version --short 2>/dev/null || $tool version 2>/dev/null | head -1 || echo "installed")
+            # Clean up version output
+            version=$(echo "$version" | sed 's/^[^0-9]*//' | head -1 | cut -d' ' -f1)
+            print_label "  $tool" "$version"
+        else
+            print_label "  $tool" "${DIM}not installed${NC}"
+        fi
+    done
+    echo ""
+
+    # Kubernetes cluster info
+    if command -v kubectl &> /dev/null && kubectl cluster-info &> /dev/null; then
+        print_header "Kubernetes Cluster"
+        local k8s_version=$(kubectl version --short 2>/dev/null | grep "Server Version" | cut -d' ' -f3 || echo "unknown")
+        print_label "  Version" "$k8s_version"
+
+        local node_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        print_label "  Nodes" "$node_count"
+
+        local ns_count=$(kubectl get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        print_label "  Namespaces" "$ns_count"
+
+        echo ""
+    fi
+
+    # File locations
+    print_header "File Locations"
+    print_label "  State file" "$STATE_FILE"
+    print_label "  Log file" "$LOG_FILE"
+    print_label "  Module logs" "$MODULE_LOG_DIR"
+    echo ""
+}
+
+# help command - show usage information
+cmd_help() {
+    cat <<EOF
+${BOLD}NAME${NC}
+    hh-lab - Hedgehog Lab Appliance management tool
+
+${BOLD}SYNOPSIS${NC}
+    ${BOLD}hh-lab${NC} ${CYAN}<command>${NC} [options]
+
+${BOLD}DESCRIPTION${NC}
+    Command-line tool for managing and monitoring the Hedgehog Lab Appliance.
+    Provides status checking, log viewing, and system information commands.
+
+${BOLD}COMMANDS${NC}
+    ${BOLD}status${NC}
+        Display lab initialization status and services health
+
+        Shows whether the lab is initialized, current initialization state,
+        and status of key services (k3d, Kubernetes, hhfab).
+
+    ${BOLD}logs${NC} [options] [lines]
+        View initialization logs
+
+        ${BOLD}Options:${NC}
+            -f, --follow          Follow log output (like tail -f)
+            -n, --lines <num>     Number of lines to show (default: 50)
+            -m, --module <name>   Show logs for specific module
+
+        ${BOLD}Examples:${NC}
+            hh-lab logs                    # Show last 50 lines
+            hh-lab logs 100                # Show last 100 lines
+            hh-lab logs -f                 # Follow logs in real-time
+            hh-lab logs -m k3d-init        # Show k3d module logs
+            hh-lab logs -m vlab-init -n 200  # Show 200 lines of vlab logs
+
+    ${BOLD}info${NC}
+        Display detailed system information
+
+        Shows version info, build information, system resources, installed
+        tools, Kubernetes cluster details, and file locations.
+
+    ${BOLD}help${NC}
+        Display this help message
+
+    ${BOLD}version${NC}
+        Display version information
+
+${BOLD}FILES${NC}
+    /var/lib/hedgehog-lab/state.json
+        Current initialization state
+
+    /var/lib/hedgehog-lab/initialized
+        Stamp file indicating successful initialization
+
+    /var/log/hedgehog-lab-init.log
+        Main initialization log
+
+    /var/log/hedgehog-lab/modules/
+        Module-specific logs
+
+${BOLD}EXAMPLES${NC}
+    # Check if lab is ready
+    hh-lab status
+
+    # View recent initialization logs
+    hh-lab logs
+
+    # Follow logs in real-time
+    hh-lab logs --follow
+
+    # Show system information
+    hh-lab info
+
+    # View specific module logs
+    hh-lab logs -m k3d-observability-init
+
+${BOLD}EXIT STATUS${NC}
+    0    Success
+    1    General error
+    2    Invalid command or arguments
+
+${BOLD}VERSION${NC}
+    hh-lab version $VERSION
+
+${BOLD}AUTHOR${NC}
+    Hedgehog Lab Appliance Project
+    https://github.com/afewell-hh/labapp
+
+${BOLD}SEE ALSO${NC}
+    hedgehog-lab-orchestrator(1), hhfab(1), k3d(1), kubectl(1)
+
+EOF
+}
+
+# version command - show version
+cmd_version() {
+    echo "hh-lab version $VERSION"
+}
+
+# Main command dispatcher
+main() {
+    # Check if any arguments provided
+    if [ $# -eq 0 ]; then
+        cmd_help
+        exit 0
+    fi
+
+    # Get command
+    local command="$1"
+    shift
+
+    # Dispatch to command handler
+    case "$command" in
+        status)
+            cmd_status "$@"
+            ;;
+        logs)
+            cmd_logs "$@"
+            ;;
+        info)
+            cmd_info "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            echo ""
+            echo "Run '${BOLD}hh-lab help${NC}' for usage information"
+            exit 2
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
