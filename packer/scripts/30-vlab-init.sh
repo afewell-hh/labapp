@@ -178,9 +178,8 @@ verify_fabric_health() {
         log_info "Fabric health check passed - all switches are operational"
         return 0
     else
-        log_warn "Fabric health check completed with warnings (this may be expected during initial setup)"
-        # Don't fail here as some warnings are expected
-        return 0
+        log_error "Fabric health check failed"
+        return 1
     fi
 }
 
