@@ -29,6 +29,17 @@ else
     exit 1
 fi
 
+# Install k3d initialization module
+echo "Installing k3d initialization module..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/20-k3d-observability-init.sh" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/20-k3d-observability-init.sh /usr/local/bin/hedgehog-k3d-init
+    chmod +x /usr/local/bin/hedgehog-k3d-init
+    echo "k3d module installed at /usr/local/bin/hedgehog-k3d-init"
+else
+    echo "ERROR: k3d init script not found"
+    exit 1
+fi
+
 # Install VLAB initialization module
 echo "Installing VLAB initialization module..."
 if [ -f "/tmp/packer-provisioner-shell-scripts/30-vlab-init.sh" ]; then
@@ -62,6 +73,7 @@ chown -R hhlab:hhlab /opt/hedgehog
 chown -R hhlab:hhlab /var/lib/hedgehog-lab
 chown -R hhlab:hhlab /var/log/hedgehog-lab
 chmod 755 /usr/local/bin/hedgehog-lab-orchestrator
+chmod 755 /usr/local/bin/hedgehog-k3d-init
 chmod 755 /usr/local/bin/hedgehog-vlab-init
 
 echo "=================================================="
@@ -69,6 +81,7 @@ echo "Orchestrator installation complete!"
 echo "=================================================="
 echo "Installed components:"
 echo "  - Main orchestrator: /usr/local/bin/hedgehog-lab-orchestrator"
+echo "  - k3d module: /usr/local/bin/hedgehog-k3d-init"
 echo "  - VLAB module: /usr/local/bin/hedgehog-vlab-init"
 echo "  - Systemd service: /etc/systemd/system/hedgehog-lab-init.service"
 echo "  - Config directory: /etc/hedgehog-lab"

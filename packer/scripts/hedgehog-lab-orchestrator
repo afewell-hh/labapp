@@ -209,8 +209,29 @@ wait_for_network() {
 
 init_k3d_cluster() {
     local module_log="/var/log/hedgehog-lab/modules/k3d.log"
-    log_info "k3d initialization will be implemented in future sprint" | tee -a "$module_log"
-    return 0
+    local k3d_script="/usr/local/bin/hedgehog-k3d-init"
+
+    log_info "Initializing k3d observability cluster..." | tee -a "$module_log"
+
+    # Check if k3d init script exists
+    if [ ! -f "$k3d_script" ]; then
+        log_error "k3d initialization script not found at $k3d_script" | tee -a "$module_log"
+        return 1
+    fi
+
+    # Set environment variables for the k3d module
+    export K3D_CLUSTER_NAME="k3d-observability"
+    export K3D_TIMEOUT="900"  # 15 minutes
+    export LOG_FILE="$module_log"
+
+    # Execute k3d initialization script
+    if "$k3d_script"; then
+        log_info "k3d cluster initialization completed successfully" | tee -a "$module_log"
+        return 0
+    else
+        log_error "k3d cluster initialization failed" | tee -a "$module_log"
+        return 1
+    fi
 }
 
 init_vlab() {
