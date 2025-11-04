@@ -1,6 +1,7 @@
+---
 name: Build Standard Appliance
 
-on:
+"on":
   push:
     tags:
       - 'v*.*.*'
@@ -106,7 +107,9 @@ jobs:
       - name: Upload checksum only
         uses: actions/upload-artifact@v4
         with:
-          name: hedgehog-lab-standard-${{ steps.version.outputs.version }}-checksums
+          name: >-
+            hedgehog-lab-standard-${{
+            steps.version.outputs.version }}-checksums
           path: |
             output-hedgehog-lab-standard/*.sha256
           retention-days: 90
@@ -132,12 +135,15 @@ jobs:
 
             **1. OVA File Not Included**
 
-            Due to GitHub's file size limits (2GB for releases), the OVA file is **not** attached to this release.
+            Due to GitHub's file size limits (2GB for releases), the OVA
+            file is **not** attached to this release.
 
             **2. CI Build Configuration**
 
-            The GitHub Actions build uses reduced resources (4GB RAM, 2 CPUs, TCG emulation) for validation purposes only.
-            **This build is NOT recommended for production use** as it may have performance limitations.
+            The GitHub Actions build uses reduced resources (4GB RAM,
+            2 CPUs, TCG emulation) for validation purposes only.
+            **This build is NOT recommended for production use** as it
+            may have performance limitations.
 
             **Download Options:**
 
@@ -183,11 +189,14 @@ jobs:
             ### Checksum Verification
 
             ```bash
-            sha256sum -c hedgehog-lab-standard-${{ steps.version.outputs.version }}.ova.sha256
+            sha256sum -c \
+              hedgehog-lab-standard-${{
+              steps.version.outputs.version }}.ova.sha256
             ```
 
             ### Documentation
 
-            See the [README](https://github.com/${{ github.repository }}) for full documentation.
+            See the [README](https://github.com/${{
+            github.repository }}) for full documentation.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

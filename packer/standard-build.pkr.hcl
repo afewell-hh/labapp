@@ -2,6 +2,15 @@
 # Built with Packer and QEMU
 # Produces OVA format suitable for VMware/VirtualBox
 
+packer {
+  required_plugins {
+    qemu = {
+      version = ">= 1.0.0"
+      source  = "github.com/hashicorp/qemu"
+    }
+  }
+}
+
 # Variables
 variable "version" {
   type    = string
@@ -29,8 +38,8 @@ variable "vm_name" {
 }
 
 variable "disk_size" {
-  type    = string
-  default = "100000M"
+  type        = string
+  default     = "100000M"
   description = "Virtual disk size (e.g., '100000M' for 100GB, or '100G'). QEMU accepts size with unit suffix."
 }
 
@@ -50,14 +59,14 @@ variable "ssh_username" {
 }
 
 variable "ssh_password" {
-  type    = string
-  default = "hhlab"
+  type      = string
+  default   = "hhlab"
   sensitive = true
 }
 
 variable "accelerator" {
-  type    = string
-  default = "kvm"
+  type        = string
+  default     = "kvm"
   description = "QEMU accelerator (kvm, tcg, or none). Use 'tcg' for GitHub Actions or environments without KVM support."
 }
 
@@ -85,13 +94,13 @@ source "qemu" "ubuntu" {
   accelerator = var.accelerator
 
   # QEMU settings
-  qemu_binary      = "qemu-system-x86_64"
-  headless         = true
-  disk_interface   = "virtio-scsi"
-  disk_cache       = "unsafe"
-  disk_discard     = "unmap"
+  qemu_binary        = "qemu-system-x86_64"
+  headless           = true
+  disk_interface     = "virtio-scsi"
+  disk_cache         = "unsafe"
+  disk_discard       = "unmap"
   disk_detect_zeroes = "unmap"
-  net_device       = "virtio-net"
+  net_device         = "virtio-net"
 
   # Boot configuration
   boot_wait = "5s"
@@ -109,9 +118,9 @@ source "qemu" "ubuntu" {
   http_port_max  = 8200
 
   # SSH settings
-  ssh_username     = var.ssh_username
-  ssh_password     = var.ssh_password
-  ssh_timeout      = "30m"
+  ssh_username           = var.ssh_username
+  ssh_password           = var.ssh_password
+  ssh_timeout            = "30m"
   ssh_handshake_attempts = 100
 
   # Shutdown
