@@ -93,22 +93,106 @@ get_array_length() {
     grep "\"$field\"" "$STATE_FILE" -A 1 | grep -o "\"[^\"]*\"" | wc -l
 }
 
+# Helper function to check Kubernetes deployment status
+check_k8s_deployment() {
+    local namespace="$1"
+    local deployment="$2"
+    local label_selector="${3:-}"
+
+    if ! command -v kubectl &> /dev/null; then
+        echo "unknown"
+        return
+    fi
+
+    if ! kubectl cluster-info &> /dev/null; then
+        echo "no-cluster"
+        return
+    fi
+
+    # Check if namespace exists
+    if ! kubectl get namespace "$namespace" &> /dev/null; then
+        echo "not-deployed"
+        return
+    fi
+
+    # Check deployment or pods with label selector
+    if [ -n "$label_selector" ]; then
+        local ready_pods
+        ready_pods=$(kubectl get pods -n "$namespace" -l "$label_selector" --field-selector=status.phase=Running 2>/dev/null | grep -c "Running" || echo "0")
+        if [ "$ready_pods" -gt 0 ]; then
+            echo "running"
+        else
+            echo "not-ready"
+        fi
+    else
+        if kubectl get deployment -n "$namespace" "$deployment" &> /dev/null; then
+            local available
+            available=$(kubectl get deployment -n "$namespace" "$deployment" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0")
+            if [ "$available" -gt 0 ]; then
+                echo "running"
+            else
+                echo "not-ready"
+            fi
+        else
+            echo "not-deployed"
+        fi
+    fi
+}
+
+# Helper function to get VLAB resource counts
+get_vlab_resources() {
+    local vlab_dir="/opt/hedgehog/vlab"
+
+    if [ ! -f "$vlab_dir/wiring.yaml" ]; then
+        echo "0 0"
+        return
+    fi
+
+    # Count switches and VPCs from wiring diagram
+    # Switches are in the "Switches:" section
+    local switch_count
+    switch_count=$(grep -A 1000 "^  Switches:" "$vlab_dir/wiring.yaml" 2>/dev/null | grep -E "^    [a-zA-Z]" | grep -v "^  VPCs:" | wc -l || echo "0")
+
+    # VPCs are in the "VPCs:" section
+    local vpc_count
+    vpc_count=$(grep -A 1000 "^  VPCs:" "$vlab_dir/wiring.yaml" 2>/dev/null | grep -E "^    [a-zA-Z]" | wc -l || echo "0")
+
+    echo "$switch_count $vpc_count"
+}
+
+# Helper function to get current scenario
+get_current_scenario() {
+    local scenario_file="/var/lib/hedgehog-lab/current-scenario"
+
+    if [ -f "$scenario_file" ]; then
+        cat "$scenario_file"
+    else
+        echo "default"
+    fi
+}
+
 # status command - show lab initialization status
 cmd_status() {
     print_header "Hedgehog Lab Status"
     echo ""
 
-    # Check if initialized
+    # Build Type and Initialization Status
+    local build_type="unknown"
+    local init_status="not-initialized"
+
+    if [ -f "$BUILD_TYPE_FILE" ]; then
+        build_type=$(cat "$BUILD_TYPE_FILE")
+    fi
+
     if [ -f "$STAMP_FILE" ]; then
+        init_status="initialized"
         print_success "Lab is initialized and ready"
 
         # Read stamp file info
         if [ -r "$STAMP_FILE" ]; then
-            local init_time=$(grep "initialized_at" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/')
-            local build_type=$(grep "build_type" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/')
+            local init_time=$(grep "initialized_at" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
             echo ""
             print_label "  Initialized" "$init_time"
-            print_label "  Build Type" "$build_type"
         fi
     else
         print_warning "Lab is not yet initialized"
@@ -117,6 +201,7 @@ cmd_status() {
         if [ -f "$STATE_FILE" ]; then
             local status=$(get_state_field "status")
             local current_module=$(get_state_field "current_module")
+            init_status="$status"
 
             echo ""
             print_label "  Status" "$status"
@@ -132,44 +217,145 @@ cmd_status() {
         fi
     fi
 
+    print_label "  Build Type" "$build_type"
     echo ""
 
-    # Check key services
-    print_header "Services Status"
+    # Services Health
+    print_header "Services Health"
     echo ""
 
-    # Check if k3d cluster exists
+    # k3d cluster
+    echo -n "  k3d cluster: "
     if command -v k3d &> /dev/null; then
-        if k3d cluster list 2>/dev/null | grep -q "hedgehog-lab"; then
-            echo -ne "  k3d cluster (hedgehog-lab): "
+        if k3d cluster list 2>/dev/null | grep -q "k3d-observability.*running"; then
             print_status_ok
         else
-            echo -ne "  k3d cluster (hedgehog-lab): "
             print_status_pending
         fi
+    else
+        print_status_fail
     fi
 
-    # Check if kubectl is configured
-    if command -v kubectl &> /dev/null; then
-        if kubectl cluster-info &> /dev/null; then
-            echo -ne "  Kubernetes API: "
-            print_status_ok
-        else
-            echo -ne "  Kubernetes API: "
-            print_status_fail
-        fi
-    fi
-
-    # Check for hhfab
-    if command -v hhfab &> /dev/null; then
-        echo -ne "  hhfab CLI: "
+    # Kubernetes API
+    echo -n "  Kubernetes API: "
+    if command -v kubectl &> /dev/null && kubectl cluster-info &> /dev/null; then
         print_status_ok
     else
-        echo -ne "  hhfab CLI: "
-        print_status_pending
+        print_status_fail
     fi
 
+    # VLAB
+    echo -n "  VLAB (hhfab): "
+    if command -v hhfab &> /dev/null; then
+        local vlab_dir="/opt/hedgehog/vlab"
+        if [ -f "$vlab_dir/wiring.yaml" ]; then
+            # Check if VLAB VMs are actually running
+            if hhfab vlab inspect &> /dev/null; then
+                print_status_ok
+            else
+                print_status_pending
+            fi
+        else
+            print_status_pending
+        fi
+    else
+        print_status_fail
+    fi
+
+    # ArgoCD
+    echo -n "  ArgoCD: "
+    local argocd_status
+    argocd_status=$(check_k8s_deployment "argocd" "" "app.kubernetes.io/name=argocd-server")
+    case "$argocd_status" in
+        running)
+            print_status_ok
+            ;;
+        not-deployed|no-cluster)
+            print_status_pending
+            ;;
+        *)
+            print_status_fail
+            ;;
+    esac
+
+    # Gitea
+    echo -n "  Gitea: "
+    local gitea_status
+    gitea_status=$(check_k8s_deployment "gitea" "" "app.kubernetes.io/name=gitea")
+    case "$gitea_status" in
+        running)
+            print_status_ok
+            ;;
+        not-deployed|no-cluster)
+            print_status_pending
+            ;;
+        *)
+            print_status_fail
+            ;;
+    esac
+
+    # Grafana
+    echo -n "  Grafana: "
+    local grafana_status
+    grafana_status=$(check_k8s_deployment "monitoring" "" "app.kubernetes.io/name=grafana")
+    case "$grafana_status" in
+        running)
+            print_status_ok
+            ;;
+        not-deployed|no-cluster)
+            print_status_pending
+            ;;
+        *)
+            print_status_fail
+            ;;
+    esac
+
+    # Prometheus
+    echo -n "  Prometheus: "
+    local prometheus_status
+    prometheus_status=$(check_k8s_deployment "monitoring" "" "app.kubernetes.io/name=prometheus")
+    case "$prometheus_status" in
+        running)
+            print_status_ok
+            ;;
+        not-deployed|no-cluster)
+            print_status_pending
+            ;;
+        *)
+            print_status_fail
+            ;;
+    esac
+
     echo ""
+
+    # Resource Counts (only if lab is initialized and VLAB is present)
+    if [ "$init_status" = "initialized" ] && [ -f "/opt/hedgehog/vlab/wiring.yaml" ]; then
+        print_header "Lab Resources"
+        echo ""
+
+        read -r switch_count vpc_count <<< "$(get_vlab_resources)"
+        print_label "  Switches" "$switch_count"
+        print_label "  VPCs" "$vpc_count"
+
+        # Get node count from k3d if available
+        if command -v kubectl &> /dev/null && kubectl cluster-info &> /dev/null; then
+            local node_count
+            node_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+            print_label "  K8s Nodes" "$node_count"
+        fi
+
+        echo ""
+    fi
+
+    # Current Scenario
+    print_header "Current Scenario"
+    echo ""
+    local current_scenario
+    current_scenario=$(get_current_scenario)
+    print_label "  Scenario" "$current_scenario"
+    echo ""
+
+    # Helpful tips
     print_info "Run '${BOLD}hh-lab logs${NC}' to view initialization logs"
     print_info "Run '${BOLD}hh-lab info${NC}' for detailed system information"
     echo ""
@@ -355,10 +541,16 @@ ${BOLD}DESCRIPTION${NC}
 
 ${BOLD}COMMANDS${NC}
     ${BOLD}status${NC}
-        Display lab initialization status and services health
+        Display comprehensive lab status
 
-        Shows whether the lab is initialized, current initialization state,
-        and status of key services (k3d, Kubernetes, hhfab).
+        Shows:
+        - Build type (standard/prewarmed)
+        - Initialization status
+        - Service health (k3d, VLAB, ArgoCD, Gitea, Grafana, Prometheus)
+        - Resource counts (switches, VPCs, K8s nodes)
+        - Current scenario
+
+        All status indicators are color-coded for easy visibility.
 
     ${BOLD}logs${NC} [options] [lines]
         View initialization logs
