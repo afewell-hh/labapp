@@ -51,6 +51,27 @@ else
     exit 1
 fi
 
+# Install hh-lab CLI tool
+echo "Installing hh-lab CLI tool..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/hh-lab" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/hh-lab /usr/local/bin/hh-lab
+    chmod +x /usr/local/bin/hh-lab
+    echo "hh-lab CLI installed at /usr/local/bin/hh-lab"
+else
+    echo "ERROR: hh-lab CLI script not found"
+    exit 1
+fi
+
+# Install bash completion for hh-lab
+echo "Installing bash completion for hh-lab..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/hh-lab-completion.bash" ]; then
+    mkdir -p /etc/bash_completion.d
+    cp /tmp/packer-provisioner-shell-scripts/hh-lab-completion.bash /etc/bash_completion.d/hh-lab
+    echo "Bash completion installed at /etc/bash_completion.d/hh-lab"
+else
+    echo "WARNING: Bash completion script not found (optional)"
+fi
+
 # Install systemd service
 echo "Installing systemd service..."
 if [ -f "/tmp/packer-provisioner-shell-scripts/hedgehog-lab-init.service" ]; then
@@ -75,6 +96,7 @@ chown -R hhlab:hhlab /var/log/hedgehog-lab
 chmod 755 /usr/local/bin/hedgehog-lab-orchestrator
 chmod 755 /usr/local/bin/hedgehog-k3d-init
 chmod 755 /usr/local/bin/hedgehog-vlab-init
+chmod 755 /usr/local/bin/hh-lab
 
 echo "=================================================="
 echo "Orchestrator installation complete!"
@@ -83,6 +105,8 @@ echo "Installed components:"
 echo "  - Main orchestrator: /usr/local/bin/hedgehog-lab-orchestrator"
 echo "  - k3d module: /usr/local/bin/hedgehog-k3d-init"
 echo "  - VLAB module: /usr/local/bin/hedgehog-vlab-init"
+echo "  - hh-lab CLI: /usr/local/bin/hh-lab"
+echo "  - Bash completion: /etc/bash_completion.d/hh-lab"
 echo "  - Systemd service: /etc/systemd/system/hedgehog-lab-init.service"
 echo "  - Config directory: /etc/hedgehog-lab"
 echo "  - State directory: /var/lib/hedgehog-lab"
