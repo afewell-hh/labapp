@@ -78,6 +78,11 @@ cleanup_on_error() {
     log_error "State saved to $STATE_FILE for debugging"
 }
 
+# Create state and log directories early (before any save_state calls)
+mkdir -p /var/lib/hedgehog-lab
+mkdir -p /var/log/hedgehog-lab
+mkdir -p /var/log/hedgehog-lab/modules
+
 # Check if already initialized
 if [ -f "$STAMP_FILE" ]; then
     log_info "Lab already initialized. Exiting."
@@ -122,11 +127,6 @@ log_info "Build type: $BUILD_TYPE"
 if [[ ! "$BUILD_TYPE" =~ ^(standard|prewarmed)$ ]]; then
     error "Invalid build type: $BUILD_TYPE (must be 'standard' or 'prewarmed')"
 fi
-
-# Create state and log directories
-mkdir -p /var/lib/hedgehog-lab
-mkdir -p /var/log/hedgehog-lab
-mkdir -p /var/log/hedgehog-lab/modules
 
 # Helper function to execute a step with error handling
 execute_step() {
