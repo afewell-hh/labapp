@@ -215,8 +215,29 @@ init_k3d_cluster() {
 
 init_vlab() {
     local module_log="/var/log/hedgehog-lab/modules/vlab.log"
-    log_info "VLAB initialization will be implemented in future sprint" | tee -a "$module_log"
-    return 0
+    local vlab_script="/usr/local/bin/hedgehog-vlab-init"
+
+    log_info "Initializing Hedgehog VLAB..." | tee -a "$module_log"
+
+    # Check if VLAB init script exists
+    if [ ! -f "$vlab_script" ]; then
+        log_error "VLAB initialization script not found at $vlab_script" | tee -a "$module_log"
+        return 1
+    fi
+
+    # Set environment variables for the VLAB module
+    export VLAB_WORK_DIR="/opt/hedgehog/vlab"
+    export VLAB_TIMEOUT="1800"  # 30 minutes
+    export LOG_FILE="$module_log"
+
+    # Execute VLAB initialization script
+    if "$vlab_script"; then
+        log_info "VLAB initialization completed successfully" | tee -a "$module_log"
+        return 0
+    else
+        log_error "VLAB initialization failed" | tee -a "$module_log"
+        return 1
+    fi
 }
 
 deploy_gitops_stack() {
