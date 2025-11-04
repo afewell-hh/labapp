@@ -5,7 +5,7 @@ This directory contains Architecture Decision Records for significant technical 
 ## Index
 
 - [ADR-001: Dual Build Pipeline Strategy](001-dual-build-pipeline.md)
-- [ADR-002: Orchestrator Design](002-orchestrator-design.md) *(planned)*
+- [ADR-002: Orchestrator Design](002-orchestrator-design.md)
 - [ADR-003: Scenario Management System](003-scenario-system.md) *(planned)*
 
 ## Format
