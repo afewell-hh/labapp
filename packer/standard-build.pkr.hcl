@@ -192,7 +192,8 @@ build {
       "OUTPUT_DIR=output-${var.vm_name}",
       "MEMORY=${var.memory}",
       "CPUS=${var.cpus}",
-      "VERSION=${var.version}"
+      "VERSION=${var.version}",
+      "DISK_SIZE=${var.disk_size}"
     ]
   }
 

@@ -11,10 +11,41 @@ OUTPUT_DIR="${OUTPUT_DIR:-output}"
 MEMORY="${MEMORY:-16384}"
 CPUS="${CPUS:-8}"
 VERSION="${VERSION:-0.1.0}"
+DISK_SIZE="${DISK_SIZE:-100000M}"  # Default from Packer template
 
 echo "=================================================="
 echo "Creating OVA from VMDK..."
 echo "=================================================="
+
+# Function to convert disk size to GiB
+# Supports formats: 100G, 100000M, 102400000K, or plain number (assumed MB)
+calculate_disk_capacity_gib() {
+    local size="$1"
+    local capacity_gib
+
+    # Extract number and unit
+    if [[ "$size" =~ ^([0-9]+)([KMGT]?)$ ]]; then
+        local num="${BASH_REMATCH[1]}"
+        local unit="${BASH_REMATCH[2]}"
+
+        case "$unit" in
+            T) capacity_gib=$((num * 1024)) ;;
+            G) capacity_gib=$num ;;
+            M) capacity_gib=$((num / 1024)) ;;
+            K) capacity_gib=$((num / 1024 / 1024)) ;;
+            "") capacity_gib=$((num / 1024)) ;;  # Assume MB if no unit
+        esac
+    else
+        # Fallback to default
+        capacity_gib=100
+    fi
+
+    echo "$capacity_gib"
+}
+
+# Calculate disk capacity in GiB for OVF descriptor
+DISK_CAPACITY_GIB=$(calculate_disk_capacity_gib "$DISK_SIZE")
+echo "Disk size: $DISK_SIZE → $DISK_CAPACITY_GIB GiB for OVF"
 
 cd "$OUTPUT_DIR"
 
@@ -39,7 +70,7 @@ cat > "${VM_NAME}.ovf" <<EOF
   </References>
   <DiskSection>
     <Info>Virtual disk information</Info>
-    <Disk ovf:capacity="100" ovf:capacityAllocationUnits="byte * 2^30" ovf:diskId="vmdisk1" ovf:fileRef="file1" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized" ovf:populatedSize="${VMDK_SIZE}"/>
+    <Disk ovf:capacity="${DISK_CAPACITY_GIB}" ovf:capacityAllocationUnits="byte * 2^30" ovf:diskId="vmdisk1" ovf:fileRef="file1" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized" ovf:populatedSize="${VMDK_SIZE}"/>
   </DiskSection>
   <NetworkSection>
     <Info>The list of logical networks</Info>
@@ -141,12 +172,23 @@ EOF
 
 echo "OVF descriptor created: ${VM_NAME}.ovf"
 
-# Create manifest file
-echo "Creating manifest..."
-sha256sum "${VM_NAME}.vmdk" > "${VM_NAME}.mf"
-sha256sum "${VM_NAME}.ovf" >> "${VM_NAME}.mf"
+# Create manifest file in OVA-compliant format
+# Format: SHA256(filename)= <hash>
+# NOT the raw sha256sum output format
+echo "Creating OVA-compliant manifest..."
 
-echo "Manifest created: ${VM_NAME}.mf"
+# Generate SHA256 hashes in OVF/OVA spec format
+{
+    # Hash for VMDK
+    vmdk_hash=$(sha256sum "${VM_NAME}.vmdk" | awk '{print $1}')
+    echo "SHA256(${VM_NAME}.vmdk)= ${vmdk_hash}"
+
+    # Hash for OVF
+    ovf_hash=$(sha256sum "${VM_NAME}.ovf" | awk '{print $1}')
+    echo "SHA256(${VM_NAME}.ovf)= ${ovf_hash}"
+} > "${VM_NAME}.mf"
+
+echo "Manifest created: ${VM_NAME}.mf (OVA-compliant format)"
 
 # Create OVA (tar archive)
 echo "Creating OVA archive..."
