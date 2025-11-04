@@ -48,6 +48,8 @@ jobs:
           if [ -f packer/standard-build.pkr.hcl ]; then
             packer init packer/standard-build.pkr.hcl
           fi
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate standard build
         run: |
@@ -73,6 +75,8 @@ jobs:
           else
             echo "Pre-warmed build not yet implemented, skipping validation"
           fi
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test:
     name: Unit Tests
