@@ -10,49 +10,154 @@ LOCK_FILE="/var/lock/hedgehog-lab-init.lock"
 LOG_FILE="/var/log/hedgehog-lab-init.log"
 STAMP_FILE="/var/lib/hedgehog-lab/initialized"
 BUILD_TYPE_FILE="/etc/hedgehog-lab/build-type"
+STATE_FILE="/var/lib/hedgehog-lab/state.json"
 
-# Logging function
+# Global state tracking
+INITIALIZATION_FAILED=false
+CURRENT_STEP=""
+STEPS_COMPLETED=()
+
+# Logging functions
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+    local level="${1:-INFO}"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a "$LOG_FILE"
 }
 
-# Error handling
+log_info() {
+    log "INFO" "$@"
+}
+
+log_warn() {
+    log "WARN" "$@"
+}
+
+log_error() {
+    log "ERROR" "$@"
+}
+
+log_debug() {
+    log "DEBUG" "$@"
+}
+
+# Error handling with rollback capability
 error() {
-    log "ERROR: $*"
+    log_error "$*"
+    INITIALIZATION_FAILED=true
+    cleanup_on_error
     exit 1
 }
 
+# Save current state to disk
+save_state() {
+    local status="$1"
+    local current_module="${2:-none}"
+
+    # Build steps_completed JSON array, handling empty array case
+    local steps_json="[]"
+    if [ ${#STEPS_COMPLETED[@]} -gt 0 ]; then
+        steps_json="[$(printf '"%s",' "${STEPS_COMPLETED[@]}" | sed 's/,$//')]"
+    fi
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "status": "$status",
+  "current_module": "$current_module",
+  "build_type": "${BUILD_TYPE:-unknown}",
+  "started_at": "${START_TIME:-unknown}",
+  "last_updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "steps_completed": ${steps_json},
+  "failed": ${INITIALIZATION_FAILED}
+}
+EOF
+}
+
+# Cleanup function for error conditions
+cleanup_on_error() {
+    log_warn "Initialization failed. Performing cleanup..."
+    save_state "failed" "$CURRENT_STEP"
+
+    # Don't remove lock file here - let trap handle it
+    # This allows for inspection of what went wrong
+
+    log_error "Initialization incomplete. Check logs at $LOG_FILE"
+    log_error "State saved to $STATE_FILE for debugging"
+}
+
+# Create state and log directories early (before any save_state calls)
+mkdir -p /var/lib/hedgehog-lab
+mkdir -p /var/log/hedgehog-lab
+mkdir -p /var/log/hedgehog-lab/modules
+
 # Check if already initialized
 if [ -f "$STAMP_FILE" ]; then
-    log "Lab already initialized. Exiting."
+    log_info "Lab already initialized. Exiting."
     exit 0
 fi
 
 # Acquire lock to prevent concurrent runs
 if [ -f "$LOCK_FILE" ]; then
-    log "Another initialization is in progress. Exiting."
-    exit 0
+    # Check if lock is stale (older than 2 hours)
+    if [ -n "$(find "$LOCK_FILE" -mmin +120 2>/dev/null)" ]; then
+        log_warn "Found stale lock file (>2 hours old). Removing it."
+        rm -f "$LOCK_FILE"
+    else
+        log_warn "Another initialization is in progress. Exiting."
+        exit 0
+    fi
 fi
 
-# Create lock file
-touch "$LOCK_FILE"
+# Create lock file with PID
+echo $$ > "$LOCK_FILE"
 trap "rm -f $LOCK_FILE" EXIT
 
+# Record start time
+START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Initialize state
+save_state "initializing" "startup"
+
 # Start initialization
-log "=================================================="
-log "Hedgehog Lab Appliance Initialization Starting..."
-log "=================================================="
+log_info "=================================================="
+log_info "Hedgehog Lab Appliance Initialization Starting..."
+log_info "=================================================="
 
 # Detect build type
 BUILD_TYPE="standard"
 if [ -f "$BUILD_TYPE_FILE" ]; then
-    BUILD_TYPE=$(cat "$BUILD_TYPE_FILE")
+    BUILD_TYPE=$(cat "$BUILD_TYPE_FILE" | tr -d '[:space:]')
 fi
-log "Build type: $BUILD_TYPE"
+log_info "Build type: $BUILD_TYPE"
 
-# Create state directory
-mkdir -p /var/lib/hedgehog-lab
-mkdir -p /var/log/hedgehog-lab
+# Validate build type
+if [[ ! "$BUILD_TYPE" =~ ^(standard|prewarmed)$ ]]; then
+    error "Invalid build type: $BUILD_TYPE (must be 'standard' or 'prewarmed')"
+fi
+
+# Helper function to execute a step with error handling
+execute_step() {
+    local step_name="$1"
+    local step_number="$2"
+    local total_steps="$3"
+    shift 3
+    local step_function="$@"
+
+    CURRENT_STEP="$step_name"
+    log_info ""
+    log_info "Step $step_number/$total_steps: $step_name..."
+    save_state "running" "$step_name"
+
+    # Execute the step function
+    if eval "$step_function"; then
+        STEPS_COMPLETED+=("$step_name")
+        log_info "✓ $step_name completed successfully"
+        save_state "running" "$step_name"
+        return 0
+    else
+        log_error "✗ $step_name failed"
+        return 1
+    fi
+}
 
 # Display banner
 cat <<'EOF'
@@ -64,21 +169,20 @@ cat <<'EOF'
                    |___/                  |___/
 EOF
 
-log ""
-log "Initializing Hedgehog Lab Appliance..."
-log ""
+log_info ""
+log_info "Initializing Hedgehog Lab Appliance..."
+log_info ""
 
-# For standard build, we need to initialize everything on first boot
-if [ "$BUILD_TYPE" = "standard" ]; then
-    log "Standard build detected - performing full initialization"
+# Define initialization steps as functions
+wait_for_network() {
+    local module_log="/var/log/hedgehog-lab/modules/network.log"
 
-    # Step 1: Wait for network
-    log "Step 1/5: Waiting for network connectivity..."
+    log_info "Waiting for network connectivity..." | tee -a "$module_log"
 
     # Wait for network with timeout (max 5 minutes)
-    NETWORK_TIMEOUT=300
-    NETWORK_ELAPSED=0
-    NETWORK_READY=false
+    local NETWORK_TIMEOUT=300
+    local NETWORK_ELAPSED=0
+    local NETWORK_READY=false
 
     while [ $NETWORK_ELAPSED -lt $NETWORK_TIMEOUT ]; do
         # Try multiple connectivity checks
@@ -93,45 +197,94 @@ if [ "$BUILD_TYPE" = "standard" ]; then
     done
 
     if [ "$NETWORK_READY" = true ]; then
-        log "Network is up"
+        log_info "Network is ready" | tee -a "$module_log"
+        return 0
     else
-        log "WARNING: Network connectivity check timed out after ${NETWORK_TIMEOUT}s"
-        log "Proceeding with initialization (some steps may fail without network)"
+        log_warn "Network connectivity check timed out after ${NETWORK_TIMEOUT}s" | tee -a "$module_log"
+        log_warn "Proceeding with initialization (some steps may fail without network)" | tee -a "$module_log"
+        # Don't fail here - return success and let later steps handle network issues
+        return 0
     fi
+}
 
-    # Step 2: Initialize k3d cluster (placeholder)
-    log "Step 2/5: Initializing k3d cluster..."
-    log "k3d initialization will be implemented in future sprint"
+init_k3d_cluster() {
+    local module_log="/var/log/hedgehog-lab/modules/k3d.log"
+    log_info "k3d initialization will be implemented in future sprint" | tee -a "$module_log"
+    return 0
+}
 
-    # Step 3: Initialize VLAB (placeholder)
-    log "Step 3/5: Initializing Hedgehog VLAB..."
-    log "VLAB initialization will be implemented in future sprint"
+init_vlab() {
+    local module_log="/var/log/hedgehog-lab/modules/vlab.log"
+    log_info "VLAB initialization will be implemented in future sprint" | tee -a "$module_log"
+    return 0
+}
 
-    # Step 4: Deploy GitOps stack (placeholder)
-    log "Step 4/5: Deploying GitOps stack..."
-    log "GitOps stack deployment will be implemented in future sprint"
+deploy_gitops_stack() {
+    local module_log="/var/log/hedgehog-lab/modules/gitops.log"
+    log_info "GitOps stack deployment will be implemented in future sprint" | tee -a "$module_log"
+    return 0
+}
 
-    # Step 5: Deploy observability stack (placeholder)
-    log "Step 5/5: Deploying observability stack..."
-    log "Observability stack deployment will be implemented in future sprint"
+deploy_observability_stack() {
+    local module_log="/var/log/hedgehog-lab/modules/observability.log"
+    log_info "Observability stack deployment will be implemented in future sprint" | tee -a "$module_log"
+    return 0
+}
+
+start_services() {
+    local module_log="/var/log/hedgehog-lab/modules/services.log"
+    log_info "Service startup will be implemented in future sprint" | tee -a "$module_log"
+    return 0
+}
+
+# Execute initialization based on build type
+if [ "$BUILD_TYPE" = "standard" ]; then
+    log_info "Standard build detected - performing full initialization"
+
+    TOTAL_STEPS=5
+    execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
+    execute_step "Initialize k3d cluster" 2 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
+    execute_step "Initialize VLAB" 3 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
+    execute_step "Deploy GitOps stack" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
+    execute_step "Deploy observability stack" 5 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
 
 else
-    log "Pre-warmed build detected - starting services only"
-    # For pre-warmed build, just start the services
-    log "Service startup will be implemented in future sprint"
+    log_info "Pre-warmed build detected - starting services only"
+
+    TOTAL_STEPS=2
+    execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
+    execute_step "Start services" 2 $TOTAL_STEPS start_services || error "Service startup failed"
 fi
 
 # Mark as initialized
 mkdir -p $(dirname "$STAMP_FILE")
-date > "$STAMP_FILE"
+cat > "$STAMP_FILE" <<EOF
+{
+  "initialized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "build_type": "$BUILD_TYPE",
+  "version": "0.1.0"
+}
+EOF
 
-log ""
-log "=================================================="
-log "Hedgehog Lab Appliance Initialization Complete!"
-log "=================================================="
-log ""
-log "Lab is ready for use."
-log "Run 'hh-lab status' to check service status."
-log ""
+# Save final state
+save_state "completed" "finalized"
+
+log_info ""
+log_info "=================================================="
+log_info "Hedgehog Lab Appliance Initialization Complete!"
+log_info "=================================================="
+log_info ""
+log_info "Build type: $BUILD_TYPE"
+log_info "Steps completed: ${#STEPS_COMPLETED[@]}/$TOTAL_STEPS"
+log_info "Initialization time: Started at $START_TIME"
+log_info ""
+log_info "Lab is ready for use."
+log_info "Logs: $LOG_FILE"
+log_info "State: $STATE_FILE"
+log_info ""
+log_info "Next steps:"
+log_info "  - Run 'hh-lab status' to check service status (when implemented)"
+log_info "  - Access services via their respective ports"
+log_info ""
 
 exit 0
