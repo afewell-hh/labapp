@@ -119,6 +119,8 @@ check_k8s_deployment() {
     if [ -n "$label_selector" ]; then
         local ready_pods
         ready_pods=$(kubectl get pods -n "$namespace" -l "$label_selector" --field-selector=status.phase=Running 2>/dev/null | grep -c "Running" || echo "0")
+        # Ensure ready_pods is numeric before comparison
+        ready_pods="${ready_pods:-0}"
         if [ "$ready_pods" -gt 0 ]; then
             echo "running"
         else
@@ -128,6 +130,8 @@ check_k8s_deployment() {
         if kubectl get deployment -n "$namespace" "$deployment" &> /dev/null; then
             local available
             available=$(kubectl get deployment -n "$namespace" "$deployment" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0")
+            # Ensure available is numeric before comparison (handles empty/null values)
+            available="${available:-0}"
             if [ "$available" -gt 0 ]; then
                 echo "running"
             else
@@ -244,8 +248,11 @@ cmd_status() {
             servers_running=$(echo "$servers_info" | cut -d/ -f1)
             local servers_total
             servers_total=$(echo "$servers_info" | cut -d/ -f2)
+            # Ensure values default to empty string if parsing fails
+            servers_running="${servers_running:-}"
+            servers_total="${servers_total:-}"
             # Check if all servers are running (X/X where X > 0)
-            if [ "$servers_running" = "$servers_total" ] && [ "$servers_total" != "0" ] && [ "$servers_total" != "" ]; then
+            if [ -n "$servers_running" ] && [ -n "$servers_total" ] && [ "$servers_running" = "$servers_total" ] && [ "$servers_total" != "0" ]; then
                 print_status_ok
             else
                 print_status_pending
