@@ -128,9 +128,26 @@ Scripts run in numerical order during the build process. All scripts are idempot
 - Remove cloud-init seed
 - Clear bash history
 - Remove SSH host keys (regenerated on first boot)
-- Zero free space for better compression
+- Run fstrim to discard unused blocks (efficient for qcow2)
+- Optional: Zero free space (disabled by default, see note below)
 
-**Runtime:** ~5-10 minutes
+**Important Note - Zero-Fill Behavior:**
+
+By default, the script **does NOT** zero-fill free space because:
+- Zero-filling expands qcow2 images to full disk size (~100GB)
+- GitHub Actions runners have limited disk space (~14GB free)
+- This causes "No space left on device" errors in CI
+- `fstrim` is used instead, which is more efficient for qcow2
+
+**To enable zero-fill** (local builds with sufficient disk space):
+```bash
+export PACKER_ZERO_FILL=true
+packer build packer/standard-build.pkr.hcl
+```
+
+**Runtime:**
+- Default (fstrim only): ~2-3 minutes
+- With zero-fill enabled: ~5-10 minutes
 
 ### create-ova.sh
 

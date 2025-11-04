@@ -42,10 +42,32 @@ history -c
 echo "Removing SSH host keys (will be regenerated)..."
 rm -f /etc/ssh/ssh_host_*
 
-# Zero out free space to improve compression (optional, can take time)
-echo "Zeroing out free space for better compression..."
-dd if=/dev/zero of=/EMPTY bs=1M || true
-rm -f /EMPTY
+# Zero out free space to improve compression
+# NOTE: This step is SKIPPED by default for qcow2 images as it causes the
+# image to expand to full disk size (~100GB), which exhausts disk space on
+# CI/CD runners (GitHub Actions has limited disk space).
+#
+# For production builds with ample disk space, you can enable this by setting:
+# export PACKER_ZERO_FILL=true
+#
+# Alternative: Use fstrim (already installed) which works better with qcow2
+echo "Running fstrim to discard unused blocks..."
+if command -v fstrim &> /dev/null; then
+    fstrim -v / || echo "fstrim completed with warnings (may not be supported on all filesystems)"
+else
+    echo "fstrim not available, skipping trim operation"
+fi
+
+# Optional zero-fill (disabled by default for CI/CD compatibility)
+if [ "${PACKER_ZERO_FILL:-false}" = "true" ]; then
+    echo "PACKER_ZERO_FILL is set - zeroing out free space..."
+    echo "WARNING: This will expand qcow2 to full size and may exhaust disk space"
+    dd if=/dev/zero of=/EMPTY bs=1M || true
+    rm -f /EMPTY
+else
+    echo "Skipping zero-fill (use PACKER_ZERO_FILL=true to enable)"
+    echo "Using fstrim instead, which is more efficient for qcow2 images"
+fi
 
 # Sync filesystem
 sync

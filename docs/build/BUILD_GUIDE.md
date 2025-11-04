@@ -206,7 +206,10 @@ Scripts are located in `packer/scripts/` and run in order:
 - Truncates log files
 - Cleans cloud-init
 - Removes SSH host keys
-- Zeroes free space for compression
+- Runs fstrim to discard unused blocks (efficient for qcow2)
+- Optional: Zero-fills free space (disabled by default, controlled by `PACKER_ZERO_FILL` env var)
+
+**Note:** Zero-fill is disabled by default to prevent disk space exhaustion on CI runners. Use `fstrim` instead for qcow2 images.
 
 ### Orchestrator
 
