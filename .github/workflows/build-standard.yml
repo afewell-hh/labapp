@@ -1,0 +1,206 @@
+---
+name: Build Standard Appliance
+
+"on":
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+env:
+  PACKER_VERSION: '1.11.2'
+
+jobs:
+  validate:
+    name: Validate Packer Template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Initialize Packer
+        run: packer init packer/standard-build.pkr.hcl
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Packer template
+        run: packer validate packer/standard-build.pkr.hcl
+
+      - name: Format check
+        run: |
+          packer fmt -check packer/standard-build.pkr.hcl || {
+            echo "Packer formatting is incorrect. Run 'packer fmt' to fix."
+            exit 1
+          }
+
+  build:
+    name: Build Standard OVA
+    needs: validate
+    runs-on: ubuntu-latest
+    # Use a larger runner for builds if available
+    # runs-on: ubuntu-latest-8-cores
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Initialize Packer
+        run: packer init packer/standard-build.pkr.hcl
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build standard appliance
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # GitHub runners limitations:
+          # - No KVM support (use TCG software emulation)
+          # - ~7GB RAM available (reduce from 16GB default)
+          # - 2 CPU cores (reduce from 8 cores default)
+          packer build \
+            -var "version=${VERSION}" \
+            -var "accelerator=tcg" \
+            -var "memory=4096" \
+            -var "cpus=2" \
+            packer/standard-build.pkr.hcl
+
+      - name: List build outputs
+        run: |
+          ls -lh output-hedgehog-lab-standard/
+          echo "Build artifacts:"
+          du -sh output-hedgehog-lab-standard/*
+
+      - name: Upload checksum only
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            hedgehog-lab-standard-${{
+            steps.version.outputs.version }}-checksums
+          path: |
+            output-hedgehog-lab-standard/*.sha256
+          retention-days: 90
+
+      - name: Create Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            output-hedgehog-lab-standard/*.sha256
+          body: |
+            # Hedgehog Lab Appliance v${{ steps.version.outputs.version }}
+
+            ## Standard Build
+
+            This is the standard build of the Hedgehog Lab Appliance.
+
+            **Size:** ~15-20GB compressed
+            **First boot:** 15-20 minutes (one-time initialization)
+            **Use case:** Self-paced online learning
+
+            ### ⚠️ Important Notes
+
+            **1. OVA File Not Included**
+
+            Due to GitHub's file size limits (2GB for releases), the OVA
+            file is **not** attached to this release.
+
+            **2. CI Build Configuration**
+
+            The GitHub Actions build uses reduced resources (4GB RAM,
+            2 CPUs, TCG emulation) for validation purposes only.
+            **This build is NOT recommended for production use** as it
+            may have performance limitations.
+
+            **Download Options:**
+
+            1. **Build Locally** (Recommended for Production):
+               ```bash
+               git clone https://github.com/${{ github.repository }}.git
+               cd labapp
+               make build-standard VERSION=${{ steps.version.outputs.version }}
+               ```
+               - Uses full resources (16GB RAM, 8 CPUs, KVM acceleration)
+               - Build time: 45-60 minutes
+               - Production-ready OVA output
+
+            2. **External Storage** (Coming Soon):
+               - Cloud storage link will be provided separately
+               - Check repository README for download links
+
+            3. **Self-Hosted Runners** (For Organizations):
+               - Use runners with KVM support and sufficient storage
+               - Configure external artifact storage (S3, GCS, Azure Blob, etc.)
+               - Build with full resource allocation
+
+            ### Installation
+
+            1. Download or build the OVA file
+            2. Import into VMware Workstation/Player or VirtualBox
+            3. Start the VM
+            4. Wait for initialization to complete
+            5. Access services via the documented URLs
+
+            ### Default Credentials
+
+            - **Username:** hhlab
+            - **Password:** hhlab
+
+            ### System Requirements
+
+            - **CPU:** 8 cores (minimum 4)
+            - **RAM:** 16GB (minimum 8GB)
+            - **Disk:** 100GB
+            - **Network:** 1 adapter (bridged or NAT)
+
+            ### Checksum Verification
+
+            ```bash
+            sha256sum -c \
+              hedgehog-lab-standard-${{
+              steps.version.outputs.version }}.ova.sha256
+            ```
+
+            ### Documentation
+
+            See the [README](https://github.com/${{
+            github.repository }}) for full documentation.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
