@@ -177,7 +177,7 @@ cmd_status() {
 
 # logs command - view initialization logs
 cmd_logs() {
-    local lines="${1:-50}"
+    local lines=50
     local follow=false
     local module=""
 
@@ -196,8 +196,20 @@ cmd_logs() {
                 module="$2"
                 shift 2
                 ;;
+            -*)
+                print_error "Unknown option: $1"
+                echo ""
+                echo "Usage: hh-lab logs [-f|--follow] [-n|--lines <num>] [-m|--module <name>] [lines]"
+                return 2
+                ;;
             *)
-                lines="$1"
+                # Positional argument for line count
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    lines="$1"
+                else
+                    print_error "Invalid line count: $1 (must be a number)"
+                    return 2
+                fi
                 shift
                 ;;
         esac
