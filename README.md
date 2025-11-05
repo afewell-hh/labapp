@@ -47,11 +47,18 @@ wget https://releases.example.com/hedgehog-lab-standard-latest.ova
 
 ## Documentation
 
-- [Contributing Guide](CONTRIBUTING.md)
-- [Roadmap](ROADMAP.md)
-- [GitHub Setup Guide](docs/GITHUB_SETUP.md)
-- [Architecture Decision Records](docs/adr/)
-- [Sprint Planning](docs/issues/MVP_SPRINT_PLAN.md)
+### User Documentation
+- [Installation Guide](docs/INSTALL.md) - Download and install on VMware/VirtualBox
+- [Quick Start Guide](docs/QUICKSTART.md) - First-time setup and usage
+- [Troubleshooting Guide](docs/TROUBLESHOOTING.md) - Solutions to common issues
+- [FAQ](docs/FAQ.md) - Frequently asked questions
+
+### Developer Documentation
+- [Build Guide](docs/build/BUILD_GUIDE.md) - Build the appliance from source
+- [Contributing Guide](CONTRIBUTING.md) - Contribution guidelines
+- [Roadmap](ROADMAP.md) - Product roadmap and timeline
+- [Architecture Decision Records](docs/adr/) - Design decisions
+- [Sprint Planning](docs/issues/MVP_SPRINT_PLAN.md) - Current sprint
 
 ## Project Management
 
