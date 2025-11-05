@@ -108,8 +108,9 @@ source "qemu" "ubuntu" {
 
   # Performance optimizations with nested virtualization enabled
   # This allows k3d/Docker/VLAB to run inside the VM during build
+  # Note: -cpu host automatically exposes nested virt (vmx/svm) if enabled on host
   qemuargs = [
-    ["-cpu", "host,+vmx"],
+    ["-cpu", "host"],
     ["-smp", "cpus=${var.cpus},sockets=1,cores=${var.cpus},threads=1"],
     ["-machine", "type=q35,accel=kvm"]
   ]
