@@ -70,6 +70,29 @@ ls -lh output-hedgehog-lab-standard/
 
 ## Build Process
 
+### Build Pipeline Types
+
+The Hedgehog Lab Appliance supports two build pipelines optimized for different use cases:
+
+1. **Standard Build**: ~15-20GB OVA that performs full initialization on first boot (15-20 minutes)
+2. **Pre-Warmed Build**: ~80-100GB OVA that is fully initialized and ready to use immediately (2-3 minutes to start services)
+
+See [ADR-001: Dual Build Pipeline Strategy](../adr/001-dual-build-pipeline.md) for the architectural decision and rationale.
+
+#### When to Use Each Build Type
+
+**Use Standard Build when:**
+- Distributing to students for self-paced online learning
+- Download size matters (limited bandwidth, cloud storage costs)
+- First-boot initialization time is acceptable (15-20 minutes)
+- Building for general public distribution
+
+**Use Pre-Warmed Build when:**
+- Running in-person workshops or training events
+- Need immediate lab access (2-3 minute startup)
+- Have local distribution method (USB drives, local network)
+- Can afford larger file size and longer build time
+
 ### Standard Build Pipeline
 
 The standard build creates a ~15-20GB OVA that performs full initialization on first boot.
@@ -118,6 +141,85 @@ packer build -var "version=$VERSION" -var "accelerator=tcg" packer/standard-buil
 ```
 
 **Note:** Builds without KVM (using TCG software emulation) will be significantly slower (2-4x build time).
+
+### Pre-Warmed Build Pipeline
+
+The pre-warmed build creates a ~80-100GB OVA that is fully initialized during the build process. This build is intended for workshops and events where immediate access is required.
+
+#### Build Steps
+
+The pre-warmed build includes all standard build steps PLUS:
+
+1. **Full Initialization at Build Time**: Runs the orchestrator during Packer build
+   - Initializes k3d observability cluster
+   - Initializes Hedgehog VLAB (requires nested virtualization)
+   - Deploys GitOps stack (ArgoCD, Gitea)
+   - Deploys observability stack (Prometheus, Grafana)
+2. **Build Type Marker**: Sets `/etc/hedgehog-lab/build-type` to `prewarmed`
+3. **Service Disabled**: Disables init service since initialization is already complete
+4. **Verification**: Confirms all initialization steps completed successfully
+
+#### Build Time
+
+- **Total**: 60-90 minutes (depending on hardware and network)
+- Standard provisioning: 45-60 minutes
+- Full initialization: 15-20 minutes
+- Cleanup and conversion: 5-10 minutes
+
+#### Nested Virtualization Requirements
+
+**IMPORTANT**: Pre-warmed builds require nested virtualization support because the build process initializes k3d/Docker/VLAB inside the VM during the Packer build.
+
+**Requirements:**
+- **Hardware**: CPU with Intel VT-x/AMD-V support
+- **Host OS**: Linux with KVM enabled
+- **QEMU**: Configured with nested virtualization enabled
+- **Self-hosted runner**: GitHub Actions cannot build pre-warmed images (no nested virt support)
+
+**Verifying Nested Virtualization Support:**
+
+```bash
+# Check if your CPU supports nested virtualization
+egrep -c '(vmx|svm)' /proc/cpuinfo  # Should be > 0
+
+# For Intel CPUs - check if nested virt is enabled
+cat /sys/module/kvm_intel/parameters/nested  # Should show 'Y' or '1'
+
+# For AMD CPUs - check if nested virt is enabled
+cat /sys/module/kvm_amd/parameters/nested  # Should show '1'
+
+# Enable nested virtualization (Intel)
+sudo modprobe -r kvm_intel
+sudo modprobe kvm_intel nested=1
+
+# Enable nested virtualization (AMD)
+sudo modprobe -r kvm_amd
+sudo modprobe kvm_amd nested=1
+
+# Make it persistent across reboots (Intel)
+echo "options kvm_intel nested=1" | sudo tee /etc/modprobe.d/kvm-nested.conf
+
+# Make it persistent across reboots (AMD)
+echo "options kvm_amd nested=1" | sudo tee /etc/modprobe.d/kvm-nested.conf
+```
+
+#### Manual Pre-Warmed Build
+
+```bash
+# Navigate to repository
+cd hedgehog-lab-appliance
+
+# Set version (optional)
+export VERSION="0.1.0"
+
+# Validate template
+packer validate packer/prewarmed-build.pkr.hcl
+
+# Build pre-warmed image (requires KVM with nested virtualization)
+packer build -var "version=$VERSION" packer/prewarmed-build.pkr.hcl
+```
+
+**Note:** Pre-warmed builds REQUIRE KVM with nested virtualization. TCG software emulation is not supported.
 
 ### Using Make
 
@@ -371,11 +473,20 @@ See `.github/workflows/build-standard.yml` for automated builds on:
 
 After successful build, you'll find:
 
+**Standard Build:**
 ```
 output-hedgehog-lab-standard/
-├── hedgehog-lab-standard-0.1.0.ova          # OVA file
+├── hedgehog-lab-standard-0.1.0.ova          # OVA file (~15-20GB)
 ├── hedgehog-lab-standard-0.1.0.ova.sha256   # Checksum
 └── hedgehog-lab-standard-0.1.0.vmdk         # VMDK (kept for debugging)
+```
+
+**Pre-Warmed Build:**
+```
+output-hedgehog-lab-prewarmed/
+├── hedgehog-lab-prewarmed-0.1.0.ova          # OVA file (~80-100GB)
+├── hedgehog-lab-prewarmed-0.1.0.ova.sha256   # Checksum
+└── hedgehog-lab-prewarmed-0.1.0.vmdk         # VMDK (kept for debugging)
 ```
 
 **OVA Contents:**
