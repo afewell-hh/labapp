@@ -40,8 +40,19 @@ tests/e2e/
 - Confirms file sizes are within expected ranges
 
 **Script:** `scripts/validate-build.sh`
+**CI Integration:** Runs automatically after Packer build in GitHub Actions
 
-### 2. Service Validation Tests
+### 2. Automated Boot and Test
+- Boots the built OVA using QEMU
+- Waits for appliance initialization to complete
+- Verifies all services start correctly
+- Checks service endpoints
+- Validates VLAB initialization
+
+**Script:** `scripts/boot-and-test.sh`
+**Usage:** Can be run manually for comprehensive pre-deployment validation
+
+### 3. Service Validation Tests
 - Tests all services start correctly
 - Validates service endpoints are accessible
 - Checks service health and readiness
@@ -55,7 +66,7 @@ tests/e2e/
 - GitOps stack (ArgoCD, Gitea)
 - Observability stack (Prometheus, Grafana, Loki)
 
-### 3. VLAB Validation Tests
+### 4. VLAB Validation Tests
 - Verifies VLAB initialization completed
 - Tests switch containers are running
 - Validates network topology
@@ -63,7 +74,7 @@ tests/e2e/
 
 **Script:** `scripts/validate-vlab.sh`
 
-### 4. GitOps Workflow Tests
+### 5. GitOps Workflow Tests
 - Creates test repository in Gitea
 - Deploys application via ArgoCD
 - Validates GitOps sync
@@ -71,7 +82,7 @@ tests/e2e/
 
 **Script:** `scripts/validate-gitops.sh`
 
-### 5. Observability Tests
+### 6. Observability Tests
 - Validates Prometheus is collecting metrics
 - Tests Grafana dashboards are accessible
 - Verifies Loki is ingesting logs
@@ -136,6 +147,30 @@ For build validation (runs on build machine, not in VM):
 ./scripts/validate-build.sh /path/to/labapp/output-hedgehog-lab-standard
 ```
 
+### Automated Boot and Test
+
+For comprehensive pre-deployment validation (boots OVA and tests services):
+
+```bash
+# Boot OVA and run all validation tests
+./scripts/boot-and-test.sh <ova-file>
+
+# Example:
+./scripts/boot-and-test.sh output-hedgehog-lab-standard/hedgehog-lab-standard-0.1.0.ova
+
+# With custom options (for CI with limited resources)
+./scripts/boot-and-test.sh \
+  --memory 4096 \
+  --cpus 2 \
+  --init-timeout 3600 \
+  output-hedgehog-lab-standard/hedgehog-lab-standard-0.1.0.ova
+
+# For debugging (leaves VM running after tests)
+./scripts/boot-and-test.sh --no-cleanup <ova-file>
+```
+
+**Note:** This test requires QEMU and can take 40-60 minutes due to VLAB initialization time.
+
 ## Manual Testing Procedures
 
 For comprehensive manual testing procedures including:
@@ -153,24 +188,63 @@ Test scripts generate results in `results/` directory:
 
 ```
 results/
-├── build-validation-YYYYMMDD-HHMMSS.json
-├── service-validation-YYYYMMDD-HHMMSS.json
-├── vlab-validation-YYYYMMDD-HHMMSS.json
-├── gitops-validation-YYYYMMDD-HHMMSS.json
-└── observability-validation-YYYYMMDD-HHMMSS.json
+├── build-validation-YYYYMMDD-HHMMSS.json      # Build artifact validation
+├── boot-test-YYYYMMDD-HHMMSS.json             # Automated boot and test results
+├── service-validation-YYYYMMDD-HHMMSS.json    # Service validation
+├── vlab-validation-YYYYMMDD-HHMMSS.json       # VLAB validation
+├── gitops-validation-YYYYMMDD-HHMMSS.json     # GitOps workflow tests
+└── observability-validation-YYYYMMDD-HHMMSS.json  # Observability tests
 ```
 
 Results are in JSON format for easy parsing and CI integration.
 
+**Example result structure:**
+```json
+{
+  "test_suite": "boot-and-test",
+  "timestamp": "20251105-120000",
+  "status": "PASS",
+  "tests_run": 8,
+  "tests_passed": 8,
+  "tests_failed": 0,
+  "warnings": [],
+  "failures": []
+}
+```
+
 ## CI Integration
 
-These tests are designed for integration with GitHub Actions:
+These tests are integrated with GitHub Actions workflows:
 
-1. **Build Validation:** Runs after Packer build in CI
-2. **Service Validation:** Can be run in nested virtualization environment
-3. **Manual Validation:** Performed before releases
+### Current CI Integration
 
-See `.github/workflows/e2e-tests.yml` (future enhancement).
+1. **Build Validation (`validate-build.sh`):**
+   - ✅ Runs automatically after every Packer build
+   - ✅ Validates OVA artifacts, checksums, and file structure
+   - ✅ Uploads validation results as artifacts
+   - ✅ Fails build if validation fails
+   - **Workflow:** `.github/workflows/build-standard.yml`
+
+### Manual/Optional Validation
+
+2. **Automated Boot Test (`boot-and-test.sh`):**
+   - Can be run manually for pre-release validation
+   - Boots OVA in QEMU and validates full initialization
+   - Requires significant resources and time (~40-60 minutes)
+   - Not run in CI due to resource/time constraints
+   - Recommended for release candidates
+
+3. **Service Validation (`validate-services.sh`):**
+   - Runs inside deployed VM
+   - Can be integrated with nested virtualization in CI (future enhancement)
+   - Currently used for manual testing
+
+### Future Enhancements
+
+- [ ] Automated boot testing on self-hosted runners with KVM
+- [ ] Nightly full validation runs
+- [ ] Performance benchmarking in CI
+- [ ] Multi-platform testing (VMware, VirtualBox)
 
 ## Acceptance Criteria
 
