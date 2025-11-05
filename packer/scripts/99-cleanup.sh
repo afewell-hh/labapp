@@ -15,9 +15,20 @@ systemctl stop unattended-upgrades || true
 
 # Clean apt cache
 echo "Cleaning apt cache..."
-apt-get autoremove -y
+apt-get autoremove -y --purge
 apt-get clean
 rm -rf /var/lib/apt/lists/*
+rm -rf /var/cache/apt/archives/*.deb
+rm -rf /var/cache/apt/archives/partial/*.deb
+
+# Clean Docker build cache and unused images
+echo "Cleaning Docker cache..."
+docker system prune -af --volumes || true
+
+# Clean pip cache
+echo "Cleaning pip cache..."
+rm -rf /root/.cache/pip
+rm -rf /home/*/.cache/pip
 
 # Clean logs
 echo "Cleaning logs..."
@@ -27,6 +38,17 @@ rm -rf /var/log/*.[0-9]
 rm -rf /var/log/*-????????
 rm -rf /tmp/*
 rm -rf /var/tmp/*
+journalctl --vacuum-size=1M || true
+
+# Clean additional caches
+echo "Cleaning additional caches..."
+rm -rf /var/cache/man/*
+rm -rf /var/cache/debconf/*-old
+rm -rf /var/lib/dpkg/*-old
+rm -rf /usr/share/doc-base/*
+rm -rf /usr/share/groff/*
+rm -rf /usr/share/linda/*
+rm -rf /usr/share/lintian/*
 
 # Clean cloud-init
 echo "Cleaning cloud-init..."

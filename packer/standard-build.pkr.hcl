@@ -100,7 +100,14 @@ source "qemu" "ubuntu" {
   disk_cache         = "unsafe"
   disk_discard       = "unmap"
   disk_detect_zeroes = "unmap"
+  disk_compression   = true
   net_device         = "virtio-net"
+
+  # Performance optimizations
+  qemuargs = [
+    ["-cpu", "host"],
+    ["-smp", "cpus=${var.cpus},sockets=1,cores=${var.cpus},threads=1"]
+  ]
 
   # Boot configuration
   boot_wait = "5s"
@@ -208,12 +215,14 @@ build {
     execute_command = "echo '${var.ssh_password}' | sudo -S bash -c '{{ .Path }}'"
   }
 
-  # Convert to VMDK format
+  # Convert to VMDK format with compression
   post-processor "shell-local" {
     inline = [
-      "echo 'Converting qcow2 to VMDK...'",
-      "qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized output-${var.vm_name}/${local.output_name} output-${var.vm_name}/${local.output_name}.vmdk",
-      "echo 'Conversion complete'"
+      "echo 'Converting qcow2 to VMDK with compression...'",
+      "qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized,compat6 -c output-${var.vm_name}/${local.output_name} output-${var.vm_name}/${local.output_name}.vmdk",
+      "echo 'Conversion complete'",
+      "echo 'Image size:'",
+      "du -h output-${var.vm_name}/${local.output_name}.vmdk"
     ]
   }
 

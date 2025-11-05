@@ -9,6 +9,19 @@ echo "=================================================="
 echo "Installing base system packages..."
 echo "=================================================="
 
+# Configure APT for faster downloads and better caching
+echo "Configuring APT for optimal performance..."
+cat > /etc/apt/apt.conf.d/99-packer-optimizations <<'EOF'
+# Packer build optimizations
+Acquire::Languages "none";
+Acquire::GzipIndexes "true";
+Acquire::CompressionTypes::Order:: "gz";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APT::AutoRemove::RecommendsImportant "false";
+APT::AutoRemove::SuggestsImportant "false";
+EOF
+
 # Update package lists
 echo "Updating package lists..."
 apt-get update
@@ -84,14 +97,31 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3-dev
 
 # Install common Python packages
-pip3 install --upgrade pip
-pip3 install --upgrade setuptools wheel
-pip3 install pyyaml requests jinja2
+pip3 install --no-cache-dir --upgrade pip setuptools wheel
+pip3 install --no-cache-dir pyyaml requests jinja2
+
+# Optimize memory usage
+echo "Configuring memory optimizations..."
+cat >> /etc/sysctl.d/99-hedgehog-lab.conf <<'EOF'
+# Memory optimizations for lab environment
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+EOF
 
 # Clean up
 echo "Cleaning up package cache..."
 apt-get autoremove -y
 apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+# Remove unnecessary documentation to save space
+echo "Removing unnecessary documentation..."
+rm -rf /usr/share/doc/*
+rm -rf /usr/share/man/*
+rm -rf /usr/share/info/*
+find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +
 
 echo "=================================================="
 echo "Base system installation complete!"
