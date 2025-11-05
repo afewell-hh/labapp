@@ -31,8 +31,13 @@ CURSOR_HIDE='\033[?25l'
 CURSOR_SHOW='\033[?25h'
 CLEAR_LINE='\033[2K'
 
-# Trap to ensure cursor is shown on exit
-trap 'echo -e "${CURSOR_SHOW}"; exit' EXIT INT TERM
+# Trap to ensure cursor is shown on exit while preserving exit status
+cleanup_and_exit() {
+    local exit_status=$?
+    echo -e "${CURSOR_SHOW}"
+    exit $exit_status
+}
+trap cleanup_and_exit EXIT INT TERM
 
 # Helper function to get terminal dimensions
 get_terminal_size() {
@@ -69,6 +74,7 @@ get_state_field() {
 }
 
 # Get array from JSON (returns count)
+# Handles both single-line and multi-line JSON arrays
 get_array_count() {
     local field="$1"
 
@@ -77,20 +83,75 @@ get_array_count() {
         return
     fi
 
-    # Extract the array and count items between [ and ]
-    # Look for the field, extract content between [ and ], count quoted strings
-    # Uses || true to prevent pipefail from exiting when key is missing
-    local array_content=$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | sed 's/.*\[\(.*\)\].*/\1/' || true)
+    # Use awk to extract and count array elements across multiple lines
+    # This handles both compact and pretty-printed JSON arrays
+    local count=$(awk -v field="$field" '
+        BEGIN { in_array=0; count=0; bracket_depth=0; found_field=0 }
 
-    if [ -z "$array_content" ] || [ "$array_content" = "[]" ]; then
-        echo "0"
-        return
-    fi
+        # Find the field and start of array
+        !found_field && $0 ~ "\"" field "\"" {
+            found_field=1
+            # Check if array starts on same line
+            if ($0 ~ /\[/) {
+                in_array=1
+                bracket_depth=1
+            }
+        }
 
-    # Count comma-separated items (add 1 since n items have n-1 commas)
-    # Uses || true to handle case where no commas exist (single item)
-    local comma_count=$(echo "$array_content" | grep -o "," 2>/dev/null | wc -l || echo "0")
-    echo $((comma_count + 1))
+        # If we found the field but array is on next line
+        found_field && !in_array && /\[/ {
+            in_array=1
+            bracket_depth=1
+            next
+        }
+
+        # Count quoted strings and track brackets within the array
+        in_array && bracket_depth > 0 {
+            line = $0
+
+            # If this is the line with the field name, remove everything up to [
+            if (line ~ "\"" field "\"") {
+                sub(/.*\[/, "", line)
+            }
+
+            # Process the line character by character to handle brackets and strings
+            while (length(line) > 0) {
+                # Check for closing bracket first (array end)
+                if (match(line, /^[[:space:]]*\]/)) {
+                    bracket_depth--
+                    if (bracket_depth == 0) {
+                        in_array=0
+                        found_field=0
+                        break
+                    }
+                    # Move past the bracket
+                    line = substr(line, RSTART + RLENGTH)
+                    continue
+                }
+
+                # Check for opening bracket (nested array)
+                if (match(line, /^[[:space:]]*\[/)) {
+                    bracket_depth++
+                    line = substr(line, RSTART + RLENGTH)
+                    continue
+                }
+
+                # Count quoted strings
+                if (match(line, /"[^"]*"/)) {
+                    count++
+                    line = substr(line, RSTART + RLENGTH)
+                    continue
+                }
+
+                # Move past other characters
+                line = substr(line, 2)
+            }
+        }
+
+        END { print count }
+    ' "$STATE_FILE" 2>/dev/null || echo "0")
+
+    echo "$count"
 }
 
 # Calculate progress percentage
