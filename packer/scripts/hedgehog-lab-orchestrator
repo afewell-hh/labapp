@@ -127,12 +127,17 @@ BUILD_TYPE="standard"
 if [ -f "$BUILD_TYPE_FILE" ]; then
     BUILD_TYPE=$(cat "$BUILD_TYPE_FILE" | tr -d '[:space:]')
 fi
-log_info "Build type: $BUILD_TYPE"
 
-# Validate build type
+# Validate build type and default to standard if invalid
 if [[ ! "$BUILD_TYPE" =~ ^(standard|prewarmed)$ ]]; then
-    error "Invalid build type: $BUILD_TYPE (must be 'standard' or 'prewarmed')"
+    if [ -f "$BUILD_TYPE_FILE" ]; then
+        log_warn "Invalid build type in $BUILD_TYPE_FILE: '$BUILD_TYPE' (must be 'standard' or 'prewarmed')"
+        log_warn "Defaulting to 'standard' build type"
+    fi
+    BUILD_TYPE="standard"
 fi
+
+log_info "Build type: $BUILD_TYPE"
 
 # Helper function to execute a step with error handling
 execute_step() {
