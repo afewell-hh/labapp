@@ -58,8 +58,9 @@ jobs:
         run: |
           echo "Checking for KVM support..."
           if [ ! -e /dev/kvm ]; then
-            echo "ERROR: /dev/kvm not found. Pre-warmed builds require KVM support."
-            echo "This workflow must run on a self-hosted runner with nested virtualization enabled."
+            echo "ERROR: /dev/kvm not found."
+            echo "Pre-warmed builds require KVM support."
+            echo "Must run on self-hosted runner with nested virt."
             exit 1
           fi
 
@@ -116,13 +117,16 @@ jobs:
       - name: Validate build artifacts
         run: |
           chmod +x tests/e2e/scripts/validate-build.sh
-          ./tests/e2e/scripts/validate-build.sh output-hedgehog-lab-prewarmed prewarmed
+          ./tests/e2e/scripts/validate-build.sh \
+            output-hedgehog-lab-prewarmed prewarmed
 
       - name: Upload validation results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-validation-results-prewarmed-${{ steps.version.outputs.version }}
+          name: >-
+            build-validation-results-prewarmed-${{
+            steps.version.outputs.version }}
           path: tests/e2e/results/build-validation-*.json
           retention-days: 90
 
@@ -136,8 +140,8 @@ jobs:
             output-hedgehog-lab-prewarmed/*.sha256
           retention-days: 90
 
-      # Note: The OVA file is typically too large (80-100GB) for GitHub artifacts
-      # Consider using external storage (S3, Azure Blob, GCS) for OVA distribution
+      # Note: OVA file is too large (80-100GB) for GitHub artifacts
+      # Consider external storage (S3, Azure Blob, GCS)
       # Example with AWS S3:
       # - name: Upload to S3
       #   if: success()
