@@ -268,10 +268,74 @@ build {
     ]
   }
 
-  # Cleanup
+  # Cleanup (modified for pre-warmed builds)
+  # IMPORTANT: Do NOT run docker system prune as it would delete all initialized containers!
   provisioner "shell" {
-    script          = "packer/scripts/99-cleanup.sh"
-    execute_command = "echo '${var.ssh_password}' | sudo -S bash -c '{{ .Path }}'"
+    inline = [
+      "echo '=================================================='",
+      "echo 'Cleaning up image (preserving Docker state)...'",
+      "echo '=================================================='",
+      "echo 'NOTE: Skipping Docker cleanup to preserve initialized containers'",
+      "",
+      "# Stop unnecessary services",
+      "echo 'Stopping unnecessary services...'",
+      "sudo systemctl stop unattended-upgrades || true",
+      "",
+      "# Clean apt cache",
+      "echo 'Cleaning apt cache...'",
+      "sudo apt-get autoremove -y --purge",
+      "sudo apt-get clean",
+      "sudo rm -rf /var/lib/apt/lists/*",
+      "sudo rm -rf /var/cache/apt/archives/*.deb",
+      "sudo rm -rf /var/cache/apt/archives/partial/*.deb",
+      "",
+      "# Clean pip cache",
+      "echo 'Cleaning pip cache...'",
+      "sudo rm -rf /root/.cache/pip",
+      "sudo rm -rf /home/*/.cache/pip",
+      "",
+      "# Clean logs (but preserve initialization logs)",
+      "echo 'Cleaning system logs...'",
+      "sudo journalctl --vacuum-size=10M || true",
+      "sudo rm -rf /var/log/*.gz",
+      "sudo rm -rf /var/log/*.[0-9]",
+      "sudo rm -rf /var/log/*-????????",
+      "",
+      "# Clean additional caches",
+      "echo 'Cleaning additional caches...'",
+      "sudo rm -rf /var/cache/man/*",
+      "sudo rm -rf /var/cache/debconf/*-old",
+      "sudo rm -rf /var/lib/dpkg/*-old",
+      "",
+      "# Clean cloud-init",
+      "echo 'Cleaning cloud-init...'",
+      "sudo cloud-init clean --logs --seed",
+      "",
+      "# Clean bash history",
+      "echo 'Cleaning bash history...'",
+      "sudo rm -f /root/.bash_history",
+      "sudo rm -f /home/*/.bash_history",
+      "history -c",
+      "",
+      "# Clean SSH keys (they will be regenerated on first boot)",
+      "echo 'Removing SSH host keys (will be regenerated)...'",
+      "sudo rm -f /etc/ssh/ssh_host_*",
+      "",
+      "# Run fstrim to discard unused blocks",
+      "echo 'Running fstrim to discard unused blocks...'",
+      "if command -v fstrim &> /dev/null; then",
+      "    sudo fstrim -v / || echo 'fstrim completed with warnings'",
+      "else",
+      "    echo 'fstrim not available, skipping trim operation'",
+      "fi",
+      "",
+      "# Sync filesystem",
+      "sudo sync",
+      "",
+      "echo '=================================================='",
+      "echo 'Cleanup complete (Docker state preserved)!'",
+      "echo '=================================================='"
+    ]
   }
 
   # Convert to VMDK format
