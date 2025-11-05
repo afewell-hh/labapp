@@ -74,6 +74,9 @@ variable "accelerator" {
 locals {
   output_name = "${var.vm_name}-${var.version}"
   build_date  = formatdate("YYYY-MM-DD", timestamp())
+
+  # CPU optimization: Use host passthrough only with KVM, fall back to qemu64 for TCG
+  cpu_type = var.accelerator == "kvm" ? "host" : "qemu64"
 }
 
 # Source: QEMU builder
@@ -103,8 +106,9 @@ source "qemu" "ubuntu" {
   net_device         = "virtio-net"
 
   # Performance optimizations
+  # CPU type is conditional: 'host' for KVM, 'qemu64' for TCG
   qemuargs = [
-    ["-cpu", "host"],
+    ["-cpu", local.cpu_type],
     ["-smp", "cpus=${var.cpus},sockets=1,cores=${var.cpus},threads=1"]
   ]
 
