@@ -123,6 +123,8 @@ Releases follow semantic versioning (semver):
 - `v1.1.0` - Minor release (features)
 - `v1.0.1` - Patch release (fixes)
 
+For detailed release procedures, see [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md).
+
 ## Getting Help
 
 - GitHub Discussions for questions
