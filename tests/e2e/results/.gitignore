@@ -1,0 +1,7 @@
+# Ignore all test result files
+*.json
+*.txt
+*.log
+
+# Keep the .gitkeep file
+!.gitkeep
