@@ -226,7 +226,9 @@ build {
   # Run full initialization at build time
   # This is the key difference from standard build
   provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
     inline = [
+      "# Enable pipefail to catch orchestrator failures even when piped to tee",
       "set -o pipefail",
       "echo '=================================================='",
       "echo 'Running full initialization at build time...'",
@@ -242,8 +244,6 @@ build {
       "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Expected duration: 20-30 minutes\" | sudo tee -a \"$BUILD_TIME_LOG\"",
       "echo ''",
       "# Run orchestrator with extended timeout (30 minutes)",
-      "# Enable pipefail to catch orchestrator failures even when piped to tee",
-      "set -o pipefail",
       "if sudo timeout 1800 /usr/local/bin/hedgehog-lab-orchestrator 2>&1 | sudo tee -a \"$BUILD_TIME_LOG\"; then",
       "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Build-time initialization completed successfully\" | sudo tee -a \"$BUILD_TIME_LOG\"",
       "  echo ''",
