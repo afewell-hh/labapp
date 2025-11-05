@@ -74,6 +74,9 @@ variable "accelerator" {
 locals {
   output_name = "${var.vm_name}-${var.version}"
   build_date  = formatdate("YYYY-MM-DD", timestamp())
+
+  # CPU optimization: Use host passthrough only with KVM, fall back to qemu64 for TCG
+  cpu_type = var.accelerator == "kvm" ? "host" : "qemu64"
 }
 
 # Source: QEMU builder
@@ -101,6 +104,13 @@ source "qemu" "ubuntu" {
   disk_discard       = "unmap"
   disk_detect_zeroes = "unmap"
   net_device         = "virtio-net"
+
+  # Performance optimizations
+  # CPU type is conditional: 'host' for KVM, 'qemu64' for TCG
+  qemuargs = [
+    ["-cpu", local.cpu_type],
+    ["-smp", "cpus=${var.cpus},sockets=1,cores=${var.cpus},threads=1"]
+  ]
 
   # Boot configuration
   boot_wait = "5s"
@@ -209,11 +219,14 @@ build {
   }
 
   # Convert to VMDK format
+  # Note: streamOptimized subformat provides compression automatically
   post-processor "shell-local" {
     inline = [
-      "echo 'Converting qcow2 to VMDK...'",
-      "qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized output-${var.vm_name}/${local.output_name} output-${var.vm_name}/${local.output_name}.vmdk",
-      "echo 'Conversion complete'"
+      "echo 'Converting qcow2 to VMDK (streamOptimized format)...'",
+      "qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized,compat6 output-${var.vm_name}/${local.output_name} output-${var.vm_name}/${local.output_name}.vmdk",
+      "echo 'Conversion complete'",
+      "echo 'Image size:'",
+      "du -h output-${var.vm_name}/${local.output_name}.vmdk"
     ]
   }
 
