@@ -1,0 +1,149 @@
+---
+name: Build Pre-Warmed Appliance
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+env:
+  PACKER_VERSION: '1.11.2'
+
+jobs:
+  validate:
+    name: Validate Packer Template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Initialize Packer
+        run: packer init packer/prewarmed-build.pkr.hcl
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Packer template
+        run: packer validate packer/prewarmed-build.pkr.hcl
+
+      - name: Format check
+        run: |
+          packer fmt -check packer/prewarmed-build.pkr.hcl || {
+            echo "Packer formatting is incorrect. Run 'packer fmt' to fix."
+            exit 1
+          }
+
+  build:
+    name: Build Pre-Warmed OVA
+    needs: validate
+    # Pre-warmed builds REQUIRE KVM nested virtualization support
+    # This workflow is designed for self-hosted runners with KVM enabled
+    # GitHub-hosted runners do NOT support nested virtualization
+    runs-on: self-hosted
+    # Alternatively, use a label for KVM-enabled runners:
+    # runs-on: [self-hosted, kvm]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify KVM support
+        run: |
+          echo "Checking for KVM support..."
+          if [ ! -e /dev/kvm ]; then
+            echo "ERROR: /dev/kvm not found. Pre-warmed builds require KVM support."
+            echo "This workflow must run on a self-hosted runner with nested virtualization enabled."
+            exit 1
+          fi
+
+          if ! lsmod | grep -q kvm; then
+            echo "ERROR: KVM kernel module not loaded."
+            exit 1
+          fi
+
+          echo "KVM support detected:"
+          ls -l /dev/kvm
+          lsmod | grep kvm
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Initialize Packer
+        run: packer init packer/prewarmed-build.pkr.hcl
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        id: version
+        run: |
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Build pre-warmed appliance
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Pre-warmed build configuration:
+          # - REQUIRES KVM acceleration (nested virt for VLAB)
+          # - Full resources (16GB RAM, 8 CPUs)
+          # - Build time: 60-90 minutes (includes full initialization)
+          packer build \
+            -var "version=${VERSION}" \
+            -var "accelerator=kvm" \
+            -var "memory=16384" \
+            -var "cpus=8" \
+            packer/prewarmed-build.pkr.hcl
+
+      - name: List build outputs
+        run: |
+          ls -lh output-hedgehog-lab-prewarmed/
+          echo "Build artifacts:"
+          du -sh output-hedgehog-lab-prewarmed/*
+
+      - name: Validate build artifacts
+        run: |
+          chmod +x tests/e2e/scripts/validate-build.sh
+          ./tests/e2e/scripts/validate-build.sh output-hedgehog-lab-prewarmed
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-results-prewarmed-${{ steps.version.outputs.version }}
+          path: tests/e2e/results/build-validation-*.json
+          retention-days: 90
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            hedgehog-lab-prewarmed-${{
+            steps.version.outputs.version }}-checksums
+          path: |
+            output-hedgehog-lab-prewarmed/*.sha256
+          retention-days: 90
+
+      # Note: The OVA file is typically too large (80-100GB) for GitHub artifacts
+      # Consider using external storage (S3, Azure Blob, GCS) for OVA distribution
+      # Example with AWS S3:
+      # - name: Upload to S3
+      #   if: success()
+      #   run: |
+      #     aws s3 cp output-hedgehog-lab-prewarmed/*.ova \
+      #       s3://your-bucket/releases/${{ steps.version.outputs.version }}/
+      #   env:
+      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
