@@ -139,7 +139,7 @@ From your host computer's web browser:
 
 - **Grafana:** http://localhost:3000 (admin/admin)
 - **ArgoCD:** http://localhost:8080 (admin/[get password])
-- **Gitea:** http://localhost:3001 (gitea/gitea)
+- **Gitea:** http://localhost:3001 (gitea_admin/admin123)
 
 See [Quick Start Guide](QUICKSTART.md#accessing-services) for details.
 

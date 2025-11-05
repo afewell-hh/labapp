@@ -90,7 +90,7 @@ The appliance includes several web-based services for managing and observing you
 |---------|-----|----------|----------|---------|
 | **Grafana** | http://localhost:3000 | `admin` | `admin` | Observability dashboards, metrics visualization |
 | **ArgoCD** | http://localhost:8080 | `admin` | See below* | GitOps continuous delivery |
-| **Gitea** | http://localhost:3001 | `gitea` | `gitea` | Git repository hosting |
+| **Gitea** | http://localhost:3001 | `gitea_admin` | `admin123` | Git repository hosting |
 | **Prometheus** | http://localhost:9090 | N/A | N/A | Metrics collection (direct access) |
 
 > **Note:** If using **VirtualBox with NAT**, ensure port forwarding is configured (see [Installation Guide](INSTALL.md#installation-on-virtualbox)).
