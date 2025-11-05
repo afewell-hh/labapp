@@ -226,35 +226,83 @@ build {
   # Run full initialization at build time
   # This is the key difference from standard build
   provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
     inline = [
+      "# Enable pipefail to catch orchestrator failures even when piped to tee",
+      "set -o pipefail",
       "echo '=================================================='",
       "echo 'Running full initialization at build time...'",
       "echo '=================================================='",
-      "echo 'This will take 15-20 minutes to complete.'",
+      "echo 'This will take 20-30 minutes to complete.'",
       "echo 'Initializing k3d cluster and VLAB...'",
       "echo ''",
-      "sudo /usr/local/bin/hedgehog-lab-orchestrator",
+      "# Create build-time log file separate from runtime logs",
+      "sudo mkdir -p /var/log/hedgehog-lab",
+      "export BUILD_TIME_LOG='/var/log/hedgehog-lab/build-time-init.log'",
+      "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Starting build-time initialization\" | sudo tee -a \"$BUILD_TIME_LOG\"",
+      "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Build type: prewarmed\" | sudo tee -a \"$BUILD_TIME_LOG\"",
+      "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Expected duration: 20-30 minutes\" | sudo tee -a \"$BUILD_TIME_LOG\"",
       "echo ''",
-      "echo 'Build-time initialization complete!'",
-      "echo '=================================================='"
+      "# Run orchestrator with extended timeout (30 minutes)",
+      "if sudo timeout 1800 /usr/local/bin/hedgehog-lab-orchestrator 2>&1 | sudo tee -a \"$BUILD_TIME_LOG\"; then",
+      "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Build-time initialization completed successfully\" | sudo tee -a \"$BUILD_TIME_LOG\"",
+      "  echo ''",
+      "  echo 'Build-time initialization complete!'",
+      "  echo '=================================================='",
+      "else",
+      "  EXIT_CODE=$?",
+      "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Build-time initialization failed with exit code: $EXIT_CODE\" | sudo tee -a \"$BUILD_TIME_LOG\"",
+      "  echo ''",
+      "  echo 'ERROR: Build-time initialization failed!'",
+      "  echo 'Check log: /var/log/hedgehog-lab/build-time-init.log'",
+      "  echo 'Last 50 lines of log:'",
+      "  sudo tail -50 \"$BUILD_TIME_LOG\"",
+      "  exit 1",
+      "fi"
     ]
     expect_disconnect = false
     pause_after       = "10s"
+    timeout           = "35m"
   }
 
   # Verify initialization succeeded
   provisioner "shell" {
     inline = [
       "echo 'Verifying initialization...'",
+      "echo ''",
+      "# Check for initialization stamp file",
       "if [ -f /var/lib/hedgehog-lab/initialized ]; then",
       "  echo 'SUCCESS: Initialization stamp file found'",
       "  cat /var/lib/hedgehog-lab/initialized",
       "else",
       "  echo 'ERROR: Initialization stamp file not found'",
-      "  echo 'Initialization logs:'",
-      "  cat /var/log/hedgehog-lab-init.log",
+      "  echo 'Build-time initialization logs:'",
+      "  sudo cat /var/log/hedgehog-lab/build-time-init.log",
       "  exit 1",
-      "fi"
+      "fi",
+      "echo ''",
+      "# Verify k3d cluster is running",
+      "echo 'Verifying k3d cluster...'",
+      "if k3d cluster list | grep -q 'k3d-observability.*running'; then",
+      "  echo 'SUCCESS: k3d-observability cluster is running'",
+      "  k3d cluster list | grep k3d-observability",
+      "else",
+      "  echo 'ERROR: k3d-observability cluster is not running'",
+      "  exit 1",
+      "fi",
+      "echo ''",
+      "# Verify VLAB is initialized",
+      "echo 'Verifying VLAB...'",
+      "if [ -f /opt/hedgehog/vlab/fab.yaml ] && [ -f /opt/hedgehog/vlab/wiring.yaml ]; then",
+      "  echo 'SUCCESS: VLAB configuration files found'",
+      "  echo '  - fab.yaml: present'",
+      "  echo '  - wiring.yaml: present'",
+      "else",
+      "  echo 'ERROR: VLAB configuration files missing'",
+      "  exit 1",
+      "fi",
+      "echo ''",
+      "echo 'All verification checks passed!'"
     ]
   }
 
