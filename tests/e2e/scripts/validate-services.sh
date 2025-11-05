@@ -59,6 +59,12 @@ test_fail() {
     log_error "✗ ${test_name}: ${reason}"
 }
 
+test_warn() {
+    local test_name="$1"
+    local reason="$2"
+    log_warn "⚠ ${test_name}: ${reason}"
+}
+
 # Main validation logic
 main() {
     echo "======================================"
