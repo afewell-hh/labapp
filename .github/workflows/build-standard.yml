@@ -108,6 +108,19 @@ jobs:
           echo "Build artifacts:"
           du -sh output-hedgehog-lab-standard/*
 
+      - name: Validate build artifacts
+        run: |
+          chmod +x tests/e2e/scripts/validate-build.sh
+          ./tests/e2e/scripts/validate-build.sh output-hedgehog-lab-standard
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-results-${{ steps.version.outputs.version }}
+          path: tests/e2e/results/build-validation-*.json
+          retention-days: 90
+
       - name: Upload checksum only
         uses: actions/upload-artifact@v4
         with:
