@@ -57,6 +57,8 @@ wget https://releases.example.com/hedgehog-lab-standard-latest.ova
 - [Build Guide](docs/build/BUILD_GUIDE.md) - Build the appliance from source
 - [Contributing Guide](CONTRIBUTING.md) - Contribution guidelines
 - [Roadmap](ROADMAP.md) - Product roadmap and timeline
+- [Changelog](CHANGELOG.md) - Version history and changes
+- [Release Process](docs/RELEASE_PROCESS.md) - Release guidelines and checklists
 - [Architecture Decision Records](docs/adr/) - Design decisions
 - [Sprint Planning](docs/issues/MVP_SPRINT_PLAN.md) - Current sprint
 
