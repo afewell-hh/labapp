@@ -8,7 +8,7 @@ _hh_lab_completions() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Main commands
-    local commands="status logs info help version"
+    local commands="status logs info monitor help version"
 
     # Options for logs command
     local logs_opts="-f --follow -n --lines -m --module"

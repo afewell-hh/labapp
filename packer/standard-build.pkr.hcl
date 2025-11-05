@@ -176,6 +176,26 @@ build {
     destination = "/tmp/packer-provisioner-shell-scripts/30-vlab-init.sh"
   }
 
+  provisioner "file" {
+    source      = "packer/scripts/20-k3d-observability-init.sh"
+    destination = "/tmp/packer-provisioner-shell-scripts/20-k3d-observability-init.sh"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/hedgehog-lab-readiness-ui"
+    destination = "/tmp/packer-provisioner-shell-scripts/hedgehog-lab-readiness-ui"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/hh-lab"
+    destination = "/tmp/packer-provisioner-shell-scripts/hh-lab"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/hh-lab-completion.bash"
+    destination = "/tmp/packer-provisioner-shell-scripts/hh-lab-completion.bash"
+  }
+
   # Install orchestrator and modules
   provisioner "shell" {
     script          = "packer/scripts/05-install-orchestrator.sh"

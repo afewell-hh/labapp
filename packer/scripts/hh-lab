@@ -601,6 +601,9 @@ ${BOLD}COMMANDS${NC}
         Shows version info, build information, system resources, installed
         tools, Kubernetes cluster details, and file locations.
 
+    ${BOLD}monitor${NC}
+        Monitor initialization progress in real-time with visual progress bar
+
     ${BOLD}help${NC}
         Display this help message
 
@@ -636,6 +639,9 @@ ${BOLD}EXAMPLES${NC}
     # View specific module logs
     hh-lab logs -m k3d-observability-init
 
+    # Monitor initialization progress in real-time
+    hh-lab monitor
+
 ${BOLD}EXIT STATUS${NC}
     0    Success
     1    General error
@@ -657,6 +663,20 @@ EOF
 # version command - show version
 cmd_version() {
     echo "hh-lab version $VERSION"
+}
+
+# monitor command - show initialization progress UI
+cmd_monitor() {
+    # Check if readiness UI is available
+    if ! command -v hedgehog-lab-readiness-ui &> /dev/null; then
+        print_error "hedgehog-lab-readiness-ui command not found"
+        echo ""
+        echo "The readiness UI tool should be installed at /usr/local/bin/hedgehog-lab-readiness-ui"
+        exit 1
+    fi
+
+    # Run the readiness UI in monitor mode
+    hedgehog-lab-readiness-ui monitor
 }
 
 # Main command dispatcher
@@ -681,6 +701,9 @@ main() {
             ;;
         info)
             cmd_info "$@"
+            ;;
+        monitor)
+            cmd_monitor "$@"
             ;;
         help|--help|-h)
             cmd_help
