@@ -185,11 +185,15 @@ cmd_status() {
     echo ""
 
     # Build Type and Initialization Status
-    local build_type="unknown"
+    local build_type="standard"
     local init_status="not-initialized"
 
     if [ -f "$BUILD_TYPE_FILE" ]; then
-        build_type=$(cat "$BUILD_TYPE_FILE")
+        build_type=$(cat "$BUILD_TYPE_FILE" | tr -d '[:space:]')
+        # Validate and default to standard if invalid
+        if [[ ! "$build_type" =~ ^(standard|prewarmed)$ ]]; then
+            build_type="standard"
+        fi
     fi
 
     if [ -f "$STAMP_FILE" ]; then
@@ -486,12 +490,15 @@ cmd_info() {
 
     # Build information
     print_header "Build Information"
+    local build_type="standard"
     if [ -f "$BUILD_TYPE_FILE" ]; then
-        local build_type=$(cat "$BUILD_TYPE_FILE")
-        print_label "  Build Type" "$build_type"
-    else
-        print_label "  Build Type" "unknown"
+        build_type=$(cat "$BUILD_TYPE_FILE" | tr -d '[:space:]')
+        # Validate and default to standard if invalid
+        if [[ ! "$build_type" =~ ^(standard|prewarmed)$ ]]; then
+            build_type="standard"
+        fi
     fi
+    print_label "  Build Type" "$build_type"
 
     if [ -f "$STAMP_FILE" ] && [ -r "$STAMP_FILE" ]; then
         local init_time=$(grep "initialized_at" "$STAMP_FILE" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
