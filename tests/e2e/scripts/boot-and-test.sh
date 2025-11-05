@@ -568,17 +568,36 @@ main() {
         exit 1
     fi
 
-    # Run tests
-    extract_ova "$ova_file" || exit 1
-    boot_vm || exit 1
-    wait_for_ssh || exit 1
-    wait_for_initialization || exit 1
-    verify_services || exit 1
-    check_endpoints || true  # Don't fail on endpoint checks
-    validate_vlab || true     # Don't fail on VLAB validation
+    # Run tests - capture status but don't exit immediately
+    local test_status=0
 
-    # Generate report
-    generate_report
+    extract_ova "$ova_file" || test_status=1
+
+    if [ $test_status -eq 0 ]; then
+        boot_vm || test_status=1
+    fi
+
+    if [ $test_status -eq 0 ]; then
+        wait_for_ssh || test_status=1
+    fi
+
+    if [ $test_status -eq 0 ]; then
+        wait_for_initialization || test_status=1
+    fi
+
+    if [ $test_status -eq 0 ]; then
+        verify_services || test_status=1
+    fi
+
+    if [ $test_status -eq 0 ]; then
+        check_endpoints || true  # Don't fail on endpoint checks
+        validate_vlab || true     # Don't fail on VLAB validation
+    fi
+
+    # Always generate report, even on failure
+    generate_report || test_status=1
+
+    return $test_status
 }
 
 # Run main function
