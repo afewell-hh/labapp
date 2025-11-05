@@ -55,10 +55,13 @@ get_state_field() {
         return
     fi
 
-    # Extract field value from JSON
-    local value=$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | sed 's/.*: "\?\([^",]*\)"\?,\?/\1/' | tr -d ' ' | head -1)
+    # Extract field value from JSON (handles both compact and pretty-printed JSON)
+    # Pattern matches: "field": "value" or "field":"value" (with or without spaces)
+    # Uses || true to prevent pipefail from exiting when key is missing
+    local value=$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | head -1 | sed 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"\?\([^",}]*\)"\?.*/\1/' || true)
 
-    if [ -z "$value" ]; then
+    if [ -z "$value" ] || [ "$value" = "$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | head -1 || true)" ]; then
+        # If value is empty or unchanged (sed substitution failed), return default
         echo "$default"
     else
         echo "$value"
@@ -76,7 +79,8 @@ get_array_count() {
 
     # Extract the array and count items between [ and ]
     # Look for the field, extract content between [ and ], count quoted strings
-    local array_content=$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | sed 's/.*\[\(.*\)\].*/\1/')
+    # Uses || true to prevent pipefail from exiting when key is missing
+    local array_content=$(grep "\"$field\"" "$STATE_FILE" 2>/dev/null | sed 's/.*\[\(.*\)\].*/\1/' || true)
 
     if [ -z "$array_content" ] || [ "$array_content" = "[]" ]; then
         echo "0"
@@ -84,7 +88,8 @@ get_array_count() {
     fi
 
     # Count comma-separated items (add 1 since n items have n-1 commas)
-    local comma_count=$(echo "$array_content" | grep -o "," | wc -l)
+    # Uses || true to handle case where no commas exist (single item)
+    local comma_count=$(echo "$array_content" | grep -o "," 2>/dev/null | wc -l || echo "0")
     echo $((comma_count + 1))
 }
 
