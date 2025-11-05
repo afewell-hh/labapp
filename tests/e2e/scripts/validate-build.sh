@@ -2,8 +2,9 @@
 # validate-build.sh
 # Validates Packer build artifacts
 #
-# Usage: ./validate-build.sh <output-directory>
+# Usage: ./validate-build.sh <output-directory> [build-type]
 # Example: ./validate-build.sh ../../output-hedgehog-lab-standard
+# Example: ./validate-build.sh ../../output-hedgehog-lab-prewarmed prewarmed
 
 set -euo pipefail
 
@@ -13,9 +14,19 @@ RESULTS_DIR="${SCRIPT_DIR}/../results"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 RESULT_FILE="${RESULTS_DIR}/build-validation-${TIMESTAMP}.json"
 
-# Expected file size ranges (in GB)
-MIN_OVA_SIZE_GB=10
-MAX_OVA_SIZE_GB=30
+# Build type (standard or prewarmed)
+BUILD_TYPE="${2:-standard}"
+
+# Expected file size ranges (in GB) - varies by build type
+if [ "${BUILD_TYPE}" = "prewarmed" ]; then
+    # Pre-warmed builds are larger due to initialized state
+    MIN_OVA_SIZE_GB=80
+    MAX_OVA_SIZE_GB=100
+else
+    # Standard builds
+    MIN_OVA_SIZE_GB=10
+    MAX_OVA_SIZE_GB=30
+fi
 
 # Color output
 RED='\033[0;31m'
@@ -68,16 +79,22 @@ test_warn() {
 # Usage
 usage() {
     cat <<EOF
-Usage: $0 <output-directory>
+Usage: $0 <output-directory> [build-type]
 
 Validates Packer build artifacts.
 
 Arguments:
   output-directory    Path to Packer output directory (e.g., output-hedgehog-lab-standard)
+  build-type         Build type: 'standard' or 'prewarmed' (default: standard)
+
+Size validation ranges:
+  standard:  10-30 GB
+  prewarmed: 80-100 GB
 
 Examples:
   $0 ../../output-hedgehog-lab-standard
-  $0 /path/to/labapp/output-hedgehog-lab-standard
+  $0 ../../output-hedgehog-lab-prewarmed prewarmed
+  $0 /path/to/labapp/output-hedgehog-lab-standard standard
 
 EOF
     exit 1
@@ -91,6 +108,8 @@ main() {
     echo "Build Validation Test"
     echo "======================================"
     echo "Output directory: ${output_dir}"
+    echo "Build type: ${BUILD_TYPE}"
+    echo "Size range: ${MIN_OVA_SIZE_GB}-${MAX_OVA_SIZE_GB} GB"
     echo "Timestamp: ${TIMESTAMP}"
     echo ""
 
@@ -248,7 +267,7 @@ EOF
 }
 
 # Entry point
-if [ $# -ne 1 ]; then
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     usage
 fi
 

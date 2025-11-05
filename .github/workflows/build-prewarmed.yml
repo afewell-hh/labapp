@@ -116,7 +116,7 @@ jobs:
       - name: Validate build artifacts
         run: |
           chmod +x tests/e2e/scripts/validate-build.sh
-          ./tests/e2e/scripts/validate-build.sh output-hedgehog-lab-prewarmed
+          ./tests/e2e/scripts/validate-build.sh output-hedgehog-lab-prewarmed prewarmed
 
       - name: Upload validation results
         if: always()
