@@ -221,8 +221,7 @@ upload_file() {
         if aws s3 cp "$file" "s3://${S3_BUCKET}/${s3_path}" \
             --region "$S3_REGION" \
             --storage-class STANDARD \
-            --metadata "version=${VERSION},build-type=${BUILD_TYPE},sha256=${SHA256_CHECKSUM}" \
-            --metadata-directive REPLACE; then
+            --metadata "version=${VERSION},build-type=${BUILD_TYPE},sha256=${SHA256_CHECKSUM}"; then
             log_info "Successfully uploaded: $(basename "$file")"
             return 0
         else
