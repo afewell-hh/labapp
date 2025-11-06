@@ -131,7 +131,11 @@ fi
 
 if [ ! -f "$CHECKSUM_FILE" ]; then
     log_info "Computing SHA256 checksum (this may take several minutes for large files)..."
-    if sha256sum "$OVA_FILE" > "$CHECKSUM_FILE"; then
+    # Generate checksum with only filename (not full path) for user verification
+    # This ensures users can verify downloads with: sha256sum -c file.ova.sha256
+    OVA_DIR=$(dirname "$OVA_FILE")
+    OVA_BASENAME=$(basename "$OVA_FILE")
+    if (cd "$OVA_DIR" && sha256sum "$OVA_BASENAME") > "$CHECKSUM_FILE"; then
         log_info "Checksum generated: $CHECKSUM_FILE"
         cat "$CHECKSUM_FILE"
     else
