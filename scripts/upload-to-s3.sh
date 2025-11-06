@@ -23,8 +23,14 @@ set -euo pipefail
 S3_BUCKET="hedgehog-lab-artifacts"
 S3_REGION="us-east-1"
 MAX_RETRIES=3
-MULTIPART_THRESHOLD="100MB"  # Use multipart for files > 100MB
-MULTIPART_CHUNKSIZE="100MB"  # Upload in 100MB chunks
+
+# Multipart upload configuration for large files (80-100GB)
+# S3 has a 10,000 part limit, so for 100GB files:
+#   100GB / 10,000 parts = 10MB minimum chunk size
+# We use 100MB chunks for better performance and safety margin
+MULTIPART_THRESHOLD=$((100 * 1024 * 1024))    # 100MB in bytes
+MULTIPART_CHUNKSIZE=$((100 * 1024 * 1024))    # 100MB in bytes
+MAX_BANDWIDTH=""  # Empty = unlimited (set to limit if needed, e.g., "50MB/s")
 
 # Color codes for output
 RED='\033[0;31m'
@@ -213,6 +219,32 @@ echo ""
 echo "=================================================="
 log_info "Step 4: Uploading files to S3..."
 echo "=================================================="
+
+# Configure AWS CLI for large file uploads (80-100GB)
+# Create temporary AWS config to set multipart upload parameters
+AWS_CONFIG_DIR=$(mktemp -d)
+export AWS_CONFIG_FILE="${AWS_CONFIG_DIR}/config"
+
+cat > "$AWS_CONFIG_FILE" << EOF
+[default]
+s3 =
+    multipart_threshold = ${MULTIPART_THRESHOLD}
+    multipart_chunksize = ${MULTIPART_CHUNKSIZE}
+    max_concurrent_requests = 10
+    max_queue_size = 1000
+EOF
+
+log_info "Configured AWS CLI for large file uploads:"
+log_info "  Multipart threshold: $((MULTIPART_THRESHOLD / 1024 / 1024))MB"
+log_info "  Multipart chunk size: $((MULTIPART_CHUNKSIZE / 1024 / 1024))MB"
+log_info "  Max parts for 100GB: $((100 * 1024 * 1024 * 1024 / MULTIPART_CHUNKSIZE)) parts"
+echo ""
+
+# Cleanup function for temporary config
+cleanup_aws_config() {
+    rm -rf "$AWS_CONFIG_DIR"
+}
+trap cleanup_aws_config EXIT
 
 upload_file() {
     local file="$1"
