@@ -140,14 +140,39 @@ jobs:
             output-hedgehog-lab-prewarmed/*.sha256
           retention-days: 90
 
-      # Note: OVA file is too large (80-100GB) for GitHub artifacts
-      # Consider external storage (S3, Azure Blob, GCS)
-      # Example with AWS S3:
-      # - name: Upload to S3
-      #   if: success()
-      #   run: |
-      #     aws s3 cp output-hedgehog-lab-prewarmed/*.ova \
-      #       s3://your-bucket/releases/${{ steps.version.outputs.version }}/
-      #   env:
-      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      # Upload artifacts to AWS S3
+      # OVA files are too large (80-100GB) for GitHub artifacts
+      # See ADR-004 for S3 storage architecture details
+      - name: Install AWS CLI
+        if: success()
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli bc
+
+      - name: Upload artifacts to S3
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          chmod +x scripts/upload-to-s3.sh
+          ./scripts/upload-to-s3.sh \
+            output-hedgehog-lab-prewarmed/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova \
+            ${{ steps.version.outputs.version }}
+
+      - name: Generate release summary
+        if: success()
+        run: |
+          echo "## Artifact Upload Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Pre-warmed build artifacts uploaded to S3" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Download URLs:**" >> $GITHUB_STEP_SUMMARY
+          echo "- OVA: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova" >> $GITHUB_STEP_SUMMARY
+          echo "- Checksum: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova.sha256" >> $GITHUB_STEP_SUMMARY
+          echo "- Metadata: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.metadata.json" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See [ADR-004](../docs/adr/004-aws-s3-artifact-storage.md) for storage architecture details." >> $GITHUB_STEP_SUMMARY
