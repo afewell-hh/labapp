@@ -202,19 +202,22 @@ init_terraform() {
     log_info "✓ Terraform initialized"
 }
 
-# Detect caller's public IP for SSH access
+# Detect caller's public IPv4 address for SSH access
 get_caller_ip() {
     local ip
 
-    # Try multiple services to get public IP
-    ip=$(curl -s https://api.ipify.org 2>/dev/null) || \
-    ip=$(curl -s https://ifconfig.me 2>/dev/null) || \
-    ip=$(curl -s https://icanhazip.com 2>/dev/null)
+    # Try multiple services to get public IPv4 address
+    # Use -4 flag or IPv4-specific endpoints to ensure we get IPv4
+    ip=$(curl -4 -s https://api.ipify.org 2>/dev/null) || \
+    ip=$(curl -4 -s https://ifconfig.me 2>/dev/null) || \
+    ip=$(curl -s https://api.ipify.org?format=json 2>/dev/null | grep -oE '"ip":"[0-9.]+"' | cut -d'"' -f4) || \
+    ip=$(curl -4 -s https://icanhazip.com 2>/dev/null)
 
-    if [ -n "$ip" ]; then
+    # Validate that we got an IPv4 address (not IPv6)
+    if [ -n "$ip" ] && echo "$ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
         echo "$ip"
     else
-        log_warn "Could not detect public IP address"
+        log_warn "Could not detect IPv4 address (got: ${ip:-none})"
         echo ""
     fi
 }
