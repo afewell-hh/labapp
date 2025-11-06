@@ -56,7 +56,7 @@ error_exit() {
 
     log_error "FATAL: ${message}"
 
-    update_build_state "failed" "{\"ErrorMessage\": \"${message}\"}"
+    update_build_state "failed" "{\":ErrorMessage\": {\"S\": \"${message}\"}}"
     send_notification "FAILED" "Build ${BUILD_ID} failed: ${message}"
 
     # Upload partial logs to S3
@@ -70,28 +70,38 @@ trap 'error_exit "Build script failed at line $LINENO"' ERR
 # Update DynamoDB build state
 update_build_state() {
     local status="$1"
-    local extra_json="${2:-{}}"
+    local extra_attributes="${2:-}"
 
     log_info "Updating build state: ${status}"
 
-    # Create update JSON
-    local update_json=$(cat <<EOF
+    # Build update expression and attribute values
+    local update_expr="SET #status = :status, LastUpdate = :timestamp"
+    local attr_values=$(cat <<EOF
 {
-    "BuildID": {"S": "${BUILD_ID}"},
-    "Status": {"S": "${status}"},
-    "LastUpdate": {"S": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"}
+    ":status": {"S": "${status}"},
+    ":timestamp": {"S": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"}
 }
 EOF
     )
 
-    # Merge with extra JSON if provided
-    if [ "$extra_json" != "{}" ]; then
-        update_json=$(echo "$update_json" | jq ". + ${extra_json}")
+    # Add extra attributes if provided (e.g., ErrorMessage, BuildDurationSeconds)
+    if [ -n "$extra_attributes" ]; then
+        attr_values=$(echo "$attr_values" | jq ". + ${extra_attributes}")
+
+        # Add to update expression (extract keys from extra_attributes)
+        local extra_keys=$(echo "$extra_attributes" | jq -r 'keys[]')
+        for key in $extra_keys; do
+            update_expr="${update_expr}, ${key} = :${key}"
+        done
     fi
 
-    aws dynamodb put-item \
+    # Use update-item instead of put-item to preserve existing attributes (LaunchTime, ExpirationTime TTL)
+    aws dynamodb update-item \
         --table-name "$DYNAMODB_TABLE" \
-        --item "$update_json" \
+        --key "{\"BuildID\":{\"S\":\"${BUILD_ID}\"}}" \
+        --update-expression "$update_expr" \
+        --expression-attribute-names '{"#status":"Status"}' \
+        --expression-attribute-values "$attr_values" \
         --region "$AWS_REGION" || log_warn "Failed to update DynamoDB"
 }
 
@@ -221,7 +231,7 @@ clone_repository() {
     log_info "Repository cloned at commit: ${actual_commit}"
 
     # Update DynamoDB with actual commit
-    update_build_state "building" "{\"ActualCommit\": {\"S\": \"${actual_commit}\"}}"
+    update_build_state "building" "{\":ActualCommit\": {\"S\": \"${actual_commit}\"}}"
 }
 
 # Run Packer build
@@ -231,7 +241,7 @@ run_packer_build() {
     cd "$WORK_DIR"
 
     local start_time=$(date +%s)
-    update_build_state "building" "{\"BuildStartTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
+    update_build_state "building" "{\":BuildStartTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
 
     # Run Packer with timeout
     timeout $MAX_BUILD_TIME_SECONDS \
@@ -254,7 +264,7 @@ run_packer_build() {
 
     log_info "Packer build completed successfully in ${duration_min} minutes"
 
-    update_build_state "uploading" "{\"BuildDurationSeconds\": {\"N\": \"${duration}\"}}"
+    update_build_state "uploading" "{\":BuildDurationSeconds\": {\"N\": \"${duration}\"}}"
 }
 
 # Upload artifacts to S3
@@ -283,7 +293,7 @@ upload_artifacts() {
 
     log_info "Artifacts uploaded successfully"
 
-    update_build_state "completed" "{\"CompletionTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
+    update_build_state "completed" "{\":CompletionTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
 }
 
 # Main execution
@@ -292,8 +302,14 @@ main() {
     log_info "Build ID: ${BUILD_ID}"
     log_info "Branch: ${BUILD_BRANCH}"
     log_info "Commit: ${BUILD_COMMIT:-HEAD}"
-    log_info "Instance Type: $(ec2-metadata --instance-type | cut -d' ' -f2)"
-    log_info "Instance ID: $(ec2-metadata --instance-id | cut -d' ' -f2)"
+
+    # Use IMDSv2 to get instance metadata (ec2-metadata not installed by default in Ubuntu 22.04)
+    local token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
+    local instance_type=$(curl -H "X-aws-ec2-metadata-token: $token" -s http://169.254.169.254/latest/meta-data/instance-type)
+    local instance_id=$(curl -H "X-aws-ec2-metadata-token: $token" -s http://169.254.169.254/latest/meta-data/instance-id)
+
+    log_info "Instance Type: ${instance_type}"
+    log_info "Instance ID: ${instance_id}"
 
     send_notification "STARTED" "Build ${BUILD_ID} started on branch ${BUILD_BRANCH}"
 

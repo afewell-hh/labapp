@@ -298,32 +298,37 @@ resource "aws_dynamodb_table_item" "build_state" {
   table_name = aws_dynamodb_table.builds.name
   hash_key   = "BuildID"
 
-  item = jsonencode({
-    BuildID = {
-      S = local.build_id
-    }
-    Status = {
-      S = "launching"
-    }
-    InstanceID = {
-      S = aws_instance.build.id
-    }
-    LaunchTime = {
-      S = time_static.build_time.rfc3339
-    }
-    BuildBranch = {
-      S = var.build_branch
-    }
-    BuildCommit = {
-      S = var.build_commit
-    }
-    CostEstimate = {
-      N = "20.00"  # Estimated max cost
-    }
-    ExpirationTime = {
-      N = tostring(time_static.build_time.unix + 604800)  # 7 days TTL
-    }
-  })
+  item = jsonencode(merge(
+    {
+      BuildID = {
+        S = local.build_id
+      }
+      Status = {
+        S = "launching"
+      }
+      InstanceID = {
+        S = aws_instance.build.id
+      }
+      LaunchTime = {
+        S = time_static.build_time.rfc3339
+      }
+      BuildBranch = {
+        S = var.build_branch
+      }
+      CostEstimate = {
+        N = "20.00"  # Estimated max cost
+      }
+      ExpirationTime = {
+        N = tostring(time_static.build_time.unix + 604800)  # 7 days TTL
+      }
+    },
+    # Only include BuildCommit if it's not empty (DynamoDB rejects empty strings)
+    var.build_commit != "" ? {
+      BuildCommit = {
+        S = var.build_commit
+      }
+    } : {}
+  ))
 
   lifecycle {
     ignore_changes = all  # Instance will update this
