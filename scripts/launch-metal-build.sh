@@ -76,21 +76,21 @@ check_prerequisites() {
 
     log_info "✓ All required tools installed"
 
-    # Check AWS credentials
-    if ! aws sts get-caller-identity &> /dev/null; then
-        error_exit "AWS credentials not configured or invalid"
-    fi
-
-    log_info "✓ AWS credentials valid"
-
-    # Check if .env file exists (for local development)
+    # Check if .env file exists and load it BEFORE credential validation
     if [ -f "${PROJECT_ROOT}/.env" ]; then
-        log_info "✓ Found .env file (loading AWS credentials)"
+        log_info "Loading .env file for AWS credentials"
         # shellcheck disable=SC1091
         set -a
         source "${PROJECT_ROOT}/.env"
         set +a
     fi
+
+    # Check AWS credentials (after loading .env)
+    if ! aws sts get-caller-identity &> /dev/null; then
+        error_exit "AWS credentials not configured or invalid"
+    fi
+
+    log_info "✓ AWS credentials valid"
 }
 
 # Check for existing builds

@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
   }
 }
 
@@ -256,7 +260,7 @@ resource "aws_instance" "build" {
 
   tags = merge(local.common_tags, {
     Name       = "labapp-metal-build-${local.build_id}"
-    LaunchTime = timestamp()
+    LaunchTime = time_static.build_time.rfc3339
   })
 
   lifecycle {
@@ -286,6 +290,9 @@ resource "aws_cloudwatch_metric_alarm" "instance_age_warning" {
   tags = local.common_tags
 }
 
+# Time resource for Unix epoch calculation
+resource "time_static" "build_time" {}
+
 # Initial DynamoDB entry for this build
 resource "aws_dynamodb_table_item" "build_state" {
   table_name = aws_dynamodb_table.builds.name
@@ -302,7 +309,7 @@ resource "aws_dynamodb_table_item" "build_state" {
       S = aws_instance.build.id
     }
     LaunchTime = {
-      S = timestamp()
+      S = time_static.build_time.rfc3339
     }
     BuildBranch = {
       S = var.build_branch
@@ -314,7 +321,7 @@ resource "aws_dynamodb_table_item" "build_state" {
       N = "20.00"  # Estimated max cost
     }
     ExpirationTime = {
-      N = tostring(floor(timestamp() / 1000) + 604800)  # 7 days TTL
+      N = tostring(time_static.build_time.unix + 604800)  # 7 days TTL
     }
   })
 
