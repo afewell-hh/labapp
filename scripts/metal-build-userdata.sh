@@ -89,9 +89,12 @@ EOF
         attr_values=$(echo "$attr_values" | jq ". + ${extra_attributes}")
 
         # Add to update expression (extract keys from extra_attributes)
+        # Keys in extra_attributes already have ':' prefix, so strip it for attribute names
         local extra_keys=$(echo "$extra_attributes" | jq -r 'keys[]')
         for key in $extra_keys; do
-            update_expr="${update_expr}, ${key} = :${key}"
+            # Strip leading ':' from key for attribute name (e.g., ':ErrorMessage' -> 'ErrorMessage')
+            local attr_name="${key#:}"
+            update_expr="${update_expr}, ${attr_name} = ${key}"
         done
     fi
 
