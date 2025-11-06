@@ -115,7 +115,12 @@ s3://hedgehog-lab-artifacts/
         "s3:PutObject",
         "s3:PutObjectAcl",
         "s3:GetObject",
-        "s3:ListBucket"
+        "s3:ListBucket",
+        "s3:CreateMultipartUpload",
+        "s3:UploadPart",
+        "s3:ListMultipartUploadParts",
+        "s3:CompleteMultipartUpload",
+        "s3:AbortMultipartUpload"
       ],
       "Resource": [
         "arn:aws:s3:::hedgehog-lab-artifacts/*",
