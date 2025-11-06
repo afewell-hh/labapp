@@ -4,12 +4,48 @@ This guide explains how to build the Hedgehog Lab Appliance from source using Pa
 
 ## Table of Contents
 
+- [Build Options](#build-options)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Build Process](#build-process)
 - [Build Configuration](#build-configuration)
 - [Troubleshooting](#troubleshooting)
 - [Advanced Topics](#advanced-topics)
+
+## Build Options
+
+The Hedgehog Lab Appliance supports two build types (see [ADR-001](../adr/001-dual-build-pipeline.md)):
+
+### Standard Build
+- **Use Case**: Self-paced learning, general distribution
+- **Size**: ~15-20GB compressed
+- **First Boot**: 15-20 minute initialization
+- **Build Environment**: Local machine or GitHub Actions
+- **Disk Required**: 150GB
+
+### Pre-Warmed Build
+- **Use Case**: Workshops, events requiring immediate access
+- **Size**: ~80-100GB compressed
+- **First Boot**: 2-3 minutes (just starts services)
+- **Build Environment**: Requires nested virtualization (KVM)
+- **Disk Required**: 300GB+
+- **Build Time**: 60-90 minutes
+
+**For Pre-Warmed Builds with Limited Resources:**
+
+If your development machine lacks the disk space or nested virtualization support for pre-warmed builds, use the **AWS Metal Instance Build System**:
+
+- **AWS Automated Builds**: See [AWS Metal Build Guide](AWS_METAL_BUILD.md)
+- **Cost**: ~$15-20 per build (pay-per-use)
+- **Requirements**: AWS account, Terraform installed
+- **Advantages**: No local resource requirements, automatic cleanup, built-in safety controls
+
+```bash
+# Launch AWS metal instance build
+./scripts/launch-metal-build.sh main
+```
+
+The remainder of this guide covers **local builds** for both standard and pre-warmed variants.
 
 ## Prerequisites
 
