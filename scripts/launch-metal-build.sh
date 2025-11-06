@@ -202,6 +202,23 @@ init_terraform() {
     log_info "✓ Terraform initialized"
 }
 
+# Detect caller's public IP for SSH access
+get_caller_ip() {
+    local ip
+
+    # Try multiple services to get public IP
+    ip=$(curl -s https://api.ipify.org 2>/dev/null) || \
+    ip=$(curl -s https://ifconfig.me 2>/dev/null) || \
+    ip=$(curl -s https://icanhazip.com 2>/dev/null)
+
+    if [ -n "$ip" ]; then
+        echo "$ip"
+    else
+        log_warn "Could not detect public IP address"
+        echo ""
+    fi
+}
+
 # Launch build instance
 launch_build() {
     log_section "Launching Build Instance"
@@ -213,6 +230,19 @@ launch_build() {
 
     log_info "Build ID: ${build_id}"
 
+    # Detect caller's IP for SSH access restriction
+    local caller_ip=$(get_caller_ip)
+    local ssh_cidrs
+
+    if [ -n "$caller_ip" ]; then
+        ssh_cidrs="[\"${caller_ip}/32\"]"
+        log_info "SSH access will be restricted to your IP: ${caller_ip}"
+    else
+        log_warn "Could not detect your IP - SSH will be open to 0.0.0.0/0"
+        log_warn "Consider manually restricting SSH access in terraform.tfvars"
+        ssh_cidrs="[\"0.0.0.0/0\"]"
+    fi
+
     # Create terraform.tfvars
     cat > terraform.tfvars <<EOF
 build_id         = "${build_id}"
@@ -223,7 +253,7 @@ aws_region       = "us-east-1"
 instance_type    = "c5n.metal"
 volume_size      = 500
 max_lifetime_hours = 3
-ssh_allowed_cidrs = ["0.0.0.0/0"]
+ssh_allowed_cidrs = ${ssh_cidrs}
 notification_email = ""
 EOF
 
