@@ -244,7 +244,7 @@ run_packer_build() {
     cd "$WORK_DIR"
 
     local start_time=$(date +%s)
-    update_build_state "building" "{\":BuildStartTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
+    update_build_state "building" "{\":BuildStartTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}}"
 
     # Run Packer with timeout
     timeout $MAX_BUILD_TIME_SECONDS \
