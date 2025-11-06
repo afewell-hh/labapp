@@ -202,6 +202,17 @@ resource "aws_iam_role_policy" "build_instance" {
           "ec2:DescribeTags"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -237,6 +248,7 @@ resource "aws_instance" "build" {
   instance_type          = var.instance_type
   iam_instance_profile   = aws_iam_instance_profile.build_instance.name
   vpc_security_group_ids = [aws_security_group.build_instance.id]
+  key_name               = var.ssh_key_name != "" ? var.ssh_key_name : null
 
   user_data = data.template_file.user_data.rendered
 

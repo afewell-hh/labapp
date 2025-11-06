@@ -56,11 +56,18 @@ error_exit() {
 
     log_error "FATAL: ${message}"
 
-    update_build_state "failed" "{\":ErrorMessage\": {\"S\": \"${message}\"}}"
-    send_notification "FAILED" "Build ${BUILD_ID} failed: ${message}"
+    # Only attempt AWS operations if AWS CLI is available
+    # This prevents failures during early stages (before install_dependencies completes)
+    if command -v aws &> /dev/null; then
+        update_build_state "failed" "{\":ErrorMessage\": {\"S\": \"${message}\"}}"
+        send_notification "FAILED" "Build ${BUILD_ID} failed: ${message}"
 
-    # Upload partial logs to S3
-    upload_logs "failed"
+        # Upload partial logs to S3
+        upload_logs "failed"
+    else
+        log_warn "AWS CLI not available - skipping state update/notification"
+        log_warn "Build will remain in 'launching' state - manual cleanup required"
+    fi
 
     exit "$exit_code"
 }

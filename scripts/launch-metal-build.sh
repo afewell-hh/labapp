@@ -243,6 +243,9 @@ launch_build() {
         ssh_cidrs="[\"0.0.0.0/0\"]"
     fi
 
+    # Detect SSH key pair for access
+    local ssh_key_name="${AWS_SSH_KEY_NAME:-}"
+
     # Create terraform.tfvars
     cat > terraform.tfvars <<EOF
 build_id         = "${build_id}"
@@ -254,6 +257,7 @@ instance_type    = "c5n.metal"
 volume_size      = 500
 max_lifetime_hours = 3
 ssh_allowed_cidrs = ${ssh_cidrs}
+ssh_key_name     = "${ssh_key_name}"
 notification_email = ""
 EOF
 
@@ -271,6 +275,14 @@ EOF
         local public_ip=$(terraform output -raw instance_public_ip)
         local log_group=$(terraform output -raw cloudwatch_log_group)
 
+        # Determine SSH access method
+        local ssh_access
+        if [ -n "$ssh_key_name" ]; then
+            ssh_access="ssh -i /path/to/${ssh_key_name}.pem ubuntu@${public_ip}"
+        else
+            ssh_access="aws ssm start-session --target ${instance_id}"
+        fi
+
         cat <<EOF
 
 Build Instance Launched:
@@ -283,7 +295,7 @@ Build Instance Launched:
 
 Monitor Progress:
   CloudWatch Logs: aws logs tail ${log_group} --follow
-  SSH Access:      ssh ubuntu@${public_ip}
+  SSH Access:      ${ssh_access}
   DynamoDB State:  aws dynamodb get-item --table-name labapp-metal-builds --key '{"BuildID":{"S":"${build_id}"}}'
 
 EOF

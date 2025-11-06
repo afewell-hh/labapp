@@ -46,6 +46,12 @@ variable "ssh_allowed_cidrs" {
   default     = ["0.0.0.0/0"]  # TODO: Restrict in production
 }
 
+variable "ssh_key_name" {
+  description = "EC2 key pair name for SSH access (optional - uses SSM Session Manager if not provided)"
+  type        = string
+  default     = ""
+}
+
 variable "notification_email" {
   description = "Email address for build notifications"
   type        = string
