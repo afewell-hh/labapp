@@ -74,12 +74,12 @@ data "archive_file" "watchdog_lambda" {
 resource "aws_lambda_function" "watchdog" {
   filename         = data.archive_file.watchdog_lambda.output_path
   function_name    = "labapp-metal-build-watchdog"
-  role            = aws_iam_role.watchdog_lambda.arn
-  handler         = "handler.lambda_handler"
+  role             = aws_iam_role.watchdog_lambda.arn
+  handler          = "handler.lambda_handler"
   source_code_hash = data.archive_file.watchdog_lambda.output_base64sha256
-  runtime         = "python3.12"
-  timeout         = 60
-  memory_size     = 128
+  runtime          = "python3.12"
+  timeout          = 60
+  memory_size      = 128
 
   environment {
     variables = {

@@ -43,7 +43,7 @@ variable "max_lifetime_hours" {
 variable "ssh_allowed_cidrs" {
   description = "CIDR blocks allowed to SSH to build instance"
   type        = list(string)
-  default     = ["0.0.0.0/0"]  # TODO: Restrict in production
+  default     = ["0.0.0.0/0"] # TODO: Restrict in production
 }
 
 variable "ssh_key_name" {

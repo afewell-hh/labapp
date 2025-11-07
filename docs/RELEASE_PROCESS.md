@@ -175,11 +175,32 @@ For critical security issues or show-stopper bugs:
 - [ ] Mark as pre-release if applicable
 - [ ] Publish release
 
+#### Cloud Storage Upload (Pre-warmed Builds Only)
+
+For pre-warmed builds, upload artifacts to AWS S3 cloud storage:
+
+- [ ] Verify AWS credentials are set (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+- [ ] Upload pre-warmed OVA to S3 using upload script:
+  ```bash
+  ./scripts/upload-to-s3.sh \
+    output-hedgehog-lab-prewarmed/hedgehog-lab-prewarmed-vX.Y.Z.ova \
+    X.Y.Z
+  ```
+- [ ] Verify upload completed successfully (script performs automatic verification)
+- [ ] Note download URLs from upload script output for documentation
+- [ ] Test download URL accessibility in browser or with curl
+- [ ] Verify checksum file is publicly accessible
+- [ ] Update DOWNLOADS.md with new version URLs
+
+**Note:** Standard builds remain on GitHub Releases. Only pre-warmed builds (80-100 GB) are uploaded to S3 due to size limitations.
+
+See [Artifact Upload Guide](build/ARTIFACT_UPLOAD.md) for detailed upload procedures.
+
 #### Distribution Channels
 - [ ] Verify GitHub Release download links work
 - [ ] Update "latest" symlinks (if using external hosting)
 - [ ] Upload to mirror sites (if configured)
-- [ ] Update download page on documentation site
+- [ ] Update [DOWNLOADS.md](DOWNLOADS.md) with new release links
 
 ### Phase 4: Announcement & Communication
 
@@ -451,6 +472,7 @@ sha256sum -c hedgehog-lab-standard-vX.Y.Z.ova.sha256
 
 ## Documentation
 
+- [Downloads](docs/DOWNLOADS.md)
 - [Installation Guide](docs/INSTALL.md)
 - [Quick Start Guide](docs/QUICKSTART.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)

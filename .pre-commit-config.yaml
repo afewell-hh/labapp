@@ -1,0 +1,67 @@
+# Pre-commit hooks for labapp
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Shell script validation
+  - repo: local
+    hooks:
+      - id: bash-syntax
+        name: Bash Syntax Check
+        entry: bash -n
+        language: system
+        files: \.sh$
+        description: Check shell scripts for syntax errors
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.6
+    hooks:
+      - id: shellcheck
+        name: Shellcheck
+        args: ["-x"]
+        description: Lint shell scripts with shellcheck
+
+  # Terraform validation
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.83.5
+    hooks:
+      - id: terraform_fmt
+        name: Terraform Format
+        description: Format Terraform files
+
+      - id: terraform_validate
+        name: Terraform Validate
+        description: Validate Terraform configurations
+        args:
+          - --args=-json
+          - --args=-no-color
+          - --init-args=-backend=false
+
+  # YAML validation
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.33.0
+    hooks:
+      - id: yamllint
+        name: YAML Lint
+        args: ["-d", "{extends: default, rules: {line-length: {max: 120}}}"]
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim Trailing Whitespace
+      - id: end-of-file-fixer
+        name: Fix End of Files
+      - id: check-yaml
+        name: Check YAML Syntax
+      - id: check-added-large-files
+        name: Check for Large Files
+        args: ["--maxkb=10240"]
+      - id: check-merge-conflict
+        name: Check for Merge Conflicts
+      - id: check-executables-have-shebangs
+        name: Check Executables Have Shebangs
+      - id: mixed-line-ending
+        name: Check Line Endings
+        args: ["--fix=lf"]
