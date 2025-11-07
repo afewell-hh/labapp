@@ -225,21 +225,28 @@ resource "aws_iam_instance_profile" "build_instance" {
   tags = local.common_tags
 }
 
-# User data script for instance initialization
-data "template_file" "user_data" {
-  template = file("${path.module}/../../scripts/metal-build-userdata.sh")
+# Locals for user data script generation
+locals {
+  user_data_script = <<EOF
+#!/bin/bash
+# User data script for AWS metal instance pre-warmed builds
+# This script runs on instance launch and performs the complete build process
 
-  vars = {
-    build_id            = local.build_id
-    build_branch        = var.build_branch
-    build_commit        = var.build_commit
-    s3_bucket           = var.s3_artifact_bucket
-    dynamodb_table      = aws_dynamodb_table.builds.name
-    sns_topic_arn       = aws_sns_topic.build_notifications.arn
-    cloudwatch_log_group = aws_cloudwatch_log_group.build_logs.name
-    github_token        = var.github_token
-    aws_region          = var.aws_region
-  }
+set -euo pipefail
+
+# Template variables (injected by Terraform)
+export BUILD_ID="${local.build_id}"
+export BUILD_BRANCH="${var.build_branch}"
+export BUILD_COMMIT="${var.build_commit}"
+export S3_BUCKET="${var.s3_artifact_bucket}"
+export DYNAMODB_TABLE="${aws_dynamodb_table.builds.name}"
+export SNS_TOPIC_ARN="${aws_sns_topic.build_notifications.arn}"
+export CLOUDWATCH_LOG_GROUP="${aws_cloudwatch_log_group.build_logs.name}"
+export GITHUB_TOKEN="${var.github_token}"
+export AWS_REGION="${var.aws_region}"
+
+${file("${path.module}/../../scripts/metal-build-userdata-body.sh")}
+EOF
 }
 
 # EC2 instance for builds
@@ -250,7 +257,7 @@ resource "aws_instance" "build" {
   vpc_security_group_ids = [aws_security_group.build_instance.id]
   key_name               = var.ssh_key_name != "" ? var.ssh_key_name : null
 
-  user_data = data.template_file.user_data.rendered
+  user_data = local.user_data_script
 
   disable_api_termination = var.enable_termination_protection
 
