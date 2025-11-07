@@ -303,7 +303,7 @@ upload_artifacts() {
 
     log_info "Artifacts uploaded successfully"
 
-    update_build_state "completed" "{\":CompletionTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ\")\"}}"
+    update_build_state "completed" "{\":CompletionTime\": {\"S\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}}"
 }
 
 # Main execution
