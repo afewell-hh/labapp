@@ -18,13 +18,13 @@ jobs:
         run: |
           echo "Checking shell syntax with bash -n"
           EXIT_CODE=0
-          find . -name "*.sh" -type f | while read script; do
+          while IFS= read -r -d '' script; do
             echo "Validating: $script"
             if ! bash -n "$script"; then
               echo "❌ Syntax error in: $script"
               EXIT_CODE=1
             fi
-          done
+          done < <(find . -name "*.sh" -type f -print0)
           if [ $EXIT_CODE -ne 0 ]; then
             echo "Shell syntax validation failed"
             exit 1
