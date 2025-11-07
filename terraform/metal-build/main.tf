@@ -39,7 +39,7 @@ locals {
 # Data source for latest Ubuntu 22.04 LTS AMI
 data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"]  # Canonical
+  owners      = ["099720109477"] # Canonical
 
   filter {
     name   = "name"
@@ -54,9 +54,9 @@ data "aws_ami" "ubuntu" {
 
 # DynamoDB table for build state tracking
 resource "aws_dynamodb_table" "builds" {
-  name           = "labapp-metal-builds"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "BuildID"
+  name         = "labapp-metal-builds"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "BuildID"
 
   attribute {
     name = "BuildID"
@@ -263,7 +263,7 @@ resource "aws_instance" "build" {
 
   metadata_options {
     http_endpoint = "enabled"
-    http_tokens   = "required"  # Require IMDSv2
+    http_tokens   = "required" # Require IMDSv2
   }
 
   root_block_device {
@@ -294,7 +294,7 @@ resource "aws_cloudwatch_metric_alarm" "instance_age_warning" {
   evaluation_periods  = "1"
   metric_name         = "StatusCheckFailed"
   namespace           = "AWS/EC2"
-  period              = "300"  # 5 minutes
+  period              = "300" # 5 minutes
   statistic           = "Sum"
   threshold           = "0"
   alarm_description   = "Warning: Build instance has been running for >2 hours"
@@ -335,10 +335,10 @@ resource "aws_dynamodb_table_item" "build_state" {
         S = var.build_branch
       }
       CostEstimate = {
-        N = "20.00"  # Estimated max cost
+        N = "20.00" # Estimated max cost
       }
       ExpirationTime = {
-        N = tostring(time_static.build_time.unix + 604800)  # 7 days TTL
+        N = tostring(time_static.build_time.unix + 604800) # 7 days TTL
       }
     },
     # Only include BuildCommit if it's not empty (DynamoDB rejects empty strings)
@@ -350,6 +350,6 @@ resource "aws_dynamodb_table_item" "build_state" {
   ))
 
   lifecycle {
-    ignore_changes = all  # Instance will update this
+    ignore_changes = all # Instance will update this
   }
 }
