@@ -157,22 +157,32 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           chmod +x scripts/upload-to-s3.sh
-          ./scripts/upload-to-s3.sh \
-            output-hedgehog-lab-prewarmed/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova \
-            ${{ steps.version.outputs.version }}
+          VERSION="${{ steps.version.outputs.version }}"
+          OVA_FILE="output-hedgehog-lab-prewarmed/hedgehog-lab-prewarmed-${VERSION}.ova"
+          ./scripts/upload-to-s3.sh "${OVA_FILE}" "${VERSION}"
 
       - name: Generate release summary
         if: success()
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          S3_BASE="https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com"
+          BASE_PATH="${S3_BASE}/releases/v${VERSION}"
+          FILE_BASE="hedgehog-lab-prewarmed-${VERSION}"
+
           echo "## Artifact Upload Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Pre-warmed build artifacts uploaded to S3" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Pre-warmed build artifacts uploaded to S3" \
+            >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${VERSION}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Download URLs:**" >> $GITHUB_STEP_SUMMARY
-          echo "- OVA: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova" >> $GITHUB_STEP_SUMMARY
-          echo "- Checksum: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.ova.sha256" >> $GITHUB_STEP_SUMMARY
-          echo "- Metadata: https://hedgehog-lab-artifacts.s3.us-east-1.amazonaws.com/releases/v${{ steps.version.outputs.version }}/hedgehog-lab-prewarmed-${{ steps.version.outputs.version }}.metadata.json" >> $GITHUB_STEP_SUMMARY
+          echo "- OVA: ${BASE_PATH}/${FILE_BASE}.ova" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "- Checksum: ${BASE_PATH}/${FILE_BASE}.ova.sha256" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "- Metadata: ${BASE_PATH}/${FILE_BASE}.metadata.json" \
+            >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "See [ADR-004](../docs/adr/004-aws-s3-artifact-storage.md) for storage architecture details." >> $GITHUB_STEP_SUMMARY
+          echo "See [ADR-004](../docs/adr/004-aws-s3-artifact-storage.md)" \
+            "for storage architecture details." >> $GITHUB_STEP_SUMMARY
