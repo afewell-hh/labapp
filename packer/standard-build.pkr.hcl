@@ -206,6 +206,16 @@ build {
     destination = "/tmp/packer-provisioner-shell-scripts/hh-lab-completion.bash"
   }
 
+  provisioner "file" {
+    source      = "packer/scripts/hhfab-vlab-runner"
+    destination = "/tmp/packer-provisioner-shell-scripts/hhfab-vlab-runner"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/hhfab-vlab.service"
+    destination = "/tmp/packer-provisioner-shell-scripts/hhfab-vlab.service"
+  }
+
   # Install orchestrator and modules
   provisioner "shell" {
     script          = "packer/scripts/05-install-orchestrator.sh"
