@@ -353,25 +353,73 @@ Scripts are located in `packer/scripts/` and run in order:
 
 The orchestrator (`packer/scripts/hedgehog-lab-orchestrator`) is installed to `/usr/local/bin/` and runs automatically on first boot via systemd service.
 
-**Systemd Service:**
-- **Unit file:** `/etc/systemd/system/hedgehog-lab-init.service`
-- **Enabled:** Runs automatically on boot
-- **Condition:** Only runs if not already initialized
-- **Logs:** Available via `journalctl -u hedgehog-lab-init`
+**Systemd Services:**
 
-**Current implementation:** Placeholder that logs initialization steps
-**Future implementation:** Will initialize k3d, VLAB, GitOps, and observability stacks
+1. **Main Orchestrator Service** (`hedgehog-lab-init.service`)
+   - **Unit file:** `/etc/systemd/system/hedgehog-lab-init.service`
+   - **Enabled:** Runs automatically on boot
+   - **Condition:** Only runs if not already initialized
+   - **Logs:** Available via `journalctl -u hedgehog-lab-init`
+   - **Purpose:** Coordinates the overall initialization sequence
+
+2. **VLAB Service** (`hhfab-vlab.service`)
+   - **Unit file:** `/etc/systemd/system/hhfab-vlab.service`
+   - **Enabled:** Started by the orchestrator (not on boot)
+   - **Condition:** Only runs if VLAB not already initialized
+   - **Logs:** Available via `journalctl -u hhfab-vlab` and `/var/log/hedgehog-lab/modules/vlab.log`
+   - **Purpose:** Runs `hhfab vlab up --controls-restricted=false --ready wait` in a detached tmux session
+
+**VLAB Tmux Session:**
+
+The VLAB initialization runs inside a persistent tmux session named `hhfab-vlab`. This allows students to inspect the VLAB startup process and provides a detachable interface for troubleshooting.
+
+```bash
+# List all tmux sessions
+tmux ls
+
+# Attach to the hhfab-vlab session (if it's still running)
+tmux attach -t hhfab-vlab
+
+# Detach from tmux session (while inside)
+# Press: Ctrl+b then d
+
+# View VLAB logs
+tail -f /var/log/hedgehog-lab/modules/vlab.log
+```
+
+**Note:** The tmux session will automatically exit once `hhfab vlab up` completes successfully. If initialization fails, the session may remain active for debugging.
+
+**Initialization Order:**
+
+The orchestrator enforces a strict initialization order to ensure proper operation:
+
+1. **Network** - Wait for network connectivity
+2. **VLAB** - Initialize Hedgehog VLAB (MUST complete first)
+3. **k3d** - Initialize k3d observability cluster (requires VLAB's controller interface)
+4. **GitOps** - Deploy ArgoCD and Gitea
+5. **Observability** - Deploy Prometheus and Grafana
+
+This order is critical because the k3d cluster needs to connect to the VLAB controller's host-facing interface.
 
 **Manual control:**
 ```bash
-# Check status
+# Check orchestrator status
 systemctl status hedgehog-lab-init
 
-# View logs
+# Check VLAB service status
+systemctl status hhfab-vlab
+
+# View orchestrator logs
 journalctl -u hedgehog-lab-init -f
 
-# Manually run (if needed)
+# View VLAB service logs
+journalctl -u hhfab-vlab -f
+
+# Manually run orchestrator (if needed)
 sudo systemctl start hedgehog-lab-init
+
+# Manually run VLAB service (if needed)
+sudo systemctl start hhfab-vlab
 ```
 
 ## Troubleshooting

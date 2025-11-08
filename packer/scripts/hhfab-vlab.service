@@ -1,0 +1,36 @@
+[Unit]
+Description=Hedgehog VLAB Service
+Documentation=https://docs.hedgehog.cloud/latest/vlab/overview/
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+ConditionPathExists=!/var/lib/hedgehog-lab/vlab-initialized
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/hhfab-vlab-runner
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=10s
+
+# Run as hhlab user for proper permissions
+User=hhlab
+Group=hhlab
+
+# Environment
+Environment="VLAB_WORK_DIR=/opt/hedgehog/vlab"
+Environment="VLAB_TIMEOUT=1800"
+Environment="LOG_FILE=/var/log/hedgehog-lab/modules/vlab.log"
+
+# Working directory
+WorkingDirectory=/opt/hedgehog/vlab
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -52,9 +52,22 @@ clean: ## Clean build artifacts
 dev-setup: install-deps ## Set up development environment
 	@echo "Development environment setup complete!"
 
-test: validate ## Run tests (validate templates)
-	@echo "Running tests..."
-	@echo "Template validation: PASSED"
+test: validate test-unit ## Run all tests (validate templates + unit tests)
+	@echo "All tests complete!"
+
+test-unit: ## Run unit tests
+	@echo "Running unit tests..."
+	@tests/unit/test-orchestrator-ordering.sh
+	@tests/unit/test-systemd-services.sh
+	@echo "Unit tests complete!"
+
+test-orchestrator: ## Run orchestrator unit tests only
+	@echo "Running orchestrator tests..."
+	@tests/unit/test-orchestrator-ordering.sh
+
+test-systemd: ## Run systemd service unit tests only
+	@echo "Running systemd service tests..."
+	@tests/unit/test-systemd-services.sh
 
 .PHONY: check-version
 check-version: ## Show current version
