@@ -115,11 +115,13 @@ else
     exit 1
 fi
 
-# Reload systemd and enable services
+# Reload systemd and enable main orchestrator service
 systemctl daemon-reload
 systemctl enable hedgehog-lab-init.service
-systemctl enable hhfab-vlab.service
-echo "Systemd services installed and enabled"
+# Note: hhfab-vlab.service is NOT enabled - it's started explicitly by the orchestrator
+# This prevents blocking multi-user.target during 30-minute VLAB initialization
+# and ensures the orchestrator controls when VLAB initialization happens
+echo "Systemd services installed (orchestrator enabled, vlab controlled by orchestrator)"
 
 # Set build type (default to standard)
 echo "standard" > /etc/hedgehog-lab/build-type

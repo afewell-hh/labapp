@@ -196,7 +196,7 @@ test_runner_logging() {
     fi
 }
 
-# Test 11: Installation script installs both service and runner
+# Test 11: Installation script installs service/runner but does NOT enable service
 test_install_script() {
     log_info "Test 11: Checking installation script installs service and runner..."
 
@@ -214,14 +214,14 @@ test_install_script() {
         install_ok=false
     fi
 
-    # Check for systemctl enable
-    if ! grep -q "systemctl enable hhfab-vlab.service" "$ORCHESTRATOR_INSTALL"; then
-        log_fail "Installation script does not enable hhfab-vlab.service"
+    # Verify service is NOT auto-enabled (orchestrator controls it)
+    if grep -q "systemctl enable hhfab-vlab.service" "$ORCHESTRATOR_INSTALL"; then
+        log_fail "Installation script enables hhfab-vlab.service (should be orchestrator-controlled)"
         install_ok=false
     fi
 
     if [ "$install_ok" = true ]; then
-        log_pass "Installation script properly installs and enables service and runner"
+        log_pass "Installation script installs service/runner without auto-enabling"
         return 0
     else
         return 1
@@ -239,6 +239,20 @@ test_runner_error_handling() {
     else
         log_fail "Runner missing proper error handling"
         return 1
+    fi
+}
+
+# Test 13: Service does not use PrivateTmp (allows tmux socket access)
+test_service_no_private_tmp() {
+    log_info "Test 13: Checking service does NOT use PrivateTmp..."
+
+    # PrivateTmp should NOT be set to true (prevents tmux socket access)
+    if grep -q "^PrivateTmp=true" "$VLAB_SERVICE_FILE"; then
+        log_fail "Service uses PrivateTmp=true (blocks tmux socket access)"
+        return 1
+    else
+        log_pass "Service does not use PrivateTmp (tmux sockets accessible)"
+        return 0
     fi
 }
 
@@ -263,6 +277,7 @@ main() {
     test_runner_logging || true
     test_install_script || true
     test_runner_error_handling || true
+    test_service_no_private_tmp || true
 
     # Summary
     echo ""
