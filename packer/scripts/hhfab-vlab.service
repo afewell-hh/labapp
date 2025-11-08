@@ -7,14 +7,13 @@ Requires=docker.service
 ConditionPathExists=!/var/lib/hedgehog-lab/vlab-initialized
 
 [Service]
-Type=forking
+Type=oneshot
 ExecStart=/usr/local/bin/hhfab-vlab-runner
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=0
-Restart=on-failure
-RestartSec=10s
+TimeoutStartSec=1800
+Restart=no
 
 # Run as hhlab user for proper permissions
 User=hhlab
