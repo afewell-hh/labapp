@@ -247,6 +247,12 @@ init_vlab() {
 
     log_info "Initializing Hedgehog VLAB via systemd service..." | tee -a "$module_log"
 
+    # Pre-check: if VLAB already initialized, skip service start
+    if [ -f "/var/lib/hedgehog-lab/vlab-initialized" ]; then
+        log_info "VLAB already initialized (state marker exists), skipping" | tee -a "$module_log"
+        return 0
+    fi
+
     # Check if systemd service exists
     if ! systemctl list-unit-files | grep -q "^${service_name}"; then
         log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
@@ -271,6 +277,7 @@ init_vlab() {
         local service_result
         service_result=$(systemctl show -p Result --value "$service_name")
 
+        # Service completed successfully
         if [ "$service_state" = "active" ] && [ "$service_result" = "success" ]; then
             log_info "VLAB service completed successfully" | tee -a "$module_log"
 
@@ -283,6 +290,11 @@ init_vlab() {
                 # Continue anyway as service reported success
                 return 0
             fi
+        # Service was skipped due to ConditionPathExists (already initialized)
+        elif [ "$service_state" = "inactive" ] && [ "$service_result" = "condition" ]; then
+            log_info "VLAB service skipped (condition not met - already initialized)" | tee -a "$module_log"
+            return 0
+        # Service failed
         elif [ "$service_state" = "failed" ]; then
             log_error "VLAB service failed" | tee -a "$module_log"
             log_error "Check service logs: journalctl -u $service_name" | tee -a "$module_log"

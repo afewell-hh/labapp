@@ -132,11 +132,11 @@ start_tmux_session() {
     # Create new detached tmux session
     # The session will run hhfab and redirect all output to the log file
     # We capture the exit code AFTER the command completes (without exec)
-    # Note: $? must be evaluated inside tmux, not in this shell - use mixed quotes
+    # Note: $? must be evaluated inside tmux, not in this shell - escape the dollar
     log_info "Creating detached tmux session..."
 
     if ! tmux new-session -d -s "$TMUX_SESSION_NAME" -c "$VLAB_WORK_DIR" \
-        "${HHFAB_CMD} >> '${LOG_FILE}' 2>&1; echo "'$?'" > /tmp/hhfab-exit-code"; then
+        "${HHFAB_CMD} >> '${LOG_FILE}' 2>&1; echo \$? > /tmp/hhfab-exit-code"; then
         log_error "Failed to create tmux session"
         return 1
     fi
