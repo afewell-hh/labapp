@@ -11,7 +11,7 @@ Read this before touching the repo. It supersedes any prior agent guidance and a
   2. Rebuild the EMC GitOps + observability stack with Hedgehog dashboards and the curriculum repo preloaded (Issue #74).
   3. Stand up the GCP-based nested-virtualization builder workflow and local validation harness (Issue #75).
 - **Build Strategy:** Validate everything locally via test harnesses, then run full Packer builds only on the GCP builder (nested KVM, ≥600 GB SSD). Pre-warmed builds stay blocked until the cold build is reliable.
-- **Source of Truth:** Hedgehog docs under `docs/docs/vlab/` and curriculum assets in `learn_content_scratchpad/`.
+- **Source of Truth:** Hedgehog docs under `https://docs.hedgehog.cloud/latest/vlab/overview/` and curriculum assets in `/home/ubuntu/afewell-hh/labapp/reference/learn_content_scratchpad`.
 
 ---
 
