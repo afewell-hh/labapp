@@ -24,6 +24,7 @@ Group=hhlab
 Environment="VLAB_WORK_DIR=/opt/hedgehog/vlab"
 Environment="VLAB_TIMEOUT=1800"
 Environment="LOG_FILE=/var/log/hedgehog-lab/modules/vlab.log"
+Environment="TERM=xterm-256color"
 
 # Working directory
 WorkingDirectory=/opt/hedgehog/vlab
