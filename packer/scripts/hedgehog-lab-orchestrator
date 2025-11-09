@@ -182,6 +182,10 @@ log_info ""
 wait_for_network() {
     local module_log="/var/log/hedgehog-lab/modules/network.log"
 
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
     log_info "Waiting for network connectivity..." | tee -a "$module_log"
 
     # Wait for network with timeout (max 5 minutes)
@@ -216,6 +220,10 @@ init_k3d_cluster() {
     local module_log="/var/log/hedgehog-lab/modules/k3d.log"
     local k3d_script="/usr/local/bin/hedgehog-k3d-init"
 
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
     log_info "Initializing k3d observability cluster..." | tee -a "$module_log"
 
     # Check if k3d init script exists
@@ -244,6 +252,11 @@ init_vlab() {
     local service_name="hhfab-vlab.service"
     local max_wait=1800  # 30 minutes
     local check_interval=10
+
+    # Ensure log file exists with correct ownership before writing
+    # The systemd service runs as hhlab, so it needs write access
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
 
     log_info "Initializing Hedgehog VLAB via systemd service..." | tee -a "$module_log"
 
