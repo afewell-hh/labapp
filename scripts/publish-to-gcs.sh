@@ -110,12 +110,36 @@ upload_artifacts() {
         error_exit "Output directory not found: ${output_dir}"
     fi
 
-    # Find OVA file
+    # Find OVA file matching the version
     local ova_file
-    ova_file=$(find "${output_dir}" -maxdepth 1 -name "*.ova" -type f | head -n 1)
+    # Try to find OVA with version in filename first
+    ova_file=$(find "${output_dir}" -maxdepth 1 -name "*${version}*.ova" -type f | head -n 1)
 
+    # If not found, try with 'v' prefix
     if [ -z "$ova_file" ]; then
-        error_exit "No OVA file found in ${output_dir}"
+        ova_file=$(find "${output_dir}" -maxdepth 1 -name "*v${version}*.ova" -type f | head -n 1)
+    fi
+
+    # If still not found, check if there's only one OVA and warn
+    if [ -z "$ova_file" ]; then
+        local ova_count
+        ova_count=$(find "${output_dir}" -maxdepth 1 -name "*.ova" -type f | wc -l)
+
+        if [ "$ova_count" -eq 0 ]; then
+            error_exit "No OVA file found in ${output_dir}"
+        elif [ "$ova_count" -eq 1 ]; then
+            ova_file=$(find "${output_dir}" -maxdepth 1 -name "*.ova" -type f)
+            log_warn "OVA filename does not contain version '${version}'"
+            log_warn "Found single OVA: $(basename "$ova_file")"
+            log_warn "This will be published as version v${version}"
+            echo ""
+            read -r -p "Continue? [y/N] " response
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                error_exit "Upload cancelled by user"
+            fi
+        else
+            error_exit "Multiple OVA files found but none match version '${version}'. Please specify correct output directory or clean old builds."
+        fi
     fi
 
     # Find checksum file
