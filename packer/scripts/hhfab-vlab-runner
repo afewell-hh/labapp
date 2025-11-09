@@ -132,13 +132,17 @@ start_tmux_session() {
     # Create new detached tmux session
     # The session will run hhfab and redirect all output to the log file
     # We capture the exit code AFTER the command completes (without exec)
-    # Using single quotes to ensure $? is evaluated inside tmux, not in parent shell
+    # Critical: Use printf to construct command with literal $? for sh to evaluate
     log_info "Creating detached tmux session..."
 
-    # Build the command string with proper quoting
-    local tmux_cmd="$HHFAB_CMD >> '$LOG_FILE' 2>&1; echo \$? > /tmp/hhfab-exit-code"
+    # Build command using printf to avoid quote/expansion issues
+    # This ensures $? is evaluated by sh inside tmux, not by the parent shell
+    local tmux_cmd
+    tmux_cmd=$(printf '%s >> %s 2>&1; echo $? > /tmp/hhfab-exit-code' \
+        "$HHFAB_CMD" "'$LOG_FILE'")
 
-    if ! tmux new-session -d -s "$TMUX_SESSION_NAME" -c "$VLAB_WORK_DIR" "$tmux_cmd"; then
+    if ! tmux new-session -d -s "$TMUX_SESSION_NAME" -c "$VLAB_WORK_DIR" \
+        sh -c "$tmux_cmd"; then
         log_error "Failed to create tmux session"
         return 1
     fi
