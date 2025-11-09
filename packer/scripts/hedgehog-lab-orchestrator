@@ -338,14 +338,89 @@ init_vlab() {
 
 deploy_gitops_stack() {
     local module_log="/var/log/hedgehog-lab/modules/gitops.log"
-    log_info "GitOps stack deployment will be implemented in future sprint" | tee -a "$module_log"
-    return 0
+    local gitops_script="/usr/local/bin/hedgehog-gitops-init"
+
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
+    log_info "Deploying GitOps stack..." | tee -a "$module_log"
+
+    # Check if GitOps init script exists
+    if [ ! -f "$gitops_script" ]; then
+        log_error "GitOps initialization script not found at $gitops_script" | tee -a "$module_log"
+        return 1
+    fi
+
+    # Set environment variables for the GitOps module
+    export LOG_FILE="$module_log"
+
+    # Execute GitOps initialization script
+    if "$gitops_script"; then
+        log_info "GitOps stack deployment completed successfully" | tee -a "$module_log"
+        return 0
+    else
+        log_error "GitOps stack deployment failed" | tee -a "$module_log"
+        return 1
+    fi
+}
+
+deploy_argocd_app() {
+    local module_log="/var/log/hedgehog-lab/modules/argocd-app.log"
+    local argocd_app_script="/usr/local/bin/hedgehog-argocd-app-init"
+
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
+    log_info "Deploying ArgoCD Application..." | tee -a "$module_log"
+
+    # Check if ArgoCD app init script exists
+    if [ ! -f "$argocd_app_script" ]; then
+        log_error "ArgoCD Application initialization script not found at $argocd_app_script" | tee -a "$module_log"
+        return 1
+    fi
+
+    # Set environment variables for the ArgoCD app module
+    export LOG_FILE="$module_log"
+
+    # Execute ArgoCD Application initialization script
+    if "$argocd_app_script"; then
+        log_info "ArgoCD Application deployment completed successfully" | tee -a "$module_log"
+        return 0
+    else
+        log_error "ArgoCD Application deployment failed" | tee -a "$module_log"
+        return 1
+    fi
 }
 
 deploy_observability_stack() {
-    local module_log="/var/log/hedgehog-lab/modules/observability.log"
-    log_info "Observability stack deployment will be implemented in future sprint" | tee -a "$module_log"
-    return 0
+    local module_log="/var/log/hedgehog-lab/modules/prometheus-scrape.log"
+    local prometheus_scrape_script="/usr/local/bin/hedgehog-prometheus-scrape"
+
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
+    log_info "Deploying observability stack (Prometheus scrape config)..." | tee -a "$module_log"
+
+    # Check if Prometheus scrape script exists
+    if [ ! -f "$prometheus_scrape_script" ]; then
+        log_error "Prometheus scrape script not found at $prometheus_scrape_script" | tee -a "$module_log"
+        return 1
+    fi
+
+    # Set environment variables for the Prometheus scrape module
+    export LOG_FILE="$module_log"
+
+    # Execute Prometheus scrape configuration script
+    if "$prometheus_scrape_script"; then
+        log_info "Observability stack deployment completed successfully" | tee -a "$module_log"
+        return 0
+    else
+        log_error "Observability stack deployment failed" | tee -a "$module_log"
+        return 1
+    fi
 }
 
 start_services() {
@@ -360,14 +435,20 @@ if [ "$BUILD_TYPE" = "standard" ]; then
     log_info "IMPORTANT: VLAB must complete before EMC/GitOps initialization"
     log_info ""
 
-    TOTAL_STEPS=5
+    TOTAL_STEPS=7
     execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
     # VLAB MUST initialize first (Issue #73) - it provides the controller interface for EMC
     execute_step "Initialize VLAB" 2 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
     # k3d cluster can only start after VLAB is ready to provide host-facing connectivity
     execute_step "Initialize k3d cluster" 3 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
-    execute_step "Deploy GitOps stack" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
-    execute_step "Deploy observability stack" 5 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
+    # Seed GitOps repository in Gitea with student/hedgehog-config
+    execute_step "Seed GitOps repository" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
+    # Create ArgoCD Application to sync repo to Hedgehog controller
+    execute_step "Deploy ArgoCD Application" 5 $TOTAL_STEPS deploy_argocd_app || error "ArgoCD Application deployment failed"
+    # Configure Prometheus to scrape Hedgehog fabric-proxy metrics
+    execute_step "Configure observability" 6 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
+    # Note: Grafana dashboard import will be added when JSON files are available (Issue #74)
+    execute_step "Finalize services" 7 $TOTAL_STEPS start_services || error "Service finalization failed"
 
 else
     log_info "Pre-warmed build detected - starting services only"

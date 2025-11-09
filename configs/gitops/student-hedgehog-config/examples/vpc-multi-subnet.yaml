@@ -1,0 +1,43 @@
+---
+# Multi-Subnet VPC Example
+# A VPC with multiple subnets: one for static IPs, one with DHCP enabled
+#
+# Use Case: Web application with:
+# - Frontend servers that need predictable IPs (for load balancer config)
+# - Backend workers that can use DHCP (for auto-scaling)
+#
+# This example creates:
+# - VPC named "web-app-vpc"
+# - "frontend" subnet: 10.20.10.0/24, static IPs only, VLAN 2010
+# - "backend" subnet: 10.20.20.0/24, DHCP enabled, VLAN 2020
+#
+# DHCP range: 10.20.20.10 - 10.20.20.250 (240 IPs available)
+# Reserved IPs: .1 (gateway), .2-.9 (static/reserved), .251-.254 (broadcast/etc)
+apiVersion: vpc.githedgehog.com/v1beta1
+kind: VPC
+metadata:
+  name: web-app-vpc
+  namespace: default
+spec:
+  ipv4Namespace: default
+  vlanNamespace: default
+
+  subnets:
+    # Frontend subnet - Static IPs for web servers
+    frontend:
+      subnet: 10.20.10.0/24
+      gateway: 10.20.10.1
+      vlan: 2010
+      # No DHCP = servers get static IPs via manual config or cloud-init
+
+    # Backend subnet - DHCP for auto-scaling worker nodes
+    backend:
+      subnet: 10.20.20.0/24
+      gateway: 10.20.20.1
+      vlan: 2020
+      dhcp:
+        enable: true
+        range:
+          start: 10.20.20.10      # First IP in DHCP pool
+          end: 10.20.20.250        # Last IP in DHCP pool
+          # Gateway (.1) and .2-.9 are outside DHCP range for static use

@@ -216,6 +216,28 @@ build {
     destination = "/tmp/packer-provisioner-shell-scripts/hhfab-vlab.service"
   }
 
+  # New GitOps and observability modules (Issue #74)
+  provisioner "file" {
+    source      = "packer/scripts/40-gitops-init.sh"
+    destination = "/tmp/packer-provisioner-shell-scripts/40-gitops-init.sh"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/50-argocd-app-init.sh"
+    destination = "/tmp/packer-provisioner-shell-scripts/50-argocd-app-init.sh"
+  }
+
+  provisioner "file" {
+    source      = "packer/scripts/60-prometheus-hedgehog-scrape.sh"
+    destination = "/tmp/packer-provisioner-shell-scripts/60-prometheus-hedgehog-scrape.sh"
+  }
+
+  # Configuration assets
+  provisioner "file" {
+    source      = "configs/"
+    destination = "/tmp/packer-provisioner-shell-scripts/configs"
+  }
+
   # Install orchestrator and modules
   provisioner "shell" {
     script          = "packer/scripts/05-install-orchestrator.sh"

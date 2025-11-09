@@ -1,0 +1,14 @@
+# This directory is where students create their active configurations
+#
+# The .gitkeep file ensures this directory exists in Git even when empty
+#
+# To get started:
+# 1. Copy an example from ../examples/
+# 2. Modify it for your use case
+# 3. Commit and push to trigger ArgoCD sync
+#
+# Example:
+#   cp ../examples/vpc-simple.yaml my-first-vpc.yaml
+#   git add my-first-vpc.yaml
+#   git commit -m "Create my first VPC"
+#   git push origin main
