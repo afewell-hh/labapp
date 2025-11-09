@@ -182,6 +182,10 @@ log_info ""
 wait_for_network() {
     local module_log="/var/log/hedgehog-lab/modules/network.log"
 
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
     log_info "Waiting for network connectivity..." | tee -a "$module_log"
 
     # Wait for network with timeout (max 5 minutes)
@@ -216,6 +220,10 @@ init_k3d_cluster() {
     local module_log="/var/log/hedgehog-lab/modules/k3d.log"
     local k3d_script="/usr/local/bin/hedgehog-k3d-init"
 
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
     log_info "Initializing k3d observability cluster..." | tee -a "$module_log"
 
     # Check if k3d init script exists
@@ -241,29 +249,91 @@ init_k3d_cluster() {
 
 init_vlab() {
     local module_log="/var/log/hedgehog-lab/modules/vlab.log"
-    local vlab_script="/usr/local/bin/hedgehog-vlab-init"
+    local service_name="hhfab-vlab.service"
+    local max_wait=1800  # 30 minutes
+    local check_interval=10
 
-    log_info "Initializing Hedgehog VLAB..." | tee -a "$module_log"
+    # Ensure log file exists with correct ownership before writing
+    # The systemd service runs as hhlab, so it needs write access
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
 
-    # Check if VLAB init script exists
-    if [ ! -f "$vlab_script" ]; then
-        log_error "VLAB initialization script not found at $vlab_script" | tee -a "$module_log"
-        return 1
-    fi
+    log_info "Initializing Hedgehog VLAB via systemd service..." | tee -a "$module_log"
 
-    # Set environment variables for the VLAB module
-    export VLAB_WORK_DIR="/opt/hedgehog/vlab"
-    export VLAB_TIMEOUT="1800"  # 30 minutes
-    export LOG_FILE="$module_log"
-
-    # Execute VLAB initialization script
-    if "$vlab_script"; then
-        log_info "VLAB initialization completed successfully" | tee -a "$module_log"
+    # Pre-check: if VLAB already initialized, skip service start
+    if [ -f "/var/lib/hedgehog-lab/vlab-initialized" ]; then
+        log_info "VLAB already initialized (state marker exists), skipping" | tee -a "$module_log"
         return 0
-    else
-        log_error "VLAB initialization failed" | tee -a "$module_log"
+    fi
+
+    # Check if systemd service exists
+    if ! systemctl list-unit-files | grep -q "^${service_name}"; then
+        log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
         return 1
     fi
+
+    # Start the hhfab-vlab service
+    log_info "Starting $service_name..." | tee -a "$module_log"
+    if ! systemctl start "$service_name"; then
+        log_error "Failed to start $service_name" | tee -a "$module_log"
+        return 1
+    fi
+
+    log_info "VLAB service started. Waiting for completion (max ${max_wait}s)..." | tee -a "$module_log"
+
+    # Wait for the service to complete
+    local elapsed=0
+    while [ $elapsed -lt $max_wait ]; do
+        # Check service status
+        local service_state
+        service_state=$(systemctl show -p ActiveState --value "$service_name")
+        local service_result
+        service_result=$(systemctl show -p Result --value "$service_name")
+
+        # Service completed successfully
+        if [ "$service_state" = "active" ] && [ "$service_result" = "success" ]; then
+            log_info "VLAB service completed successfully" | tee -a "$module_log"
+
+            # Verify the state marker was created
+            if [ -f "/var/lib/hedgehog-lab/vlab-initialized" ]; then
+                log_info "VLAB initialization state marker confirmed" | tee -a "$module_log"
+                return 0
+            else
+                log_warn "VLAB service succeeded but state marker not found" | tee -a "$module_log"
+                # Continue anyway as service reported success
+                return 0
+            fi
+        # Service was skipped due to ConditionPathExists (already initialized)
+        elif [ "$service_state" = "inactive" ] && [ "$service_result" = "condition" ]; then
+            log_info "VLAB service skipped (condition not met - already initialized)" | tee -a "$module_log"
+            return 0
+        # Service failed
+        elif [ "$service_state" = "failed" ]; then
+            log_error "VLAB service failed" | tee -a "$module_log"
+            log_error "Check service logs: journalctl -u $service_name" | tee -a "$module_log"
+            # Display last 20 lines of service log
+            log_error "Last 20 lines of service output:" | tee -a "$module_log"
+            journalctl -u "$service_name" --no-pager -n 20 | while IFS= read -r line; do
+                log_error "  $line" | tee -a "$module_log"
+            done
+            return 1
+        fi
+
+        # Still running, wait and check again
+        sleep "$check_interval"
+        elapsed=$((elapsed + check_interval))
+
+        # Log progress every minute
+        if [ $((elapsed % 60)) -eq 0 ]; then
+            log_info "Still waiting for VLAB... (${elapsed}s elapsed)" | tee -a "$module_log"
+        fi
+    done
+
+    # Timeout reached
+    log_error "VLAB initialization timed out after ${max_wait}s" | tee -a "$module_log"
+    log_error "Service state: $(systemctl show -p ActiveState --value $service_name)" | tee -a "$module_log"
+    log_error "Check service logs: journalctl -u $service_name" | tee -a "$module_log"
+    return 1
 }
 
 deploy_gitops_stack() {
@@ -287,11 +357,15 @@ start_services() {
 # Execute initialization based on build type
 if [ "$BUILD_TYPE" = "standard" ]; then
     log_info "Standard build detected - performing full initialization"
+    log_info "IMPORTANT: VLAB must complete before EMC/GitOps initialization"
+    log_info ""
 
     TOTAL_STEPS=5
     execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
-    execute_step "Initialize k3d cluster" 2 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
-    execute_step "Initialize VLAB" 3 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
+    # VLAB MUST initialize first (Issue #73) - it provides the controller interface for EMC
+    execute_step "Initialize VLAB" 2 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
+    # k3d cluster can only start after VLAB is ready to provide host-facing connectivity
+    execute_step "Initialize k3d cluster" 3 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
     execute_step "Deploy GitOps stack" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
     execute_step "Deploy observability stack" 5 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
 

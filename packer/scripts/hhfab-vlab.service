@@ -1,0 +1,37 @@
+[Unit]
+Description=Hedgehog VLAB Service
+Documentation=https://docs.hedgehog.cloud/latest/vlab/overview/
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+ConditionPathExists=!/var/lib/hedgehog-lab/vlab-initialized
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hhfab-vlab-runner
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1800
+Restart=no
+
+# Run as hhlab user for proper permissions
+User=hhlab
+Group=hhlab
+
+# Environment
+Environment="VLAB_WORK_DIR=/opt/hedgehog/vlab"
+Environment="VLAB_TIMEOUT=1800"
+Environment="LOG_FILE=/var/log/hedgehog-lab/modules/vlab.log"
+Environment="TERM=xterm-256color"
+
+# Working directory
+WorkingDirectory=/opt/hedgehog/vlab
+
+# Security hardening
+NoNewPrivileges=true
+# Note: PrivateTmp is NOT enabled to allow students to attach to the tmux session
+# tmux stores sockets in /tmp/tmux-<uid>/ which must be accessible from login shells
+
+[Install]
+WantedBy=multi-user.target

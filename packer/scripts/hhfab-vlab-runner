@@ -1,0 +1,312 @@
+#!/bin/bash
+# hhfab-vlab-runner
+# Wrapper script for launching hhfab VLAB in a detached tmux session
+# This script is called by the hhfab-vlab.service systemd unit
+#
+# Features:
+# - Runs hhfab vlab up in a persistent, detachable tmux session
+# - Handles retries and logging
+# - Creates state marker on successful completion
+# - Allows students to inspect via `tmux attach -t hhfab-vlab`
+
+set -euo pipefail
+
+# Configuration
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-hhfab-vlab}"
+VLAB_WORK_DIR="${VLAB_WORK_DIR:-/opt/hedgehog/vlab}"
+VLAB_TIMEOUT="${VLAB_TIMEOUT:-1800}"
+LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
+STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
+HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# Logging functions
+log() {
+    local level="${1:-INFO}"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    log "INFO" "$@"
+}
+
+log_warn() {
+    log "WARN" "$@"
+}
+
+log_error() {
+    log "ERROR" "$@"
+}
+
+# Check prerequisites
+check_prerequisites() {
+    log_info "Checking prerequisites for hhfab VLAB..."
+
+    # Check for tmux
+    if ! command -v tmux &> /dev/null; then
+        log_error "tmux command not found. Cannot create detached session."
+        return 1
+    fi
+
+    # Check for hhfab
+    if ! command -v hhfab &> /dev/null; then
+        log_error "hhfab command not found. Cannot start VLAB."
+        return 1
+    fi
+
+    # Check working directory
+    if [ ! -d "$VLAB_WORK_DIR" ]; then
+        log_error "VLAB working directory does not exist: $VLAB_WORK_DIR"
+        return 1
+    fi
+
+    # Check if already initialized
+    if [ -f "$VLAB_WORK_DIR/fab.yaml" ]; then
+        log_info "VLAB working directory already initialized"
+    else
+        log_info "VLAB working directory needs initialization"
+    fi
+
+    return 0
+}
+
+# Initialize VLAB working directory if needed
+init_vlab_workdir() {
+    log_info "Initializing VLAB working directory at $VLAB_WORK_DIR..."
+
+    cd "$VLAB_WORK_DIR" || {
+        log_error "Failed to change to VLAB working directory"
+        return 1
+    }
+
+    # Initialize hhfab if not already initialized
+    if [ ! -f "$VLAB_WORK_DIR/fab.yaml" ]; then
+        log_info "Initializing hhfab with development credentials..."
+        if ! hhfab init --dev >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to initialize hhfab"
+            return 1
+        fi
+        log_info "hhfab initialized successfully"
+    fi
+
+    # Generate wiring diagram if not present
+    if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
+        log_info "Generating VLAB wiring diagram..."
+        if ! hhfab vlab gen >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to generate wiring diagram"
+            return 1
+        fi
+        log_info "Wiring diagram generated successfully"
+    fi
+
+    return 0
+}
+
+# Check if tmux session exists
+session_exists() {
+    tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null
+}
+
+# Create and start tmux session with hhfab
+start_tmux_session() {
+    log_info "Starting hhfab VLAB in detached tmux session: $TMUX_SESSION_NAME"
+    log_info "Command: $HHFAB_CMD"
+    log_info "Working directory: $VLAB_WORK_DIR"
+    log_info "Timeout: ${VLAB_TIMEOUT}s ($(( VLAB_TIMEOUT / 60 )) minutes)"
+
+    cd "$VLAB_WORK_DIR" || {
+        log_error "Failed to change to VLAB working directory"
+        return 1
+    }
+
+    # Kill existing session if it exists
+    if session_exists; then
+        log_warn "Existing tmux session found. Killing it..."
+        tmux kill-session -t "$TMUX_SESSION_NAME" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Create new detached tmux session
+    # The session will run hhfab and redirect all output to the log file
+    # We capture the exit code AFTER the command completes (without exec)
+    # Critical: Use printf to construct command with literal $? for sh to evaluate
+    log_info "Creating detached tmux session..."
+
+    # Build command using printf to avoid quote/expansion issues
+    # This ensures $? is evaluated by sh inside tmux, not by the parent shell
+    local tmux_cmd
+    tmux_cmd=$(printf '%s >> %s 2>&1; echo $? > /tmp/hhfab-exit-code' \
+        "$HHFAB_CMD" "'$LOG_FILE'")
+
+    if ! tmux new-session -d -s "$TMUX_SESSION_NAME" -c "$VLAB_WORK_DIR" \
+        sh -c "$tmux_cmd"; then
+        log_error "Failed to create tmux session"
+        return 1
+    fi
+
+    log_info "Tmux session '$TMUX_SESSION_NAME' created successfully"
+    log_info "Students can view the session with: tmux attach -t $TMUX_SESSION_NAME"
+    log_info "Or list sessions with: tmux ls"
+
+    return 0
+}
+
+# Wait for hhfab to complete
+wait_for_completion() {
+    log_info "Waiting for VLAB initialization to complete..."
+    log_info "This may take up to $(( VLAB_TIMEOUT / 60 )) minutes..."
+
+    local start_time
+    start_time=$(date +%s)
+    local end_time
+    end_time=$((start_time + VLAB_TIMEOUT))
+    local check_interval=10
+
+    while [ "$(date +%s)" -lt "$end_time" ]; do
+        # Check if the tmux session still exists
+        if ! session_exists; then
+            log_info "Tmux session has exited"
+
+            # Check exit code
+            if [ -f /tmp/hhfab-exit-code ]; then
+                local exit_code
+                exit_code=$(cat /tmp/hhfab-exit-code)
+                rm -f /tmp/hhfab-exit-code
+
+                if [ "$exit_code" -eq 0 ]; then
+                    log_info "hhfab vlab up completed successfully (exit code: 0)"
+                    return 0
+                else
+                    log_error "hhfab vlab up failed with exit code: $exit_code"
+                    log_error "Check logs at: $LOG_FILE"
+                    return 1
+                fi
+            else
+                log_error "Tmux session exited but no exit code found"
+                return 1
+            fi
+        fi
+
+        # Log progress
+        local elapsed=$(($(date +%s) - start_time))
+        log_info "Still waiting... (${elapsed}s elapsed, session is running)"
+
+        sleep "$check_interval"
+    done
+
+    # Timeout reached
+    log_error "VLAB initialization timed out after ${VLAB_TIMEOUT}s"
+    log_error "Tmux session '$TMUX_SESSION_NAME' is still running but exceeded timeout"
+    log_error "You can inspect it with: tmux attach -t $TMUX_SESSION_NAME"
+
+    return 1
+}
+
+# Verify VLAB health
+verify_vlab_health() {
+    log_info "Verifying VLAB health..."
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    # Use hhfab vlab inspect to check switch status
+    if hhfab vlab inspect >> "$LOG_FILE" 2>&1; then
+        log_info "VLAB health check passed - all switches are operational"
+        return 0
+    else
+        log_error "VLAB health check failed"
+        return 1
+    fi
+}
+
+# Create state marker
+create_state_marker() {
+    log_info "Creating VLAB initialization state marker..."
+
+    mkdir -p "$(dirname "$STATE_FILE")"
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "initialized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "tmux_session": "$TMUX_SESSION_NAME",
+  "working_directory": "$VLAB_WORK_DIR",
+  "version": "1.0.0"
+}
+EOF
+
+    log_info "State marker created at: $STATE_FILE"
+    return 0
+}
+
+# Main execution
+main() {
+    log_info "=================================================="
+    log_info "hhfab VLAB Runner Starting..."
+    log_info "=================================================="
+    log_info "Tmux session: $TMUX_SESSION_NAME"
+    log_info "Working directory: $VLAB_WORK_DIR"
+    log_info "Log file: $LOG_FILE"
+    log_info ""
+
+    # Track overall start time
+    local overall_start
+    overall_start=$(date +%s)
+
+    # Execute initialization steps
+    if ! check_prerequisites; then
+        log_error "Prerequisites check failed"
+        return 1
+    fi
+
+    if ! init_vlab_workdir; then
+        log_error "VLAB working directory initialization failed"
+        return 1
+    fi
+
+    if ! start_tmux_session; then
+        log_error "Failed to start tmux session"
+        return 1
+    fi
+
+    if ! wait_for_completion; then
+        log_error "VLAB initialization failed or timed out"
+        log_error "Tmux session may still be running for debugging"
+        return 1
+    fi
+
+    if ! verify_vlab_health; then
+        log_error "VLAB health verification failed"
+        return 1
+    fi
+
+    if ! create_state_marker; then
+        log_warn "Failed to create state marker (non-fatal)"
+    fi
+
+    # Calculate total time
+    local overall_end
+    overall_end=$(date +%s)
+    local total_time
+    total_time=$((overall_end - overall_start))
+
+    log_info ""
+    log_info "=================================================="
+    log_info "hhfab VLAB Initialization Complete!"
+    log_info "=================================================="
+    log_info "Total time: ${total_time}s ($(( total_time / 60 )) minutes)"
+    log_info "Tmux session: $TMUX_SESSION_NAME (exited after successful completion)"
+    log_info "Working directory: $VLAB_WORK_DIR"
+    log_info "Log file: $LOG_FILE"
+    log_info ""
+    log_info "Note: The tmux session has exited because hhfab completed successfully."
+    log_info "To start a new session for debugging, run: tmux new -s debug"
+    log_info ""
+
+    return 0
+}
+
+# Run main function
+main "$@"
+exit $?

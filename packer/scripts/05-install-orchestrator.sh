@@ -40,14 +40,25 @@ else
     exit 1
 fi
 
-# Install VLAB initialization module
-echo "Installing VLAB initialization module..."
+# Install VLAB initialization module (legacy, kept for compatibility)
+echo "Installing VLAB initialization module (legacy)..."
 if [ -f "/tmp/packer-provisioner-shell-scripts/30-vlab-init.sh" ]; then
     cp /tmp/packer-provisioner-shell-scripts/30-vlab-init.sh /usr/local/bin/hedgehog-vlab-init
     chmod +x /usr/local/bin/hedgehog-vlab-init
     echo "VLAB module installed at /usr/local/bin/hedgehog-vlab-init"
 else
     echo "ERROR: VLAB init script not found"
+    exit 1
+fi
+
+# Install hhfab-vlab-runner (new tmux-based runner)
+echo "Installing hhfab-vlab-runner..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/hhfab-vlab-runner" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/hhfab-vlab-runner /usr/local/bin/hhfab-vlab-runner
+    chmod +x /usr/local/bin/hhfab-vlab-runner
+    echo "hhfab-vlab-runner installed at /usr/local/bin/hhfab-vlab-runner"
+else
+    echo "ERROR: hhfab-vlab-runner script not found"
     exit 1
 fi
 
@@ -83,17 +94,34 @@ else
     echo "WARNING: Bash completion script not found (optional)"
 fi
 
-# Install systemd service
-echo "Installing systemd service..."
+# Install systemd services
+echo "Installing systemd services..."
+
+# Install main orchestrator service
 if [ -f "/tmp/packer-provisioner-shell-scripts/hedgehog-lab-init.service" ]; then
     cp /tmp/packer-provisioner-shell-scripts/hedgehog-lab-init.service /etc/systemd/system/hedgehog-lab-init.service
-    systemctl daemon-reload
-    systemctl enable hedgehog-lab-init.service
-    echo "Systemd service installed and enabled"
+    echo "Main orchestrator service installed"
 else
-    echo "ERROR: Systemd service file not found"
+    echo "ERROR: hedgehog-lab-init.service file not found"
     exit 1
 fi
+
+# Install hhfab-vlab service
+if [ -f "/tmp/packer-provisioner-shell-scripts/hhfab-vlab.service" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/hhfab-vlab.service /etc/systemd/system/hhfab-vlab.service
+    echo "hhfab-vlab service installed"
+else
+    echo "ERROR: hhfab-vlab.service file not found"
+    exit 1
+fi
+
+# Reload systemd and enable main orchestrator service
+systemctl daemon-reload
+systemctl enable hedgehog-lab-init.service
+# Note: hhfab-vlab.service is NOT enabled - it's started explicitly by the orchestrator
+# This prevents blocking multi-user.target during 30-minute VLAB initialization
+# and ensures the orchestrator controls when VLAB initialization happens
+echo "Systemd services installed (orchestrator enabled, vlab controlled by orchestrator)"
 
 # Set build type (default to standard)
 echo "standard" > /etc/hedgehog-lab/build-type
@@ -107,6 +135,7 @@ chown -R hhlab:hhlab /var/log/hedgehog-lab
 chmod 755 /usr/local/bin/hedgehog-lab-orchestrator
 chmod 755 /usr/local/bin/hedgehog-k3d-init
 chmod 755 /usr/local/bin/hedgehog-vlab-init
+chmod 755 /usr/local/bin/hhfab-vlab-runner
 chmod 755 /usr/local/bin/hedgehog-lab-readiness-ui
 chmod 755 /usr/local/bin/hh-lab
 
@@ -117,10 +146,16 @@ echo "Installed components:"
 echo "  - Main orchestrator: /usr/local/bin/hedgehog-lab-orchestrator"
 echo "  - k3d module: /usr/local/bin/hedgehog-k3d-init"
 echo "  - VLAB module: /usr/local/bin/hedgehog-vlab-init"
+echo "  - VLAB runner: /usr/local/bin/hhfab-vlab-runner"
 echo "  - Readiness UI: /usr/local/bin/hedgehog-lab-readiness-ui"
 echo "  - hh-lab CLI: /usr/local/bin/hh-lab"
 echo "  - Bash completion: /etc/bash_completion.d/hh-lab"
-echo "  - Systemd service: /etc/systemd/system/hedgehog-lab-init.service"
+echo ""
+echo "Systemd services:"
+echo "  - Main orchestrator: /etc/systemd/system/hedgehog-lab-init.service"
+echo "  - VLAB service: /etc/systemd/system/hhfab-vlab.service"
+echo ""
+echo "Directories:"
 echo "  - Config directory: /etc/hedgehog-lab"
 echo "  - State directory: /var/lib/hedgehog-lab"
 echo "  - Log directory: /var/log/hedgehog-lab"
