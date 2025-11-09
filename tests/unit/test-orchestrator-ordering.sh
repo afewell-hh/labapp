@@ -172,6 +172,43 @@ test_vlab_first_comments() {
     fi
 }
 
+# Test 9: Log files pre-created with hhlab ownership
+test_log_ownership_setup() {
+    log_info "Test 9: Checking orchestrator sets up log file ownership..."
+
+    # Each init function should touch and chown the log file before writing
+    # This prevents permission errors when services run as hhlab
+    local ownership_ok=true
+
+    # Check wait_for_network sets up log ownership
+    if ! grep -A 10 "wait_for_network()" "$ORCHESTRATOR_SCRIPT" | \
+         grep -q 'chown hhlab:hhlab.*module_log'; then
+        log_fail "wait_for_network does not set up log file ownership"
+        ownership_ok=false
+    fi
+
+    # Check init_k3d_cluster sets up log ownership
+    if ! grep -A 10 "init_k3d_cluster()" "$ORCHESTRATOR_SCRIPT" | \
+         grep -q 'chown hhlab:hhlab.*module_log'; then
+        log_fail "init_k3d_cluster does not set up log file ownership"
+        ownership_ok=false
+    fi
+
+    # Check init_vlab sets up log ownership
+    if ! grep -A 10 "init_vlab()" "$ORCHESTRATOR_SCRIPT" | \
+         grep -q 'chown hhlab:hhlab.*module_log'; then
+        log_fail "init_vlab does not set up log file ownership"
+        ownership_ok=false
+    fi
+
+    if [ "$ownership_ok" = true ]; then
+        log_pass "All module logs are pre-created with hhlab ownership"
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Main test execution
 main() {
     echo ""
@@ -189,6 +226,7 @@ main() {
     test_step_numbering || true
     test_vlab_is_step_2 || true
     test_vlab_first_comments || true
+    test_log_ownership_setup || true
 
     # Summary
     echo ""

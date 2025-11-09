@@ -256,6 +256,40 @@ test_service_no_private_tmp() {
     fi
 }
 
+# Test 14: Runner uses proper exit code capture mechanism
+test_runner_exit_code_capture() {
+    log_info "Test 14: Checking runner captures exit code correctly..."
+
+    # The runner must use a mechanism that prevents $? expansion in the parent shell
+    # Valid approaches: printf with literal $?, sh -c with escaped \$?, or heredoc
+    local capture_ok=false
+
+    # Check for printf approach (preferred)
+    if grep -q "printf.*echo.*\\\$?" "$VLAB_RUNNER_SCRIPT" || \
+       grep -q "printf.*echo.*\$?" "$VLAB_RUNNER_SCRIPT"; then
+        capture_ok=true
+    fi
+
+    # Check for sh -c with proper escaping
+    if grep -q "sh -c.*echo.*\\\$?.*exit-code" "$VLAB_RUNNER_SCRIPT"; then
+        capture_ok=true
+    fi
+
+    # Make sure it's NOT using simple variable assignment which expands $? immediately
+    if grep -q 'local tmux_cmd=".*echo \$?.*exit-code"' "$VLAB_RUNNER_SCRIPT"; then
+        log_fail "Runner uses direct assignment which expands \$? in parent shell"
+        return 1
+    fi
+
+    if [ "$capture_ok" = true ]; then
+        log_pass "Runner uses proper exit code capture mechanism"
+        return 0
+    else
+        log_fail "Runner exit code capture mechanism unclear or missing"
+        return 1
+    fi
+}
+
 # Main test execution
 main() {
     echo ""
@@ -278,6 +312,7 @@ main() {
     test_install_script || true
     test_runner_error_handling || true
     test_service_no_private_tmp || true
+    test_runner_exit_code_capture || true
 
     # Summary
     echo ""
