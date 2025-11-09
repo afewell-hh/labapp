@@ -33,17 +33,23 @@ The Hedgehog Lab Appliance supports two build types (see [ADR-001](../adr/001-du
 
 **For Pre-Warmed Builds with Limited Resources:**
 
-If your development machine lacks the disk space or nested virtualization support for pre-warmed builds, use the **AWS Metal Instance Build System**:
+If your development machine lacks the disk space or nested virtualization support for pre-warmed builds, use the **GCP Nested Virtualization Builder** (recommended):
 
-- **AWS Automated Builds**: See [AWS Metal Build Guide](AWS_METAL_BUILD.md)
-- **Cost**: ~$15-20 per build (pay-per-use)
-- **Requirements**: AWS account, Terraform installed
-- **Advantages**: No local resource requirements, automatic cleanup, built-in safety controls
+- **GCP Builder**: See [GCP Builder Guide](GCP_BUILDER.md)
+- **Cost**: ~$4-15 per build (pay-per-use)
+- **Requirements**: GCP account, gcloud CLI installed
+- **Advantages**: Native nested virtualization support, automatic artifact upload to GCS, built-in cost controls
+- **Artifacts**: Automatically uploaded to Google Cloud Storage (GCS)
 
 ```bash
-# Launch AWS metal instance build
-./scripts/launch-metal-build.sh main
+# Launch GCP builder instance
+./scripts/launch-gcp-build.sh main
 ```
+
+**Alternate: AWS Metal Instance Builder** (for future marketplace integration):
+- **AWS Automated Builds**: See [AWS Metal Build Guide](AWS_METAL_BUILD.md) - Available as alternate option
+- **Cost**: ~$15-20 per build
+- **Note**: AWS/S3 integration planned for future marketplace distribution
 
 The remainder of this guide covers **local builds** for both standard and pre-warmed variants.
 
