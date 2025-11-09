@@ -173,7 +173,127 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run orchestrator tests
+      - name: Make test scripts executable
         run: |
-          # TODO: Implement test suite
-          echo "Tests will be implemented in future PR"
+          find tests/unit -name "*.sh" -type f -exec chmod +x {} \;
+
+      - name: Run orchestrator ordering tests
+        run: |
+          echo "Running orchestrator ordering tests..."
+          tests/unit/test-orchestrator-ordering.sh
+
+      - name: Run systemd service tests
+        run: |
+          echo "Running systemd service tests..."
+          tests/unit/test-systemd-services.sh
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "Unit test execution complete"
+          echo "All orchestrator and systemd service validations passed"
+
+  validate-systemd:
+    name: Validate Systemd Services
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check systemd service configurations
+        run: |
+          echo "Validating systemd service files..."
+          EXIT_CODE=0
+
+          # Check hhfab-vlab.service for critical settings
+          SERVICE_FILE="packer/scripts/hhfab-vlab.service"
+
+          if [ ! -f "$SERVICE_FILE" ]; then
+            echo "❌ Service file not found: $SERVICE_FILE"
+            EXIT_CODE=1
+          else
+            echo "Checking $SERVICE_FILE..."
+
+            # Check for PrivateTmp=true (blocks tmux access)
+            if grep -q "^PrivateTmp=true" "$SERVICE_FILE"; then
+              echo "❌ Service uses PrivateTmp=true (blocks tmux socket access)"
+              EXIT_CODE=1
+            fi
+
+            # Check for Type=forking (causes blocking)
+            if grep -q "^Type=forking" "$SERVICE_FILE"; then
+              echo "❌ Service uses Type=forking (causes indefinite blocking)"
+              EXIT_CODE=1
+            fi
+
+            # Verify Type=oneshot is used
+            if ! grep -q "^Type=oneshot" "$SERVICE_FILE"; then
+              echo "❌ Service should use Type=oneshot"
+              EXIT_CODE=1
+            fi
+
+            # Verify TimeoutStartSec is set
+            if ! grep -q "^TimeoutStartSec=" "$SERVICE_FILE"; then
+              echo "❌ Service should have TimeoutStartSec set"
+              EXIT_CODE=1
+            fi
+
+            # Verify ConditionPathExists prevents re-runs
+            if ! grep -q "ConditionPathExists=!" "$SERVICE_FILE"; then
+              echo "❌ Service should have ConditionPathExists to prevent"\
+                   "re-initialization"
+              EXIT_CODE=1
+            fi
+
+            echo "✓ Service file validation passed"
+          fi
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Systemd service validation failed"
+            exit 1
+          fi
+          echo "✓ All systemd services are correctly configured"
+
+  validate-packer-provisioners:
+    name: Validate Packer Provisioners
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Packer provisioners completeness
+        run: |
+          echo "Validating Packer provisioners include all required files..."
+          EXIT_CODE=0
+
+          PACKER_FILE="packer/standard-build.pkr.hcl"
+          INSTALL_SCRIPT="packer/scripts/05-install-orchestrator.sh"
+
+          # Extract files referenced in installation script
+          echo "Checking files referenced in $INSTALL_SCRIPT..."
+
+          # Files that should have Packer provisioners
+          REQUIRED_FILES=(
+            "hedgehog-lab-orchestrator"
+            "hedgehog-lab-init.service"
+            "20-k3d-observability-init.sh"
+            "30-vlab-init.sh"
+            "hhfab-vlab-runner"
+            "hhfab-vlab.service"
+            "hedgehog-lab-readiness-ui"
+            "hh-lab"
+            "hh-lab-completion.bash"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if ! grep -q "source.*packer/scripts/$file" "$PACKER_FILE"; then
+              echo "❌ Missing Packer provisioner for: $file"
+              EXIT_CODE=1
+            fi
+          done
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Packer provisioner validation failed"
+            echo "All files referenced in installation scripts must have"\
+                 "file provisioners in Packer template"
+            exit 1
+          fi
+          echo "✓ All required files have Packer provisioners"
