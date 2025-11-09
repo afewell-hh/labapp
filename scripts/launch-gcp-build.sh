@@ -417,6 +417,7 @@ fi
 
 # Run build
 echo "[$(date -u +"%Y-%m-%d %H:%M:%S UTC")] Starting Packer build..."
+export HOME="/root"
 export VERSION="${BUILD_ID}"
 
 if [ "$BUILD_TYPE" = "prewarmed" ]; then
