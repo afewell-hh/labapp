@@ -145,30 +145,31 @@ EOF
     fi
 
     # Patch Prometheus to use additional scrape configs
+    # Note: The field is initialized as an empty array in k3d provisioning, so we use "replace"
     log_info "Patching Prometheus to use additional scrape configs..."
 
-    kubectl patch prometheus kube-prometheus-stack-prometheus \
+    if ! kubectl patch prometheus kube-prometheus-stack-prometheus \
         -n "$PROMETHEUS_NAMESPACE" \
         --type='json' \
         -p='[{
-          "op": "add",
+          "op": "replace",
           "path": "/spec/additionalScrapeConfigs",
           "value": {
             "name": "additional-scrape-configs",
             "key": "prometheus-additional.yaml"
           }
-        }]' >> "$LOG_FILE" 2>&1
-
-    if [ $? -eq 0 ]; then
-        log_info "Patched Prometheus successfully"
-        # Wait for Prometheus to reload
-        log_info "Waiting for Prometheus to reload configuration..."
-        sleep 10
-        return 0
-    else
-        log_warn "Failed to patch Prometheus (may already be configured)"
-        return 0  # Don't fail - it might already be configured
+        }]' >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to patch Prometheus with additional scrape configs"
+        log_error "Check $LOG_FILE for details"
+        return 1
     fi
+
+    log_info "Patched Prometheus successfully"
+
+    # Wait for Prometheus to reload
+    log_info "Waiting for Prometheus to reload configuration..."
+    sleep 10
+    return 0
 }
 
 # Verify Prometheus is scraping
