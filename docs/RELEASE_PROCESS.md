@@ -175,26 +175,35 @@ For critical security issues or show-stopper bugs:
 - [ ] Mark as pre-release if applicable
 - [ ] Publish release
 
-#### Cloud Storage Upload (Pre-warmed Builds Only)
+####Cloud Storage Upload (All Builds)
 
-For pre-warmed builds, upload artifacts to AWS S3 cloud storage:
+Artifacts are automatically uploaded to Google Cloud Storage (GCS) during the build process:
 
-- [ ] Verify AWS credentials are set (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-- [ ] Upload pre-warmed OVA to S3 using upload script:
+- [ ] Verify GCS bucket is configured in `.env.gcp` (GCS_BUCKET variable)
+- [ ] Confirm artifacts were uploaded during GCP builder run:
   ```bash
-  ./scripts/upload-to-s3.sh \
-    output-hedgehog-lab-prewarmed/hedgehog-lab-prewarmed-vX.Y.Z.ova \
-    X.Y.Z
+  gsutil ls gs://${GCS_BUCKET}/releases/vX.Y.Z/
   ```
-- [ ] Verify upload completed successfully (script performs automatic verification)
-- [ ] Note download URLs from upload script output for documentation
-- [ ] Test download URL accessibility in browser or with curl
-- [ ] Verify checksum file is publicly accessible
-- [ ] Update DOWNLOADS.md with new version URLs
+- [ ] Verify both OVA and checksum files are present:
+  ```bash
+  gsutil ls gs://${GCS_BUCKET}/releases/vX.Y.Z/*
+  ```
+- [ ] Test artifact accessibility:
+  ```bash
+  gsutil cp gs://${GCS_BUCKET}/releases/vX.Y.Z/hedgehog-lab-standard-vX.Y.Z.ova.sha256 .
+  ```
+- [ ] Generate signed URLs for download distribution (valid for 7 days):
+  ```bash
+  gsutil signurl -d 7d ${GCP_SERVICE_ACCOUNT_KEY_PATH} \
+    gs://${GCS_BUCKET}/releases/vX.Y.Z/hedgehog-lab-standard-vX.Y.Z.ova
+  ```
+- [ ] Update DOWNLOADS.md with GCS URLs and signed URLs
 
-**Note:** Standard builds remain on GitHub Releases. Only pre-warmed builds (80-100 GB) are uploaded to S3 due to size limitations.
+**Note:** The GCP builder automatically uploads artifacts to GCS after successful builds. For manual re-upload, use `make publish-gcs`.
 
-See [Artifact Upload Guide](build/ARTIFACT_UPLOAD.md) for detailed upload procedures.
+**Alternate: AWS S3 Upload** (for future marketplace integration):
+- See [Artifact Upload Guide](build/ARTIFACT_UPLOAD.md) for AWS S3 upload procedures
+- AWS/S3 integration planned for future marketplace distribution
 
 #### Distribution Channels
 - [ ] Verify GitHub Release download links work
@@ -346,13 +355,22 @@ Source code (zip)
 Source code (tar.gz)
 ```
 
-### Secondary Distribution (Future)
+### Secondary Distribution
 
-**Cloud Storage** (For large pre-warmed builds)
-- **Options:** AWS S3, Google Cloud Storage, Azure Blob
-- **Use Case:** Workshop distributions, large files
-- **Access:** Direct download links, signed URLs for workshops
+**Google Cloud Storage (GCS)** (Primary cloud storage)
+- **Current Status:** Active and recommended
+- **Use Case:** All builds (standard and pre-warmed)
+- **Access:** Direct GCS URLs, signed URLs for time-limited sharing
+- **Cost:** Pay per storage and bandwidth
+- **Bucket:** `gs://hedgehog-lab-artifacts-{project-id}/`
+- **Advantages:** Automatic upload via GCP builder, integrated with build workflow
+
+**AWS S3** (Alternate, for future marketplace integration)
+- **Current Status:** Available as alternate option
+- **Use Case:** Planned for future marketplace distribution
+- **Access:** S3 URLs, CloudFront CDN
 - **Cost:** Pay per download/bandwidth
+- **Note:** See [AWS Artifact Upload Guide](build/ARTIFACT_UPLOAD.md)
 
 **Docker Hub** (Future consideration)
 - **Use Case:** Container-based lab alternative

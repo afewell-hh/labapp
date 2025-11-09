@@ -2,15 +2,27 @@
 
 This guide explains how to use the GCP nested virtualization builder system to create OVA builds for the Hedgehog Lab appliance.
 
+**Status:** This is the **primary recommended builder** for the Hedgehog Lab project. All artifacts are automatically uploaded to Google Cloud Storage (GCS).
+
 ### Overview
 
 Building OVAs requires significant resources and nested virtualization support:
 - **Disk Space**: 200-300GB during build (standard) or 600GB+ (pre-warmed)
 - **Nested Virtualization**: KVM support required for QEMU builds
 - **Build Time**: 45-60 minutes (standard) or 60-90 minutes (pre-warmed)
-- **Cost**: ~$10-15 per build (pay-per-use)
+- **Cost**: ~$4-15 per build (pay-per-use)
+- **Artifact Storage**: Automatic upload to GCS (Google Cloud Storage)
 
-The GCP builder system provides automated VM provisioning with built-in cost controls and automatic cleanup.
+The GCP builder system provides automated VM provisioning with built-in cost controls, automatic cleanup, and seamless GCS integration.
+
+**Why GCP Builder?**
+- **Primary Method:** Official builder for all release artifacts
+- **Integrated Storage:** Automatic upload to GCS bucket during build
+- **Cost Effective:** ~$4 for standard builds, ~$15 for pre-warmed
+- **Native KVM:** Full nested virtualization support
+- **Audit Trail:** Build logs uploaded to GCS for tracking
+
+**Alternate:** AWS Metal Builder is available as an alternate option for future marketplace integration. See [AWS Metal Build Guide](AWS_METAL_BUILD.md).
 
 ### Architecture
 

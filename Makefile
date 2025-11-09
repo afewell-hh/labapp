@@ -60,6 +60,7 @@ test-unit: ## Run unit tests
 	@tests/unit/test-orchestrator-ordering.sh
 	@tests/unit/test-systemd-services.sh
 	@tests/unit/test-gcp-build-script.sh
+	@tests/unit/test-publish-to-gcs.sh
 	@echo "Unit tests complete!"
 
 test-orchestrator: ## Run orchestrator unit tests only
@@ -138,3 +139,20 @@ validate-provisioning: test-provisioning ## Alias for test-provisioning
 
 .PHONY: validate-orchestrator
 validate-orchestrator: test-orchestrator ## Alias for test-orchestrator
+
+.PHONY: publish-gcs
+publish-gcs: ## Publish build artifacts to Google Cloud Storage
+	@echo "Publishing artifacts to GCS..."
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Error: VERSION not set. Usage: make publish-gcs VERSION=0.1.0"; \
+		exit 1; \
+	fi
+	@if [ -d "output-hedgehog-lab-standard" ]; then \
+		./scripts/publish-to-gcs.sh output-hedgehog-lab-standard $(VERSION); \
+	elif [ -d "output-hedgehog-lab-prewarmed" ]; then \
+		./scripts/publish-to-gcs.sh output-hedgehog-lab-prewarmed $(VERSION); \
+	else \
+		echo "Error: No build output directory found."; \
+		echo "Build first with 'make build-standard' or similar."; \
+		exit 1; \
+	fi
