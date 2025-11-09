@@ -196,7 +196,8 @@ jobs:
         if: always()
         run: |
           echo "Unit test execution complete"
-          echo "All orchestrator, systemd service, and GCP build script validations passed"
+          echo "All orchestrator, systemd service, and GCP build script"
+          echo "validations passed"
 
   validate-systemd:
     name: Validate Systemd Services
@@ -328,6 +329,8 @@ jobs:
           EOF
 
           # Run dry-run to validate argument parsing and script logic
-          # Expected to fail at gcloud auth check, but should validate argument parsing
+          # Expected to fail at gcloud auth check, but should validate
+          # argument parsing
           ./scripts/launch-gcp-build.sh --dry-run main || \
-            echo "Dry-run validation complete (gcloud auth expected to fail in CI)"
+            echo "Dry-run validation complete (gcloud auth expected" \
+                 "to fail in CI)"
