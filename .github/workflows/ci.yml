@@ -192,12 +192,17 @@ jobs:
           echo "Running GCP build script tests..."
           tests/unit/test-gcp-build-script.sh
 
+      - name: Run publish-to-gcs script tests
+        run: |
+          echo "Running publish-to-gcs script tests..."
+          tests/unit/test-publish-to-gcs.sh
+
       - name: Test Summary
         if: always()
         run: |
           echo "Unit test execution complete"
-          echo "All orchestrator, systemd service, and GCP build script"
-          echo "validations passed"
+          echo "All orchestrator, systemd service, GCP build script, and"
+          echo "publish-to-gcs validations passed"
 
   validate-systemd:
     name: Validate Systemd Services

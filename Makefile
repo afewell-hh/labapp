@@ -60,6 +60,7 @@ test-unit: ## Run unit tests
 	@tests/unit/test-orchestrator-ordering.sh
 	@tests/unit/test-systemd-services.sh
 	@tests/unit/test-gcp-build-script.sh
+	@tests/unit/test-publish-to-gcs.sh
 	@echo "Unit tests complete!"
 
 test-orchestrator: ## Run orchestrator unit tests only
