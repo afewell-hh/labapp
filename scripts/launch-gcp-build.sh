@@ -541,7 +541,7 @@ launch_build() {
         --shielded-integrity-monitoring \
         --labels="purpose=labapp-builder,build-id=${build_id},build-type=${BUILD_TYPE},managed-by=script" \
         --metadata-from-file=startup-script="$startup_script" \
-        --min-cpu-platform="Intel Haswell" \
+        --min-cpu-platform="Intel Cascadelake" \
         ${preemptible_flag}
 
     log_info "✓ Instance created successfully"
