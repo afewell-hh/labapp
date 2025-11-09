@@ -242,6 +242,8 @@ seed_repo() {
         log_info "No changes to commit (repository may already be seeded)"
         cd - > /dev/null
         rm -rf "$TMP_REPO_DIR"
+        rm -f "$git_credentials_file"
+        git config --global --unset credential.helper
         return 0
     fi
 
@@ -258,6 +260,8 @@ Auto-seeded by 40-gitops-init.sh during lab initialization." >> "$LOG_FILE" 2>&1
         log_error "Failed to commit changes"
         cd - > /dev/null
         rm -rf "$TMP_REPO_DIR"
+        rm -f "$git_credentials_file"
+        git config --global --unset credential.helper
         return 1
     fi
 
