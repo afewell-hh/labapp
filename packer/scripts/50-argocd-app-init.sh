@@ -221,11 +221,19 @@ create_cluster_secret() {
     # because the certificate doesn't include the Docker bridge IP (172.19.0.1)
 
     # Extract the bearer token from kubeconfig
+    # Use grep -m1 to get the first matching line with 'token:', then extract just the token value
     local bearer_token
-    bearer_token=$(echo "$HEDGEHOG_KUBECONFIG" | grep -A 1 'token:' | tail -1 | sed 's/.*token: //' | tr -d ' ')
+    bearer_token=$(echo "$HEDGEHOG_KUBECONFIG" | grep -m1 'token:' | sed 's/.*token:[[:space:]]*//' | tr -d '[:space:]')
 
     if [ -z "$bearer_token" ]; then
         log_error "Failed to extract bearer token from kubeconfig"
+        return 1
+    fi
+
+    # Validate token format (should be base64-like characters, no colons or other kubeconfig syntax)
+    if echo "$bearer_token" | grep -q ':'; then
+        log_error "Extracted token appears invalid (contains ':' character)"
+        log_error "Token extraction may have captured wrong line from kubeconfig"
         return 1
     fi
 
