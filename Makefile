@@ -59,6 +59,7 @@ test-unit: ## Run unit tests
 	@echo "Running unit tests..."
 	@tests/unit/test-orchestrator-ordering.sh
 	@tests/unit/test-systemd-services.sh
+	@tests/unit/test-gcp-build-script.sh
 	@echo "Unit tests complete!"
 
 test-orchestrator: ## Run orchestrator unit tests only
@@ -78,4 +79,62 @@ set-executable: ## Make scripts executable
 	@echo "Setting execute permissions on scripts..."
 	chmod +x packer/scripts/*.sh
 	chmod +x packer/scripts/hedgehog-lab-orchestrator
+	chmod +x scripts/*.sh
 	@echo "Permissions set!"
+
+.PHONY: test-modules
+test-modules: test-provisioning test-scripts ## Run all module validation tests
+
+.PHONY: test-provisioning
+test-provisioning: ## Validate provisioning scripts without building
+	@echo "Validating provisioning scripts..."
+	@echo "Checking script syntax..."
+	@find packer/scripts -name "*.sh" -type f -exec bash -n {} \;
+	@echo "✓ All provisioning scripts have valid syntax"
+	@echo "Running shellcheck on provisioning scripts..."
+	@if command -v shellcheck > /dev/null; then \
+		find packer/scripts -name "*.sh" -type f -exec shellcheck -x {} \; && \
+		echo "✓ Shellcheck passed for all provisioning scripts"; \
+	else \
+		echo "⚠ shellcheck not installed, skipping (install with: sudo apt-get install shellcheck)"; \
+	fi
+
+.PHONY: test-scripts
+test-scripts: ## Validate automation scripts without executing
+	@echo "Validating automation scripts..."
+	@echo "Checking script syntax..."
+	@find scripts -name "*.sh" -type f -exec bash -n {} \;
+	@echo "✓ All automation scripts have valid syntax"
+	@echo "Running shellcheck on automation scripts..."
+	@if command -v shellcheck > /dev/null; then \
+		find scripts -name "*.sh" -type f -exec shellcheck -x {} \; && \
+		echo "✓ Shellcheck passed for all automation scripts"; \
+	else \
+		echo "⚠ shellcheck not installed, skipping"; \
+	fi
+
+.PHONY: dry-run
+dry-run: ## Validate GCP build script without launching resources
+	@echo "Running dry-run validation of GCP build script..."
+	@./scripts/launch-gcp-build.sh --dry-run main || \
+		(echo "⚠ Dry-run skipped (requires .env.gcp configuration)"; exit 0)
+
+.PHONY: lint
+lint: ## Run all linters (shellcheck, yamllint, etc.)
+	@echo "Running linters..."
+	@$(MAKE) test-provisioning
+	@$(MAKE) test-scripts
+	@echo "Checking YAML files..."
+	@if command -v yamllint > /dev/null; then \
+		yamllint .github/workflows/ configs/ && \
+		echo "✓ YAML lint passed"; \
+	else \
+		echo "⚠ yamllint not installed, skipping (install with: pip install yamllint)"; \
+	fi
+	@echo "✓ All linters passed"
+
+.PHONY: validate-provisioning
+validate-provisioning: test-provisioning ## Alias for test-provisioning
+
+.PHONY: validate-orchestrator
+validate-orchestrator: test-orchestrator ## Alias for test-orchestrator

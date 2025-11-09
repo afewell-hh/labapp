@@ -35,7 +35,17 @@ secrets/
 *.pem
 !*.key.example
 
+# Environment files (may contain secrets)
+.env
+.env.gcp
+.env.local
+.env.*.local
+
+# Build state files
+.last-build-id
+.last-gcp-build-id
+.last-gcp-instance
+
 # Test outputs
 test-results/
 coverage/
-.env

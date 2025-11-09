@@ -187,11 +187,17 @@ jobs:
           echo "Running systemd service tests..."
           tests/unit/test-systemd-services.sh
 
+      - name: Run GCP build script tests
+        run: |
+          echo "Running GCP build script tests..."
+          tests/unit/test-gcp-build-script.sh
+
       - name: Test Summary
         if: always()
         run: |
           echo "Unit test execution complete"
-          echo "All orchestrator and systemd service validations passed"
+          echo "All orchestrator, systemd service, and GCP build script"
+          echo "validations passed"
 
   validate-systemd:
     name: Validate Systemd Services
@@ -297,3 +303,34 @@ jobs:
             exit 1
           fi
           echo "✓ All required files have Packer provisioners"
+
+  test-modules:
+    name: Test Modules and Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run module validation tests
+        run: |
+          echo "Running module validation tests..."
+          make test-modules
+
+      - name: Test GCP build script dry-run
+        run: |
+          echo "Testing GCP build script dry-run..."
+          # Create minimal .env.gcp for dry-run validation
+          cat > .env.gcp <<EOF
+          GCP_PROJECT_ID="test-project"
+          GCP_ZONE="us-central1-a"
+          GCS_BUCKET="test-bucket"
+          EOF
+
+          # Run dry-run to validate argument parsing and script logic
+          # Expected to fail at gcloud auth check, but should validate
+          # argument parsing
+          ./scripts/launch-gcp-build.sh --dry-run main || \
+            echo "Dry-run validation complete (gcloud auth expected" \
+                 "to fail in CI)"

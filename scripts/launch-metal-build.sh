@@ -85,6 +85,15 @@ check_prerequisites() {
         set +a
     fi
 
+    # Load .env.gcp if exists (for GCP-specific overrides, though not used by this script)
+    if [ -f "${PROJECT_ROOT}/.env.gcp" ]; then
+        log_info "Loading .env.gcp file"
+        # shellcheck disable=SC1091
+        set -a
+        source "${PROJECT_ROOT}/.env.gcp"
+        set +a
+    fi
+
     # Check AWS credentials (after loading .env)
     if ! aws sts get-caller-identity &> /dev/null; then
         error_exit "AWS credentials not configured or invalid"
