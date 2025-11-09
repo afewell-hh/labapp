@@ -535,7 +535,8 @@ launch_build() {
         --provisioning-model="${provisioning_model}" \
         --service-account="${GCP_SERVICE_ACCOUNT:-default}" \
         --scopes=https://www.googleapis.com/auth/devstorage.full_control,https://www.googleapis.com/auth/cloud-platform \
-        --create-disk="auto-delete=yes,boot=yes,device-name=${instance_name},image=projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts,mode=rw,size=${GCP_DISK_SIZE:-600},type=projects/${GCP_PROJECT_ID}/zones/${GCP_ZONE}/diskTypes/${GCP_DISK_TYPE:-pd-ssd},licenses=https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx" \
+        --create-disk="auto-delete=yes,boot=yes,device-name=${instance_name},image=projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts,mode=rw,size=${GCP_DISK_SIZE:-600},type=projects/${GCP_PROJECT_ID}/zones/${GCP_ZONE}/diskTypes/${GCP_DISK_TYPE:-pd-ssd}" \
+        --enable-nested-virtualization \
         --no-shielded-secure-boot \
         --shielded-vtpm \
         --shielded-integrity-monitoring \
