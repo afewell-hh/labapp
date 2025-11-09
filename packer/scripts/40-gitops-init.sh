@@ -188,14 +188,22 @@ seed_repo() {
     log_info "Cloning repository..."
     local clone_url="${GITEA_URL}/${STUDENT_ORG}/${REPO_NAME}.git"
 
-    # Configure git to store credentials temporarily
-    export GIT_ASKPASS=/bin/echo
-    export GIT_USERNAME="${GITEA_ADMIN_USER}"
-    export GIT_PASSWORD="${GITEA_ADMIN_PASSWORD}"
+    # Configure git credential helper to avoid password in URL
+    # This prevents credentials from appearing in process lists or git output
+    git config --global credential.helper store
 
-    # Use credential helper to avoid password prompts
-    if ! git clone "http://${GITEA_ADMIN_USER}:${GITEA_ADMIN_PASSWORD}@localhost:${GITEA_HTTP_PORT}/${STUDENT_ORG}/${REPO_NAME}.git" "$TMP_REPO_DIR" >> "$LOG_FILE" 2>&1; then
+    # Create credential file temporarily
+    local git_credentials_file="/tmp/.git-credentials-$$"
+    echo "http://${GITEA_ADMIN_USER}:${GITEA_ADMIN_PASSWORD}@localhost:${GITEA_HTTP_PORT}" > "$git_credentials_file"
+    chmod 600 "$git_credentials_file"
+    git config --global credential.helper "store --file=$git_credentials_file"
+
+    # Clone without password in URL
+    log_info "Cloning repository (credentials managed securely)..."
+    if ! git clone "http://localhost:${GITEA_HTTP_PORT}/${STUDENT_ORG}/${REPO_NAME}.git" "$TMP_REPO_DIR" >> "$LOG_FILE" 2>&1; then
         log_error "Failed to clone repository"
+        rm -f "$git_credentials_file"
+        git config --global --unset credential.helper
         return 1
     fi
 
@@ -253,12 +261,14 @@ Auto-seeded by 40-gitops-init.sh during lab initialization." >> "$LOG_FILE" 2>&1
         return 1
     fi
 
-    # Push changes
+    # Push changes (using credential helper configured earlier)
     log_info "Pushing seed content to Gitea..."
     if ! git push origin main >> "$LOG_FILE" 2>&1; then
         log_error "Failed to push changes"
         cd - > /dev/null
         rm -rf "$TMP_REPO_DIR"
+        rm -f "$git_credentials_file"
+        git config --global --unset credential.helper
         return 1
     fi
 
@@ -267,6 +277,8 @@ Auto-seeded by 40-gitops-init.sh during lab initialization." >> "$LOG_FILE" 2>&1
     # Cleanup
     cd - > /dev/null
     rm -rf "$TMP_REPO_DIR"
+    rm -f "$git_credentials_file"
+    git config --global --unset credential.helper
 
     return 0
 }
@@ -314,7 +326,8 @@ get_repo_summary() {
     log_info "  Clone URL (SSH): ssh://git@localhost:2222/${STUDENT_ORG}/${REPO_NAME}.git"
     log_info "  Web URL: ${GITEA_URL}/${STUDENT_ORG}/${REPO_NAME}"
     log_info "  Service URL (internal): ${GITEA_SERVICE_URL}/${STUDENT_ORG}/${REPO_NAME}.git"
-    log_info "  Credentials: ${GITEA_ADMIN_USER} / ${GITEA_ADMIN_PASSWORD}"
+    log_info "  Admin User: ${GITEA_ADMIN_USER}"
+    log_info "  Password: (stored in Gitea - retrieve via: kubectl get secret gitea-admin-secret -n gitea)"
     log_info ""
     log_info "Repository Structure:"
     log_info "  - examples/          Example VPC and VPCAttachment manifests"
