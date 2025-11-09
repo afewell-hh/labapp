@@ -154,12 +154,24 @@ create_cluster_secret() {
         kubectl delete secret -n "$ARGOCD_NAMESPACE" "cluster-${HEDGEHOG_CLUSTER_NAME}" >> "$LOG_FILE" 2>&1
     fi
 
-    # Extract certificate and token from kubeconfig
-    # For VLAB, we'll use insecure mode since the cert doesn't include the bridge IP
-    local config_data
-    config_data=$(echo "$HEDGEHOG_KUBECONFIG" | base64 -w 0)
+    # Extract certificate and token from kubeconfig using yq/jq
+    # For VLAB, we need to use the kubeconfig but allow insecure TLS
+    # because the certificate doesn't include the Docker bridge IP (172.19.0.1)
+
+    # Extract the bearer token from kubeconfig
+    local bearer_token
+    bearer_token=$(echo "$HEDGEHOG_KUBECONFIG" | grep -A 1 'token:' | tail -1 | sed 's/.*token: //' | tr -d ' ')
+
+    if [ -z "$bearer_token" ]; then
+        log_error "Failed to extract bearer token from kubeconfig"
+        return 1
+    fi
+
+    log_info "Successfully extracted authentication token from kubeconfig"
 
     # Create cluster secret with ArgoCD labels
+    # ArgoCD expects the 'config' field to contain connection configuration (not the full kubeconfig)
+    # and uses the 'name' and 'server' fields from stringData
     cat <<EOF | kubectl apply -f - >> "$LOG_FILE" 2>&1
 apiVersion: v1
 kind: Secret
@@ -174,12 +186,11 @@ stringData:
   server: ${HEDGEHOG_API_SERVER}
   config: |
     {
+      "bearerToken": "${bearer_token}",
       "tlsClientConfig": {
         "insecure": true
       }
     }
-data:
-  config: ${config_data}
 EOF
 
     if [ $? -eq 0 ]; then
