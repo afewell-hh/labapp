@@ -73,6 +73,61 @@ else
     exit 1
 fi
 
+# Install GitOps initialization module
+echo "Installing GitOps initialization module..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/40-gitops-init.sh" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/40-gitops-init.sh /usr/local/bin/hedgehog-gitops-init
+    chmod +x /usr/local/bin/hedgehog-gitops-init
+    echo "GitOps module installed at /usr/local/bin/hedgehog-gitops-init"
+else
+    echo "ERROR: GitOps init script not found"
+    exit 1
+fi
+
+# Install ArgoCD Application initialization module
+echo "Installing ArgoCD Application initialization module..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/50-argocd-app-init.sh" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/50-argocd-app-init.sh /usr/local/bin/hedgehog-argocd-app-init
+    chmod +x /usr/local/bin/hedgehog-argocd-app-init
+    echo "ArgoCD App module installed at /usr/local/bin/hedgehog-argocd-app-init"
+else
+    echo "ERROR: ArgoCD App init script not found"
+    exit 1
+fi
+
+# Install Prometheus Hedgehog scrape configuration module
+echo "Installing Prometheus Hedgehog scrape configuration module..."
+if [ -f "/tmp/packer-provisioner-shell-scripts/60-prometheus-hedgehog-scrape.sh" ]; then
+    cp /tmp/packer-provisioner-shell-scripts/60-prometheus-hedgehog-scrape.sh /usr/local/bin/hedgehog-prometheus-scrape
+    chmod +x /usr/local/bin/hedgehog-prometheus-scrape
+    echo "Prometheus scrape module installed at /usr/local/bin/hedgehog-prometheus-scrape"
+else
+    echo "ERROR: Prometheus scrape script not found"
+    exit 1
+fi
+
+# Install GitOps seed configuration
+echo "Installing GitOps seed configuration..."
+if [ -d "/tmp/packer-provisioner-shell-scripts/configs/gitops" ]; then
+    mkdir -p /opt/hedgehog-lab/configs
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /opt/hedgehog-lab/configs/
+    echo "GitOps seed configs installed at /opt/hedgehog-lab/configs/gitops"
+else
+    echo "ERROR: GitOps seed configs not found"
+    exit 1
+fi
+
+# Install Grafana dashboard configuration
+echo "Installing Grafana dashboard configuration..."
+if [ -d "/tmp/packer-provisioner-shell-scripts/configs/grafana" ]; then
+    mkdir -p /opt/hedgehog-lab/configs
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /opt/hedgehog-lab/configs/
+    echo "Grafana configs installed at /opt/hedgehog-lab/configs/grafana"
+else
+    echo "ERROR: Grafana configs not found"
+    exit 1
+fi
+
 # Install hh-lab CLI tool
 echo "Installing hh-lab CLI tool..."
 if [ -f "/tmp/packer-provisioner-shell-scripts/hh-lab" ]; then
@@ -130,12 +185,16 @@ echo "Build type set to: standard"
 # Set proper permissions
 echo "Setting permissions..."
 chown -R hhlab:hhlab /opt/hedgehog
+chown -R hhlab:hhlab /opt/hedgehog-lab
 chown -R hhlab:hhlab /var/lib/hedgehog-lab
 chown -R hhlab:hhlab /var/log/hedgehog-lab
 chmod 755 /usr/local/bin/hedgehog-lab-orchestrator
 chmod 755 /usr/local/bin/hedgehog-k3d-init
 chmod 755 /usr/local/bin/hedgehog-vlab-init
 chmod 755 /usr/local/bin/hhfab-vlab-runner
+chmod 755 /usr/local/bin/hedgehog-gitops-init
+chmod 755 /usr/local/bin/hedgehog-argocd-app-init
+chmod 755 /usr/local/bin/hedgehog-prometheus-scrape
 chmod 755 /usr/local/bin/hedgehog-lab-readiness-ui
 chmod 755 /usr/local/bin/hh-lab
 
@@ -147,9 +206,16 @@ echo "  - Main orchestrator: /usr/local/bin/hedgehog-lab-orchestrator"
 echo "  - k3d module: /usr/local/bin/hedgehog-k3d-init"
 echo "  - VLAB module: /usr/local/bin/hedgehog-vlab-init"
 echo "  - VLAB runner: /usr/local/bin/hhfab-vlab-runner"
+echo "  - GitOps module: /usr/local/bin/hedgehog-gitops-init"
+echo "  - ArgoCD App module: /usr/local/bin/hedgehog-argocd-app-init"
+echo "  - Prometheus scrape module: /usr/local/bin/hedgehog-prometheus-scrape"
 echo "  - Readiness UI: /usr/local/bin/hedgehog-lab-readiness-ui"
 echo "  - hh-lab CLI: /usr/local/bin/hh-lab"
 echo "  - Bash completion: /etc/bash_completion.d/hh-lab"
+echo ""
+echo "Configuration assets:"
+echo "  - GitOps seed: /opt/hedgehog-lab/configs/gitops"
+echo "  - Grafana dashboards: /opt/hedgehog-lab/configs/grafana"
 echo ""
 echo "Systemd services:"
 echo "  - Main orchestrator: /etc/systemd/system/hedgehog-lab-init.service"
@@ -160,4 +226,5 @@ echo "  - Config directory: /etc/hedgehog-lab"
 echo "  - State directory: /var/lib/hedgehog-lab"
 echo "  - Log directory: /var/log/hedgehog-lab"
 echo "  - VLAB working directory: /opt/hedgehog/vlab"
+echo "  - Lab configs: /opt/hedgehog-lab/configs"
 echo ""

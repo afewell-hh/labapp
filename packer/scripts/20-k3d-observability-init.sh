@@ -277,6 +277,10 @@ prometheus:
         cpu: 2000m
         memory: 4Gi
 
+    # Additional scrape configs for Hedgehog fabric-proxy
+    # This will be populated after VLAB initialization
+    additionalScrapeConfigs: []
+
 # Alert manager configuration
 alertmanager:
   alertmanagerSpec:

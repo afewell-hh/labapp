@@ -1,0 +1,30 @@
+---
+# Simple VPC Example
+# A basic VPC with a single IPv4 subnet for static IP assignments
+#
+# Use Case: Small application that needs a few static IPs for servers
+#
+# This example creates:
+# - VPC named "simple-vpc"
+# - One subnet (10.10.10.0/24) with 254 usable IPs
+# - Gateway at 10.10.10.1
+# - VLAN 1010 for layer 2 isolation
+#
+# After applying, attach this VPC to server connections using VPCAttachment
+apiVersion: vpc.githedgehog.com/v1beta1
+kind: VPC
+metadata:
+  name: simple-vpc
+  namespace: default
+spec:
+  # IP and VLAN allocation groups (use "default" for most cases)
+  ipv4Namespace: default
+  vlanNamespace: default
+
+  # Subnets within this VPC
+  subnets:
+    app-servers:
+      subnet: 10.10.10.0/24      # CIDR block (254 usable IPs: .1-.254)
+      gateway: 10.10.10.1        # Gateway IP (first usable IP)
+      vlan: 1010                 # VLAN ID (must be unique in vlanNamespace)
+      # No DHCP block = static IP assignments only

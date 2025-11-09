@@ -1,0 +1,51 @@
+---
+# VPCAttachment Example
+# Attaches a VPC subnet to server connections in the fabric
+#
+# Use Case: After creating a VPC, you need to "wire" it to actual servers
+#
+# This example attaches the "web-app-vpc" to server connections:
+# - server-01 gets the "frontend" subnet
+# - server-02 gets the "backend" subnet (with DHCP)
+#
+# Connection names come from the wiring diagram (run: kubectl fabric vlabsetup inspect)
+# Format: <server-name>--<switch-name>
+#
+# Prerequisites:
+# - VPC "web-app-vpc" must exist (see vpc-multi-subnet.yaml)
+# - Server connections must exist in the fabric wiring
+#
+# Verification:
+# - kubectl get vpcattachments
+# - kubectl describe vpcattachment frontend-server-01
+# - Check Grafana Interface dashboard for port statistics
+---
+apiVersion: vpc.githedgehog.com/v1beta1
+kind: VPCAttachment
+metadata:
+  name: frontend-server-01
+  namespace: default
+spec:
+  vpc: web-app-vpc                # Reference to VPC name
+  subnet: frontend                # Subnet within the VPC (static IPs)
+  connection: server-01--leaf-01  # Server connection from wiring diagram
+---
+apiVersion: vpc.githedgehog.com/v1beta1
+kind: VPCAttachment
+metadata:
+  name: backend-server-02
+  namespace: default
+spec:
+  vpc: web-app-vpc
+  subnet: backend                 # Subnet with DHCP enabled
+  connection: server-02--leaf-01  # Different server connection
+---
+apiVersion: vpc.githedgehog.com/v1beta1
+kind: VPCAttachment
+metadata:
+  name: backend-server-03
+  namespace: default
+spec:
+  vpc: web-app-vpc
+  subnet: backend                 # Multiple servers can use same subnet
+  connection: server-03--leaf-02  # Servers can be on different leaf switches

@@ -393,13 +393,31 @@ tail -f /var/log/hedgehog-lab/modules/vlab.log
 
 The orchestrator enforces a strict initialization order to ensure proper operation:
 
-1. **Network** - Wait for network connectivity
-2. **VLAB** - Initialize Hedgehog VLAB (MUST complete first)
-3. **k3d** - Initialize k3d observability cluster (requires VLAB's controller interface)
-4. **GitOps** - Deploy ArgoCD and Gitea
-5. **Observability** - Deploy Prometheus and Grafana
+1. **Network** - Wait for network connectivity (max 5 minutes)
+2. **VLAB** - Initialize Hedgehog VLAB (15-20 minutes, MUST complete first)
+   - Runs `hhfab vlab up` in persistent tmux session
+   - Creates Hedgehog controller with fabric switches
+   - Provides host-facing API at `https://172.19.0.1:6443`
+3. **k3d Cluster** - Initialize k3d observability cluster (5-10 minutes)
+   - Deploys Prometheus, Grafana, ArgoCD, Gitea
+   - Exposes services on localhost ports (3000, 8080, 3001, etc.)
+4. **GitOps Repository** - Seed `student/hedgehog-config` in Gitea (1-2 minutes)
+   - Creates `student` organization in Gitea
+   - Creates `hedgehog-config` repository
+   - Seeds with example VPC manifests and documentation
+5. **ArgoCD Application** - Configure GitOps sync (1-2 minutes)
+   - Creates cluster secret for Hedgehog controller
+   - Creates ArgoCD Application `hedgehog-fabric`
+   - Enables automated sync with self-heal to VLAB controller
+6. **Observability Config** - Configure Prometheus scraping (1 minute)
+   - Adds scrape config for Hedgehog fabric-proxy metrics
+   - Configures metrics collection from fabric switches
+7. **Service Finalization** - Final health checks and status reporting
 
-This order is critical because the k3d cluster needs to connect to the VLAB controller's host-facing interface.
+This order is critical because:
+- VLAB must complete before k3d can connect to its API
+- GitOps repository must exist before ArgoCD can sync it
+- Prometheus must be running before adding Hedgehog scrape targets
 
 **Manual control:**
 ```bash
