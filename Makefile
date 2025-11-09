@@ -1,7 +1,7 @@
 # Makefile for Hedgehog Lab Appliance
 # Build automation for Packer-based VM images
 
-.PHONY: help validate build-standard clean install-deps
+.PHONY: help init validate build-standard clean install-deps
 
 # Default target
 .DEFAULT_GOAL := help
@@ -25,7 +25,12 @@ install-deps: ## Install build dependencies
 	@which qemu-system-x86_64 > /dev/null || (echo "Installing QEMU..." && sudo apt-get install -y qemu-system-x86 qemu-utils)
 	@echo "Dependencies installed successfully"
 
-validate: ## Validate Packer templates
+init: ## Initialize Packer plugins
+	@echo "Initializing Packer plugins..."
+	$(PACKER) init packer/standard-build.pkr.hcl
+	@echo "Packer plugins initialized successfully"
+
+validate: init ## Validate Packer templates
 	@echo "Validating Packer template..."
 	$(PACKER) validate packer/standard-build.pkr.hcl
 	@echo "Validation successful!"
