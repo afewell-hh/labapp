@@ -94,6 +94,68 @@ check_prerequisites() {
     return 0
 }
 
+# Wait for ArgoCD CRDs and controllers to be ready
+wait_for_argocd_ready() {
+    log_info "Waiting for ArgoCD CRDs and controllers to be ready..."
+
+    local max_wait=300  # 5 minutes
+    local elapsed=0
+    local check_interval=5
+
+    # First, wait for the Application CRD to be established
+    log_info "Waiting for Application CRD to be registered..."
+    while [ $elapsed -lt $max_wait ]; do
+        if kubectl get crd applications.argoproj.io &> /dev/null; then
+            log_info "Application CRD is registered"
+            break
+        fi
+
+        sleep "$check_interval"
+        elapsed=$((elapsed + check_interval))
+
+        if [ $((elapsed % 30)) -eq 0 ]; then
+            log_info "Still waiting for Application CRD... (${elapsed}s elapsed)"
+        fi
+    done
+
+    if [ $elapsed -ge $max_wait ]; then
+        log_error "Application CRD not available after ${max_wait}s"
+        return 1
+    fi
+
+    # Wait for ArgoCD pods to be ready
+    log_info "Waiting for ArgoCD pods to be ready..."
+    elapsed=0
+    while [ $elapsed -lt $max_wait ]; do
+        # Check if application-controller is ready
+        local controller_ready
+        controller_ready=$(kubectl get pods -n "$ARGOCD_NAMESPACE" \
+            -l app.kubernetes.io/name=argocd-application-controller \
+            -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+
+        # Check if server is ready
+        local server_ready
+        server_ready=$(kubectl get pods -n "$ARGOCD_NAMESPACE" \
+            -l app.kubernetes.io/name=argocd-server \
+            -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+
+        if [ "$controller_ready" = "True" ] && [ "$server_ready" = "True" ]; then
+            log_info "ArgoCD controllers are ready"
+            return 0
+        fi
+
+        sleep "$check_interval"
+        elapsed=$((elapsed + check_interval))
+
+        if [ $((elapsed % 30)) -eq 0 ]; then
+            log_info "Still waiting for ArgoCD pods... (${elapsed}s elapsed)"
+        fi
+    done
+
+    log_error "ArgoCD pods not ready after ${max_wait}s"
+    return 1
+}
+
 # Wait for Hedgehog controller API to be accessible
 wait_for_hedgehog_api() {
     log_info "Waiting for Hedgehog controller API to be accessible..."
@@ -373,6 +435,11 @@ main() {
     # Execute initialization steps
     if ! check_prerequisites; then
         log_error "Prerequisites check failed"
+        return 1
+    fi
+
+    if ! wait_for_argocd_ready; then
+        log_error "ArgoCD CRDs and controllers not ready"
         return 1
     fi
 
