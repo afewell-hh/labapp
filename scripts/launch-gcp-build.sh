@@ -520,13 +520,19 @@ launch_build() {
         preemptible_flag="--preemptible"
     fi
 
+    # Convert boolean GCP_ENABLE_PREEMPTIBLE to gcloud provisioning model
+    local provisioning_model="STANDARD"
+    if [[ "${GCP_ENABLE_PREEMPTIBLE:-false}" == "true" ]]; then
+        provisioning_model="SPOT"
+    fi
+
     gcloud compute instances create "$instance_name" \
         --project="${GCP_PROJECT_ID}" \
         --zone="${GCP_ZONE}" \
         --machine-type="${GCP_MACHINE_TYPE:-n2-standard-32}" \
         --network-interface="network-tier=PREMIUM,subnet=${GCP_NETWORK:-default}" \
         --maintenance-policy=TERMINATE \
-        --provisioning-model="${GCP_ENABLE_PREEMPTIBLE:-false}" \
+        --provisioning-model="${provisioning_model}" \
         --service-account="${GCP_SERVICE_ACCOUNT:-default}" \
         --scopes=https://www.googleapis.com/auth/devstorage.full_control,https://www.googleapis.com/auth/cloud-platform \
         --create-disk="auto-delete=yes,boot=yes,device-name=${instance_name},image=projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts,mode=rw,size=${GCP_DISK_SIZE:-600},type=projects/${GCP_PROJECT_ID}/zones/${GCP_ZONE}/diskTypes/${GCP_DISK_TYPE:-pd-ssd}" \
