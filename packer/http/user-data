@@ -50,6 +50,7 @@ autoinstall:
     - chmod 440 /target/etc/sudoers.d/hhlab
     - curtin in-target --target=/target -- systemctl enable ssh
     # Ensure SSH is ready by creating a marker file
+    - curtin in-target --target=/target -- mkdir -p /var/lib/cloud/instance
     - curtin in-target --target=/target -- touch /var/lib/cloud/instance/boot-finished
 
   # User data - disable auto-updates during provisioning
