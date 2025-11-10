@@ -4,6 +4,7 @@ Documentation=https://github.com/afewell-hh/labapp
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=!/var/lib/hedgehog-lab/initialized
+ConditionPathExists=/var/lib/hedgehog-lab/ghcr-authenticated
 
 [Service]
 Type=oneshot
