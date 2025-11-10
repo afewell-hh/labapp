@@ -106,26 +106,24 @@ else
     exit 1
 fi
 
-# Install GitOps seed configuration
+# Install GitOps seed configuration (optional - will be added in Issue #74)
 echo "Installing GitOps seed configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/gitops" ]; then
     mkdir -p /opt/hedgehog-lab/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /opt/hedgehog-lab/configs/
     echo "GitOps seed configs installed at /opt/hedgehog-lab/configs/gitops"
 else
-    echo "ERROR: GitOps seed configs not found"
-    exit 1
+    echo "WARNING: GitOps seed configs not found, skipping (will be added in Issue #74)"
 fi
 
-# Install Grafana dashboard configuration
+# Install Grafana dashboard configuration (optional - will be added in Issue #74)
 echo "Installing Grafana dashboard configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/grafana" ]; then
     mkdir -p /opt/hedgehog-lab/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /opt/hedgehog-lab/configs/
     echo "Grafana configs installed at /opt/hedgehog-lab/configs/grafana"
 else
-    echo "ERROR: Grafana configs not found"
-    exit 1
+    echo "WARNING: Grafana configs not found, skipping (will be added in Issue #74)"
 fi
 
 # Install hh-lab CLI tool
