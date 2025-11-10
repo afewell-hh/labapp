@@ -31,7 +31,8 @@ systemctl enable lightdm
 # Install xRDP for RDP access
 echo "Installing xRDP for RDP access..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    xrdp
+    xrdp \
+    xorgxrdp
 
 # Configure xRDP
 echo "Configuring xRDP..."
