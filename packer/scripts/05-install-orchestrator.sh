@@ -182,6 +182,8 @@ echo "Build type set to: standard"
 
 # Set proper permissions
 echo "Setting permissions..."
+# Create directories if they don't exist (some may not be created if configs are missing)
+mkdir -p /opt/hedgehog-lab /var/lib/hedgehog-lab /var/log/hedgehog-lab
 chown -R hhlab:hhlab /opt/hedgehog
 chown -R hhlab:hhlab /opt/hedgehog-lab
 chown -R hhlab:hhlab /var/lib/hedgehog-lab
