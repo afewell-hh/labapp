@@ -20,17 +20,17 @@ variable "version" {
 
 variable "ubuntu_version" {
   type    = string
-  default = "22.04.5"
+  default = "24.04.3"
 }
 
 variable "iso_url" {
   type    = string
-  default = "https://releases.ubuntu.com/22.04/ubuntu-22.04.5-live-server-amd64.iso"
+  default = "https://releases.ubuntu.com/noble/ubuntu-24.04.3-live-server-amd64.iso"
 }
 
 variable "iso_checksum" {
   type    = string
-  default = "sha256:9bc6028870aef3f74f4e16b900008179e78b130e6b0b9a140635434a46aa98b0"
+  default = "sha256:c3514bf0056180d09376462a7a1b4f213c1d6e8ea67fae5c25099c6fd3d8274b"
 }
 
 variable "vm_name" {
@@ -161,7 +161,8 @@ build {
       "packer/scripts/01-install-base.sh",
       "packer/scripts/02-install-k3d.sh",
       "packer/scripts/03-install-hhfab.sh",
-      "packer/scripts/04-install-tools.sh"
+      "packer/scripts/04-install-tools.sh",
+      "packer/scripts/04.5-install-desktop.sh"
     ]
     execute_command = "echo '${var.ssh_password}' | sudo -S bash -c '{{ .Path }}'"
   }
