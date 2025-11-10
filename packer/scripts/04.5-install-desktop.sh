@@ -64,7 +64,8 @@ systemctl enable xrdp-sesman
 echo "Installing TigerVNC server..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     tigervnc-standalone-server \
-    tigervnc-common
+    tigervnc-common \
+    tigervnc-tools
 
 # Configure VNC for user hhlab
 echo "Configuring VNC server for hhlab user..."
