@@ -130,8 +130,8 @@ source "qemu" "ubuntu" {
   # SSH settings
   ssh_username           = var.ssh_username
   ssh_password           = var.ssh_password
-  ssh_timeout            = "30m"
-  ssh_handshake_attempts = 100
+  ssh_timeout            = "45m"
+  ssh_handshake_attempts = 500
 
   # Shutdown
   shutdown_command = "echo '${var.ssh_password}' | sudo -S shutdown -P now"
