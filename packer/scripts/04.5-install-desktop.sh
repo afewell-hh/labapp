@@ -52,8 +52,9 @@ EOF
 chmod +x /etc/xrdp/startxfce.sh
 
 # Configure xRDP to use XFCE
+# Replace the default Xsession exec with our XFCE startup script
 sed -i 's|^test -x /etc/X11/Xsession|#test -x /etc/X11/Xsession|' /etc/xrdp/startwm.sh
-echo "/etc/xrdp/startxfce.sh" >> /etc/xrdp/startwm.sh
+sed -i 's|^exec /bin/sh /etc/X11/Xsession|exec /etc/xrdp/startxfce.sh|' /etc/xrdp/startwm.sh
 
 # Enable and start xRDP service
 systemctl enable xrdp
@@ -114,6 +115,9 @@ systemctl enable vncserver@1.service
 
 # Install VS Code
 echo "Installing Visual Studio Code..."
+
+# Install gnupg for key management (required on minimal Ubuntu images)
+DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg
 
 # Add Microsoft GPG key and repository
 wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/packages.microsoft.gpg
