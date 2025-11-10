@@ -232,11 +232,13 @@ EOF
 
 chown hhlab:hhlab /home/hhlab/Desktop/README.txt
 
-# Configure firewall rules for RDP and VNC (if ufw is active)
-if systemctl is-active --quiet ufw; then
+# Configure firewall rules for RDP and VNC (if ufw is installed and active)
+if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw; then
     echo "Configuring firewall rules..."
     ufw allow 3389/tcp comment 'RDP access'
     ufw allow 5901/tcp comment 'VNC access'
+else
+    echo "UFW not installed or not active, skipping firewall configuration"
 fi
 
 echo "=================================================="
