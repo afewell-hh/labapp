@@ -14,6 +14,8 @@ STAMP_FILE="/var/lib/hedgehog-lab/initialized"
 BUILD_TYPE_FILE="/etc/hedgehog-lab/build-type"
 LOG_FILE="/var/log/hedgehog-lab-init.log"
 MODULE_LOG_DIR="/var/log/hedgehog-lab/modules"
+GHCR_CREDS_MARKER="/var/lib/hedgehog-lab/ghcr-authenticated"
+SETUP_LOG="/var/log/hedgehog-lab/setup.log"
 
 # ANSI color codes for colored output
 RED='\033[0;31m'
@@ -230,6 +232,28 @@ cmd_status() {
     fi
 
     print_label "  Build Type" "$build_type"
+    echo ""
+
+    # Credentials status
+    print_header "Credentials"
+    echo ""
+
+    echo -n "  GHCR Authentication: "
+    if [ -f "$GHCR_CREDS_MARKER" ]; then
+        print_status_ok
+        # Read authentication info if readable
+        if [ -r "$GHCR_CREDS_MARKER" ]; then
+            local ghcr_user=$(grep "username" "$GHCR_CREDS_MARKER" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
+            local ghcr_date=$(grep "authenticated_at" "$GHCR_CREDS_MARKER" | sed 's/.*: "\([^"]*\)".*/\1/' || echo "unknown")
+            print_label "    Username" "$ghcr_user"
+            print_label "    Authenticated" "$ghcr_date"
+        fi
+    else
+        print_status_fail
+        echo ""
+        print_warning "  GHCR credentials not configured"
+        print_info "  Run 'hh-lab setup' to configure credentials"
+    fi
     echo ""
 
     # Services Health
@@ -561,6 +585,131 @@ cmd_info() {
     echo ""
 }
 
+# setup command - configure GHCR credentials and start lab initialization
+cmd_setup() {
+    print_header "Hedgehog Lab Setup"
+    echo ""
+
+    # Ensure log directory and file exist
+    mkdir -p "$(dirname "$SETUP_LOG")" 2>/dev/null || true
+    touch "$SETUP_LOG" 2>/dev/null || true
+
+    # Check if already set up
+    if [ -f "$GHCR_CREDS_MARKER" ]; then
+        print_warning "GHCR credentials are already configured"
+        echo ""
+        read -r -p "Do you want to re-configure credentials? [y/N] " response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Setup cancelled"
+            return 0
+        fi
+        # Remove old marker
+        sudo rm -f "$GHCR_CREDS_MARKER" 2>/dev/null || true
+    fi
+
+    # Display instructions
+    cat <<EOF
+This setup wizard will configure your lab environment with GitHub Container
+Registry (GHCR) credentials required to pull Hedgehog container images.
+
+You will need:
+  - A GitHub username
+  - A GitHub Personal Access Token (PAT) with 'read:packages' scope
+
+To create a PAT:
+  1. Go to https://github.com/settings/tokens
+  2. Click "Generate new token" (classic)
+  3. Give it a descriptive name (e.g., "Hedgehog Lab")
+  4. Select the 'read:packages' scope
+  5. Click "Generate token" and copy it immediately
+
+EOF
+
+    # Prompt for GHCR username
+    read -r -p "Enter your GitHub username: " ghcr_username
+    if [ -z "$ghcr_username" ]; then
+        print_error "Username cannot be empty"
+        return 1
+    fi
+
+    # Prompt for GHCR token (hide input)
+    echo ""
+    read -r -s -p "Enter your GitHub Personal Access Token: " ghcr_token
+    echo ""
+
+    if [ -z "$ghcr_token" ]; then
+        print_error "Token cannot be empty"
+        return 1
+    fi
+
+    # Perform docker login
+    echo ""
+    print_info "Authenticating with ghcr.io..."
+
+    # Try docker login and capture output
+    if echo "$ghcr_token" | sudo docker login ghcr.io -u "$ghcr_username" --password-stdin >> "$SETUP_LOG" 2>&1; then
+        print_success "Successfully authenticated with ghcr.io"
+
+        # Create marker file
+        sudo mkdir -p "$(dirname "$GHCR_CREDS_MARKER")"
+        sudo tee "$GHCR_CREDS_MARKER" > /dev/null <<MARKER_EOF
+{
+  "authenticated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "username": "$ghcr_username",
+  "registry": "ghcr.io"
+}
+MARKER_EOF
+
+        # Unset variables containing sensitive data
+        ghcr_token=""
+        unset ghcr_token
+
+        echo ""
+        print_info "Credentials have been configured and the token has been securely discarded"
+        print_info "You can now start the lab initialization"
+        echo ""
+
+        # Ask if user wants to start initialization now
+        read -r -p "Would you like to start lab initialization now? [Y/n] " start_now
+        if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
+            print_info "Starting lab initialization..."
+            echo ""
+
+            # Start the hedgehog-lab-init service
+            if sudo systemctl start hedgehog-lab-init.service; then
+                print_success "Lab initialization started"
+                echo ""
+                print_info "You can monitor progress with:"
+                echo "  - hh-lab status"
+                echo "  - hh-lab logs -f"
+                echo "  - hh-lab monitor"
+                echo ""
+            else
+                print_error "Failed to start lab initialization"
+                print_info "Try manually with: sudo systemctl start hedgehog-lab-init.service"
+                return 1
+            fi
+        else
+            echo ""
+            print_info "Lab initialization not started"
+            print_info "Start it manually with: sudo systemctl start hedgehog-lab-init.service"
+            echo ""
+        fi
+    else
+        print_error "Authentication failed"
+        print_info "Please check your username and token"
+        print_info "See logs at: $SETUP_LOG"
+
+        # Unset variables containing sensitive data
+        ghcr_token=""
+        unset ghcr_token
+
+        return 1
+    fi
+
+    return 0
+}
+
 # help command - show usage information
 cmd_help() {
     cat <<EOF
@@ -575,12 +724,34 @@ ${BOLD}DESCRIPTION${NC}
     Provides status checking, log viewing, and system information commands.
 
 ${BOLD}COMMANDS${NC}
+    ${BOLD}setup${NC}
+        Configure GHCR credentials and initialize the lab
+
+        This command prompts for GitHub Container Registry credentials,
+        performs 'docker login ghcr.io', and optionally starts the lab
+        initialization process.
+
+        IMPORTANT: Run this command FIRST on a new appliance before
+        using any other lab features. The credentials are required to
+        pull Hedgehog container images.
+
+        The setup wizard will:
+        - Prompt for GitHub username
+        - Prompt for GitHub Personal Access Token (PAT)
+        - Authenticate with ghcr.io
+        - Create a credentials marker file
+        - Optionally start lab initialization
+
+        Tokens are never stored permanently and are wiped from memory
+        after successful authentication.
+
     ${BOLD}status${NC}
         Display comprehensive lab status
 
         Shows:
         - Build type (standard/prewarmed)
         - Initialization status
+        - Credentials status (whether GHCR login has been performed)
         - Service health (k3d, VLAB, ArgoCD, Gitea, Grafana, Prometheus)
         - Resource counts (switches, VPCs, K8s nodes)
         - Current scenario
@@ -700,6 +871,9 @@ main() {
 
     # Dispatch to command handler
     case "$command" in
+        setup)
+            cmd_setup "$@"
+            ;;
         status)
             cmd_status "$@"
             ;;
