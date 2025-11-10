@@ -67,14 +67,12 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 # Configure VNC for user hhlab
 echo "Configuring VNC server for hhlab user..."
 
-# Create VNC password for hhlab user (password: hhlab)
-# Note: This is for lab/demo use only
+# Create VNC directory and set ownership first
 mkdir -p /home/hhlab/.vnc
-cat > /home/hhlab/.vnc/passwd <<'EOF'
-hhlab
-EOF
+chown -R hhlab:hhlab /home/hhlab/.vnc
 
-# Set VNC password using vncpasswd
+# Set VNC password using vncpasswd (must run after ownership is set)
+# Note: Password is 'hhlab' - for lab/demo use only
 echo -e "hhlab\nhhlab" | sudo -u hhlab vncpasswd
 
 # Create VNC xstartup script
@@ -86,7 +84,7 @@ exec startxfce4
 EOF
 
 chmod +x /home/hhlab/.vnc/xstartup
-chown -R hhlab:hhlab /home/hhlab/.vnc
+chown hhlab:hhlab /home/hhlab/.vnc/xstartup
 
 # Create systemd service for VNC
 cat > /etc/systemd/system/vncserver@.service <<'EOF'
