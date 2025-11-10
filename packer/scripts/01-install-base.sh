@@ -97,8 +97,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3-dev
 
 # Install common Python packages
-pip3 install --no-cache-dir --upgrade pip setuptools wheel
-pip3 install --no-cache-dir pyyaml requests jinja2
+# Ubuntu 24.04 uses PEP 668 externally-managed environment, use --break-system-packages for system-wide install
+pip3 install --break-system-packages --no-cache-dir --upgrade pip setuptools wheel
+pip3 install --break-system-packages --no-cache-dir pyyaml requests jinja2
 
 # Optimize memory usage
 echo "Configuring memory optimizations..."
