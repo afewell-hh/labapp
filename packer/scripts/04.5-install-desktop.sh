@@ -71,9 +71,10 @@ echo "Configuring VNC server for hhlab user..."
 mkdir -p /home/hhlab/.vnc
 chown -R hhlab:hhlab /home/hhlab/.vnc
 
-# Set VNC password using vncpasswd (must run after ownership is set)
+# Set VNC password using vncpasswd non-interactive mode
 # Note: Password is 'hhlab' - for lab/demo use only
-echo -e "hhlab\nhhlab" | sudo -u hhlab vncpasswd
+echo 'hhlab' | vncpasswd -f | sudo -u hhlab tee /home/hhlab/.vnc/passwd > /dev/null
+sudo -u hhlab chmod 600 /home/hhlab/.vnc/passwd
 
 # Create VNC xstartup script
 cat > /home/hhlab/.vnc/xstartup <<'EOF'
