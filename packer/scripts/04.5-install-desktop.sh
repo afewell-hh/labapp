@@ -75,7 +75,8 @@ chown -R hhlab:hhlab /home/hhlab/.vnc
 
 # Set VNC password using vncpasswd non-interactive mode
 # Note: Password is 'hhlab' - for lab/demo use only
-echo 'hhlab' | vncpasswd -f | sudo -u hhlab tee /home/hhlab/.vnc/passwd > /dev/null
+# Use full path to vncpasswd as it may not be in PATH immediately after install
+echo 'hhlab' | /usr/bin/vncpasswd -f | sudo -u hhlab tee /home/hhlab/.vnc/passwd > /dev/null
 sudo -u hhlab chmod 600 /home/hhlab/.vnc/passwd
 
 # Create VNC xstartup script
