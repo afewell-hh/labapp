@@ -216,6 +216,54 @@ wait_for_network() {
     fi
 }
 
+install_hhfab() {
+    local module_log="/var/log/hedgehog-lab/modules/hhfab-install.log"
+
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
+    log_info "Installing hhfab CLI..." | tee -a "$module_log"
+
+    # Check if hhfab is already installed
+    if command -v hhfab &> /dev/null; then
+        local hhfab_version
+        hhfab_version=$(hhfab --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' || echo "unknown")
+        log_info "hhfab is already installed (version: $hhfab_version)" | tee -a "$module_log"
+        return 0
+    fi
+
+    # Check if GHCR credentials are configured
+    if [ ! -f "/var/lib/hedgehog-lab/ghcr-authenticated" ]; then
+        log_error "GHCR credentials not configured. Please run 'hh-lab setup' first." | tee -a "$module_log"
+        return 1
+    fi
+
+    log_info "GHCR credentials found. Proceeding with installation..." | tee -a "$module_log"
+
+    # Download and run the hhfab installer
+    # The installer uses 'oras' which will automatically use the Docker credentials from ~/.docker/config.json
+    log_info "Downloading hhfab installer from https://i.hhdev.io/hhfab..." | tee -a "$module_log"
+
+    if curl -fsSL https://i.hhdev.io/hhfab | bash >> "$module_log" 2>&1; then
+        log_info "hhfab installer completed successfully" | tee -a "$module_log"
+
+        # Verify installation
+        if command -v hhfab &> /dev/null; then
+            local hhfab_version
+            hhfab_version=$(hhfab --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' || echo "unknown")
+            log_info "hhfab successfully installed (version: $hhfab_version)" | tee -a "$module_log"
+            return 0
+        else
+            log_error "hhfab installer ran but command not found" | tee -a "$module_log"
+            return 1
+        fi
+    else
+        log_error "hhfab installer failed. See $module_log for details" | tee -a "$module_log"
+        return 1
+    fi
+}
+
 init_k3d_cluster() {
     local module_log="/var/log/hedgehog-lab/modules/k3d.log"
     local k3d_script="/usr/local/bin/hedgehog-k3d-init"
@@ -435,20 +483,22 @@ if [ "$BUILD_TYPE" = "standard" ]; then
     log_info "IMPORTANT: VLAB must complete before EMC/GitOps initialization"
     log_info ""
 
-    TOTAL_STEPS=7
+    TOTAL_STEPS=8
     execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
-    # VLAB MUST initialize first (Issue #73) - it provides the controller interface for EMC
-    execute_step "Initialize VLAB" 2 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
+    # Install hhfab CLI (Bug #14) - required before VLAB initialization
+    execute_step "Install hhfab CLI" 2 $TOTAL_STEPS install_hhfab || error "hhfab installation failed"
+    # VLAB MUST initialize next (Issue #73) - it provides the controller interface for EMC
+    execute_step "Initialize VLAB" 3 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
     # k3d cluster can only start after VLAB is ready to provide host-facing connectivity
-    execute_step "Initialize k3d cluster" 3 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
+    execute_step "Initialize k3d cluster" 4 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
     # Seed GitOps repository in Gitea with student/hedgehog-config
-    execute_step "Seed GitOps repository" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
+    execute_step "Seed GitOps repository" 5 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
     # Create ArgoCD Application to sync repo to Hedgehog controller
-    execute_step "Deploy ArgoCD Application" 5 $TOTAL_STEPS deploy_argocd_app || error "ArgoCD Application deployment failed"
+    execute_step "Deploy ArgoCD Application" 6 $TOTAL_STEPS deploy_argocd_app || error "ArgoCD Application deployment failed"
     # Configure Prometheus to scrape Hedgehog fabric-proxy metrics
-    execute_step "Configure observability" 6 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
+    execute_step "Configure observability" 7 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
     # Note: Grafana dashboard import will be added when JSON files are available (Issue #74)
-    execute_step "Finalize services" 7 $TOTAL_STEPS start_services || error "Service finalization failed"
+    execute_step "Finalize services" 8 $TOTAL_STEPS start_services || error "Service finalization failed"
 
 else
     log_info "Pre-warmed build detected - starting services only"
