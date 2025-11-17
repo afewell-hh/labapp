@@ -30,6 +30,16 @@ apt-get update
 echo "Upgrading existing packages..."
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 
+# Expand root filesystem to consume full disk (Bug #23)
+if lsblk /dev/ubuntu-vg/ubuntu-lv &>/dev/null; then
+    echo "Expanding root logical volume to use all free space..."
+    lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+    echo "Resizing filesystem to match expanded LV..."
+    resize2fs /dev/ubuntu-vg/ubuntu-lv
+else
+    echo "WARNING: /dev/ubuntu-vg/ubuntu-lv not found; skipping LV expansion"
+fi
+
 # Install essential build tools and utilities
 echo "Installing essential packages..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \

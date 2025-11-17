@@ -50,12 +50,6 @@ autoinstall:
     - echo 'hhlab ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/hhlab
     - chmod 440 /target/etc/sudoers.d/hhlab
     - curtin in-target --target=/target -- systemctl enable ssh
-    - curtin in-target --target=/target -- lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
-    - curtin in-target --target=/target -- resize2fs /dev/ubuntu-vg/ubuntu-lv
-    - curtin in-target --target=/target -- install -d -o hhlab -g hhlab -m 700 /home/hhlab/.ssh
-    - curtin in-target --target=/target -- touch /home/hhlab/.ssh/authorized_keys
-    - curtin in-target --target=/target -- chown hhlab:hhlab /home/hhlab/.ssh/authorized_keys
-    - curtin in-target --target=/target -- chmod 600 /home/hhlab/.ssh/authorized_keys
 
   # User data - disable auto-updates during provisioning
   user-data:
