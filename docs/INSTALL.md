@@ -19,13 +19,13 @@ This guide walks you through downloading and installing the Hedgehog Lab Applian
 **Minimum:**
 - CPU: 4 cores (Intel VT-x or AMD-V virtualization support required)
 - RAM: 20 GB (4 GB for host + 16 GB for VM)
-- Disk: 120 GB free space
+- Disk: 320 GB free space
 - OS: Windows 10+, macOS 10.15+, or Linux
 
 **Recommended:**
 - CPU: 8+ cores with hardware virtualization
 - RAM: 32 GB (16 GB for host + 16 GB for VM)
-- Disk: 150 GB free space (SSD preferred)
+- Disk: 400 GB free space (SSD preferred)
 - Network: High-speed internet connection for initial download
 
 ### VM Resource Allocation
@@ -33,7 +33,7 @@ This guide walks you through downloading and installing the Hedgehog Lab Applian
 The appliance is configured with:
 - **vCPUs:** 8
 - **Memory:** 16 GB
-- **Disk:** 100 GB (dynamically allocated)
+- **Disk:** 300 GB (thin provisioned, dynamically allocated)
 - **Network:** 1 adapter (NAT or Bridged)
 
 ## Download
@@ -293,7 +293,10 @@ rm disk.raw hedgehog-lab.tar.gz *.vmdk *.ovf *.mf
 gcloud compute images create hedgehog-lab-20251110 \
     --source-uri=gs://${BUCKET_NAME}/images/hedgehog-lab.tar.gz \
     --guest-os-features=UEFI_COMPATIBLE,VIRTIO_SCSI_MULTIQUEUE \
+    --licenses="https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx" \
     --project=${PROJECT_ID}
+
+> **Why this matters:** The `enable-vmx` license flag is required for nested virtualization. Without it the imported image cannot expose `/dev/kvm`, causing hhfab VLAB to crash immediately (Bug #24).
 
 # Monitor progress
 gcloud compute images describe hedgehog-lab-20251110 --project=${PROJECT_ID}
@@ -308,7 +311,7 @@ gcloud compute instances create hedgehog-lab-instance \
     --zone=us-central1-a \
     --machine-type=n2-standard-16 \
     --image=hedgehog-lab-20251110 \
-    --boot-disk-size=100GB \
+    --boot-disk-size=300GB \
     --boot-disk-type=pd-ssd \
     --enable-nested-virtualization \
     --min-cpu-platform="Intel Cascade Lake" \
@@ -341,7 +344,7 @@ gcloud compute instances describe hedgehog-lab-instance \
 
 **Cost Considerations:**
 - **n2-standard-16** (16 vCPUs, 64GB RAM): ~$0.78/hour
-- **100GB SSD**: ~$17/month
+- **300GB SSD**: ~$50/month (pd-ssd)
 - **Stop when not in use** to save costs:
   ```bash
   gcloud compute instances stop hedgehog-lab-instance --zone=us-central1-a
@@ -358,6 +361,8 @@ gcloud compute instances describe hedgehog-lab-instance \
 The Hedgehog VLAB pulls container images from GitHub Container Registry (ghcr.io), which requires authentication. Even though the lab uses development configuration (`hhfab init --dev`), it still needs production container images from GHCR.
 
 ### First-Time Setup Process
+
+> **Tip:** `hh-lab setup` now copies Docker credentials to both `/root/.docker` and `/home/hhlab/.docker`, so the hhfab VLAB service can pull private images without manual fixes (Issue #92 / Bug #17).
 
 1. **VM Boots and Login**
    - GRUB bootloader appears

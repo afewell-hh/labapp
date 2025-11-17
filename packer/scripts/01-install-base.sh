@@ -72,7 +72,10 @@ echo "Installing virtualization support packages..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     qemu-guest-agent \
     linux-tools-virtual \
-    linux-cloud-tools-virtual
+    linux-cloud-tools-virtual \
+    qemu-utils \
+    qemu-system-x86 \
+    socat
 
 # Install Docker
 echo "Installing Docker..."
@@ -81,12 +84,18 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Add hhlab user to docker group
-usermod -aG docker hhlab
+# Add hhlab user to all required desktop/system groups (Bug #17 dependency)
+usermod -aG sudo,adm,dialout,cdrom,floppy,audio,dip,video,plugdev,netdev,docker hhlab
 
 # Enable and start Docker
 systemctl enable docker
 systemctl start docker
+
+# Ensure SSH directory exists with correct permissions for hhlab (Bug #15/#92)
+install -d -m 700 -o hhlab -g hhlab /home/hhlab/.ssh
+touch /home/hhlab/.ssh/authorized_keys
+chown hhlab:hhlab /home/hhlab/.ssh/authorized_keys
+chmod 600 /home/hhlab/.ssh/authorized_keys
 
 # Install Python 3 and pip
 echo "Installing Python 3 and related packages..."

@@ -40,8 +40,8 @@ variable "vm_name" {
 
 variable "disk_size" {
   type        = string
-  default     = "100000M"
-  description = "Virtual disk size (e.g., '100000M' for 100GB, or '100G'). QEMU accepts size with unit suffix."
+  default     = "300G"
+  description = "Virtual disk size (e.g., '300G' for 300GB). QEMU accepts size with unit suffix."
 }
 
 variable "memory" {

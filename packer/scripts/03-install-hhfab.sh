@@ -39,9 +39,22 @@ EOF
 mkdir -p /home/hhlab/go
 chown -R hhlab:hhlab /home/hhlab/go
 
-# Install hhfab CLI (placeholder - update with actual installation)
-# This will be updated when the actual hhfab tool is available
-echo "Hedgehog Fabric tool installation placeholder created"
+# Install oras CLI (required by hhfab installer - Bug #16)
+echo "Installing oras CLI dependency..."
+if curl -fsSL https://i.hhdev.io/oras | bash; then
+    if command -v oras &> /dev/null; then
+        oras --version 2>/dev/null || true
+        echo "oras CLI installed successfully"
+    else
+        echo "WARNING: oras installer completed but oras not found in PATH" >&2
+    fi
+else
+    echo "ERROR: Failed to install oras CLI" >&2
+    exit 1
+fi
+
+# Placeholder for future hhfab installation improvements
+echo "Hedgehog Fabric tool bootstrap complete"
 
 # Set permissions
 chown -R hhlab:hhlab /opt/hedgehog

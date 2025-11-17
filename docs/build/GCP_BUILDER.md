@@ -553,7 +553,7 @@ Create a persistent disk for Packer cache to speed up repeated builds:
 ```bash
 # Create persistent cache disk
 gcloud compute disks create packer-cache \
-  --size=100GB \
+  --size=300GB \
   --type=pd-ssd \
   --zone=$GCP_ZONE
 

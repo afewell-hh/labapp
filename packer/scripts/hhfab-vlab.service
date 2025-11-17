@@ -29,9 +29,9 @@ Environment="TERM=xterm-256color"
 WorkingDirectory=/opt/hedgehog/vlab
 
 # Security hardening
-NoNewPrivileges=true
-# Note: PrivateTmp is NOT enabled to allow students to attach to the tmux session
-# tmux stores sockets in /tmp/tmux-<uid>/ which must be accessible from login shells
+# NOTE: hhfab needs to run sudo helpers to create TAP devices. Disabling
+# NoNewPrivileges fixes Bug #21 (systemd prevented sudo escalation).
+# PrivateTmp stays disabled so tmux sockets remain accessible to students.
 
 [Install]
 WantedBy=multi-user.target
