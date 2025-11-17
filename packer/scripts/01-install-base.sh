@@ -94,8 +94,14 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Add hhlab user to all required desktop/system groups (Bug #17 dependency)
-usermod -aG sudo,adm,dialout,cdrom,floppy,audio,dip,video,plugdev,netdev,docker hhlab
+# Add hhlab user to required desktop/system groups (Bug #17 dependency)
+for grp in sudo adm dialout cdrom floppy audio dip video plugdev netdev docker; do
+    if getent group "$grp" >/dev/null; then
+        usermod -aG "$grp" hhlab
+    else
+        echo "WARNING: Group $grp not found; skipping"
+    fi
+done
 
 # Enable and start Docker
 systemctl enable docker
