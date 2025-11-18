@@ -364,6 +364,8 @@ The Hedgehog VLAB pulls container images from GitHub Container Registry (ghcr.io
 
 > **Tip:** `hh-lab setup` now copies Docker credentials to both `/root/.docker` and `/home/hhlab/.docker`, so the hhfab VLAB service can pull private images without manual fixes (Issue #92 / Bug #17).
 
+> **Heads-up:** The orchestrator refuses to start VLAB unless the root filesystem has at least 120 GB free (override with `VLAB_MIN_FREE_GB`). If you see an "insufficient disk space" error, expand the boot disk or rerun the `lvextend`/`resize2fs` commands described earlier (Issue #92 / Bug #22).
+
 1. **VM Boots and Login**
    - GRUB bootloader appears
    - Ubuntu 24.04 boots automatically

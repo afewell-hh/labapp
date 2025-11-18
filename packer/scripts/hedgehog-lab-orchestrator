@@ -11,6 +11,8 @@ LOG_FILE="/var/log/hedgehog-lab-init.log"
 STAMP_FILE="/var/lib/hedgehog-lab/initialized"
 BUILD_TYPE_FILE="/etc/hedgehog-lab/build-type"
 STATE_FILE="/var/lib/hedgehog-lab/state.json"
+# Bug #22 regression guard: ensure ample space before launching hhfab VLAB
+VLAB_MIN_FREE_GB="${VLAB_MIN_FREE_GB:-120}"
 
 # Global state tracking
 INITIALIZATION_FAILED=false
@@ -38,6 +40,32 @@ log_error() {
 
 log_debug() {
     log "DEBUG" "$@"
+}
+
+# Verify the specified mount point has at least X GB free
+check_disk_space() {
+    local mount_point="${1:-/}"
+    local min_free_gb="${2:-100}"
+    local available_gb
+
+    if ! available_gb=$(df -BG --output=avail "$mount_point" 2>/dev/null | tail -n 1 | tr -dc '0-9'); then
+        log_warn "Unable to determine free space on ${mount_point}; skipping disk preflight."
+        return 0
+    fi
+
+    if [ -z "$available_gb" ]; then
+        log_warn "Disk availability check returned no data for ${mount_point}; skipping."
+        return 0
+    fi
+
+    if [ "$available_gb" -lt "$min_free_gb" ]; then
+        log_error "Insufficient disk on ${mount_point}: ${available_gb}GB free (need at least ${min_free_gb}GB for VLAB)."
+        log_error "Expand the root LV or increase the boot disk (see Issue #92 / Bug #22)."
+        return 1
+    fi
+
+    log_info "Disk check passed: ${available_gb}GB free on ${mount_point} (>= ${min_free_gb}GB required)."
+    return 0
 }
 
 # Error handling with rollback capability
@@ -308,21 +336,41 @@ init_vlab() {
 
     log_info "Initializing Hedgehog VLAB via systemd service..." | tee -a "$module_log"
 
+    # Ensure enough disk space remains before launching hhfab (Bug #22)
+    if ! check_disk_space "/" "$VLAB_MIN_FREE_GB" | tee -a "$module_log"; then
+        log_error "VLAB initialization aborted due to insufficient disk space. Resize the disk/LV and rerun hh-lab setup." | tee -a "$module_log"
+        return 1
+    fi
+
     # Pre-check: if VLAB already initialized, skip service start
     if [ -f "/var/lib/hedgehog-lab/vlab-initialized" ]; then
         log_info "VLAB already initialized (state marker exists), skipping" | tee -a "$module_log"
         return 0
     fi
 
-    # Check if systemd service exists
-    if ! systemctl list-unit-files | grep -q "^${service_name}"; then
-        log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
-        return 1
+    # Check if systemd service exists (trigger daemon-reload if needed)
+    if ! systemctl list-unit-files "$service_name" >/dev/null 2>&1; then
+        log_warn "VLAB systemd service $service_name not registered yet; reloading systemd..." | tee -a "$module_log"
+        systemctl daemon-reload || log_warn "systemctl daemon-reload failed; continuing check" | tee -a "$module_log"
+        if ! systemctl list-unit-files "$service_name" >/dev/null 2>&1; then
+            log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
+            return 1
+        fi
+    fi
+
+    # Ensure Docker creds are available for hhlab before VLAB pull (Bug #17 fallback)
+    if [ -f /root/.docker/config.json ] && [ ! -f /home/hhlab/.docker/config.json ]; then
+        log_warn "hhlab Docker config missing; copying credentials from root" | tee -a "$module_log"
+        mkdir -p /home/hhlab/.docker
+        cp /root/.docker/config.json /home/hhlab/.docker/config.json
+        chown -R hhlab:hhlab /home/hhlab/.docker
+        chmod 600 /home/hhlab/.docker/config.json
     fi
 
     # Start the hhfab-vlab service
     log_info "Starting $service_name..." | tee -a "$module_log"
-    if ! systemctl start "$service_name"; then
+    systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
+    if ! systemctl restart "$service_name"; then
         log_error "Failed to start $service_name" | tee -a "$module_log"
         return 1
     fi

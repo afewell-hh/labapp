@@ -97,7 +97,7 @@ test_orchestrator_waits_for_service() {
     log_info "Test 4: Checking orchestrator waits for VLAB service completion..."
 
     # Check that init_vlab function waits for systemd service
-    if grep -A 50 "^init_vlab()" "$ORCHESTRATOR_SCRIPT" | grep -q "systemctl show"; then
+    if grep -A 120 "^init_vlab()" "$ORCHESTRATOR_SCRIPT" | grep -q "systemctl show"; then
         log_pass "Orchestrator waits for VLAB service state"
         return 0
     else
@@ -141,18 +141,18 @@ test_step_numbering() {
     fi
 }
 
-# Test 7: VLAB is step 2 (after network)
-test_vlab_is_step_2() {
-    log_info "Test 7: Checking VLAB is step 2 (after network wait)..."
+# Test 7: VLAB is step 3 (after network + hhfab install)
+test_vlab_is_step_3() {
+    log_info "Test 7: Checking VLAB is step 3 (after hhfab install)..."
 
-    # Check that "Initialize VLAB" is step 2
-    if grep -A 20 'BUILD_TYPE.*=.*"standard"' "$ORCHESTRATOR_SCRIPT" | \
+    # Check that "Initialize VLAB" is step 3
+    if grep -A 20 'BUILD_TYPE.*=.*\"standard\"' "$ORCHESTRATOR_SCRIPT" | \
        grep "execute_step.*Initialize VLAB" | \
-       grep -q "2"; then
-        log_pass "VLAB is step 2 (after network)"
+       grep -q " 3 "; then
+        log_pass "VLAB runs at step 3 after network + hhfab install"
         return 0
     else
-        log_fail "VLAB is not step 2"
+        log_fail "VLAB is not step 3"
         return 1
     fi
 }
@@ -209,6 +209,18 @@ test_log_ownership_setup() {
     fi
 }
 
+test_vlab_disk_check() {
+    log_info "Test 10: Checking VLAB preflight enforces disk space guard..."
+
+    if grep -A 40 "^init_vlab()" "$ORCHESTRATOR_SCRIPT" | grep -q "check_disk_space"; then
+        log_pass "init_vlab() calls check_disk_space before launching hhfab"
+        return 0
+    else
+        log_fail "init_vlab() is missing the disk space preflight check"
+        return 1
+    fi
+}
+
 # Main test execution
 main() {
     echo ""
@@ -224,9 +236,10 @@ main() {
     test_orchestrator_waits_for_service || true
     test_state_marker_check || true
     test_step_numbering || true
-    test_vlab_is_step_2 || true
+    test_vlab_is_step_3 || true
     test_vlab_first_comments || true
     test_log_ownership_setup || true
+    test_vlab_disk_check || true
 
     # Summary
     echo ""
