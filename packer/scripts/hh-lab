@@ -590,9 +590,11 @@ cmd_setup() {
     print_header "Hedgehog Lab Setup"
     echo ""
 
-    # Ensure log directory and file exist
-    mkdir -p "$(dirname "$SETUP_LOG")" 2>/dev/null || true
-    touch "$SETUP_LOG" 2>/dev/null || true
+    # Ensure log directory and file exist with proper permissions
+    # Create with sudo to ensure write access, then make writable for output redirection
+    sudo mkdir -p "$(dirname "$SETUP_LOG")" 2>/dev/null || true
+    sudo touch "$SETUP_LOG" 2>/dev/null || true
+    sudo chmod 666 "$SETUP_LOG" 2>/dev/null || true
 
     # Check if already set up
     if [ -f "$GHCR_CREDS_MARKER" ]; then
@@ -647,7 +649,8 @@ EOF
     print_info "Authenticating with ghcr.io..."
 
     # Try docker login and capture output
-    if echo "$ghcr_token" | sudo docker login ghcr.io -u "$ghcr_username" --password-stdin >> "$SETUP_LOG" 2>&1; then
+    # Use sh -c to ensure the redirect happens within sudo context
+    if echo "$ghcr_token" | sudo sh -c "docker login ghcr.io -u '$ghcr_username' --password-stdin >> '$SETUP_LOG' 2>&1"; then
         print_success "Successfully authenticated with ghcr.io"
 
         # Copy docker credentials for the hhlab user (Bug #17)
