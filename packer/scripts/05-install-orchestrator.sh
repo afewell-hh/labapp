@@ -109,9 +109,11 @@ fi
 # Install GitOps seed configuration (optional - will be added in Issue #74)
 echo "Installing GitOps seed configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/gitops" ]; then
-    mkdir -p /opt/hedgehog-lab/configs
+    mkdir -p /opt/hedgehog-lab/configs /usr/local/share/hedgehog/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /opt/hedgehog-lab/configs/
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /usr/local/share/hedgehog/configs/
     echo "GitOps seed configs installed at /opt/hedgehog-lab/configs/gitops"
+    echo "GitOps seed backup stored at /usr/local/share/hedgehog/configs/gitops"
 else
     echo "WARNING: GitOps seed configs not found, skipping (will be added in Issue #74)"
 fi
@@ -119,9 +121,11 @@ fi
 # Install Grafana dashboard configuration (optional - will be added in Issue #74)
 echo "Installing Grafana dashboard configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/grafana" ]; then
-    mkdir -p /opt/hedgehog-lab/configs
+    mkdir -p /opt/hedgehog-lab/configs /usr/local/share/hedgehog/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /opt/hedgehog-lab/configs/
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /usr/local/share/hedgehog/configs/
     echo "Grafana configs installed at /opt/hedgehog-lab/configs/grafana"
+    echo "Grafana configs backup stored at /usr/local/share/hedgehog/configs/grafana"
 else
     echo "WARNING: Grafana configs not found, skipping (will be added in Issue #74)"
 fi

@@ -12,7 +12,7 @@ ExecStart=/usr/local/bin/hhfab-vlab-runner
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=1800
+TimeoutStartSec=0
 Restart=no
 
 # Run as hhlab user for proper permissions
@@ -21,7 +21,7 @@ Group=hhlab
 
 # Environment
 Environment="VLAB_WORK_DIR=/opt/hedgehog/vlab"
-Environment="VLAB_TIMEOUT=1800"
+Environment="VLAB_TIMEOUT=7200"
 Environment="LOG_FILE=/var/log/hedgehog-lab/modules/vlab.log"
 Environment="TERM=xterm-256color"
 

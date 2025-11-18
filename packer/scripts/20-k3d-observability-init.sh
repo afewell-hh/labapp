@@ -473,6 +473,16 @@ persistence:
 # PostgreSQL (disabled, using SQLite for simplicity)
 postgresql:
   enabled: false
+
+# Disable bundled HA postgres/redis components to reduce resource usage
+postgresql-ha:
+  enabled: false
+
+valkey-cluster:
+  enabled: false
+
+redis-cluster:
+  enabled: false
 EOF
 
     # Install/upgrade chart (idempotent)
@@ -483,13 +493,19 @@ EOF
         --version "$GITEA_CHART_VERSION" \
         --values /tmp/gitea-values.yaml \
         --wait \
-        --timeout 10m >> "$LOG_FILE" 2>&1; then
+        --timeout 20m >> "$LOG_FILE" 2>&1; then
         log_error "Failed to install/upgrade Gitea"
         rm -f /tmp/gitea-values.yaml
         return 1
     fi
 
     rm -f /tmp/gitea-values.yaml
+    log_info "Waiting for Gitea deployment to become ready..."
+    if ! kubectl rollout status deployment/gitea -n "$GITEA_NAMESPACE" --timeout=600s >> "$LOG_FILE" 2>&1; then
+        log_error "Gitea deployment failed to become ready"
+        return 1
+    fi
+
     log_info "Gitea installed/upgraded successfully"
     log_info "Gitea admin username: gitea_admin"
     log_info "Gitea admin password: admin123"
