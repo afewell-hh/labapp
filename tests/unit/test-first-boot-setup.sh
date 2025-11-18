@@ -117,7 +117,7 @@ fi
 
 # Test 9: hh-lab help text documents setup command
 log_test "hh-lab help text documents setup command"
-if grep -q "setup}" "$HH_LAB_SCRIPT" && grep -q "Configure GHCR credentials" "$HH_LAB_SCRIPT"; then
+if grep -q 'setup.*NC}' "$HH_LAB_SCRIPT" && grep -q "Configure GHCR credentials" "$HH_LAB_SCRIPT"; then
     pass "hh-lab help text documents setup command"
 else
     fail "hh-lab help text missing setup command documentation"

@@ -124,8 +124,13 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 # Install common Python packages
 # Ubuntu 24.04 uses PEP 668 externally-managed environment, use --break-system-packages for system-wide install
 # Use --ignore-installed to avoid trying to uninstall Debian-packaged versions
-pip3 install --break-system-packages --ignore-installed --no-cache-dir --upgrade pip setuptools wheel
-pip3 install --break-system-packages --no-cache-dir pyyaml requests jinja2
+# Check if pip supports --break-system-packages (pip >= 23.0)
+PIP_BREAK_SYSTEM_FLAG=""
+if pip3 install --help 2>&1 | grep -q -- "--break-system-packages"; then
+    PIP_BREAK_SYSTEM_FLAG="--break-system-packages"
+fi
+pip3 install $PIP_BREAK_SYSTEM_FLAG --ignore-installed --no-cache-dir --upgrade pip setuptools wheel
+pip3 install $PIP_BREAK_SYSTEM_FLAG --no-cache-dir pyyaml requests jinja2
 
 # Optimize memory usage
 echo "Configuring memory optimizations..."
