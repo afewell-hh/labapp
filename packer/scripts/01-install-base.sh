@@ -30,6 +30,17 @@ apt-get update
 echo "Upgrading existing packages..."
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 
+# Expand root filesystem to consume full disk (Bug #23)
+if lsblk /dev/ubuntu-vg/ubuntu-lv &>/dev/null; then
+    echo "Expanding root logical volume to use all free space..."
+    # Use || true to prevent build failure when LV already consumes 100% of VG
+    lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv || echo "LV already at maximum size (expected on some configurations)"
+    echo "Resizing filesystem to match expanded LV..."
+    resize2fs /dev/ubuntu-vg/ubuntu-lv
+else
+    echo "WARNING: /dev/ubuntu-vg/ubuntu-lv not found; skipping LV expansion"
+fi
+
 # Install essential build tools and utilities
 echo "Installing essential packages..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -72,7 +83,10 @@ echo "Installing virtualization support packages..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     qemu-guest-agent \
     linux-tools-virtual \
-    linux-cloud-tools-virtual
+    linux-cloud-tools-virtual \
+    qemu-utils \
+    qemu-system-x86 \
+    socat
 
 # Install Docker
 echo "Installing Docker..."
@@ -81,12 +95,24 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Add hhlab user to docker group
-usermod -aG docker hhlab
+# Add hhlab user to required desktop/system groups (Bug #17 dependency)
+for grp in sudo adm dialout cdrom floppy audio dip video plugdev netdev docker; do
+    if getent group "$grp" >/dev/null; then
+        usermod -aG "$grp" hhlab
+    else
+        echo "WARNING: Group $grp not found; skipping"
+    fi
+done
 
 # Enable and start Docker
 systemctl enable docker
 systemctl start docker
+
+# Ensure SSH directory exists with correct permissions for hhlab (Bug #15/#92)
+install -d -m 700 -o hhlab -g hhlab /home/hhlab/.ssh
+touch /home/hhlab/.ssh/authorized_keys
+chown hhlab:hhlab /home/hhlab/.ssh/authorized_keys
+chmod 600 /home/hhlab/.ssh/authorized_keys
 
 # Install Python 3 and pip
 echo "Installing Python 3 and related packages..."
@@ -97,8 +123,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3-dev
 
 # Install common Python packages
-pip3 install --no-cache-dir --upgrade pip setuptools wheel
-pip3 install --no-cache-dir pyyaml requests jinja2
+# Ubuntu 24.04 uses PEP 668 externally-managed environment, use --break-system-packages for system-wide install
+# Use --ignore-installed to avoid trying to uninstall Debian-packaged versions
+# Check if pip supports --break-system-packages (pip >= 23.0)
+PIP_BREAK_SYSTEM_FLAG=""
+if pip3 install --help 2>&1 | grep -q -- "--break-system-packages"; then
+    PIP_BREAK_SYSTEM_FLAG="--break-system-packages"
+fi
+pip3 install $PIP_BREAK_SYSTEM_FLAG --ignore-installed --no-cache-dir --upgrade pip setuptools wheel
+pip3 install $PIP_BREAK_SYSTEM_FLAG --no-cache-dir pyyaml requests jinja2
 
 # Optimize memory usage
 echo "Configuring memory optimizations..."

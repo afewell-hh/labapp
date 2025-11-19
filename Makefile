@@ -25,7 +25,15 @@ install-deps: ## Install build dependencies
 	@which qemu-system-x86_64 > /dev/null || (echo "Installing QEMU..." && sudo apt-get install -y qemu-system-x86 qemu-utils)
 	@echo "Dependencies installed successfully"
 
-validate: ## Validate Packer templates
+init: ## Initialize Packer plugins
+	@echo "Initializing Packer plugins..."
+	$(PACKER) init packer/standard-build.pkr.hcl
+	@if [ -f packer/prewarmed-build.pkr.hcl ]; then \
+		$(PACKER) init packer/prewarmed-build.pkr.hcl; \
+	fi
+	@echo "Packer plugins initialized!"
+
+validate: init ## Validate Packer templates
 	@echo "Validating Packer template..."
 	$(PACKER) validate packer/standard-build.pkr.hcl
 	@echo "Validation successful!"

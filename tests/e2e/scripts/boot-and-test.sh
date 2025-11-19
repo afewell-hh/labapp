@@ -18,7 +18,7 @@ VM_WORK_DIR="/tmp/hedgehog-lab-test-${TIMESTAMP}"
 VM_NAME="hedgehog-lab-test-${TIMESTAMP}"
 VM_MEMORY="8192"  # 8GB (reduced from 16GB for CI)
 VM_CPUS="4"       # 4 CPUs (reduced from 8 for CI)
-VM_DISK_SIZE="100G"
+VM_DISK_SIZE="300G"
 
 # SSH Configuration
 VM_SSH_PORT="2222"

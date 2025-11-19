@@ -11,6 +11,8 @@ LOG_FILE="/var/log/hedgehog-lab-init.log"
 STAMP_FILE="/var/lib/hedgehog-lab/initialized"
 BUILD_TYPE_FILE="/etc/hedgehog-lab/build-type"
 STATE_FILE="/var/lib/hedgehog-lab/state.json"
+# Bug #22 regression guard: ensure ample space before launching hhfab VLAB
+VLAB_MIN_FREE_GB="${VLAB_MIN_FREE_GB:-120}"
 
 # Global state tracking
 INITIALIZATION_FAILED=false
@@ -38,6 +40,32 @@ log_error() {
 
 log_debug() {
     log "DEBUG" "$@"
+}
+
+# Verify the specified mount point has at least X GB free
+check_disk_space() {
+    local mount_point="${1:-/}"
+    local min_free_gb="${2:-100}"
+    local available_gb
+
+    if ! available_gb=$(df -BG --output=avail "$mount_point" 2>/dev/null | tail -n 1 | tr -dc '0-9'); then
+        log_warn "Unable to determine free space on ${mount_point}; skipping disk preflight."
+        return 0
+    fi
+
+    if [ -z "$available_gb" ]; then
+        log_warn "Disk availability check returned no data for ${mount_point}; skipping."
+        return 0
+    fi
+
+    if [ "$available_gb" -lt "$min_free_gb" ]; then
+        log_error "Insufficient disk on ${mount_point}: ${available_gb}GB free (need at least ${min_free_gb}GB for VLAB)."
+        log_error "Expand the root LV or increase the boot disk (see Issue #92 / Bug #22)."
+        return 1
+    fi
+
+    log_info "Disk check passed: ${available_gb}GB free on ${mount_point} (>= ${min_free_gb}GB required)."
+    return 0
 }
 
 # Error handling with rollback capability
@@ -216,6 +244,54 @@ wait_for_network() {
     fi
 }
 
+install_hhfab() {
+    local module_log="/var/log/hedgehog-lab/modules/hhfab-install.log"
+
+    # Ensure log file exists with correct ownership
+    touch "$module_log"
+    chown hhlab:hhlab "$module_log"
+
+    log_info "Installing hhfab CLI..." | tee -a "$module_log"
+
+    # Check if hhfab is already installed
+    if command -v hhfab &> /dev/null; then
+        local hhfab_version
+        hhfab_version=$(hhfab --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' || echo "unknown")
+        log_info "hhfab is already installed (version: $hhfab_version)" | tee -a "$module_log"
+        return 0
+    fi
+
+    # Check if GHCR credentials are configured
+    if [ ! -f "/var/lib/hedgehog-lab/ghcr-authenticated" ]; then
+        log_error "GHCR credentials not configured. Please run 'hh-lab setup' first." | tee -a "$module_log"
+        return 1
+    fi
+
+    log_info "GHCR credentials found. Proceeding with installation..." | tee -a "$module_log"
+
+    # Download and run the hhfab installer
+    # The installer uses 'oras' which will automatically use the Docker credentials from ~/.docker/config.json
+    log_info "Downloading hhfab installer from https://i.hhdev.io/hhfab..." | tee -a "$module_log"
+
+    if curl -fsSL https://i.hhdev.io/hhfab | bash >> "$module_log" 2>&1; then
+        log_info "hhfab installer completed successfully" | tee -a "$module_log"
+
+        # Verify installation
+        if command -v hhfab &> /dev/null; then
+            local hhfab_version
+            hhfab_version=$(hhfab --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' || echo "unknown")
+            log_info "hhfab successfully installed (version: $hhfab_version)" | tee -a "$module_log"
+            return 0
+        else
+            log_error "hhfab installer ran but command not found" | tee -a "$module_log"
+            return 1
+        fi
+    else
+        log_error "hhfab installer failed. See $module_log for details" | tee -a "$module_log"
+        return 1
+    fi
+}
+
 init_k3d_cluster() {
     local module_log="/var/log/hedgehog-lab/modules/k3d.log"
     local k3d_script="/usr/local/bin/hedgehog-k3d-init"
@@ -250,7 +326,7 @@ init_k3d_cluster() {
 init_vlab() {
     local module_log="/var/log/hedgehog-lab/modules/vlab.log"
     local service_name="hhfab-vlab.service"
-    local max_wait=1800  # 30 minutes
+    local max_wait=7200  # 2 hours - matches systemd TimeoutStartSec
     local check_interval=10
 
     # Ensure log file exists with correct ownership before writing
@@ -260,21 +336,41 @@ init_vlab() {
 
     log_info "Initializing Hedgehog VLAB via systemd service..." | tee -a "$module_log"
 
+    # Ensure enough disk space remains before launching hhfab (Bug #22)
+    if ! check_disk_space "/" "$VLAB_MIN_FREE_GB" | tee -a "$module_log"; then
+        log_error "VLAB initialization aborted due to insufficient disk space. Resize the disk/LV and rerun hh-lab setup." | tee -a "$module_log"
+        return 1
+    fi
+
     # Pre-check: if VLAB already initialized, skip service start
     if [ -f "/var/lib/hedgehog-lab/vlab-initialized" ]; then
         log_info "VLAB already initialized (state marker exists), skipping" | tee -a "$module_log"
         return 0
     fi
 
-    # Check if systemd service exists
-    if ! systemctl list-unit-files | grep -q "^${service_name}"; then
-        log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
-        return 1
+    # Check if systemd service exists (trigger daemon-reload if needed)
+    if ! systemctl list-unit-files "$service_name" >/dev/null 2>&1; then
+        log_warn "VLAB systemd service $service_name not registered yet; reloading systemd..." | tee -a "$module_log"
+        systemctl daemon-reload || log_warn "systemctl daemon-reload failed; continuing check" | tee -a "$module_log"
+        if ! systemctl list-unit-files "$service_name" >/dev/null 2>&1; then
+            log_error "VLAB systemd service not found: $service_name" | tee -a "$module_log"
+            return 1
+        fi
+    fi
+
+    # Ensure Docker creds are available for hhlab before VLAB pull (Bug #17 fallback)
+    if [ -f /root/.docker/config.json ] && [ ! -f /home/hhlab/.docker/config.json ]; then
+        log_warn "hhlab Docker config missing; copying credentials from root" | tee -a "$module_log"
+        mkdir -p /home/hhlab/.docker
+        cp /root/.docker/config.json /home/hhlab/.docker/config.json
+        chown -R hhlab:hhlab /home/hhlab/.docker
+        chmod 600 /home/hhlab/.docker/config.json
     fi
 
     # Start the hhfab-vlab service
     log_info "Starting $service_name..." | tee -a "$module_log"
-    if ! systemctl start "$service_name"; then
+    systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
+    if ! systemctl restart "$service_name"; then
         log_error "Failed to start $service_name" | tee -a "$module_log"
         return 1
     fi
@@ -435,20 +531,22 @@ if [ "$BUILD_TYPE" = "standard" ]; then
     log_info "IMPORTANT: VLAB must complete before EMC/GitOps initialization"
     log_info ""
 
-    TOTAL_STEPS=7
+    TOTAL_STEPS=8
     execute_step "Wait for network" 1 $TOTAL_STEPS wait_for_network || error "Network check failed"
-    # VLAB MUST initialize first (Issue #73) - it provides the controller interface for EMC
-    execute_step "Initialize VLAB" 2 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
+    # Install hhfab CLI (Bug #14) - required before VLAB initialization
+    execute_step "Install hhfab CLI" 2 $TOTAL_STEPS install_hhfab || error "hhfab installation failed"
+    # VLAB MUST initialize next (Issue #73) - it provides the controller interface for EMC
+    execute_step "Initialize VLAB" 3 $TOTAL_STEPS init_vlab || error "VLAB initialization failed"
     # k3d cluster can only start after VLAB is ready to provide host-facing connectivity
-    execute_step "Initialize k3d cluster" 3 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
+    execute_step "Initialize k3d cluster" 4 $TOTAL_STEPS init_k3d_cluster || error "k3d initialization failed"
     # Seed GitOps repository in Gitea with student/hedgehog-config
-    execute_step "Seed GitOps repository" 4 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
+    execute_step "Seed GitOps repository" 5 $TOTAL_STEPS deploy_gitops_stack || error "GitOps deployment failed"
     # Create ArgoCD Application to sync repo to Hedgehog controller
-    execute_step "Deploy ArgoCD Application" 5 $TOTAL_STEPS deploy_argocd_app || error "ArgoCD Application deployment failed"
+    execute_step "Deploy ArgoCD Application" 6 $TOTAL_STEPS deploy_argocd_app || error "ArgoCD Application deployment failed"
     # Configure Prometheus to scrape Hedgehog fabric-proxy metrics
-    execute_step "Configure observability" 6 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
+    execute_step "Configure observability" 7 $TOTAL_STEPS deploy_observability_stack || error "Observability deployment failed"
     # Note: Grafana dashboard import will be added when JSON files are available (Issue #74)
-    execute_step "Finalize services" 7 $TOTAL_STEPS start_services || error "Service finalization failed"
+    execute_step "Finalize services" 8 $TOTAL_STEPS start_services || error "Service finalization failed"
 
 else
     log_info "Pre-warmed build detected - starting services only"

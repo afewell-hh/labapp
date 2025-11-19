@@ -14,7 +14,7 @@ set -euo pipefail
 # Configuration
 TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-hhfab-vlab}"
 VLAB_WORK_DIR="${VLAB_WORK_DIR:-/opt/hedgehog/vlab}"
-VLAB_TIMEOUT="${VLAB_TIMEOUT:-1800}"
+VLAB_TIMEOUT="${VLAB_TIMEOUT:-7200}"
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
 HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
@@ -164,6 +164,7 @@ wait_for_completion() {
     local end_time
     end_time=$((start_time + VLAB_TIMEOUT))
     local check_interval=10
+    local success_marker="All on-ready commands finished"
 
     while [ "$(date +%s)" -lt "$end_time" ]; do
         # Check if the tmux session still exists
@@ -188,6 +189,12 @@ wait_for_completion() {
                 log_error "Tmux session exited but no exit code found"
                 return 1
             fi
+        fi
+
+        # Detect success marker even if hhfab keeps streaming logs
+        if tail -n 200 "$LOG_FILE" | grep -q "$success_marker"; then
+            log_info "Detected hhfab completion marker; leaving tmux session running for monitoring"
+            return 0
         fi
 
         # Log progress
@@ -296,12 +303,12 @@ main() {
     log_info "hhfab VLAB Initialization Complete!"
     log_info "=================================================="
     log_info "Total time: ${total_time}s ($(( total_time / 60 )) minutes)"
-    log_info "Tmux session: $TMUX_SESSION_NAME (exited after successful completion)"
+    log_info "Tmux session: $TMUX_SESSION_NAME (continues running for ongoing monitoring)"
     log_info "Working directory: $VLAB_WORK_DIR"
     log_info "Log file: $LOG_FILE"
     log_info ""
-    log_info "Note: The tmux session has exited because hhfab completed successfully."
-    log_info "To start a new session for debugging, run: tmux new -s debug"
+    log_info "Note: The tmux session remains running to keep lab VMs alive."
+    log_info "Attach for troubleshooting with: tmux attach -t $TMUX_SESSION_NAME"
     log_info ""
 
     return 0

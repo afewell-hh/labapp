@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+- Install oras CLI plus qemu-utils/qemu-system-x86/socat during provisioning so hhfab and VLAB dependencies are present on first boot (#90, #92)
+- Ensure the `hhlab` account has required groups, SSH scaffolding, and copies Docker credentials from hh-lab setup so hhfab can pull private images (#92)
+- Expand LVM to consume 100% of the volume group, bump the virtual disk default to 300GB, and document the larger host/boot disk requirements (#90, #92)
+- Remove `NoNewPrivileges` from `hhfab-vlab.service` to unblock helper sudo calls and automated TAP creation (#92)
+- Update GCP image import docs to require the `enable-vmx` license, preventing nested virtualization failures on rebuilt instances (#92)
+- Allow hhfab-vlab.service to run for up to two hours (TimeoutStartSec=0) and extend hhfab runner timeout so large topologies can finish initializing without being killed (#90, #92)
+- Add a VLAB disk-space preflight (120GB default, override via `VLAB_MIN_FREE_GB`) so low-capacity imports fail fast with actionable guidance (#92)
 
 ### Security
 

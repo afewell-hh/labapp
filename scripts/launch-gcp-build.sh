@@ -365,6 +365,9 @@ GCS_ARTIFACT_PATH="__GCS_ARTIFACT_PATH__"
 GITHUB_TOKEN="__GITHUB_TOKEN__"
 REPO_URL="https://github.com/afewell-hh/labapp.git"
 
+# Set HOME for Packer
+export HOME=/root
+
 echo "Build Configuration:"
 echo "  Build ID: $BUILD_ID"
 echo "  Branch: $BUILD_BRANCH"
@@ -526,7 +529,6 @@ launch_build() {
         --machine-type="${GCP_MACHINE_TYPE:-n2-standard-32}" \
         --network-interface="network-tier=PREMIUM,subnet=${GCP_NETWORK:-default}" \
         --maintenance-policy=TERMINATE \
-        --provisioning-model="${GCP_ENABLE_PREEMPTIBLE:-false}" \
         --service-account="${GCP_SERVICE_ACCOUNT:-default}" \
         --scopes=https://www.googleapis.com/auth/devstorage.full_control,https://www.googleapis.com/auth/cloud-platform \
         --create-disk="auto-delete=yes,boot=yes,device-name=${instance_name},image=projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts,mode=rw,size=${GCP_DISK_SIZE:-600},type=projects/${GCP_PROJECT_ID}/zones/${GCP_ZONE}/diskTypes/${GCP_DISK_TYPE:-pd-ssd}" \
@@ -535,7 +537,8 @@ launch_build() {
         --shielded-integrity-monitoring \
         --labels="purpose=labapp-builder,build-id=${build_id},build-type=${BUILD_TYPE},managed-by=script" \
         --metadata-from-file=startup-script="$startup_script" \
-        --min-cpu-platform="Intel Haswell" \
+        --min-cpu-platform="Intel Cascade Lake" \
+        --enable-nested-virtualization \
         ${preemptible_flag}
 
     log_info "✓ Instance created successfully"

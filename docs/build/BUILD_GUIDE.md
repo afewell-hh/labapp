@@ -21,7 +21,7 @@ The Hedgehog Lab Appliance supports two build types (see [ADR-001](../adr/001-du
 - **Size**: ~15-20GB compressed
 - **First Boot**: 15-20 minute initialization
 - **Build Environment**: Local machine or GitHub Actions
-- **Disk Required**: 150GB
+- **Disk Required**: 300GB+
 
 ### Pre-Warmed Build
 - **Use Case**: Workshops, events requiring immediate access
@@ -142,7 +142,7 @@ The standard build creates a ~15-20GB OVA that performs full initialization on f
 #### Build Steps
 
 1. **ISO Download**: Packer downloads Ubuntu 22.04 LTS Server ISO
-2. **VM Creation**: Creates a QEMU VM with 8 CPUs, 16GB RAM, 100GB disk
+2. **VM Creation**: Creates a QEMU VM with 8 CPUs, 16GB RAM, 300GB disk
 3. **OS Installation**: Automated installation using Ubuntu autoinstall (cloud-init)
 4. **Provisioning**: Runs installation scripts in order:
    - `01-install-base.sh` - Base system packages and Docker

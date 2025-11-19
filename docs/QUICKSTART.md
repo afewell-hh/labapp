@@ -14,28 +14,63 @@ Get up and running with the Hedgehog Lab Appliance in minutes.
 
 ## First Login
 
-After the VM boots, you'll see the Ubuntu login prompt.
+After the VM boots, you'll see the Ubuntu login prompt or desktop.
 
 **Default Credentials:**
 - **Username:** `hhlab`
 - **Password:** `hhlab`
 
-```bash
-# Login at the console or via SSH
-Ubuntu 22.04.5 LTS hedgehog-lab tty1
+**Access Methods:**
 
-hedgehog-lab login: hhlab
+**Console/SSH:**
+```bash
+# SSH to VM
+ssh hhlab@<vm-ip>
 Password: hhlab
 ```
+
+**RDP (Recommended for Desktop):**
+- Connect to: `<vm-ip>:3389`
+- Username: `hhlab`
+- Password: `hhlab`
+
+**VNC:**
+- Connect to: `<vm-ip>:5901`
+- Password: `hhlab`
 
 > **Security Note:** For production or shared environments, change the default password immediately:
 > ```bash
 > passwd
 > ```
 
+## IMPORTANT: First-Time Setup Required
+
+**The lab does NOT initialize automatically.** You must configure GHCR credentials first.
+
+### Run the Setup Wizard
+
+```bash
+hh-lab setup
+```
+
+This interactive wizard will:
+1. Prompt for your GitHub username
+2. Prompt for your GitHub Personal Access Token (PAT)
+3. Authenticate with ghcr.io
+4. Optionally start lab initialization
+
+**Creating a GitHub PAT:**
+1. Go to https://github.com/settings/tokens
+2. Click "Generate new token" (classic)
+3. Give it a name: "Hedgehog Lab"
+4. Select scope: `read:packages`
+5. Click "Generate token" and copy it
+
+**Security:** The token is used only for `docker login` and immediately wiped from memory. It's NEVER stored to disk.
+
 ## Verify Services
 
-Check that initialization completed successfully and all services are running.
+After running `hh-lab setup` and allowing initialization to complete (15-20 minutes), verify everything is working.
 
 ### Quick Status Check
 
@@ -44,28 +79,57 @@ Check that initialization completed successfully and all services are running.
 hh-lab status
 ```
 
-**Expected output:**
+**Expected output after initialization:**
 ```
 Hedgehog Lab Status
 
 ✓ Lab is initialized and ready
   Build Type: standard
-  Version: 0.1.0
-  Initialized: 2025-11-05T10:23:45Z
+  Initialized: 2025-11-11T00:13:45Z
 
-Services:
-  k3d Cluster: [OK] (k3d-observability)
-  VLAB: [OK] (7 switches, 0 VPCs)
-  GitOps: [PENDING] (deployment in future sprint)
-  Observability: [OK] (Prometheus, Grafana, Loki)
+GHCR Authentication: ✓ Configured
+  Username: your-github-username
+  Authenticated: 2025-11-11T00:00:00Z
 
-Current Scenario: default
+Services Status:
+  k3d cluster (hedgehog-lab): [OK]
+  Kubernetes API: [OK]
+  hhfab CLI: [OK]
+  VLAB: [OK] (7 switches running)
+  ArgoCD: [OK]
+  Gitea: [OK]
+  Grafana: [OK]
+```
+
+**Before setup:**
+```
+Hedgehog Lab Status
+
+⚠ Lab is not yet initialized
+ℹ GHCR credentials not configured
+
+GHCR Authentication: ✗ Not configured
+  Run 'hh-lab setup' to configure credentials
+```
+
+### Monitor Initialization Progress
+
+```bash
+# Follow initialization logs in real-time
+hh-lab logs -f
+
+# Or use the monitor command for a cleaner view
+hh-lab monitor
+
+# Or use systemd directly
+sudo journalctl -u hedgehog-lab-init.service -f
 ```
 
 ### Detailed Status
 
 ```bash
 # Check k3d cluster
+k3d cluster list
 kubectl cluster-info
 kubectl get nodes
 
@@ -73,12 +137,16 @@ kubectl get nodes
 kubectl get pods -A
 
 # Check specific services
-kubectl get pods -n monitoring
+kubectl get pods -n grafana
 kubectl get pods -n argocd
 kubectl get pods -n gitea
+
+# Inspect VLAB tmux session
+tmux attach -t hhfab-vlab
+# Press Ctrl+B then D to detach
 ```
 
-**All pods should show `Running` status** (may take a few minutes after first boot)
+**All pods should show `Running` status** (initialization takes 15-20 minutes)
 
 ## Accessing Services
 
@@ -88,21 +156,26 @@ The appliance includes several web-based services for managing and observing you
 
 | Service | URL | Username | Password | Purpose |
 |---------|-----|----------|----------|---------|
-| **Grafana** | http://localhost:3000 | `admin` | `admin` | Observability dashboards, metrics visualization |
+| **Grafana** | http://localhost:3000 | `admin` | `admin` (change on first login) | Observability dashboards, metrics visualization |
 | **ArgoCD** | http://localhost:8080 | `admin` | See below* | GitOps continuous delivery |
-| **Gitea** | http://localhost:3001 | `gitea_admin` | `admin123` | Git repository hosting |
+| **Gitea** | http://localhost:3001 | `hedgehog` | `hedgehog` | Git repository hosting |
 | **Prometheus** | http://localhost:9090 | N/A | N/A | Metrics collection (direct access) |
 
 > **Note:** If using **VirtualBox with NAT**, ensure port forwarding is configured (see [Installation Guide](INSTALL.md#installation-on-virtualbox)).
 >
 > If using **Bridged networking**, replace `localhost` with the VM's IP address.
+>
+> If using **GCP**, replace `localhost` with the instance's external IP address.
 
 ### Getting the ArgoCD Password
 
-ArgoCD generates a random initial admin password. Retrieve it with:
+ArgoCD's initial admin password is stored in a file:
 
 ```bash
 # Get ArgoCD admin password
+cat /var/lib/hedgehog-lab/argocd-admin-password
+
+# Or use kubectl
 kubectl -n argocd get secret argocd-initial-admin-secret \
   -o jsonpath="{.data.password}" | base64 -d; echo
 ```
@@ -150,6 +223,11 @@ The Hedgehog Virtual Lab (VLAB) provides a simulated 7-switch Hedgehog Fabric to
 ### View VLAB Status
 
 ```bash
+# Use hhfab CLI to inspect VLAB
+cd /opt/hedgehog/vlab
+hhfab vlab inspect
+hhfab vlab status
+
 # Check VLAB directory
 ls -la /opt/hedgehog/vlab/
 
@@ -157,40 +235,53 @@ ls -la /opt/hedgehog/vlab/
 cat /opt/hedgehog/vlab/wiring.yaml
 
 # Check VLAB containers
-docker ps | grep vlab
+docker ps
+```
+
+### Attach to VLAB tmux Session
+
+The VLAB runs in a persistent tmux session that you can view:
+
+```bash
+# List tmux sessions
+tmux ls
+
+# Attach to VLAB session
+tmux attach -t hhfab-vlab
+
+# Press Ctrl+B then D to detach without stopping
 ```
 
 ### Access Switch Consoles
 
-VLAB switches run in Docker containers with SONiC network OS.
+VLAB switches run in Docker containers with Hedgehog SONiC-based network OS.
 
 ```bash
-# List VLAB containers
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+# Use hhfab to list switches
+cd /opt/hedgehog/vlab
+hhfab vlab switch list
 
-# Connect to a switch console (example)
-docker exec -it vlab-leaf-1 bash
+# Connect to a switch console via hhfab
+hhfab vlab switch console <switch-name>
 
-# Inside the switch container
-sonic-cli
-show version
-show interfaces status
-exit
+# Or use docker directly
+docker ps --format "table {{.Names}}\t{{.Status}}"
+docker exec -it <container-name> bash
 ```
 
 **Available switches in default topology:**
-- `vlab-spine-1`, `vlab-spine-2` (Spine switches)
-- `vlab-leaf-1`, `vlab-leaf-2`, `vlab-leaf-3`, `vlab-leaf-4` (Leaf switches)
-- `vlab-control-1` (Control node)
+- Spine switches (2)
+- Leaf switches (4-5 depending on config)
+- Control node (1)
 
 ### View VLAB Networking
 
 ```bash
 # Show Docker networks created for VLAB
-docker network ls | grep vlab
+docker network ls
 
-# Inspect a VLAB network
-docker network inspect vlab-fabric
+# Inspect VLAB working directory
+ls -la /opt/hedgehog/vlab/
 ```
 
 ## Using the CLI
@@ -201,7 +292,10 @@ The `hh-lab` CLI tool provides convenient commands for managing the lab applianc
 
 ```bash
 # Show help
-hh-lab --help
+hh-lab help
+
+# Configure GHCR credentials (REQUIRED first time)
+hh-lab setup
 
 # View lab status
 hh-lab status
@@ -210,29 +304,59 @@ hh-lab status
 hh-lab logs
 
 # Follow logs in real-time
-hh-lab logs --follow
+hh-lab logs -f
+
+# Monitor initialization progress
+hh-lab monitor
 
 # View system information
 hh-lab info
-
-# View service details
-hh-lab services
 ```
 
 ### Command Examples
 
+**First-Time Setup:**
 ```bash
+# Run setup wizard (required before first use)
+hh-lab setup
+```
+
+**Checking Status:**
+```bash
+# Check overall status
+hh-lab status
+
+# Check if GHCR credentials are configured
+hh-lab status | grep "GHCR Authentication"
+
 # Check if initialization is complete
 hh-lab status | grep initialized
+```
 
-# View only errors from logs
-hh-lab logs | grep ERROR
+**Viewing Logs:**
+```bash
+# View all logs
+hh-lab logs
 
-# View k3d-specific logs
-sudo cat /var/log/hedgehog-lab/modules/k3d.log
+# Follow logs in real-time
+hh-lab logs -f
 
-# View VLAB-specific logs
-sudo cat /var/log/hedgehog-lab/modules/vlab.log
+# View module-specific logs
+tail -f /var/log/hedgehog-lab/modules/vlab.log
+tail -f /var/log/hedgehog-lab/modules/k3d.log
+tail -f /var/log/hedgehog-lab/modules/gitops.log
+```
+
+**Troubleshooting:**
+```bash
+# View detailed system info
+hh-lab info
+
+# Check VLAB tmux session
+tmux attach -t hhfab-vlab
+
+# Manually restart initialization (if needed)
+sudo systemctl restart hedgehog-lab-init.service
 ```
 
 ### CLI Auto-completion

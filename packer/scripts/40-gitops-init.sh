@@ -34,6 +34,7 @@ REPO_DESCRIPTION="Hedgehog Fabric GitOps Configuration"
 
 # Source directory for seed content
 SEED_DIR="/opt/hedgehog-lab/configs/gitops/student-hedgehog-config"
+CONFIG_BACKUP_ROOT="/usr/local/share/hedgehog/configs"
 TMP_REPO_DIR="/tmp/hedgehog-config-seed"
 
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/gitops.log}"
@@ -55,6 +56,24 @@ log_info() { log "INFO" "$@"; }
 log_warn() { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
 log_debug() { log "DEBUG" "$@"; }
+
+# Ensure seed content exists, restore from backup if necessary
+ensure_seed_content() {
+    if [ -d "$SEED_DIR" ]; then
+        return 0
+    fi
+
+    local backup_dir="${CONFIG_BACKUP_ROOT}/gitops/student-hedgehog-config"
+    if [ -d "$backup_dir" ]; then
+        log_warn "Seed directory $SEED_DIR missing; restoring from $backup_dir"
+        mkdir -p "$(dirname "$SEED_DIR")"
+        cp -r "$backup_dir" "$(dirname "$SEED_DIR")"
+        return 0
+    fi
+
+    log_error "GitOps seed content not found (checked $SEED_DIR and $backup_dir)"
+    return 1
+}
 
 # Check prerequisites
 check_prerequisites() {
@@ -356,6 +375,11 @@ main() {
     # Execute initialization steps
     if ! check_prerequisites; then
         log_error "Prerequisites check failed"
+        return 1
+    fi
+
+    if ! ensure_seed_content; then
+        log_error "Required GitOps seed content is missing"
         return 1
     fi
 

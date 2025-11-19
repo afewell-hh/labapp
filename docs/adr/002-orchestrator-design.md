@@ -492,7 +492,7 @@ PREWARMED_ACTION="start"      # Just start services
 - **Input Validation:** All module inputs validated before execution
 - **Secrets:** No secrets in logs or state files (use secure storage)
 - **Lock File:** Prevents race conditions and concurrent runs
-- **Systemd Hardening:** `NoNewPrivileges=true`, `PrivateTmp=true`
+- **Systemd Hardening:** `NoNewPrivileges=true`, `PrivateTmp=true` (the hhfab-vlab.service unit is exempt so it can run sudo helpers for TAP creation)
 
 ### Testing Strategy
 

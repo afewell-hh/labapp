@@ -106,26 +106,28 @@ else
     exit 1
 fi
 
-# Install GitOps seed configuration
+# Install GitOps seed configuration (optional - will be added in Issue #74)
 echo "Installing GitOps seed configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/gitops" ]; then
-    mkdir -p /opt/hedgehog-lab/configs
+    mkdir -p /opt/hedgehog-lab/configs /usr/local/share/hedgehog/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /opt/hedgehog-lab/configs/
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/gitops /usr/local/share/hedgehog/configs/
     echo "GitOps seed configs installed at /opt/hedgehog-lab/configs/gitops"
+    echo "GitOps seed backup stored at /usr/local/share/hedgehog/configs/gitops"
 else
-    echo "ERROR: GitOps seed configs not found"
-    exit 1
+    echo "WARNING: GitOps seed configs not found, skipping (will be added in Issue #74)"
 fi
 
-# Install Grafana dashboard configuration
+# Install Grafana dashboard configuration (optional - will be added in Issue #74)
 echo "Installing Grafana dashboard configuration..."
 if [ -d "/tmp/packer-provisioner-shell-scripts/configs/grafana" ]; then
-    mkdir -p /opt/hedgehog-lab/configs
+    mkdir -p /opt/hedgehog-lab/configs /usr/local/share/hedgehog/configs
     cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /opt/hedgehog-lab/configs/
+    cp -r /tmp/packer-provisioner-shell-scripts/configs/grafana /usr/local/share/hedgehog/configs/
     echo "Grafana configs installed at /opt/hedgehog-lab/configs/grafana"
+    echo "Grafana configs backup stored at /usr/local/share/hedgehog/configs/grafana"
 else
-    echo "ERROR: Grafana configs not found"
-    exit 1
+    echo "WARNING: Grafana configs not found, skipping (will be added in Issue #74)"
 fi
 
 # Install hh-lab CLI tool
@@ -184,6 +186,8 @@ echo "Build type set to: standard"
 
 # Set proper permissions
 echo "Setting permissions..."
+# Create directories if they don't exist (some may not be created if configs are missing)
+mkdir -p /opt/hedgehog-lab /var/lib/hedgehog-lab /var/log/hedgehog-lab
 chown -R hhlab:hhlab /opt/hedgehog
 chown -R hhlab:hhlab /opt/hedgehog-lab
 chown -R hhlab:hhlab /var/lib/hedgehog-lab

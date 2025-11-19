@@ -22,28 +22,48 @@ The Hedgehog Lab Appliance is a pre-configured virtual machine that provides a c
 ## Quick Start
 
 ```bash
-# Download the appliance
-# Standard build (15-20GB)
-wget https://releases.example.com/hedgehog-lab-standard-latest.ova
+# Download the appliance from GCS
+gsutil cp gs://hedgehog-lab-artifacts-teched-473722/releases/hedgehog-lab-standard-build-20251110-235348.ova .
 
-# Import into VMware/VirtualBox
-# Start the VM and wait for initialization
-# Access services at http://localhost:3000 (Grafana), :8080 (ArgoCD), :3001 (Gitea)
+# Import into VMware/VirtualBox/GCP (see Installation Guide)
+
+# After first boot, login (hhlab/hhlab) and run setup wizard:
+hh-lab setup
+
+# The wizard will:
+# 1. Prompt for GitHub credentials (required for GHCR)
+# 2. Authenticate with ghcr.io
+# 3. Start initialization (15-20 minutes)
+
+# Access services:
+# - Grafana: http://localhost:3000 (admin/admin)
+# - ArgoCD: http://localhost:8080 (admin/<see /var/lib/hedgehog-lab/argocd-admin-password>)
+# - Gitea: http://localhost:3001 (hedgehog/hedgehog)
+# - Desktop: RDP to <vm-ip>:3389 or VNC to <vm-ip>:5901
 ```
 
 ## Build Types
 
-### Standard Build (Default)
-- **Size:** 15-20GB compressed
-- **First boot:** 15-20 minutes (one-time initialization)
-- **Use case:** Self-paced online learning
-- **Distribution:** Direct download
+### Standard Build (Current)
+- **Size:** ~3-4 GB compressed
+- **First boot:** Requires GHCR setup, then 15-20 minutes initialization
+- **Use case:** Self-paced learning, workshops, training
+- **Distribution:** Google Cloud Storage
+- **Features:**
+  - Ubuntu 24.04 LTS base
+  - XFCE desktop with RDP/VNC access
+  - VS Code, Firefox pre-installed
+  - Hedgehog VLAB (7-switch topology)
+  - k3d observability cluster
+  - GitOps stack (ArgoCD, Gitea)
+  - Prometheus + Grafana monitoring
 
-### Pre-warmed Build (On-demand)
-- **Size:** 80-100GB compressed
+### Pre-warmed Build (Future)
+- **Status:** Coming soon (after Issue #74)
+- **Size:** TBD
 - **First boot:** 2-3 minutes
-- **Use case:** In-person workshops, instructor-led training
-- **Distribution:** USB drives, local network, cloud storage
+- **Use case:** In-person workshops with limited internet
+- **Distribution:** USB drives or pre-provisioned cloud instances
 
 ## Documentation
 

@@ -64,7 +64,8 @@ systemctl enable xrdp-sesman
 echo "Installing TigerVNC server..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     tigervnc-standalone-server \
-    tigervnc-common
+    tigervnc-common \
+    tigervnc-tools
 
 # Configure VNC for user hhlab
 echo "Configuring VNC server for hhlab user..."
@@ -75,7 +76,8 @@ chown -R hhlab:hhlab /home/hhlab/.vnc
 
 # Set VNC password using vncpasswd non-interactive mode
 # Note: Password is 'hhlab' - for lab/demo use only
-echo 'hhlab' | vncpasswd -f | sudo -u hhlab tee /home/hhlab/.vnc/passwd > /dev/null
+# Use full path to vncpasswd as it may not be in PATH immediately after install
+echo 'hhlab' | /usr/bin/vncpasswd -f | sudo -u hhlab tee /home/hhlab/.vnc/passwd > /dev/null
 sudo -u hhlab chmod 600 /home/hhlab/.vnc/passwd
 
 # Create VNC xstartup script
@@ -230,11 +232,13 @@ EOF
 
 chown hhlab:hhlab /home/hhlab/Desktop/README.txt
 
-# Configure firewall rules for RDP and VNC (if ufw is active)
-if systemctl is-active --quiet ufw; then
+# Configure firewall rules for RDP and VNC (if ufw is installed and active)
+if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw; then
     echo "Configuring firewall rules..."
     ufw allow 3389/tcp comment 'RDP access'
     ufw allow 5901/tcp comment 'VNC access'
+else
+    echo "UFW not installed or not active, skipping firewall configuration"
 fi
 
 echo "=================================================="
