@@ -33,7 +33,8 @@ DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 # Expand root filesystem to consume full disk (Bug #23)
 if lsblk /dev/ubuntu-vg/ubuntu-lv &>/dev/null; then
     echo "Expanding root logical volume to use all free space..."
-    lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+    # Use || true to prevent build failure when LV already consumes 100% of VG
+    lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv || echo "LV already at maximum size (expected on some configurations)"
     echo "Resizing filesystem to match expanded LV..."
     resize2fs /dev/ubuntu-vg/ubuntu-lv
 else

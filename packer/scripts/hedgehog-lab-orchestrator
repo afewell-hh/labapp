@@ -326,7 +326,7 @@ init_k3d_cluster() {
 init_vlab() {
     local module_log="/var/log/hedgehog-lab/modules/vlab.log"
     local service_name="hhfab-vlab.service"
-    local max_wait=1800  # 30 minutes
+    local max_wait=7200  # 2 hours - matches systemd TimeoutStartSec
     local check_interval=10
 
     # Ensure log file exists with correct ownership before writing
