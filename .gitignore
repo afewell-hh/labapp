@@ -28,6 +28,7 @@ Thumbs.db
 *.tmp
 tmp/
 temp/
+.work/
 
 # Secrets
 secrets/

@@ -16,10 +16,70 @@ autoinstall:
           name: "e*"
         dhcp4: true
 
-  # Storage configuration
+  # Storage configuration - explicit GPT layout with BIOS+UEFI support
   storage:
-    layout:
-      name: lvm
+    config:
+      - type: disk
+        id: disk0
+        match:
+          size: largest
+        ptable: gpt
+        wipe: superblock-recursive
+        preserve: false
+        grub_device: true
+      - type: partition
+        id: disk0-partition-bios
+        device: disk0
+        size: 1M
+        flag: bios_grub
+      - type: partition
+        id: disk0-partition-efi
+        device: disk0
+        size: 512M
+        flag: [boot, esp]
+      - type: format
+        id: disk0-format-efi
+        volume: disk0-partition-efi
+        fstype: fat32
+      - type: mount
+        id: disk0-mount-efi
+        device: disk0-format-efi
+        path: /boot/efi
+      - type: partition
+        id: disk0-partition-boot
+        device: disk0
+        size: 2G
+      - type: format
+        id: disk0-format-boot
+        volume: disk0-partition-boot
+        fstype: ext4
+      - type: mount
+        id: disk0-mount-boot
+        device: disk0-format-boot
+        path: /boot
+      - type: partition
+        id: disk0-partition-lvm
+        device: disk0
+        size: -1
+        flag: lvm
+      - type: lvm_volgroup
+        id: vg-hedgehog
+        name: vg-hedgehog
+        devices:
+          - disk0-partition-lvm
+      - type: lvm_partition
+        id: vg-hedgehog-root
+        name: vg-hedgehog-root
+        volgroup: vg-hedgehog
+        size: -1
+      - type: format
+        id: vg-hedgehog-root-fs
+        volume: vg-hedgehog-root
+        fstype: ext4
+      - type: mount
+        id: vg-hedgehog-root-mount
+        device: vg-hedgehog-root-fs
+        path: /
 
   # Identity
   identity:
@@ -44,12 +104,19 @@ autoinstall:
     - vim
     - net-tools
     - build-essential
+    - grub-efi-amd64-signed
+    - shim-signed
 
   # Late commands
   late-commands:
     - echo 'hhlab ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/hhlab
     - chmod 440 /target/etc/sudoers.d/hhlab
     - curtin in-target --target=/target -- systemctl enable ssh
+    - curtin in-target --target=/target -- apt-get update
+    - curtin in-target --target=/target -- apt-get install -y grub-pc-bin
+    - curtin in-target --target=/target -- grub-install --target=i386-pc /dev/vda
+    - curtin in-target --target=/target -- grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --no-nvram --removable
+    - curtin in-target --target=/target -- update-grub
 
   # User data - disable auto-updates during provisioning
   user-data:
