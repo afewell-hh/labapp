@@ -7,91 +7,30 @@ autoinstall:
   keyboard:
     layout: us
 
-  # Network configuration - use match to catch any ethernet interface
+  # Network configuration
   network:
-    version: 2
-    ethernets:
-      any:
-        match:
-          name: "e*"
-        dhcp4: true
+    network:
+      version: 2
+      ethernets:
+        ens3:
+          dhcp4: true
 
-  # Storage configuration - explicit GPT layout with BIOS+UEFI support
+  # Storage configuration
   storage:
-    config:
-      - type: disk
-        id: disk0
-        match:
-          size: largest
-        ptable: gpt
-        wipe: superblock-recursive
-        preserve: false
-        grub_device: true
-      - type: partition
-        id: disk0-partition-bios
-        device: disk0
-        size: 1M
-        flag: bios_grub
-      - type: partition
-        id: disk0-partition-efi
-        device: disk0
-        size: 512M
-        flag: [boot, esp]
-      - type: format
-        id: disk0-format-efi
-        volume: disk0-partition-efi
-        fstype: fat32
-      - type: mount
-        id: disk0-mount-efi
-        device: disk0-format-efi
-        path: /boot/efi
-      - type: partition
-        id: disk0-partition-boot
-        device: disk0
-        size: 2G
-      - type: format
-        id: disk0-format-boot
-        volume: disk0-partition-boot
-        fstype: ext4
-      - type: mount
-        id: disk0-mount-boot
-        device: disk0-format-boot
-        path: /boot
-      - type: partition
-        id: disk0-partition-lvm
-        device: disk0
-        size: -1
-        flag: lvm
-      - type: lvm_volgroup
-        id: ubuntu-vg
-        name: ubuntu-vg
-        devices:
-          - disk0-partition-lvm
-      - type: lvm_partition
-        id: ubuntu-vg-root
-        name: ubuntu-lv
-        volgroup: ubuntu-vg
-        size: -1
-      - type: format
-        id: ubuntu-root-fs
-        volume: ubuntu-vg-root
-        fstype: ext4
-      - type: mount
-        id: ubuntu-root-mount
-        device: ubuntu-root-fs
-        path: /
+    layout:
+      name: lvm
 
   # Identity
   identity:
     hostname: hedgehog-lab
     username: hhlab
-    password: "$6$PviSqPN/jwbO37iH$bj9e6wTWhqQIACy3Xbrk93XRfyOYa.S16PElAcN02kB9cw95DOEqKrNMG0IK3cGOWbsil0lUqVl4ip..ugI7V."
-    # Pre-hashed password (hhlab) to prevent autoinstall from re-hashing
+    password: "$6$zekBnFoOMUC4ehNU$WHGkkd1xQxNlIdWia6DS6eO2qhYxHnAQyLh.O0M9Y1BwIuyCTe1TNs8b5fe.ORRTF/1wpPJJEM.vlmQvq.Orr/"
+    # Password: hhlab (encrypted with SHA-512)
 
   # SSH configuration
   ssh:
-    install-server: true
-    allow-pw: true
+    install-server: yes
+    allow-pw: yes
 
   # Packages to install
   packages:
@@ -104,27 +43,15 @@ autoinstall:
     - vim
     - net-tools
     - build-essential
-    - grub-efi-amd64-signed
-    - shim-signed
 
   # Late commands
   late-commands:
     - echo 'hhlab ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/hhlab
     - chmod 440 /target/etc/sudoers.d/hhlab
     - curtin in-target --target=/target -- systemctl enable ssh
-    - curtin in-target --target=/target -- apt-get update
-    - curtin in-target --target=/target -- apt-get install -y grub-pc-bin
-    - curtin in-target --target=/target -- grub-install --target=i386-pc /dev/vda
-    - curtin in-target --target=/target -- grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --no-nvram --removable
-    - curtin in-target --target=/target -- update-grub
-    - curtin in-target --target=/target -- usermod --password '$6$PviSqPN/jwbO37iH$bj9e6wTWhqQIACy3Xbrk93XRfyOYa.S16PElAcN02kB9cw95DOEqKrNMG0IK3cGOWbsil0lUqVl4ip..ugI7V.' hhlab
 
   # User data - disable auto-updates during provisioning
   user-data:
     disable_root: false
     package_update: true
     package_upgrade: false
-    # Prevent cloud-init from changing the password
-    chpasswd:
-      expire: false
-    ssh_pwauth: true
