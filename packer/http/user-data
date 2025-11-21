@@ -7,13 +7,14 @@ autoinstall:
   keyboard:
     layout: us
 
-  # Network configuration
+  # Network configuration - use match to catch any ethernet interface
   network:
-    network:
-      version: 2
-      ethernets:
-        ens3:
-          dhcp4: true
+    version: 2
+    ethernets:
+      any:
+        match:
+          name: "e*"
+        dhcp4: true
 
   # Storage configuration
   storage:
