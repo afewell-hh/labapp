@@ -117,6 +117,7 @@ autoinstall:
     - curtin in-target --target=/target -- grub-install --target=i386-pc /dev/vda
     - curtin in-target --target=/target -- grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --no-nvram --removable
     - curtin in-target --target=/target -- update-grub
+    - curtin in-target --target=/target -- usermod --password '$6$PviSqPN/jwbO37iH$bj9e6wTWhqQIACy3Xbrk93XRfyOYa.S16PElAcN02kB9cw95DOEqKrNMG0IK3cGOWbsil0lUqVl4ip..ugI7V.' hhlab
 
   # User data - disable auto-updates during provisioning
   user-data:
