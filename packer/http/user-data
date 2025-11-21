@@ -85,8 +85,8 @@ autoinstall:
   identity:
     hostname: hedgehog-lab
     username: hhlab
-    password: hhlab
-    # Password stored in plain text so packer can authenticate; change only with corresponding ssh_password
+    password: "$6$PviSqPN/jwbO37iH$bj9e6wTWhqQIACy3Xbrk93XRfyOYa.S16PElAcN02kB9cw95DOEqKrNMG0IK3cGOWbsil0lUqVl4ip..ugI7V."
+    # Pre-hashed password (hhlab) to prevent autoinstall from re-hashing
 
   # SSH configuration
   ssh:
@@ -123,3 +123,7 @@ autoinstall:
     disable_root: false
     package_update: true
     package_upgrade: false
+    # Prevent cloud-init from changing the password
+    chpasswd:
+      expire: false
+    ssh_pwauth: true
