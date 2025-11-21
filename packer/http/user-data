@@ -63,35 +63,35 @@ autoinstall:
         size: -1
         flag: lvm
       - type: lvm_volgroup
-        id: vg-hedgehog
-        name: vg-hedgehog
+        id: ubuntu-vg
+        name: ubuntu-vg
         devices:
           - disk0-partition-lvm
       - type: lvm_partition
-        id: vg-hedgehog-root
-        name: vg-hedgehog-root
-        volgroup: vg-hedgehog
+        id: ubuntu-vg-root
+        name: ubuntu-lv
+        volgroup: ubuntu-vg
         size: -1
       - type: format
-        id: vg-hedgehog-root-fs
-        volume: vg-hedgehog-root
+        id: ubuntu-root-fs
+        volume: ubuntu-vg-root
         fstype: ext4
       - type: mount
-        id: vg-hedgehog-root-mount
-        device: vg-hedgehog-root-fs
+        id: ubuntu-root-mount
+        device: ubuntu-root-fs
         path: /
 
   # Identity
   identity:
     hostname: hedgehog-lab
     username: hhlab
-    password: "$6$zekBnFoOMUC4ehNU$WHGkkd1xQxNlIdWia6DS6eO2qhYxHnAQyLh.O0M9Y1BwIuyCTe1TNs8b5fe.ORRTF/1wpPJJEM.vlmQvq.Orr/"
-    # Password: hhlab (encrypted with SHA-512)
+    password: hhlab
+    # Password stored in plain text so packer can authenticate; change only with corresponding ssh_password
 
   # SSH configuration
   ssh:
-    install-server: yes
-    allow-pw: yes
+    install-server: true
+    allow-pw: true
 
   # Packages to install
   packages:
