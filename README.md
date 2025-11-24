@@ -4,47 +4,43 @@ Virtual appliance for Hedgehog Fabric learning and lab exercises.
 
 ## Project Status
 
-🚧 **In Development** - MVP in progress
-
-[![Standard Build](https://github.com/example/labapp/workflows/build-standard/badge.svg)](https://github.com/example/labapp/actions)
-[![Pre-warmed Build](https://github.com/example/labapp/workflows/build-prewarmed/badge.svg)](https://github.com/example/labapp/actions)
+🚧 **In Development** – shifting from OVA to Bring-Your-Own VM installer (Issue #97).
 
 ## Overview
 
-The Hedgehog Lab Appliance is a pre-configured virtual machine that provides a complete learning environment for Hedgehog Fabric. It includes:
+Hedgehog Lab now installs onto a fresh Ubuntu 24.04 VM you provide. The installer delivers:
 
 - Hedgehog Virtual Lab (VLAB) with 7-switch topology
-- GitOps stack (ArgoCD, Gitea)
-- Observability stack (Prometheus, Grafana, Loki)
-- Scenario management system
-- Lab orchestration tools
+- EMC GitOps stack (ArgoCD, Gitea)
+- Observability stack (Prometheus, Grafana)
+- hh-lab CLI for status/logs/monitoring
 
-## Quick Start
+## Quick Start (BYO Ubuntu 24.04)
 
 ```bash
-# Download the appliance from GCS
-gsutil cp gs://hedgehog-lab-artifacts-teched-473722/releases/hedgehog-lab-standard-build-20251110-235348.ova .
+curl -fsSL https://raw.githubusercontent.com/afewell-hh/labapp/main/scripts/install.sh \
+  | sudo bash -s -- --ghcr-user <github_user> --ghcr-token <read:packages_pat>
 
-# Import into VMware/VirtualBox/GCP (see Installation Guide)
+# Monitor progress
+hh-lab status
+hh-lab logs -f
 
-# After first boot, login (hhlab/hhlab) and run setup wizard:
-hh-lab setup
-
-# The wizard will:
-# 1. Prompt for GitHub credentials (required for GHCR)
-# 2. Authenticate with ghcr.io
-# 3. Start initialization (15-20 minutes)
-
-# Access services:
-# - Grafana: http://localhost:3000 (admin/admin)
-# - ArgoCD: http://localhost:8080 (admin/<see /var/lib/hedgehog-lab/argocd-admin-password>)
-# - Gitea: http://localhost:3001 (hedgehog/hedgehog)
-# - Desktop: RDP to <vm-ip>:3389 or VNC to <vm-ip>:5901
+# Access services (after completion)
+# Grafana:   http://<host-ip>:3000  (admin/prom-operator)
+# ArgoCD:    http://<host-ip>:8080  (password from argocd-initial-admin-secret)
+# Gitea:     http://<host-ip>:3001  (gitea_admin/admin123)
+# Prometheus:http://<host-ip>:9090
 ```
 
 ## Build Types
 
-### Standard Build (Current)
+### BYO Ubuntu Installer (Default)
+- **Delivery:** `hh-lab-installer` script (no prebuilt image required)
+- **Use case:** Students bring their own Ubuntu 24.04 VM (cloud or local)
+- **Flow:** Run installer → orchestrator initializes VLAB + EMC
+- **Status:** 🚧 New in Issue #97 (replaces legacy `hh-lab setup`)
+
+### Standard Build (Legacy OVA)
 - **Size:** ~3-4 GB compressed
 - **First boot:** Requires GHCR setup, then 15-20 minutes initialization
 - **Use case:** Self-paced learning, workshops, training

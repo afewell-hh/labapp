@@ -9,6 +9,16 @@ echo "=================================================="
 echo "Installing base system packages..."
 echo "=================================================="
 
+# Ensure the hhlab user exists for downstream scripts and services
+if ! id hhlab >/dev/null 2>&1; then
+    echo "Creating lab user 'hhlab' (password: hhlab)..."
+    useradd -m -s /bin/bash hhlab
+    echo "hhlab:hhlab" | chpasswd
+    usermod -aG sudo hhlab
+else
+    echo "User 'hhlab' already exists; skipping creation."
+fi
+
 # Configure APT for faster downloads and better caching
 echo "Configuring APT for optimal performance..."
 cat > /etc/apt/apt.conf.d/99-packer-optimizations <<'EOF'
