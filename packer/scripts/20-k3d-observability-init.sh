@@ -26,6 +26,7 @@ POD_READY_TIMEOUT="${POD_READY_TIMEOUT:-600}"  # 10 minutes for all pods ready
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/k3d.log}"
 
 # Port mappings for services
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
 GRAFANA_PORT="${GRAFANA_PORT:-3000}"
 ARGOCD_HTTP_PORT="${ARGOCD_HTTP_PORT:-8080}"
 ARGOCD_HTTPS_PORT="${ARGOCD_HTTPS_PORT:-8443}"
@@ -137,6 +138,7 @@ create_k3d_cluster() {
     # Create cluster with port mappings
     log_info "Creating k3d cluster with port mappings..."
     log_info "  Grafana: localhost:${GRAFANA_PORT}"
+    log_info "  Prometheus (remote_write + UI): localhost:${PROMETHEUS_PORT}"
     log_info "  ArgoCD HTTP: localhost:${ARGOCD_HTTP_PORT}"
     log_info "  ArgoCD HTTPS: localhost:${ARGOCD_HTTPS_PORT}"
     log_info "  Gitea HTTP: localhost:${GITEA_HTTP_PORT}"
@@ -145,6 +147,7 @@ create_k3d_cluster() {
     if ! k3d cluster create "$K3D_CLUSTER_NAME" \
         --api-port 6550 \
         --port "${GRAFANA_PORT}:${GRAFANA_PORT}@loadbalancer" \
+        --port "${PROMETHEUS_PORT}:${PROMETHEUS_PORT}@loadbalancer" \
         --port "${ARGOCD_HTTP_PORT}:${ARGOCD_HTTP_PORT}@loadbalancer" \
         --port "${ARGOCD_HTTPS_PORT}:${ARGOCD_HTTPS_PORT}@loadbalancer" \
         --port "${GITEA_HTTP_PORT}:${GITEA_HTTP_PORT}@loadbalancer" \
@@ -260,7 +263,13 @@ grafana:
 
 # Prometheus configuration
 prometheus:
+  service:
+    type: LoadBalancer
+    port: ${PROMETHEUS_PORT}
+    targetPort: ${PROMETHEUS_PORT}
   prometheusSpec:
+    # Enable remote write receiver for Alloy telemetry
+    enableRemoteWriteReceiver: true
     retention: 7d
     storageSpec:
       volumeClaimTemplate:

@@ -81,6 +81,7 @@ hh-lab setup
 - [Release Process](docs/RELEASE_PROCESS.md) - Release guidelines and checklists
 - [Architecture Decision Records](docs/adr/) - Design decisions
 - [Sprint Planning](docs/issues/MVP_SPRINT_PLAN.md) - Current sprint
+- [Observability Remote Write](docs/observability-remote-write.md) - Alloy → Prometheus pipeline details (Issue #96)
 
 ## Project Management
 

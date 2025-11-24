@@ -27,12 +27,12 @@ ARGOCD_NAMESPACE="${ARGOCD_NAMESPACE:-argocd}"
 GITEA_NAMESPACE="${GITEA_NAMESPACE:-gitea}"
 
 # Hedgehog controller configuration
-# The controller API is accessible from k3d containers via the Docker bridge gateway IP
-HEDGEHOG_API_SERVER="https://172.19.0.1:6443"
+# The controller API is accessible from k3d containers via the bridge gateway IP
+HEDGEHOG_API_SERVER="${HEDGEHOG_API_SERVER:-https://172.18.0.1:6443}"
 HEDGEHOG_CLUSTER_NAME="hedgehog-vlab"
 
 # GitOps repository
-GITEA_SERVICE_URL="http://gitea-http.${GITEA_NAMESPACE}:3000"
+GITEA_SERVICE_URL="http://gitea-http.${GITEA_NAMESPACE}:3001"
 REPO_URL="${GITEA_SERVICE_URL}/student/hedgehog-config.git"
 REPO_PATH="active"  # ArgoCD watches the active/ directory
 REPO_BRANCH="main"
@@ -220,24 +220,14 @@ create_cluster_secret() {
     # For VLAB, we need to use the kubeconfig but allow insecure TLS
     # because the certificate doesn't include the Docker bridge IP (172.19.0.1)
 
-    # Extract the bearer token from kubeconfig
-    # Use grep -m1 to get the first matching line with 'token:', then extract just the token value
+    # Create / refresh serviceaccount token for Argo to talk to the controller cluster
     local bearer_token
-    bearer_token=$(echo "$HEDGEHOG_KUBECONFIG" | grep -m1 'token:' | sed 's/.*token:[[:space:]]*//' | tr -d '[:space:]')
-
-    if [ -z "$bearer_token" ]; then
-        log_error "Failed to extract bearer token from kubeconfig"
+    if ! bearer_token=$(KUBECONFIG="$vlab_kubeconfig" kubectl -n kube-system create token argocd-manager 2>/dev/null); then
+        log_error "Failed to create service account token (argocd-manager)"
         return 1
     fi
 
-    # Validate token format (should be base64-like characters, no colons or other kubeconfig syntax)
-    if echo "$bearer_token" | grep -q ':'; then
-        log_error "Extracted token appears invalid (contains ':' character)"
-        log_error "Token extraction may have captured wrong line from kubeconfig"
-        return 1
-    fi
-
-    log_info "Successfully extracted authentication token from kubeconfig"
+    log_info "Generated service account token for ArgoCD cluster secret"
 
     # Create cluster secret with ArgoCD labels
     # ArgoCD expects the 'config' field to contain connection configuration (not the full kubeconfig)
