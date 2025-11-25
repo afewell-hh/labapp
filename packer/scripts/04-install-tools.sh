@@ -60,6 +60,7 @@ mv kustomize /usr/local/bin/
 kustomize version
 
 echo "Installing kubectx and kubens..."
+rm -rf /opt/kubectx /usr/local/bin/kubectx /usr/local/bin/kubens
 git clone --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx
 ln -s /opt/kubectx/kubectx /usr/local/bin/kubectx
 ln -s /opt/kubectx/kubens /usr/local/bin/kubens
@@ -85,6 +86,7 @@ echo "Installing bat..."
 dpkg -i bat.deb
 
 echo "Installing fzf..."
+rm -rf /opt/fzf /usr/local/bin/fzf /usr/local/bin/fzf-tmux
 git clone --depth 1 https://github.com/junegunn/fzf.git /opt/fzf
 /opt/fzf/install --all --no-update-rc
 ln -s /opt/fzf/bin/fzf /usr/local/bin/fzf
