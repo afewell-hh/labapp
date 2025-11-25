@@ -4,8 +4,16 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Handle both direct execution and curl | bash
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "bash" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    # When piped from curl, download to temp location
+    SCRIPT_DIR="/tmp/hh-lab-installer-$$"
+    mkdir -p "$SCRIPT_DIR"
+fi
+
+REPO_ROOT="https://raw.githubusercontent.com/afewell-hh/labapp/feature/97-standalone-installer"
 STAGING_DIR="/tmp/packer-provisioner-shell-scripts"
 LOG_ROOT="/var/log/hedgehog-lab-installer"
 
