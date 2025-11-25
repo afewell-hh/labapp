@@ -101,6 +101,27 @@ stage_payload() {
             chmod +x "${STAGING_DIR}/${script}"
         done
 
+        # Download orchestrator components
+        local orchestrator_files=(
+            "hedgehog-lab-orchestrator"
+            "hhfab-vlab-runner"
+            "hedgehog-lab-readiness-ui"
+            "hh-lab"
+            "hh-lab-completion.bash"
+            "20-k3d-observability-init.sh"
+            "30-vlab-init.sh"
+            "40-gitops-init.sh"
+            "50-argocd-app-init.sh"
+            "60-prometheus-hedgehog-scrape.sh"
+            "hedgehog-lab-init.service"
+            "hhfab-vlab.service"
+        )
+
+        for file in "${orchestrator_files[@]}"; do
+            download_file "${REPO_ROOT}/packer/scripts/${file}" "${STAGING_DIR}/${file}"
+            chmod +x "${STAGING_DIR}/${file}" 2>/dev/null || true  # chmod fails for .service files
+        done
+
         # Download helper scripts to SCRIPT_DIR
         local helper_scripts=(
             "00-preflight-checks.sh"
