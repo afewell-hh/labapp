@@ -39,7 +39,7 @@ check_resources() {
     local cpu mem disk
     cpu=$(nproc)
     mem=$(free -g | awk '/^Mem:/ {print $2}')
-    disk=$(df -BG / | awk 'NR==2 {gsub(\"G\",\"\",$4); print $4}')
+    disk=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
 
     if [ "$cpu" -lt 32 ]; then
         log WARN "Detected ${cpu} vCPUs (<32). Installer will continue but VLAB performance may degrade."
