@@ -193,11 +193,11 @@ main() {
     prepare_logs
     parse_args "$@"
 
-    # Preflight + user
-    run_step "00-preflight" "${SCRIPT_DIR}/00-preflight-checks.sh"
-
     # Stage packer payload so the existing scripts work unchanged
     stage_payload
+
+    # Preflight + user
+    run_step "00-preflight" "${SCRIPT_DIR}/00-preflight-checks.sh"
 
     if [ "$DRY_RUN" = true ]; then
         log INFO "Dry run complete (staged files only)."
