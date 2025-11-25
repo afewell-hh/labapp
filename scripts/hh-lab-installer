@@ -66,12 +66,55 @@ prepare_logs() {
     touch "${LOG_ROOT}/installer.log"
 }
 
+download_file() {
+    local url="$1"
+    local dest="$2"
+    log INFO "Downloading ${url} to ${dest}"
+    curl -fsSL "$url" -o "$dest" || {
+        log ERROR "Failed to download ${url}"
+        return 1
+    }
+}
+
 stage_payload() {
     log INFO "Staging installer payload in ${STAGING_DIR}"
     rm -rf "$STAGING_DIR"
     mkdir -p "$STAGING_DIR"
-    cp -a "${REPO_ROOT}/packer/scripts/." "$STAGING_DIR/"
-    cp -a "${REPO_ROOT}/configs" "$STAGING_DIR/" 2>/dev/null || true
+
+    # Check if REPO_ROOT is a URL (curl mode) or local path
+    if [[ "$REPO_ROOT" =~ ^https?:// ]]; then
+        log INFO "Running in remote mode; downloading scripts from GitHub"
+
+        # Download packer provisioning scripts
+        local packer_scripts=(
+            "01-install-base.sh"
+            "02-install-k3d.sh"
+            "03-install-hhfab.sh"
+            "04-install-tools.sh"
+            "05-install-orchestrator.sh"
+        )
+
+        for script in "${packer_scripts[@]}"; do
+            download_file "${REPO_ROOT}/packer/scripts/${script}" "${STAGING_DIR}/${script}"
+            chmod +x "${STAGING_DIR}/${script}"
+        done
+
+        # Download helper scripts to SCRIPT_DIR
+        local helper_scripts=(
+            "00-preflight-checks.sh"
+            "10-ghcr-auth.sh"
+            "99-finalize.sh"
+        )
+
+        for script in "${helper_scripts[@]}"; do
+            download_file "${REPO_ROOT}/scripts/${script}" "${SCRIPT_DIR}/${script}"
+            chmod +x "${SCRIPT_DIR}/${script}"
+        done
+    else
+        log INFO "Running in local mode; copying scripts from repository"
+        cp -a "${REPO_ROOT}/packer/scripts/." "$STAGING_DIR/"
+        cp -a "${REPO_ROOT}/configs" "$STAGING_DIR/" 2>/dev/null || true
+    fi
 }
 
 run_step() {
