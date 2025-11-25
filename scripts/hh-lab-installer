@@ -44,7 +44,9 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --ghcr-user=*) GHCR_USER="${1#*=}"; shift ;;
             --ghcr-user) GHCR_USER="$2"; shift 2 ;;
+            --ghcr-token=*) GHCR_TOKEN="${1#*=}"; shift ;;
             --ghcr-token) GHCR_TOKEN="$2"; shift 2 ;;
             -i|--interactive) INTERACTIVE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
