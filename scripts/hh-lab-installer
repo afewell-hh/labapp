@@ -17,8 +17,9 @@ REPO_ROOT="https://raw.githubusercontent.com/afewell-hh/labapp/main"
 STAGING_DIR="/tmp/packer-provisioner-shell-scripts"
 LOG_ROOT="/var/log/hedgehog-lab-installer"
 
-GHCR_USER=""
-GHCR_TOKEN=""
+# Check for environment variables first, then allow command-line args to override
+GHCR_USER="${GHCR_USER:-}"
+GHCR_TOKEN="${GHCR_TOKEN:-}"
 INTERACTIVE=false
 DRY_RUN=false
 
