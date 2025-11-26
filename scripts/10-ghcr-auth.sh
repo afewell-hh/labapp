@@ -10,13 +10,21 @@ log() {
     printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
 }
 
-# Accept credentials as command-line arguments OR environment variables
-GHCR_USER="${1:-${GHCR_USER:-}}"
-GHCR_TOKEN="${2:-${GHCR_TOKEN:-}}"
+# Accept credentials from file (preferred), command-line arguments, or environment variables
+if [ -n "${GHCR_CREDS_FILE:-}" ] && [ -f "${GHCR_CREDS_FILE}" ]; then
+    log INFO "Reading GHCR credentials from ${GHCR_CREDS_FILE}"
+    GHCR_USER=$(sed -n '1p' "$GHCR_CREDS_FILE")
+    GHCR_TOKEN=$(sed -n '2p' "$GHCR_CREDS_FILE")
+else
+    # Fallback to command-line arguments or environment variables
+    GHCR_USER="${1:-${GHCR_USER:-}}"
+    GHCR_TOKEN="${2:-${GHCR_TOKEN:-}}"
+fi
 
 if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
-    log ERROR "GHCR_USER and GHCR_TOKEN must be provided as arguments or environment variables"
+    log ERROR "GHCR_USER and GHCR_TOKEN must be provided via GHCR_CREDS_FILE, arguments, or environment variables"
     log ERROR "Usage: $0 <ghcr-user> <ghcr-token>"
+    log ERROR "   OR: GHCR_CREDS_FILE=/path/to/creds $0"
     exit 1
 fi
 

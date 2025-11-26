@@ -232,8 +232,18 @@ main() {
     run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
     run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
 
-    # GHCR authentication - pass credentials as positional args
-    run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh" "${GHCR_USER}" "${GHCR_TOKEN}"
+    # GHCR authentication - write credentials to temp file to avoid pipe issues
+    local cred_file="/tmp/ghcr-creds-$$"
+    cat > "$cred_file" <<EOF
+${GHCR_USER}
+${GHCR_TOKEN}
+EOF
+    chmod 600 "$cred_file"
+
+    GHCR_CREDS_FILE="$cred_file" run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+
+    # Clean up credentials file
+    rm -f "$cred_file"
 
     # Kick off orchestrator
     start_orchestrator
