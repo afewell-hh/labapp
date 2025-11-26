@@ -233,12 +233,8 @@ main() {
     run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
 
     # GHCR authentication
-    # Credentials already validated by parse_args; no need to re-collect
-    if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
-        log ERROR "GHCR credentials required. Use --interactive or provide --ghcr-user/--ghcr-token."
-        exit 1
-    fi
-    GHCR_USER="$GHCR_USER" GHCR_TOKEN="$GHCR_TOKEN" run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+    export GHCR_USER GHCR_TOKEN
+    run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
 
     # Kick off orchestrator
     start_orchestrator
