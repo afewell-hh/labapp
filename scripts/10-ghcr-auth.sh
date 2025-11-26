@@ -10,11 +10,13 @@ log() {
     printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
 }
 
-GHCR_USER="${GHCR_USER:-}"
-GHCR_TOKEN="${GHCR_TOKEN:-}"
+# Accept credentials as command-line arguments OR environment variables
+GHCR_USER="${1:-${GHCR_USER:-}}"
+GHCR_TOKEN="${2:-${GHCR_TOKEN:-}}"
 
 if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
-    log ERROR "GHCR_USER and GHCR_TOKEN must be set before running 10-ghcr-auth.sh"
+    log ERROR "GHCR_USER and GHCR_TOKEN must be provided as arguments or environment variables"
+    log ERROR "Usage: $0 <ghcr-user> <ghcr-token>"
     exit 1
 fi
 

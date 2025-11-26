@@ -232,9 +232,8 @@ main() {
     run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
     run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
 
-    # GHCR authentication
-    export GHCR_USER GHCR_TOKEN
-    run_step "10-ghcr-auth" "env" "GHCR_USER=${GHCR_USER}" "GHCR_TOKEN=${GHCR_TOKEN}" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+    # GHCR authentication - pass credentials as positional args
+    run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh" "${GHCR_USER}" "${GHCR_TOKEN}"
 
     # Kick off orchestrator
     start_orchestrator
