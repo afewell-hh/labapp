@@ -233,7 +233,13 @@ main() {
     run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
 
     # GHCR authentication - write credentials to temp file to avoid pipe issues
+    if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
+        log ERROR "GHCR credentials not set. Use --ghcr-user and --ghcr-token."
+        exit 1
+    fi
+
     local cred_file="/tmp/ghcr-creds-$$"
+    log INFO "Writing GHCR credentials to ${cred_file}"
     cat > "$cred_file" <<EOF
 ${GHCR_USER}
 ${GHCR_TOKEN}
