@@ -1,0 +1,262 @@
+#!/bin/bash
+# hh-lab-installer
+# Transform a fresh Ubuntu 24.04 host into a Hedgehog Lab (VLAB + EMC)
+
+set -euo pipefail
+
+# Handle both direct execution and curl | bash
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "bash" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    # When piped from curl, download to temp location
+    SCRIPT_DIR="/tmp/hh-lab-installer-$$"
+    mkdir -p "$SCRIPT_DIR"
+fi
+
+REPO_ROOT="https://raw.githubusercontent.com/afewell-hh/labapp/feature/97-standalone-installer"
+STAGING_DIR="/tmp/packer-provisioner-shell-scripts"
+LOG_ROOT="/var/log/hedgehog-lab-installer"
+
+GHCR_USER=""
+GHCR_TOKEN=""
+INTERACTIVE=false
+DRY_RUN=false
+
+log() {
+    local level="${1:-INFO}"
+    shift
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" | tee -a "${LOG_ROOT}/installer.log"
+}
+
+usage() {
+    cat <<EOF
+Usage: hh-lab-installer [options]
+
+Options:
+  --ghcr-user USER      GitHub username for GHCR authentication
+  --ghcr-token TOKEN    GitHub PAT with read:packages scope
+  -i, --interactive     Prompt for credentials if not provided
+  --dry-run             Stage files only; do not install or start services
+  -h, --help            Show this help message
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ghcr-user=*) GHCR_USER="${1#*=}"; shift ;;
+            --ghcr-user) GHCR_USER="$2"; shift 2 ;;
+            --ghcr-token=*) GHCR_TOKEN="${1#*=}"; shift ;;
+            --ghcr-token) GHCR_TOKEN="$2"; shift 2 ;;
+            -i|--interactive) INTERACTIVE=true; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+    done
+}
+
+ensure_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        echo "Please run as root (sudo hh-lab-installer ...)." >&2
+        exit 1
+    fi
+}
+
+prepare_logs() {
+    mkdir -p "$LOG_ROOT"
+    touch "${LOG_ROOT}/installer.log"
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    log INFO "Downloading ${url} to ${dest}"
+    curl -fsSL "$url" -o "$dest" || {
+        log ERROR "Failed to download ${url}"
+        return 1
+    }
+}
+
+stage_payload() {
+    log INFO "Staging installer payload in ${STAGING_DIR}"
+    rm -rf "$STAGING_DIR"
+    mkdir -p "$STAGING_DIR"
+
+    # Check if REPO_ROOT is a URL (curl mode) or local path
+    if [[ "$REPO_ROOT" =~ ^https?:// ]]; then
+        log INFO "Running in remote mode; downloading scripts from GitHub"
+
+        # Download packer provisioning scripts
+        local packer_scripts=(
+            "01-install-base.sh"
+            "02-install-k3d.sh"
+            "03-install-hhfab.sh"
+            "04-install-tools.sh"
+            "05-install-orchestrator.sh"
+        )
+
+        for script in "${packer_scripts[@]}"; do
+            download_file "${REPO_ROOT}/packer/scripts/${script}" "${STAGING_DIR}/${script}"
+            chmod +x "${STAGING_DIR}/${script}"
+        done
+
+        # Download orchestrator components
+        local orchestrator_files=(
+            "hedgehog-lab-orchestrator"
+            "hhfab-vlab-runner"
+            "hedgehog-lab-readiness-ui"
+            "hh-lab"
+            "hh-lab-completion.bash"
+            "20-k3d-observability-init.sh"
+            "30-vlab-init.sh"
+            "40-gitops-init.sh"
+            "50-argocd-app-init.sh"
+            "60-prometheus-hedgehog-scrape.sh"
+            "hedgehog-lab-init.service"
+            "hhfab-vlab.service"
+        )
+
+        for file in "${orchestrator_files[@]}"; do
+            download_file "${REPO_ROOT}/packer/scripts/${file}" "${STAGING_DIR}/${file}"
+            chmod +x "${STAGING_DIR}/${file}" 2>/dev/null || true  # chmod fails for .service files
+        done
+
+        # Download helper scripts to SCRIPT_DIR
+        local helper_scripts=(
+            "00-preflight-checks.sh"
+            "10-ghcr-auth.sh"
+            "99-finalize.sh"
+        )
+
+        for script in "${helper_scripts[@]}"; do
+            download_file "${REPO_ROOT}/scripts/${script}" "${SCRIPT_DIR}/${script}"
+            chmod +x "${SCRIPT_DIR}/${script}"
+        done
+    else
+        log INFO "Running in local mode; copying scripts from repository"
+        cp -a "${REPO_ROOT}/packer/scripts/." "$STAGING_DIR/"
+        cp -a "${REPO_ROOT}/configs" "$STAGING_DIR/" 2>/dev/null || true
+    fi
+}
+
+run_step() {
+    local name="$1"
+    shift
+    log INFO "=== ${name} ==="
+    "$@" | tee -a "${LOG_ROOT}/${name}.log"
+}
+
+collect_credentials() {
+    if [ -z "$GHCR_USER" ] && [ "$INTERACTIVE" = true ]; then
+        read -r -p "GitHub username: " GHCR_USER
+    fi
+    if [ -z "$GHCR_TOKEN" ] && [ "$INTERACTIVE" = true ]; then
+        read -r -s -p "GitHub PAT (read:packages): " GHCR_TOKEN
+        echo ""
+    fi
+
+    if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
+        echo "GHCR credentials required. Use --interactive or provide --ghcr-user/--ghcr-token."
+        exit 1
+    fi
+}
+
+start_orchestrator() {
+    log INFO "Reloading systemd units"
+    systemctl daemon-reload
+    systemctl enable hedgehog-lab-init.service >/dev/null
+
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "Dry run enabled; skipping service start."
+        return
+    fi
+
+    log INFO "Starting hedgehog-lab-init.service (this can take ~25-30 minutes)..."
+    systemctl start hedgehog-lab-init.service
+}
+
+wait_for_completion() {
+    if [ "$DRY_RUN" = true ]; then
+        return
+    fi
+
+    local service="hedgehog-lab-init.service"
+    local timeout=$((60*40)) # 40 minutes
+    local elapsed=0
+
+    while [ $elapsed -lt $timeout ]; do
+        local state result
+        state=$(systemctl show -p ActiveState --value "$service")
+        result=$(systemctl show -p Result --value "$service")
+
+        if [ "$state" = "inactive" ] && [ "$result" = "success" ]; then
+            log INFO "Initialization service completed successfully."
+            return 0
+        elif [ "$state" = "failed" ]; then
+            log ERROR "Initialization service failed. Check journalctl -u ${service}"
+            return 1
+        fi
+
+        if [ $((elapsed % 60)) -eq 0 ]; then
+            log INFO "Still provisioning... (${elapsed}s elapsed)"
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    log ERROR "Timed out waiting for ${service} to finish."
+    return 1
+}
+
+main() {
+    ensure_root
+    prepare_logs
+    parse_args "$@"
+
+    # Stage packer payload so the existing scripts work unchanged
+    stage_payload
+
+    # Preflight + user
+    run_step "00-preflight" "${SCRIPT_DIR}/00-preflight-checks.sh"
+
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "Dry run complete (staged files only)."
+        exit 0
+    fi
+
+    # Core install (reuses proven packer modules)
+    run_step "01-install-base" "bash" "${STAGING_DIR}/01-install-base.sh"
+    run_step "02-install-k3d" "bash" "${STAGING_DIR}/02-install-k3d.sh"
+    run_step "03-install-hhfab" "bash" "${STAGING_DIR}/03-install-hhfab.sh"
+    run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
+    run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
+
+    # GHCR authentication - write credentials to temp file to avoid pipe issues
+    if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
+        log ERROR "GHCR credentials not set. Use --ghcr-user and --ghcr-token."
+        exit 1
+    fi
+
+    local cred_file="/tmp/ghcr-creds-$$"
+    log INFO "Writing GHCR credentials to ${cred_file}"
+    cat > "$cred_file" <<EOF
+${GHCR_USER}
+${GHCR_TOKEN}
+EOF
+    chmod 600 "$cred_file"
+
+    GHCR_CREDS_FILE="$cred_file" run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+
+    # Clean up credentials file
+    rm -f "$cred_file"
+
+    # Kick off orchestrator
+    start_orchestrator
+    wait_for_completion
+
+    # Final messaging
+    run_step "99-finalize" "bash" "${SCRIPT_DIR}/99-finalize.sh"
+}
+
+main "$@"

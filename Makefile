@@ -9,7 +9,9 @@
 # Variables
 PACKER := packer
 VERSION ?= 0.1.0
+INSTALLER_VERSION ?= $(VERSION)
 OUTPUT_DIR := output-hedgehog-lab-standard
+DIST_DIR := dist
 
 help: ## Show this help message
 	@echo "Hedgehog Lab Appliance - Build Commands"
@@ -148,6 +150,28 @@ validate-provisioning: test-provisioning ## Alias for test-provisioning
 
 .PHONY: validate-orchestrator
 validate-orchestrator: test-orchestrator ## Alias for test-orchestrator
+
+.PHONY: installer-package
+installer-package: ## Package hh-lab installer tarball
+	@echo "Packaging hh-lab installer..."
+	@rm -rf $(DIST_DIR)
+	@mkdir -p $(DIST_DIR)/installer
+	@cp -a scripts/hh-lab-installer scripts/install.sh scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh $(DIST_DIR)/installer/
+	@cp -a packer/scripts $(DIST_DIR)/installer/packer-scripts
+	@cp -a configs $(DIST_DIR)/installer/configs
+	@tar -czf $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz -C $(DIST_DIR)/installer .
+	@echo "Installer packaged at $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz"
+
+.PHONY: installer-test
+installer-test: ## Validate installer scripts (syntax + shellcheck)
+	@echo "Validating installer scripts..."
+	@bash -n scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh
+	@if command -v shellcheck > /dev/null; then \
+		shellcheck -x scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh; \
+	else \
+		echo "⚠ shellcheck not installed, skipping"; \
+	fi
+	@echo "Installer validation complete."
 
 .PHONY: publish-gcs
 publish-gcs: ## Publish build artifacts to Google Cloud Storage

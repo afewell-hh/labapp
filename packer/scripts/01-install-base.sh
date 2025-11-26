@@ -9,6 +9,16 @@ echo "=================================================="
 echo "Installing base system packages..."
 echo "=================================================="
 
+# Ensure the hhlab user exists for downstream scripts and services
+if ! id hhlab >/dev/null 2>&1; then
+    echo "Creating lab user 'hhlab' (password: hhlab)..."
+    useradd -m -s /bin/bash hhlab
+    echo "hhlab:hhlab" | chpasswd
+    usermod -aG sudo hhlab
+else
+    echo "User 'hhlab' already exists; skipping creation."
+fi
+
 # Configure APT for faster downloads and better caching
 echo "Configuring APT for optimal performance..."
 cat > /etc/apt/apt.conf.d/99-packer-optimizations <<'EOF'
@@ -90,7 +100,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 # Install Docker
 echo "Installing Docker..."
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+if [ ! -f /usr/share/keyrings/docker-archive-keyring.gpg ]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor --batch --yes -o /usr/share/keyrings/docker-archive-keyring.gpg
+fi
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
