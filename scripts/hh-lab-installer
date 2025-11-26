@@ -246,7 +246,9 @@ ${GHCR_TOKEN}
 EOF
     chmod 600 "$cred_file"
 
-    GHCR_CREDS_FILE="$cred_file" run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+    export GHCR_CREDS_FILE="$cred_file"
+    run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+    unset GHCR_CREDS_FILE
 
     # Clean up credentials file
     rm -f "$cred_file"
