@@ -234,7 +234,7 @@ main() {
 
     # GHCR authentication
     export GHCR_USER GHCR_TOKEN
-    run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
+    run_step "10-ghcr-auth" "env" "GHCR_USER=${GHCR_USER}" "GHCR_TOKEN=${GHCR_TOKEN}" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
 
     # Kick off orchestrator
     start_orchestrator
