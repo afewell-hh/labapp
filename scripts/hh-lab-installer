@@ -225,14 +225,7 @@ main() {
         exit 0
     fi
 
-    # Core install (reuses proven packer modules)
-    run_step "01-install-base" "bash" "${STAGING_DIR}/01-install-base.sh"
-    run_step "02-install-k3d" "bash" "${STAGING_DIR}/02-install-k3d.sh"
-    run_step "03-install-hhfab" "bash" "${STAGING_DIR}/03-install-hhfab.sh"
-    run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
-    run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
-
-    # GHCR authentication - write credentials to temp file to avoid pipe issues
+    # GHCR authentication - must happen before core install steps
     if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
         log ERROR "GHCR credentials not set. Use --ghcr-user and --ghcr-token."
         exit 1
@@ -252,6 +245,13 @@ EOF
 
     # Clean up credentials file
     rm -f "$cred_file"
+
+    # Core install (reuses proven packer modules)
+    run_step "01-install-base" "bash" "${STAGING_DIR}/01-install-base.sh"
+    run_step "02-install-k3d" "bash" "${STAGING_DIR}/02-install-k3d.sh"
+    run_step "03-install-hhfab" "bash" "${STAGING_DIR}/03-install-hhfab.sh"
+    run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
+    run_step "05-install-orchestrator" "bash" "${STAGING_DIR}/05-install-orchestrator.sh"
 
     # Kick off orchestrator
     start_orchestrator
