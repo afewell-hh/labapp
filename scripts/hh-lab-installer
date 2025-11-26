@@ -13,7 +13,7 @@ else
     mkdir -p "$SCRIPT_DIR"
 fi
 
-REPO_ROOT="https://raw.githubusercontent.com/afewell-hh/labapp/feature/97-standalone-installer"
+REPO_ROOT="https://raw.githubusercontent.com/afewell-hh/labapp/main"
 STAGING_DIR="/tmp/packer-provisioner-shell-scripts"
 LOG_ROOT="/var/log/hedgehog-lab-installer"
 
