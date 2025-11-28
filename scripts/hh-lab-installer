@@ -134,6 +134,26 @@ stage_payload() {
             download_file "${REPO_ROOT}/scripts/${script}" "${SCRIPT_DIR}/${script}"
             chmod +x "${SCRIPT_DIR}/${script}"
         done
+
+        # Download GitOps seed configuration
+        log INFO "Downloading GitOps seed configuration..."
+        mkdir -p "${STAGING_DIR}/configs/gitops/student-hedgehog-config"/{active,examples}
+
+        # Download GitOps seed files
+        local gitops_files=(
+            "configs/gitops/student-hedgehog-config/README.md"
+            "configs/gitops/student-hedgehog-config/REPOSITORY_README.md"
+            "configs/gitops/student-hedgehog-config/active/.gitkeep"
+            "configs/gitops/student-hedgehog-config/examples/vpc-multi-subnet.yaml"
+            "configs/gitops/student-hedgehog-config/examples/vpc-simple.yaml"
+            "configs/gitops/student-hedgehog-config/examples/vpcattachment-example.yaml"
+        )
+
+        for file in "${gitops_files[@]}"; do
+            local dest="${STAGING_DIR}/${file}"
+            mkdir -p "$(dirname "$dest")"
+            download_file "${REPO_ROOT}/${file}" "$dest" || log WARN "Failed to download ${file}"
+        done
     else
         log INFO "Running in local mode; copying scripts from repository"
         cp -a "${REPO_ROOT}/packer/scripts/." "$STAGING_DIR/"
@@ -226,7 +246,7 @@ main() {
         exit 0
     fi
 
-    # GHCR authentication - must happen before core install steps
+    # GHCR credentials must be present before install continues
     if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
         log ERROR "GHCR credentials not set. Use --ghcr-user and --ghcr-token."
         exit 1
@@ -241,14 +261,17 @@ EOF
     chmod 600 "$cred_file"
 
     export GHCR_CREDS_FILE="$cred_file"
+
+    # Core install (reuses proven packer modules)
+    run_step "01-install-base" "bash" "${STAGING_DIR}/01-install-base.sh"
+
+    # GHCR authentication after Docker is available
     run_step "10-ghcr-auth" "bash" "${SCRIPT_DIR}/10-ghcr-auth.sh"
     unset GHCR_CREDS_FILE
 
     # Clean up credentials file
     rm -f "$cred_file"
 
-    # Core install (reuses proven packer modules)
-    run_step "01-install-base" "bash" "${STAGING_DIR}/01-install-base.sh"
     run_step "02-install-k3d" "bash" "${STAGING_DIR}/02-install-k3d.sh"
     run_step "03-install-hhfab" "bash" "${STAGING_DIR}/03-install-hhfab.sh"
     run_step "04-install-tools" "bash" "${STAGING_DIR}/04-install-tools.sh"
