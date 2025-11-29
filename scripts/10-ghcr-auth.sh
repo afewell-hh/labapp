@@ -28,6 +28,11 @@ if [ -z "$GHCR_USER" ] || [ -z "$GHCR_TOKEN" ]; then
     exit 1
 fi
 
+if ! command -v docker >/dev/null 2>&1; then
+    log INFO "Docker not installed yet; skipping GHCR login. Will be handled post-install-base."
+    exit 0
+fi
+
 log INFO "Authenticating to ghcr.io as ${GHCR_USER}..."
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 log INFO "Docker login succeeded."

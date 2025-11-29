@@ -392,17 +392,28 @@ repoServer:
 EOF
 
     # Install/upgrade chart (idempotent)
+    # NOTE: We don't use --wait because k3d's servicelb can't assign external IPs
+    # to LoadBalancer services, causing Helm to timeout waiting. Instead, we verify
+    # pod readiness separately after installation.
     log_info "Installing/upgrading ArgoCD chart (version: ${ARGOCD_CHART_VERSION})..."
     if ! helm upgrade --install argocd argo/argo-cd \
         --namespace "$ARGOCD_NAMESPACE" \
         --create-namespace \
         --version "$ARGOCD_CHART_VERSION" \
         --values /tmp/argocd-values.yaml \
-        --wait \
         --timeout 10m >> "$LOG_FILE" 2>&1; then
         log_error "Failed to install/upgrade ArgoCD"
         rm -f /tmp/argocd-values.yaml
         return 1
+    fi
+
+    # Wait for ArgoCD pods to be ready (separate from Helm --wait to avoid LoadBalancer timeout)
+    log_info "Waiting for ArgoCD pods to be ready..."
+    if ! kubectl wait --for=condition=ready pod \
+        -l "app.kubernetes.io/name=argocd-server" \
+        -n "$ARGOCD_NAMESPACE" \
+        --timeout=300s >> "$LOG_FILE" 2>&1; then
+        log_warn "ArgoCD server pod readiness check timed out, continuing anyway..."
     fi
 
     rm -f /tmp/argocd-values.yaml
