@@ -160,24 +160,18 @@ for doc in docs:
                 existing_sans.append(san)
         doc['spec']['config']['control']['tlsSAN'] = existing_sans
 
-        # Add Alloy config for telemetry
+        # Add Alloy config for telemetry (using hhfab v0.43+ schema)
+        # See: https://docs.githedgehog.com/24.09/install-upgrade/config/
         doc['spec']['config']['fabric']['defaultAlloyConfig'] = {
-            'controlProxy': {
-                'enabled': True
-            },
-            'collectors': {
-                'integrations/self': {'enabled': True},
-                'integrations/unix': {'enabled': True},
-                'integrations/syslog': {'enabled': True}
-            },
-            'destinations': {
-                'prom': {
-                    'type': 'prometheus',
-                    'remoteWrite': {
-                        'url': '${ALLOY_PROM_REMOTE_WRITE_URL}'
-                    },
-                    'sendInterval': ${ALLOY_PROM_SEND_INTERVAL},
-                    'extraLabels': {
+            'agentScrapeIntervalSeconds': 120,
+            'unixScrapeIntervalSeconds': 120,
+            'unixExporterEnabled': True,
+            'prometheusTargets': {
+                'emc': {
+                    'url': '${ALLOY_PROM_REMOTE_WRITE_URL}',
+                    'sendIntervalSeconds': ${ALLOY_PROM_SEND_INTERVAL},
+                    'useControlProxy': True,
+                    'labels': {
                         'env': '${ALLOY_PROM_LABEL_ENV}',
                         'cluster': '${ALLOY_PROM_LABEL_CLUSTER}'
                     }
