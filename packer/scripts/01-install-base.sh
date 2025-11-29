@@ -19,6 +19,11 @@ else
     echo "User 'hhlab' already exists; skipping creation."
 fi
 
+# Configure passwordless sudo for hhlab (required for hhfab setup-taps)
+echo "Configuring passwordless sudo for hhlab..."
+echo 'hhlab ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/hhlab
+chmod 440 /etc/sudoers.d/hhlab
+
 # Configure APT for faster downloads and better caching
 echo "Configuring APT for optimal performance..."
 cat > /etc/apt/apt.conf.d/99-packer-optimizations <<'EOF'
