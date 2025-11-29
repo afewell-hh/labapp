@@ -31,6 +31,7 @@ ARGOCD_HTTP_PORT="${ARGOCD_HTTP_PORT:-8080}"
 ARGOCD_HTTPS_PORT="${ARGOCD_HTTPS_PORT:-8443}"
 GITEA_HTTP_PORT="${GITEA_HTTP_PORT:-3001}"
 GITEA_SSH_PORT="${GITEA_SSH_PORT:-2222}"
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"  # For Alloy remote write from VLAB
 
 # Helm chart versions
 PROMETHEUS_STACK_CHART_VERSION="${PROMETHEUS_STACK_CHART_VERSION:-65.2.0}"
@@ -141,6 +142,7 @@ create_k3d_cluster() {
     log_info "  ArgoCD HTTPS: localhost:${ARGOCD_HTTPS_PORT}"
     log_info "  Gitea HTTP: localhost:${GITEA_HTTP_PORT}"
     log_info "  Gitea SSH: localhost:${GITEA_SSH_PORT}"
+    log_info "  Prometheus: localhost:${PROMETHEUS_PORT} (for Alloy remote write)"
 
     if ! k3d cluster create "$K3D_CLUSTER_NAME" \
         --api-port 6550 \
@@ -149,6 +151,7 @@ create_k3d_cluster() {
         --port "${ARGOCD_HTTPS_PORT}:${ARGOCD_HTTPS_PORT}@loadbalancer" \
         --port "${GITEA_HTTP_PORT}:${GITEA_HTTP_PORT}@loadbalancer" \
         --port "${GITEA_SSH_PORT}:${GITEA_SSH_PORT}@loadbalancer" \
+        --port "${PROMETHEUS_PORT}:${PROMETHEUS_PORT}@loadbalancer" \
         --agents 2 \
         --wait >> "$LOG_FILE" 2>&1; then
         log_error "Failed to create k3d cluster"
@@ -260,8 +263,18 @@ grafana:
 
 # Prometheus configuration
 prometheus:
+  # Service must be LoadBalancer type to receive metrics from VLAB Alloy agents
+  service:
+    type: LoadBalancer
+    port: ${PROMETHEUS_PORT}
+
   prometheusSpec:
     retention: 7d
+
+    # CRITICAL: Enable remote write receiver for Alloy to push metrics
+    # This allows the VLAB Alloy agents to send metrics to Prometheus
+    enableRemoteWriteReceiver: true
+
     storageSpec:
       volumeClaimTemplate:
         spec:
@@ -379,17 +392,28 @@ repoServer:
 EOF
 
     # Install/upgrade chart (idempotent)
+    # NOTE: We don't use --wait because k3d's servicelb can't assign external IPs
+    # to LoadBalancer services, causing Helm to timeout waiting. Instead, we verify
+    # pod readiness separately after installation.
     log_info "Installing/upgrading ArgoCD chart (version: ${ARGOCD_CHART_VERSION})..."
     if ! helm upgrade --install argocd argo/argo-cd \
         --namespace "$ARGOCD_NAMESPACE" \
         --create-namespace \
         --version "$ARGOCD_CHART_VERSION" \
         --values /tmp/argocd-values.yaml \
-        --wait \
         --timeout 10m >> "$LOG_FILE" 2>&1; then
         log_error "Failed to install/upgrade ArgoCD"
         rm -f /tmp/argocd-values.yaml
         return 1
+    fi
+
+    # Wait for ArgoCD pods to be ready (separate from Helm --wait to avoid LoadBalancer timeout)
+    log_info "Waiting for ArgoCD pods to be ready..."
+    if ! kubectl wait --for=condition=ready pod \
+        -l "app.kubernetes.io/name=argocd-server" \
+        -n "$ARGOCD_NAMESPACE" \
+        --timeout=300s >> "$LOG_FILE" 2>&1; then
+        log_warn "ArgoCD server pod readiness check timed out, continuing anyway..."
     fi
 
     rm -f /tmp/argocd-values.yaml

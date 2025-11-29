@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab-info
+  namespace: default
+data:
+  welcome: |
+    Hedgehog VLAB is installed.
+    - ArgoCD: http://localhost:8080 (admin password: argocd-initial-admin-secret)
+    - Grafana: http://localhost:3000 (admin / prom-operator)
+    - Gitea:   http://localhost:3001 (gitea_admin / admin123)
+    This file provides initial content so ArgoCD can report a Synced status.

@@ -26,6 +26,16 @@ VLAB_WAIT_TIMEOUT="${VLAB_WAIT_TIMEOUT:-600}"  # 10 minutes for switch readiness
 VLAB_HEALTH_CHECK_INTERVAL="${VLAB_HEALTH_CHECK_INTERVAL:-10}"
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 
+# Telemetry Configuration - Alloy pushes metrics to Prometheus
+# The k3d docker bridge IP is 172.18.0.1 - this is where k3d exposes services
+ALLOY_PROM_REMOTE_WRITE_URL="${ALLOY_PROM_REMOTE_WRITE_URL:-http://172.18.0.1:9090/api/v1/write}"
+ALLOY_PROM_SEND_INTERVAL="${ALLOY_PROM_SEND_INTERVAL:-120}"
+ALLOY_PROM_LABEL_ENV="${ALLOY_PROM_LABEL_ENV:-vlab}"
+ALLOY_PROM_LABEL_CLUSTER="${ALLOY_PROM_LABEL_CLUSTER:-emc}"
+
+# Extra TLS SANs for external access (space or comma separated, supports wildcards)
+EXTRA_TLS_SANS="${EXTRA_TLS_SANS:-}"
+
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -94,6 +104,207 @@ init_vlab_workdir() {
     else
         log_info "VLAB already initialized (fab.yaml exists)"
     fi
+
+    return 0
+}
+
+# Apply fab.yaml overrides for TLS SANs and Alloy telemetry configuration
+# This MUST be done before 'hhfab vlab up' is called
+apply_fab_overrides() {
+    log_info "Applying fab.yaml overrides for external access and telemetry..."
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    if [ ! -f "$VLAB_WORK_DIR/fab.yaml" ]; then
+        log_error "fab.yaml not found - cannot apply overrides"
+        return 1
+    fi
+
+    # Backup original
+    cp "$VLAB_WORK_DIR/fab.yaml" "$VLAB_WORK_DIR/fab.yaml.orig.$(date +%Y%m%d%H%M%S)"
+
+    # Collect TLS SANs - these are needed for external access to the Hedgehog controller
+    # Include: loopback, docker bridges, host IPs, and any extra SANs
+    local tls_sans=()
+
+    # Standard entries
+    tls_sans+=("127.0.0.1" "localhost")
+    tls_sans+=("172.17.0.1")   # docker0 bridge
+    tls_sans+=("172.18.0.1")   # k3d bridge (where k3d exposes services)
+    tls_sans+=("0.0.0.0")      # Wildcard bind (lab-only!)
+    tls_sans+=("0.0.0.0/0")    # CIDR wildcard (lab-only!)
+
+    # Add host's primary IP
+    local host_ip
+    host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$host_ip" ]; then
+        tls_sans+=("$host_ip")
+        log_info "Adding host IP to TLS SANs: $host_ip"
+    fi
+
+    # Add hostname and FQDN
+    local hostname_short hostname_fqdn
+    hostname_short=$(hostname -s 2>/dev/null)
+    hostname_fqdn=$(hostname -f 2>/dev/null || echo "")
+    [ -n "$hostname_short" ] && tls_sans+=("$hostname_short")
+    [ -n "$hostname_fqdn" ] && [ "$hostname_fqdn" != "$hostname_short" ] && tls_sans+=("$hostname_fqdn")
+
+    # Add common service DNS names
+    tls_sans+=("argocd-server.argocd")
+    tls_sans+=("gitea-http.gitea")
+    tls_sans+=("kube-prometheus-stack-prometheus.monitoring")
+
+    # Add any extra SANs from environment
+    if [ -n "$EXTRA_TLS_SANS" ]; then
+        # Support both space and comma separation
+        local extra
+        for extra in $(echo "$EXTRA_TLS_SANS" | tr ',' ' '); do
+            [ -n "$extra" ] && tls_sans+=("$extra")
+        done
+    fi
+
+    log_info "TLS SANs to be added: ${tls_sans[*]}"
+
+    # Build the YAML for tlsSAN entries
+    local tls_san_yaml=""
+    for san in "${tls_sans[@]}"; do
+        tls_san_yaml+="        - \"$san\"\n"
+    done
+
+    # Build the defaultAlloyConfig YAML for telemetry
+    # This configures Alloy agents on switches to push metrics to Prometheus via remote write
+    local alloy_config_yaml
+    alloy_config_yaml=$(cat <<EOF
+    defaultAlloyConfig:
+      controlProxy:
+        enabled: true
+      collectors:
+        integrations/self:
+          enabled: true
+        integrations/unix:
+          enabled: true
+        integrations/syslog:
+          enabled: true
+      destinations:
+        prom:
+          type: prometheus
+          remoteWrite:
+            url: "${ALLOY_PROM_REMOTE_WRITE_URL}"
+          sendInterval: ${ALLOY_PROM_SEND_INTERVAL}
+          extraLabels:
+            env: "${ALLOY_PROM_LABEL_ENV}"
+            cluster: "${ALLOY_PROM_LABEL_CLUSTER}"
+EOF
+)
+
+    log_info "Alloy config to be added with remote write to: $ALLOY_PROM_REMOTE_WRITE_URL"
+
+    # Now patch the fab.yaml file using yq if available, otherwise sed
+    if command -v yq &> /dev/null; then
+        log_info "Using yq to patch fab.yaml..."
+
+        # Add TLS SANs
+        for san in "${tls_sans[@]}"; do
+            yq -i ".spec.config.control.tlsSAN += [\"$san\"]" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE" || true
+        done
+
+        # Add Alloy config
+        yq -i ".spec.config.fabric.defaultAlloyConfig.controlProxy.enabled = true" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.collectors.\"integrations/self\".enabled = true" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.collectors.\"integrations/unix\".enabled = true" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.collectors.\"integrations/syslog\".enabled = true" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.destinations.prom.type = \"prometheus\"" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.destinations.prom.remoteWrite.url = \"${ALLOY_PROM_REMOTE_WRITE_URL}\"" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.destinations.prom.sendInterval = ${ALLOY_PROM_SEND_INTERVAL}" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.destinations.prom.extraLabels.env = \"${ALLOY_PROM_LABEL_ENV}\"" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+        yq -i ".spec.config.fabric.defaultAlloyConfig.destinations.prom.extraLabels.cluster = \"${ALLOY_PROM_LABEL_CLUSTER}\"" "$VLAB_WORK_DIR/fab.yaml" 2>> "$LOG_FILE"
+
+    else
+        log_info "yq not found, using Python YAML patching..."
+
+        # Use Python to patch YAML (more reliable than sed for YAML)
+        python3 << PYEOF
+import yaml
+import sys
+
+fab_yaml_path = "$VLAB_WORK_DIR/fab.yaml"
+
+# Load all documents from fab.yaml
+with open(fab_yaml_path, 'r') as f:
+    docs = list(yaml.safe_load_all(f))
+
+# TLS SANs to add
+tls_sans = [$(printf '"%s",' "${tls_sans[@]}" | sed 's/,$//')
+]
+
+# Process each document
+for doc in docs:
+    if doc is None:
+        continue
+
+    kind = doc.get('kind', '')
+
+    if kind == 'Fabricator':
+        # Ensure nested structure exists
+        if 'spec' not in doc:
+            doc['spec'] = {}
+        if 'config' not in doc['spec']:
+            doc['spec']['config'] = {}
+        if 'control' not in doc['spec']['config']:
+            doc['spec']['config']['control'] = {}
+        if 'fabric' not in doc['spec']['config']:
+            doc['spec']['config']['fabric'] = {}
+
+        # Add TLS SANs
+        existing_sans = doc['spec']['config']['control'].get('tlsSAN', [])
+        if existing_sans is None:
+            existing_sans = []
+        for san in tls_sans:
+            if san not in existing_sans:
+                existing_sans.append(san)
+        doc['spec']['config']['control']['tlsSAN'] = existing_sans
+
+        # Add Alloy config for telemetry
+        doc['spec']['config']['fabric']['defaultAlloyConfig'] = {
+            'controlProxy': {
+                'enabled': True
+            },
+            'collectors': {
+                'integrations/self': {'enabled': True},
+                'integrations/unix': {'enabled': True},
+                'integrations/syslog': {'enabled': True}
+            },
+            'destinations': {
+                'prom': {
+                    'type': 'prometheus',
+                    'remoteWrite': {
+                        'url': '${ALLOY_PROM_REMOTE_WRITE_URL}'
+                    },
+                    'sendInterval': ${ALLOY_PROM_SEND_INTERVAL},
+                    'extraLabels': {
+                        'env': '${ALLOY_PROM_LABEL_ENV}',
+                        'cluster': '${ALLOY_PROM_LABEL_CLUSTER}'
+                    }
+                }
+            }
+        }
+
+# Write back
+with open(fab_yaml_path, 'w') as f:
+    yaml.dump_all(docs, f, default_flow_style=False, sort_keys=False)
+
+print("fab.yaml patched successfully")
+PYEOF
+
+        if [ $? -ne 0 ]; then
+            log_error "Failed to patch fab.yaml with Python"
+            return 1
+        fi
+    fi
+
+    log_info "fab.yaml patched successfully"
+    log_debug "Patched fab.yaml contents:"
+    cat "$VLAB_WORK_DIR/fab.yaml" >> "$LOG_FILE" 2>&1
 
     return 0
 }
@@ -234,6 +445,14 @@ main() {
 
     if ! init_vlab_workdir; then
         log_error "VLAB working directory initialization failed"
+        cleanup_on_error
+        return 1
+    fi
+
+    # CRITICAL: Apply fab.yaml overrides for TLS SANs and Alloy config BEFORE vlab up
+    # This enables external access and telemetry from day one
+    if ! apply_fab_overrides; then
+        log_error "Failed to apply fab.yaml overrides"
         cleanup_on_error
         return 1
     fi

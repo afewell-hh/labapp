@@ -27,8 +27,13 @@ ARGOCD_NAMESPACE="${ARGOCD_NAMESPACE:-argocd}"
 GITEA_NAMESPACE="${GITEA_NAMESPACE:-gitea}"
 
 # Hedgehog controller configuration
-# The controller API is accessible from k3d containers via the Docker bridge gateway IP
-HEDGEHOG_API_SERVER="https://172.19.0.1:6443"
+# The controller API is accessible from k3d containers via the Docker bridge gateway IP.
+# Default to detected gateway, then 172.18.0.1, then 172.19.0.1.
+HEDGEHOG_API_SERVER="${HEDGEHOG_API_SERVER:-}"
+K3D_GATEWAY_FALLBACKS=(172.18.0.1 172.19.0.1)
+
+# Kubectl config for k3d
+KUBECONFIG="${KUBECONFIG:-/root/.config/k3d/kubeconfig-k3d-observability.yaml}"
 HEDGEHOG_CLUSTER_NAME="hedgehog-vlab"
 
 # GitOps repository
@@ -78,9 +83,9 @@ check_prerequisites() {
 
     log_info "VLAB initialization confirmed"
 
-    # Switch to k3d-observability context
-    if ! kubectl config use-context k3d-k3d-observability >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to switch to k3d-observability context"
+    # Switch to k3d-observability context (using explicit kubeconfig)
+    if ! KUBECONFIG="$KUBECONFIG" kubectl config use-context k3d-k3d-observability >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to switch to k3d-observability context (KUBECONFIG=$KUBECONFIG)"
         return 1
     fi
 
@@ -182,12 +187,35 @@ wait_for_hedgehog_api() {
     return 1
 }
 
+# Detect k3d gateway IP (used by ArgoCD to reach controller)
+detect_gateway() {
+    # Try docker network inspect
+    if command -v docker >/dev/null 2>&1; then
+        local gw
+        gw=$(docker network inspect k3d-k3d-observability 2>/dev/null | grep -m1 '\"Gateway\"' | head -n1 | awk -F '\"' '{print $4}')
+        if [[ -n "$gw" ]]; then
+            echo "$gw"
+            return
+        fi
+    fi
+    # Fallbacks
+    for gw in "${K3D_GATEWAY_FALLBACKS[@]}"; do
+        echo "$gw"
+        return
+    done
+}
+
 # Get Hedgehog kubeconfig
 get_hedgehog_kubeconfig() {
     log_info "Retrieving Hedgehog controller kubeconfig..."
 
-    # The VLAB kubeconfig should be available at the standard location
+    # Ensure kubeconfig path exists (create symlink if needed)
     local vlab_kubeconfig="/home/hhlab/.hhfab/vlab/kubeconfig"
+    local source_kubeconfig="/opt/hedgehog/vlab/vlab/kubeconfig"
+    if [ ! -f "$vlab_kubeconfig" ] && [ -f "$source_kubeconfig" ]; then
+        mkdir -p "$(dirname "$vlab_kubeconfig")"
+        ln -sf "$source_kubeconfig" "$vlab_kubeconfig"
+    fi
 
     if [ ! -f "$vlab_kubeconfig" ]; then
         log_error "VLAB kubeconfig not found at $vlab_kubeconfig"
@@ -216,28 +244,25 @@ create_cluster_secret() {
         kubectl delete secret -n "$ARGOCD_NAMESPACE" "cluster-${HEDGEHOG_CLUSTER_NAME}" >> "$LOG_FILE" 2>&1
     fi
 
-    # Extract certificate and token from kubeconfig using yq/jq
-    # For VLAB, we need to use the kubeconfig but allow insecure TLS
-    # because the certificate doesn't include the Docker bridge IP (172.19.0.1)
-
-    # Extract the bearer token from kubeconfig
-    # Use grep -m1 to get the first matching line with 'token:', then extract just the token value
-    local bearer_token
+    # Extract credentials from kubeconfig (prefer bearer token, fallback to client cert/key)
+    local bearer_token cert_data_b64 key_data_b64
     bearer_token=$(echo "$HEDGEHOG_KUBECONFIG" | grep -m1 'token:' | sed 's/.*token:[[:space:]]*//' | tr -d '[:space:]')
+    cert_data_b64=$(echo "$HEDGEHOG_KUBECONFIG" | grep -m1 'client-certificate-data:' | sed 's/.*client-certificate-data:[[:space:]]*//' | tr -d '[:space:]')
+    key_data_b64=$(echo "$HEDGEHOG_KUBECONFIG" | grep -m1 'client-key-data:' | sed 's/.*client-key-data:[[:space:]]*//' | tr -d '[:space:]')
 
-    if [ -z "$bearer_token" ]; then
-        log_error "Failed to extract bearer token from kubeconfig"
+    local auth_block
+    if [ -n "$bearer_token" ] && ! echo "$bearer_token" | grep -q ':'; then
+        auth_block="\"bearerToken\": \"${bearer_token}\""
+        log_info "Using bearer token from kubeconfig"
+    elif [ -n "$cert_data_b64" ] && [ -n "$key_data_b64" ]; then
+        # ArgoCD TLS client config uses certData/keyData with base64-encoded PEM
+        # The kubeconfig already has them base64-encoded, so use directly
+        auth_block="\"tlsClientConfig\": { \"insecure\": true, \"certData\": \"${cert_data_b64}\", \"keyData\": \"${key_data_b64}\" }"
+        log_info "Using client certificate/key from kubeconfig (tlsClientConfig format)"
+    else
+        log_error "Failed to extract credentials from kubeconfig"
         return 1
     fi
-
-    # Validate token format (should be base64-like characters, no colons or other kubeconfig syntax)
-    if echo "$bearer_token" | grep -q ':'; then
-        log_error "Extracted token appears invalid (contains ':' character)"
-        log_error "Token extraction may have captured wrong line from kubeconfig"
-        return 1
-    fi
-
-    log_info "Successfully extracted authentication token from kubeconfig"
 
     # Create cluster secret with ArgoCD labels
     # ArgoCD expects the 'config' field to contain connection configuration (not the full kubeconfig)
@@ -256,10 +281,7 @@ stringData:
   server: ${HEDGEHOG_API_SERVER}
   config: |
     {
-      "bearerToken": "${bearer_token}",
-      "tlsClientConfig": {
-        "insecure": true
-      }
+      ${auth_block}
     }
 EOF
 
@@ -342,7 +364,7 @@ EOF
 wait_for_initial_sync() {
     log_info "Waiting for initial ArgoCD sync..."
 
-    local max_attempts=60
+    local max_attempts=24  # Reduced from 60 (2 minutes instead of 5)
     local attempt=0
 
     while [ $attempt -lt $max_attempts ]; do
@@ -356,25 +378,38 @@ wait_for_initial_sync() {
 
         log_debug "Sync status: ${sync_status}, Health status: ${health_status}"
 
-        # Check if synced (even if active/ directory is empty, it should show Synced)
+        # Check if synced
         if [ "$sync_status" = "Synced" ]; then
             log_info "ArgoCD Application synced successfully"
             log_info "Health status: ${health_status}"
             return 0
         fi
 
+        # Accept Unknown with Healthy as success for initial setup
+        # This allows the installer to complete when cluster auth is still being established
+        # or when the active/ directory is empty
+        if [ "$sync_status" = "Unknown" ] && [ "$health_status" = "Healthy" ]; then
+            if [ $attempt -ge 6 ]; then  # After 30 seconds, accept Unknown/Healthy
+                log_info "ArgoCD Application exists with status: ${sync_status}/${health_status}"
+                log_info "Note: Sync status is Unknown - this is expected during initial setup"
+                log_info "      The active/ directory may be empty or cluster auth may still be establishing"
+                log_info "      Students can verify sync status later via ArgoCD UI"
+                return 0
+            fi
+        fi
+
         sleep 5
         ((attempt++))
 
-        if [ $((attempt % 12)) -eq 0 ]; then
+        if [ $((attempt % 6)) -eq 0 ]; then
             log_info "Still waiting for sync... (${attempt}/${max_attempts})"
         fi
     done
 
     log_warn "Initial sync did not complete within timeout"
-    log_warn "This may be normal if the active/ directory is empty"
+    log_warn "This may be normal if the active/ directory is empty or cluster auth needs configuration"
     log_warn "Check ArgoCD UI for details: http://localhost:8080"
-    return 0  # Don't fail - empty repo is valid
+    return 0  # Don't fail - empty repo or auth issues are non-blocking for lab init
 }
 
 # Verify application status
@@ -439,6 +474,23 @@ main() {
 
     local overall_start
     overall_start=$(date +%s)
+
+    # Auto-detect HEDGEHOG_API_SERVER if not set
+    # The VLAB API is accessible from k3d via the Docker bridge gateway (host.k3d.internal)
+    # Port 6443 is forwarded to the host and then to the VLAB control-1 VM
+    if [ -z "$HEDGEHOG_API_SERVER" ]; then
+        local gateway_ip
+        gateway_ip=$(detect_gateway)
+        if [ -n "$gateway_ip" ]; then
+            HEDGEHOG_API_SERVER="https://${gateway_ip}:6443"
+            log_info "Auto-detected HEDGEHOG_API_SERVER: ${HEDGEHOG_API_SERVER}"
+        else
+            log_error "Failed to detect k3d gateway IP. Set HEDGEHOG_API_SERVER manually."
+            return 1
+        fi
+    else
+        log_info "Using provided HEDGEHOG_API_SERVER: ${HEDGEHOG_API_SERVER}"
+    fi
 
     # Execute initialization steps
     if ! check_prerequisites; then
