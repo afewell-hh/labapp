@@ -475,6 +475,23 @@ main() {
     local overall_start
     overall_start=$(date +%s)
 
+    # Auto-detect HEDGEHOG_API_SERVER if not set
+    # The VLAB API is accessible from k3d via the Docker bridge gateway (host.k3d.internal)
+    # Port 6443 is forwarded to the host and then to the VLAB control-1 VM
+    if [ -z "$HEDGEHOG_API_SERVER" ]; then
+        local gateway_ip
+        gateway_ip=$(detect_gateway)
+        if [ -n "$gateway_ip" ]; then
+            HEDGEHOG_API_SERVER="https://${gateway_ip}:6443"
+            log_info "Auto-detected HEDGEHOG_API_SERVER: ${HEDGEHOG_API_SERVER}"
+        else
+            log_error "Failed to detect k3d gateway IP. Set HEDGEHOG_API_SERVER manually."
+            return 1
+        fi
+    else
+        log_info "Using provided HEDGEHOG_API_SERVER: ${HEDGEHOG_API_SERVER}"
+    fi
+
     # Execute initialization steps
     if ! check_prerequisites; then
         log_error "Prerequisites check failed"
