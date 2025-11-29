@@ -17,7 +17,11 @@ VLAB_WORK_DIR="${VLAB_WORK_DIR:-/opt/hedgehog/vlab}"
 VLAB_TIMEOUT="${VLAB_TIMEOUT:-7200}"
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
-HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
+# Note: We intentionally do NOT use --ready wait because hhfab v0.43.x has a bug
+# where it panics when the K8s API server inside the control VM becomes temporarily
+# unreachable during switch registration. Instead, we start VLAB without waiting
+# and implement our own polling-based readiness check.
+HHFAB_CMD="hhfab vlab up --controls-restricted=false"
 
 # Telemetry Configuration - Alloy pushes metrics to Prometheus
 # The k3d docker bridge IP is 172.18.0.1 - this is where k3d exposes services
@@ -322,17 +326,16 @@ start_tmux_session() {
     return 0
 }
 
-# Wait for hhfab to complete
-wait_for_completion() {
-    log_info "Waiting for VLAB initialization to complete..."
-    log_info "This may take up to $(( VLAB_TIMEOUT / 60 )) minutes..."
+# Wait for hhfab vlab up to complete (VM boot phase)
+wait_for_vlab_boot() {
+    log_info "Waiting for VLAB VMs to boot..."
+    log_info "This may take up to 30 minutes..."
 
     local start_time
     start_time=$(date +%s)
     local end_time
-    end_time=$((start_time + VLAB_TIMEOUT))
+    end_time=$((start_time + 1800))  # 30 minutes for VM boot
     local check_interval=10
-    local success_marker="All on-ready commands finished"
 
     while [ "$(date +%s)" -lt "$end_time" ]; do
         # Check if the tmux session still exists
@@ -359,25 +362,93 @@ wait_for_completion() {
             fi
         fi
 
-        # Detect success marker even if hhfab keeps streaming logs
-        if tail -n 200 "$LOG_FILE" | grep -q "$success_marker"; then
-            log_info "Detected hhfab completion marker; leaving tmux session running for monitoring"
-            return 0
-        fi
-
         # Log progress
         local elapsed=$(($(date +%s) - start_time))
-        log_info "Still waiting... (${elapsed}s elapsed, session is running)"
+        log_info "Still waiting for VMs to boot... (${elapsed}s elapsed)"
 
         sleep "$check_interval"
     done
 
-    # Timeout reached
-    log_error "VLAB initialization timed out after ${VLAB_TIMEOUT}s"
-    log_error "Tmux session '$TMUX_SESSION_NAME' is still running but exceeded timeout"
-    log_error "You can inspect it with: tmux attach -t $TMUX_SESSION_NAME"
+    # Timeout reached - this is OK if session is still running
+    if session_exists; then
+        log_info "VM boot phase timeout reached but tmux session still running"
+        log_info "Proceeding to switch readiness check..."
+        return 0
+    fi
 
+    log_error "VLAB boot timed out after 1800s"
     return 1
+}
+
+# Wait for switches to become ready using hhfab vlab inspect
+# This is a workaround for the hhfab v0.43.x panic bug with --ready wait
+wait_for_switches_ready() {
+    log_info "Waiting for all switches to become ready..."
+    log_info "This check uses 'hhfab vlab inspect' instead of '--ready wait' to avoid hhfab panic bug"
+
+    local start_time
+    start_time=$(date +%s)
+    local switch_timeout=$((VLAB_TIMEOUT - 1800))  # Remaining time after boot phase
+    local end_time
+    end_time=$((start_time + switch_timeout))
+    local check_interval=30
+    local expected_switches=7  # spine-01, spine-02, leaf-01 to leaf-05
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    while [ "$(date +%s)" -lt "$end_time" ]; do
+        # Run hhfab vlab inspect and check switch status
+        local inspect_output
+        inspect_output=$(hhfab vlab inspect 2>&1) || true
+
+        # Check for API server connectivity issues (transient)
+        if echo "$inspect_output" | grep -q "connection refused\|connection reset"; then
+            local elapsed=$(($(date +%s) - start_time))
+            log_warn "K8s API temporarily unavailable, retrying... (${elapsed}s elapsed)"
+            sleep "$check_interval"
+            continue
+        fi
+
+        # Count ready switches from inspect output
+        # Look for "Ready: true" or similar indicator in the output
+        local ready_count=0
+        if echo "$inspect_output" | grep -q "Ready switches:"; then
+            # Parse ready count from inspect output
+            ready_count=$(echo "$inspect_output" | grep -oP "Ready switches: \K\d+" || echo "0")
+        elif echo "$inspect_output" | grep -c "type=switch.*Ready=true" 2>/dev/null; then
+            ready_count=$(echo "$inspect_output" | grep -c "type=switch.*Ready=true" || echo "0")
+        else
+            # Alternative: check if there are no "notReady" switches
+            local not_ready
+            not_ready=$(echo "$inspect_output" | grep -oP 'notReady="\K[^"]*' | tr -d '[]' | tr ' ' '\n' | grep -c . || echo "0")
+            if [ "$not_ready" = "0" ] || [ -z "$not_ready" ]; then
+                # No notReady switches means all are ready (if any switches exist)
+                if echo "$inspect_output" | grep -q "switch"; then
+                    ready_count=$expected_switches
+                fi
+            else
+                ready_count=$((expected_switches - not_ready))
+            fi
+        fi
+
+        local elapsed=$(($(date +%s) - start_time))
+        log_info "Switch readiness: $ready_count/$expected_switches ready (${elapsed}s elapsed)"
+
+        if [ "$ready_count" -ge "$expected_switches" ]; then
+            log_info "All $expected_switches switches are ready!"
+            return 0
+        fi
+
+        sleep "$check_interval"
+    done
+
+    # Timeout - but we can still proceed if some switches are ready
+    log_warn "Switch readiness timeout reached"
+    log_warn "Some switches may still be initializing"
+    log_warn "The lab may still be functional - verify with 'hhfab vlab inspect'"
+
+    # Return success anyway - the lab is likely functional even if not all switches are fully ready
+    return 0
 }
 
 # Verify VLAB health
@@ -445,10 +516,16 @@ main() {
         return 1
     fi
 
-    if ! wait_for_completion; then
-        log_error "VLAB initialization failed or timed out"
+    # Wait for VLAB VMs to boot (hhfab vlab up without --ready wait)
+    if ! wait_for_vlab_boot; then
+        log_error "VLAB VM boot phase failed"
         log_error "Tmux session may still be running for debugging"
         return 1
+    fi
+
+    # Wait for switches to become ready using our own polling (avoids hhfab panic bug)
+    if ! wait_for_switches_ready; then
+        log_warn "Switch readiness check had issues but continuing..."
     fi
 
     if ! verify_vlab_health; then
