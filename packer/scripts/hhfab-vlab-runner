@@ -19,6 +19,16 @@ LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
 HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
 
+# Telemetry Configuration - Alloy pushes metrics to Prometheus
+# The k3d docker bridge IP is 172.18.0.1 - this is where k3d exposes services
+ALLOY_PROM_REMOTE_WRITE_URL="${ALLOY_PROM_REMOTE_WRITE_URL:-http://172.18.0.1:9090/api/v1/write}"
+ALLOY_PROM_SEND_INTERVAL="${ALLOY_PROM_SEND_INTERVAL:-120}"
+ALLOY_PROM_LABEL_ENV="${ALLOY_PROM_LABEL_ENV:-vlab}"
+ALLOY_PROM_LABEL_CLUSTER="${ALLOY_PROM_LABEL_CLUSTER:-emc}"
+
+# Extra TLS SANs for external access (space or comma separated)
+EXTRA_TLS_SANS="${EXTRA_TLS_SANS:-}"
+
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -39,6 +49,154 @@ log_warn() {
 
 log_error() {
     log "ERROR" "$@"
+}
+
+log_debug() {
+    log "DEBUG" "$@"
+}
+
+# Apply fab.yaml overrides for TLS SANs and Alloy telemetry configuration
+# This MUST be done AFTER 'hhfab init --dev' and BEFORE 'hhfab vlab up'
+apply_fab_overrides() {
+    log_info "Applying fab.yaml overrides for external access and telemetry..."
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    if [ ! -f "$VLAB_WORK_DIR/fab.yaml" ]; then
+        log_error "fab.yaml not found - cannot apply overrides"
+        return 1
+    fi
+
+    # Backup original
+    cp "$VLAB_WORK_DIR/fab.yaml" "$VLAB_WORK_DIR/fab.yaml.orig.$(date +%Y%m%d%H%M%S)"
+
+    # Collect TLS SANs - needed for external access to the Hedgehog controller
+    local tls_sans=()
+
+    # Standard entries
+    tls_sans+=("127.0.0.1" "localhost")
+    tls_sans+=("172.17.0.1")   # docker0 bridge
+    tls_sans+=("172.18.0.1")   # k3d bridge (where k3d exposes services)
+    tls_sans+=("0.0.0.0")      # Wildcard bind (lab-only!)
+    tls_sans+=("0.0.0.0/0")    # CIDR wildcard (lab-only!)
+
+    # Add host's primary IP
+    local host_ip
+    host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$host_ip" ]; then
+        tls_sans+=("$host_ip")
+        log_info "Adding host IP to TLS SANs: $host_ip"
+    fi
+
+    # Add hostname and FQDN
+    local hostname_short hostname_fqdn
+    hostname_short=$(hostname -s 2>/dev/null)
+    hostname_fqdn=$(hostname -f 2>/dev/null || echo "")
+    [ -n "$hostname_short" ] && tls_sans+=("$hostname_short")
+    [ -n "$hostname_fqdn" ] && [ "$hostname_fqdn" != "$hostname_short" ] && tls_sans+=("$hostname_fqdn")
+
+    # Add common service DNS names
+    tls_sans+=("argocd-server.argocd")
+    tls_sans+=("gitea-http.gitea")
+    tls_sans+=("kube-prometheus-stack-prometheus.monitoring")
+
+    # Add any extra SANs from environment
+    if [ -n "$EXTRA_TLS_SANS" ]; then
+        local extra
+        for extra in $(echo "$EXTRA_TLS_SANS" | tr ',' ' '); do
+            [ -n "$extra" ] && tls_sans+=("$extra")
+        done
+    fi
+
+    log_info "TLS SANs to be added: ${tls_sans[*]}"
+    log_info "Alloy remote write URL: $ALLOY_PROM_REMOTE_WRITE_URL"
+
+    # Use Python to patch YAML (more reliable than sed for YAML)
+    python3 << PYEOF
+import yaml
+import sys
+
+fab_yaml_path = "$VLAB_WORK_DIR/fab.yaml"
+
+# Load all documents from fab.yaml
+with open(fab_yaml_path, 'r') as f:
+    docs = list(yaml.safe_load_all(f))
+
+# TLS SANs to add
+tls_sans = [$(printf '"%s",' "${tls_sans[@]}" | sed 's/,$//')
+]
+
+# Process each document
+for doc in docs:
+    if doc is None:
+        continue
+
+    kind = doc.get('kind', '')
+
+    if kind == 'Fabricator':
+        # Ensure nested structure exists
+        if 'spec' not in doc:
+            doc['spec'] = {}
+        if 'config' not in doc['spec']:
+            doc['spec']['config'] = {}
+        if 'control' not in doc['spec']['config']:
+            doc['spec']['config']['control'] = {}
+        if 'fabric' not in doc['spec']['config']:
+            doc['spec']['config']['fabric'] = {}
+
+        # Add TLS SANs
+        existing_sans = doc['spec']['config']['control'].get('tlsSAN', [])
+        if existing_sans is None:
+            existing_sans = []
+        for san in tls_sans:
+            if san not in existing_sans:
+                existing_sans.append(san)
+        doc['spec']['config']['control']['tlsSAN'] = existing_sans
+
+        # Add Alloy config for telemetry
+        doc['spec']['config']['fabric']['defaultAlloyConfig'] = {
+            'controlProxy': {
+                'enabled': True
+            },
+            'collectors': {
+                'integrations/self': {'enabled': True},
+                'integrations/unix': {'enabled': True},
+                'integrations/syslog': {'enabled': True}
+            },
+            'destinations': {
+                'prom': {
+                    'type': 'prometheus',
+                    'remoteWrite': {
+                        'url': '${ALLOY_PROM_REMOTE_WRITE_URL}'
+                    },
+                    'sendInterval': ${ALLOY_PROM_SEND_INTERVAL},
+                    'extraLabels': {
+                        'env': '${ALLOY_PROM_LABEL_ENV}',
+                        'cluster': '${ALLOY_PROM_LABEL_CLUSTER}'
+                    }
+                }
+            }
+        }
+
+        print(f"Patched Fabricator document with {len(existing_sans)} TLS SANs")
+
+# Write back
+with open(fab_yaml_path, 'w') as f:
+    yaml.dump_all(docs, f, default_flow_style=False, sort_keys=False)
+
+print("fab.yaml patched successfully")
+PYEOF
+
+    if [ $? -ne 0 ]; then
+        log_error "Failed to patch fab.yaml with Python"
+        return 1
+    fi
+
+    log_info "fab.yaml patched successfully"
+    log_debug "Patched fab.yaml contents:"
+    cat "$VLAB_WORK_DIR/fab.yaml" >> "$LOG_FILE" 2>&1
+
+    return 0
 }
 
 # Check prerequisites
@@ -90,6 +248,15 @@ init_vlab_workdir() {
             return 1
         fi
         log_info "hhfab initialized successfully"
+    fi
+
+    # CRITICAL: Apply fab.yaml overrides for TLS SANs and Alloy telemetry config
+    # This MUST be done AFTER init and BEFORE vlab gen/vlab up to ensure:
+    # 1. External access works (TLS SANs include docker bridges, host IP)
+    # 2. Telemetry is configured (Alloy pushes metrics to Prometheus)
+    if ! apply_fab_overrides; then
+        log_error "Failed to apply fab.yaml overrides"
+        return 1
     fi
 
     # Generate wiring diagram if not present
