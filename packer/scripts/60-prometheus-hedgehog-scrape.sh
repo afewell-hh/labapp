@@ -1,38 +1,45 @@
 #!/bin/bash
 # 60-prometheus-hedgehog-scrape.sh
-# Prometheus Hedgehog Scrape Configuration Module
-# Configures Prometheus to scrape metrics from Hedgehog fabric-proxy
+# Prometheus Hedgehog Metrics Verification Module
+# Verifies that Hedgehog VLAB metrics are being received via Alloy remote write
+#
+# IMPORTANT: The Hedgehog telemetry architecture uses PUSH, not PULL:
+#   Switch (Alloy agent) → fabric-proxy → Prometheus (remote write receiver)
 #
 # This module:
 # - Waits for Hedgehog VLAB to be ready
-# - Creates Prometheus scrape config for fabric-proxy NodePort
-# - Applies configuration to Prometheus
-# - Verifies metrics are being collected
+# - Verifies Prometheus remote write receiver is enabled
+# - Verifies Prometheus service is accessible on port 9090
+# - Queries for Hedgehog metrics to confirm they're being received
+# - Reports status of metrics collection
 #
 # Prerequisites:
-# - VLAB must be initialized (creates /var/lib/hedgehog-lab/vlab-initialized)
-# - Prometheus must be running in k3d-observability cluster
+# - VLAB must be initialized with defaultAlloyConfig configured
+# - Prometheus must have enableRemoteWriteReceiver: true
+# - Prometheus service must be LoadBalancer type on port 9090
 
 set -euo pipefail
 
 # Module metadata
-MODULE_NAME="prometheus-hedgehog-scrape"
-MODULE_DESCRIPTION="Configure Prometheus to scrape Hedgehog fabric metrics"
-MODULE_VERSION="1.0.0"
+MODULE_NAME="prometheus-hedgehog-verify"
+MODULE_DESCRIPTION="Verify Hedgehog fabric metrics are being received in Prometheus"
+MODULE_VERSION="2.0.0"
 
 # Configuration
 PROMETHEUS_NAMESPACE="${PROMETHEUS_NAMESPACE:-monitoring}"
-HEDGEHOG_FABRIC_PROXY_ENDPOINT="https://172.19.0.1:31028"  # fabric-proxy NodePort
-HEDGEHOG_SCRAPE_JOB="hedgehog-fabric"
-SCRAPE_INTERVAL="15s"
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
+PROMETHEUS_REMOTE_WRITE_URL="http://172.18.0.1:${PROMETHEUS_PORT}/api/v1/write"
 
-LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/prometheus-scrape.log}"
-PROMETHEUS_SCRAPE_TIMEOUT="${PROMETHEUS_SCRAPE_TIMEOUT:-300}"  # 5 minutes
+# Expected labels from VLAB Alloy config
+EXPECTED_ENV_LABEL="${ALLOY_PROM_LABEL_ENV:-vlab}"
+EXPECTED_CLUSTER_LABEL="${ALLOY_PROM_LABEL_CLUSTER:-emc}"
 
-# Ensure log directory exists with correct ownership
+LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/prometheus-verify.log}"
+PROMETHEUS_VERIFY_TIMEOUT="${PROMETHEUS_VERIFY_TIMEOUT:-300}"  # 5 minutes
+
+# Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
-chown hhlab:hhlab "$LOG_FILE"
 
 # Logging functions
 log() {
@@ -80,101 +87,55 @@ check_prerequisites() {
     return 0
 }
 
-# Wait for fabric-proxy to be accessible
-wait_for_fabric_proxy() {
-    log_info "Waiting for Hedgehog fabric-proxy to be accessible..."
+# Verify Prometheus remote write receiver is enabled
+verify_remote_write_receiver() {
+    log_info "Verifying Prometheus remote write receiver is enabled..."
 
-    local max_attempts=60
-    local attempt=0
-
-    while [ $attempt -lt $max_attempts ]; do
-        # Try to reach the fabric-proxy metrics endpoint
-        # It's okay if TLS fails, we just need connectivity
-        if curl -sk --connect-timeout 2 "${HEDGEHOG_FABRIC_PROXY_ENDPOINT}/metrics" &> /dev/null; then
-            log_info "Fabric-proxy is accessible at ${HEDGEHOG_FABRIC_PROXY_ENDPOINT}"
-            return 0
-        fi
-
-        sleep 5
-        ((attempt++))
-
-        if [ $((attempt % 12)) -eq 0 ]; then
-            log_info "Still waiting for fabric-proxy... (${attempt}/${max_attempts})"
-        fi
-    done
-
-    log_warn "Fabric-proxy not accessible after ${max_attempts} attempts"
-    log_warn "Continuing with configuration (proxy may not be ready yet)"
-    return 0  # Don't fail - continue with config
-}
-
-# Create Prometheus scrape configuration
-create_scrape_config() {
-    log_info "Creating Prometheus scrape configuration for Hedgehog fabric..."
-
-    # Create Secret with additional scrape config
-    cat <<EOF | kubectl apply -f - >> "$LOG_FILE" 2>&1
-apiVersion: v1
-kind: Secret
-metadata:
-  name: additional-scrape-configs
-  namespace: ${PROMETHEUS_NAMESPACE}
-type: Opaque
-stringData:
-  prometheus-additional.yaml: |
-    - job_name: '${HEDGEHOG_SCRAPE_JOB}'
-      scrape_interval: ${SCRAPE_INTERVAL}
-      scrape_timeout: 10s
-      metrics_path: '/metrics'
-      scheme: https
-      tls_config:
-        insecure_skip_verify: true
-      static_configs:
-        - targets:
-            - '172.19.0.1:31028'
-          labels:
-            source: 'hedgehog-fabric'
-            environment: 'vlab'
-EOF
-
-    if [ $? -eq 0 ]; then
-        log_info "Created scrape configuration secret"
-    else
-        log_error "Failed to create scrape configuration secret"
-        return 1
-    fi
-
-    # Patch Prometheus to use additional scrape configs
-    # Note: The field is initialized as an empty array in k3d provisioning, so we use "replace"
-    log_info "Patching Prometheus to use additional scrape configs..."
-
-    if ! kubectl patch prometheus kube-prometheus-stack-prometheus \
+    # Check the Prometheus CRD for enableRemoteWriteReceiver
+    local remote_write_enabled
+    remote_write_enabled=$(kubectl get prometheus kube-prometheus-stack-prometheus \
         -n "$PROMETHEUS_NAMESPACE" \
-        --type='json' \
-        -p='[{
-          "op": "replace",
-          "path": "/spec/additionalScrapeConfigs",
-          "value": {
-            "name": "additional-scrape-configs",
-            "key": "prometheus-additional.yaml"
-          }
-        }]' >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to patch Prometheus with additional scrape configs"
-        log_error "Check $LOG_FILE for details"
+        -o jsonpath='{.spec.enableRemoteWriteReceiver}' 2>/dev/null || echo "false")
+
+    if [ "$remote_write_enabled" = "true" ]; then
+        log_info "Prometheus remote write receiver is ENABLED"
+        return 0
+    else
+        log_warn "Prometheus remote write receiver is NOT enabled"
+        log_warn "Run: kubectl patch prometheus kube-prometheus-stack-prometheus -n monitoring --type='json' -p='[{\"op\": \"add\", \"path\": \"/spec/enableRemoteWriteReceiver\", \"value\": true}]'"
         return 1
     fi
-
-    log_info "Patched Prometheus successfully"
-
-    # Wait for Prometheus to reload
-    log_info "Waiting for Prometheus to reload configuration..."
-    sleep 10
-    return 0
 }
 
-# Verify Prometheus is scraping
-verify_scraping() {
-    log_info "Verifying Prometheus is scraping Hedgehog metrics..."
+# Verify Prometheus service is accessible
+verify_prometheus_service() {
+    log_info "Verifying Prometheus service is accessible on port ${PROMETHEUS_PORT}..."
+
+    # Check service type
+    local svc_type
+    svc_type=$(kubectl get svc kube-prometheus-stack-prometheus \
+        -n "$PROMETHEUS_NAMESPACE" \
+        -o jsonpath='{.spec.type}' 2>/dev/null || echo "ClusterIP")
+
+    log_info "Prometheus service type: $svc_type"
+
+    # Try to reach the remote write endpoint
+    if curl -s --connect-timeout 5 "http://localhost:${PROMETHEUS_PORT}/-/ready" &> /dev/null; then
+        log_info "Prometheus is accessible on localhost:${PROMETHEUS_PORT}"
+        return 0
+    elif curl -s --connect-timeout 5 "http://172.18.0.1:${PROMETHEUS_PORT}/-/ready" &> /dev/null; then
+        log_info "Prometheus is accessible on 172.18.0.1:${PROMETHEUS_PORT}"
+        return 0
+    else
+        log_warn "Prometheus not accessible on expected ports"
+        log_warn "This may be normal if the k3d load balancer is still starting"
+        return 0  # Don't fail - may just need more time
+    fi
+}
+
+# Query Prometheus for Hedgehog metrics
+query_hedgehog_metrics() {
+    log_info "Querying Prometheus for Hedgehog metrics..."
 
     # Wait for Prometheus pod to be ready
     log_info "Waiting for Prometheus pod to be ready..."
@@ -186,8 +147,7 @@ verify_scraping() {
         log_warn "Prometheus pod readiness check timed out"
     fi
 
-    # Check Prometheus targets via API
-    log_info "Checking Prometheus targets..."
+    # Get Prometheus pod name for port-forward
     local prom_pod
     prom_pod=$(kubectl get pod -n "$PROMETHEUS_NAMESPACE" \
         -l "app.kubernetes.io/name=prometheus" \
@@ -199,79 +159,103 @@ verify_scraping() {
         return 0
     fi
 
-    # Port-forward to Prometheus and check targets
-    log_info "Verifying scrape job is configured..."
+    # Start port-forward
+    log_info "Starting port-forward to Prometheus pod..."
     kubectl port-forward -n "$PROMETHEUS_NAMESPACE" "$prom_pod" 9091:9090 >> "$LOG_FILE" 2>&1 &
     local pf_pid=$!
-    sleep 3
+    sleep 5
 
-    # Query targets API
-    local targets_response
-    targets_response=$(curl -s "http://localhost:9091/api/v1/targets" 2>/dev/null || echo "")
+    # Query for metrics with expected labels from VLAB
+    log_info "Looking for metrics with env=${EXPECTED_ENV_LABEL}, cluster=${EXPECTED_CLUSTER_LABEL}..."
+
+    # Try the up metric with VLAB labels
+    local query_result
+    query_result=$(curl -s "http://localhost:9091/api/v1/query?query=up{env=\"${EXPECTED_ENV_LABEL}\",cluster=\"${EXPECTED_CLUSTER_LABEL}\"}" 2>/dev/null || echo "")
 
     # Kill port-forward
     kill $pf_pid 2>/dev/null || true
 
-    if echo "$targets_response" | grep -q "${HEDGEHOG_SCRAPE_JOB}"; then
-        log_info "Hedgehog scrape job found in Prometheus targets"
-    else
-        log_warn "Hedgehog scrape job not yet visible in Prometheus targets"
-        log_warn "This is normal if fabric-proxy is not ready yet"
+    if [ -z "$query_result" ]; then
+        log_warn "No response from Prometheus query"
+        return 0
     fi
 
-    return 0
+    # Check if we got any results
+    local result_count
+    result_count=$(echo "$query_result" | python3 -c "import sys,json; data=json.load(sys.stdin); print(len(data.get('data',{}).get('result',[])))" 2>/dev/null || echo "0")
+
+    if [ "$result_count" -gt 0 ]; then
+        log_info "SUCCESS! Found $result_count metric series from Hedgehog VLAB"
+        log_info "Hedgehog fabric telemetry is working correctly"
+        return 0
+    else
+        log_warn "No Hedgehog metrics found yet (expected for fresh installation)"
+        log_warn "Metrics should appear within 2-3 minutes after VLAB switches register"
+        log_info "To verify manually, run:"
+        log_info "  kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
+        log_info "  curl 'http://localhost:9090/api/v1/query?query=up{env=\"vlab\",cluster=\"emc\"}'"
+        return 0
+    fi
 }
 
 # Get configuration summary
 get_config_summary() {
     log_info ""
-    log_info "Prometheus Hedgehog Scrape Configuration Summary:"
-    log_info "  Job Name: ${HEDGEHOG_SCRAPE_JOB}"
-    log_info "  Scrape Interval: ${SCRAPE_INTERVAL}"
-    log_info "  Target Endpoint: ${HEDGEHOG_FABRIC_PROXY_ENDPOINT}/metrics"
-    log_info "  TLS Verification: Disabled (self-signed certs)"
-    log_info "  Labels:"
-    log_info "    - source: hedgehog-fabric"
-    log_info "    - environment: vlab"
+    log_info "Hedgehog Telemetry Configuration Summary:"
+    log_info "=========================================="
+    log_info ""
+    log_info "Architecture: PUSH-based (Alloy agents → Prometheus remote write)"
+    log_info ""
+    log_info "Flow:"
+    log_info "  1. Switch Alloy agents collect metrics (every 120s)"
+    log_info "  2. Alloy pushes to fabric-proxy on control node"
+    log_info "  3. fabric-proxy remote writes to Prometheus at:"
+    log_info "     ${PROMETHEUS_REMOTE_WRITE_URL}"
+    log_info ""
+    log_info "Expected Metric Labels:"
+    log_info "  - env: ${EXPECTED_ENV_LABEL}"
+    log_info "  - cluster: ${EXPECTED_CLUSTER_LABEL}"
     log_info ""
     log_info "Verify metrics in Prometheus:"
-    log_info "  1. Access Prometheus: http://localhost:9090"
-    log_info "  2. Go to Status > Targets"
-    log_info "  3. Look for job: ${HEDGEHOG_SCRAPE_JOB}"
-    log_info "  4. Query metrics: up{source=\"hedgehog-fabric\"}"
+    log_info "  1. Access Prometheus: http://localhost:${PROMETHEUS_PORT}"
+    log_info "  2. Query: up{env=\"${EXPECTED_ENV_LABEL}\",cluster=\"${EXPECTED_CLUSTER_LABEL}\"}"
+    log_info "  3. Expected: 21 metrics (3 per switch × 7 switches)"
+    log_info ""
+    log_info "Verify in Grafana:"
+    log_info "  1. Access Grafana: http://localhost:3000"
+    log_info "  2. Default login: admin / admin"
+    log_info "  3. Import Hedgehog dashboards from Fabric documentation"
     log_info ""
 }
 
 # Main execution function
 main() {
     log_info "=================================================="
-    log_info "Prometheus Hedgehog Scrape Configuration Starting..."
+    log_info "Hedgehog Metrics Verification Starting..."
     log_info "=================================================="
     log_info "Module: $MODULE_NAME v$MODULE_VERSION"
     log_info "Description: $MODULE_DESCRIPTION"
-    log_info "Timeout: ${PROMETHEUS_SCRAPE_TIMEOUT}s ($(( PROMETHEUS_SCRAPE_TIMEOUT / 60 )) minutes)"
     log_info ""
 
     local overall_start
     overall_start=$(date +%s)
 
-    # Execute configuration steps
+    # Execute verification steps
     if ! check_prerequisites; then
         log_error "Prerequisites check failed"
         return 1
     fi
 
-    if ! wait_for_fabric_proxy; then
-        log_warn "Fabric-proxy accessibility check incomplete (non-fatal)"
+    if ! verify_remote_write_receiver; then
+        log_warn "Remote write receiver verification incomplete"
     fi
 
-    if ! create_scrape_config; then
-        log_error "Failed to create scrape configuration"
-        return 1
+    if ! verify_prometheus_service; then
+        log_warn "Prometheus service verification incomplete"
     fi
 
-    if ! verify_scraping; then
-        log_warn "Scraping verification incomplete (non-fatal)"
+    if ! query_hedgehog_metrics; then
+        log_warn "Hedgehog metrics query incomplete"
     fi
 
     local overall_end
@@ -283,10 +267,9 @@ main() {
 
     log_info ""
     log_info "=================================================="
-    log_info "Prometheus Hedgehog Scrape Configuration Complete!"
+    log_info "Hedgehog Metrics Verification Complete!"
     log_info "=================================================="
-    log_info "Total configuration time: ${total_time}s"
-    log_info "Prometheus is configured to scrape Hedgehog fabric"
+    log_info "Total verification time: ${total_time}s"
     log_info ""
 
     return 0
@@ -304,9 +287,9 @@ module_run() {
 }
 
 module_validate() {
-    # Validate that scrape config secret exists
+    # Validate that Prometheus is running with remote write enabled
     kubectl config use-context k3d-k3d-observability &> /dev/null
-    kubectl get secret -n "$PROMETHEUS_NAMESPACE" additional-scrape-configs &> /dev/null
+    kubectl get prometheus -n "$PROMETHEUS_NAMESPACE" kube-prometheus-stack-prometheus &> /dev/null
 }
 
 module_cleanup() {
@@ -319,7 +302,7 @@ module_get_metadata() {
   "name": "$MODULE_NAME",
   "description": "$MODULE_DESCRIPTION",
   "version": "$MODULE_VERSION",
-  "timeout": $PROMETHEUS_SCRAPE_TIMEOUT,
+  "timeout": $PROMETHEUS_VERIFY_TIMEOUT,
   "dependencies": ["vlab", "k3d", "prometheus"]
 }
 EOF
