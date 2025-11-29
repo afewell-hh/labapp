@@ -118,9 +118,16 @@ import sys
 
 fab_yaml_path = "$VLAB_WORK_DIR/fab.yaml"
 
-# Load all documents from fab.yaml
+# Load fab.yaml - hhfab generates YAML with tabs, which PyYAML cannot parse
+# We need to convert tabs to spaces first
 with open(fab_yaml_path, 'r') as f:
-    docs = list(yaml.safe_load_all(f))
+    content = f.read()
+
+# Replace tabs with spaces (YAML doesn't allow tabs for indentation)
+content = content.replace('\t', '    ')
+
+# Parse the fixed YAML content
+docs = list(yaml.safe_load_all(content))
 
 # TLS SANs to add
 tls_sans = [$(printf '"%s",' "${tls_sans[@]}" | sed 's/,$//')
