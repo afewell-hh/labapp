@@ -47,8 +47,8 @@ jobs:
           echo "Running shellcheck on installer scripts"
           EXIT_CODE=0
           # Only check active directories, not _archive
-          if [ -d packer/scripts ]; then
-            find packer/scripts -name "*.sh" \
+          if [ -d installer/modules ]; then
+            find installer/modules -name "*.sh" \
               -exec shellcheck -x {} \; || EXIT_CODE=1
           fi
           if [ -d scripts ]; then
@@ -85,7 +85,7 @@ jobs:
           EXIT_CODE=0
 
           # Check hhfab-vlab.service for critical settings
-          SERVICE_FILE="packer/scripts/hhfab-vlab.service"
+          SERVICE_FILE="installer/modules/hhfab-vlab.service"
 
           if [ ! -f "$SERVICE_FILE" ]; then
             echo "❌ Service file not found: $SERVICE_FILE"
@@ -203,12 +203,12 @@ jobs:
 
           # Check core installer files exist
           REQUIRED_FILES=(
-            "packer/scripts/01-install-base.sh"
-            "packer/scripts/02-install-k3d.sh"
-            "packer/scripts/03-install-hhfab.sh"
-            "packer/scripts/20-k3d-observability-init.sh"
-            "packer/scripts/30-vlab-init.sh"
-            "packer/scripts/hhfab-vlab-runner"
+            "installer/modules/01-install-base.sh"
+            "installer/modules/02-install-k3d.sh"
+            "installer/modules/03-install-hhfab.sh"
+            "installer/modules/20-k3d-observability-init.sh"
+            "installer/modules/30-vlab-init.sh"
+            "installer/modules/hhfab-vlab-runner"
           )
 
           for file in "${REQUIRED_FILES[@]}"; do

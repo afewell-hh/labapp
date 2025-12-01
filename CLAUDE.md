@@ -20,8 +20,8 @@ Read this before touching the repo. It supersedes any prior agent guidance and a
 ## 2. Project Structure
 
 **Active Components:**
-- `packer/scripts/` - Installer modules (10-base-install.sh, 20-k3d-observability-init.sh, 30-vlab-init.sh, etc.)
-- `packer/scripts/hhfab-vlab-runner` - VLAB execution wrapper (runs in tmux session)
+- `installer/modules/` - Installer modules (01-install-base.sh, 20-k3d-observability-init.sh, 30-vlab-init.sh, etc.)
+- `installer/modules/hhfab-vlab-runner` - VLAB execution wrapper (runs in tmux session)
 - `docs/MANUAL_INSTALLATION_GUIDE.md` - Step-by-step manual process the installer automates
 - `tests/` - Unit and integration tests
 

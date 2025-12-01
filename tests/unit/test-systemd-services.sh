@@ -10,9 +10,9 @@ set -euo pipefail
 
 # Test configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VLAB_SERVICE_FILE="${SCRIPT_DIR}/../../packer/scripts/hhfab-vlab.service"
-VLAB_RUNNER_SCRIPT="${SCRIPT_DIR}/../../packer/scripts/hhfab-vlab-runner"
-ORCHESTRATOR_INSTALL="${SCRIPT_DIR}/../../packer/scripts/05-install-orchestrator.sh"
+VLAB_SERVICE_FILE="${SCRIPT_DIR}/../../installer/modules/hhfab-vlab.service"
+VLAB_RUNNER_SCRIPT="${SCRIPT_DIR}/../../installer/modules/hhfab-vlab-runner"
+ORCHESTRATOR_INSTALL="${SCRIPT_DIR}/../../installer/modules/05-install-orchestrator.sh"
 TESTS_PASSED=0
 TESTS_FAILED=0
 

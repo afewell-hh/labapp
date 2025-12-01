@@ -420,8 +420,7 @@ cd labapp
 make build-standard
 
 # Customize by editing:
-# - packer/*.pkr.hcl (Packer templates)
-# - packer/scripts/*.sh (Provisioning scripts)
+# - installer/modules/*.sh (Installer modules)
 ```
 
 See [Build Guide](build/BUILD_GUIDE.md) for comprehensive instructions.

@@ -14,8 +14,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-HH_LAB_SCRIPT="packer/scripts/hh-lab"
-INIT_SERVICE="packer/scripts/hedgehog-lab-init.service"
+HH_LAB_SCRIPT="installer/modules/hh-lab"
+INIT_SERVICE="installer/modules/hedgehog-lab-init.service"
 INSTALLER="scripts/hh-lab-installer"
 GHCR_AUTH="scripts/10-ghcr-auth.sh"
 

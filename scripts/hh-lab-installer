@@ -98,7 +98,7 @@ stage_payload() {
         )
 
         for script in "${packer_scripts[@]}"; do
-            download_file "${REPO_ROOT}/packer/scripts/${script}" "${STAGING_DIR}/${script}"
+            download_file "${REPO_ROOT}/installer/modules/${script}" "${STAGING_DIR}/${script}"
             chmod +x "${STAGING_DIR}/${script}"
         done
 
@@ -119,7 +119,7 @@ stage_payload() {
         )
 
         for file in "${orchestrator_files[@]}"; do
-            download_file "${REPO_ROOT}/packer/scripts/${file}" "${STAGING_DIR}/${file}"
+            download_file "${REPO_ROOT}/installer/modules/${file}" "${STAGING_DIR}/${file}"
             chmod +x "${STAGING_DIR}/${file}" 2>/dev/null || true  # chmod fails for .service files
         done
 
@@ -156,7 +156,7 @@ stage_payload() {
         done
     else
         log INFO "Running in local mode; copying scripts from repository"
-        cp -a "${REPO_ROOT}/packer/scripts/." "$STAGING_DIR/"
+        cp -a "${REPO_ROOT}/installer/modules/." "$STAGING_DIR/"
         cp -a "${REPO_ROOT}/configs" "$STAGING_DIR/" 2>/dev/null || true
     fi
 }

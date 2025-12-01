@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT="packer/scripts/hhfab-vlab-runner"
+SCRIPT="installer/modules/hhfab-vlab-runner"
 
 echo ">> Ensuring hhfab-vlab-runner uses --ready wait"
 if ! grep -q -- "--ready wait" "$SCRIPT"; then

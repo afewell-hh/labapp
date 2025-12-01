@@ -16,13 +16,13 @@ Issue #9 requested the creation of a systemd service to run the orchestrator on 
 **Requirement:** Service unit file must be created
 
 **Implementation:**
-- **File:** `packer/scripts/hedgehog-lab-init.service`
+- **File:** `installer/modules/hedgehog-lab-init.service`
 - **Status:** EXISTS
 
 **Evidence:**
 ```bash
-$ ls -l packer/scripts/hedgehog-lab-init.service
--rw-r--r-- 1 user user 626 Nov 4 10:00 packer/scripts/hedgehog-lab-init.service
+$ ls -l installer/modules/hedgehog-lab-init.service
+-rw-r--r-- 1 user user 626 Nov 4 10:00 installer/modules/hedgehog-lab-init.service
 ```
 
 **Service File Contents:**

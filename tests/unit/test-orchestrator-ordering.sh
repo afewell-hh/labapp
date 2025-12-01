@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Test configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ORCHESTRATOR_SCRIPT="${SCRIPT_DIR}/../../packer/scripts/hedgehog-lab-orchestrator"
+ORCHESTRATOR_SCRIPT="${SCRIPT_DIR}/../../installer/modules/hedgehog-lab-orchestrator"
 TESTS_PASSED=0
 TESTS_FAILED=0
 

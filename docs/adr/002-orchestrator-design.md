@@ -521,8 +521,8 @@ PREWARMED_ACTION="start"      # Just start services
 
 - Issue #7: Design orchestrator architecture
 - Issue #8: Implement orchestrator main script
-- Packer scripts: `packer/scripts/hedgehog-lab-orchestrator`
-- Systemd service: `packer/scripts/hedgehog-lab-init.service`
+- Installer modules: `installer/modules/hedgehog-lab-orchestrator`
+- Systemd service: `installer/modules/hedgehog-lab-init.service`
 - Cloud-init patterns: https://cloudinit.readthedocs.io
 - Systemd best practices: https://www.freedesktop.org/software/systemd/man/systemd.service.html
 

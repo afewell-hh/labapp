@@ -60,8 +60,8 @@ check-version: ## Show current version
 .PHONY: set-executable
 set-executable: ## Make scripts executable
 	@echo "Setting execute permissions on scripts..."
-	chmod +x packer/scripts/*.sh
-	chmod +x packer/scripts/hedgehog-lab-orchestrator
+	chmod +x installer/modules/*.sh
+	chmod +x installer/modules/hedgehog-lab-orchestrator
 	chmod +x scripts/*.sh 2>/dev/null || true
 	@echo "Permissions set!"
 
@@ -72,11 +72,11 @@ test-modules: test-provisioning test-scripts ## Run all module validation tests
 test-provisioning: ## Validate provisioning scripts without building
 	@echo "Validating provisioning scripts..."
 	@echo "Checking script syntax..."
-	@find packer/scripts -name "*.sh" -type f -exec bash -n {} \;
+	@find installer/modules -name "*.sh" -type f -exec bash -n {} \;
 	@echo "✓ All provisioning scripts have valid syntax"
 	@echo "Running shellcheck on provisioning scripts..."
 	@if command -v shellcheck > /dev/null; then \
-		find packer/scripts -name "*.sh" -type f -exec shellcheck -x {} \; && \
+		find installer/modules -name "*.sh" -type f -exec shellcheck -x {} \; && \
 		echo "✓ Shellcheck passed for all provisioning scripts"; \
 	else \
 		echo "⚠ shellcheck not installed, skipping (install with: sudo apt-get install shellcheck)"; \
@@ -122,7 +122,7 @@ installer-package: ## Package hh-lab installer tarball
 	@rm -rf $(DIST_DIR)
 	@mkdir -p $(DIST_DIR)/installer
 	@cp -a scripts/hh-lab-installer scripts/install.sh scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh $(DIST_DIR)/installer/ 2>/dev/null || true
-	@cp -a packer/scripts $(DIST_DIR)/installer/packer-scripts
+	@cp -a installer/modules $(DIST_DIR)/installer/installer-modules
 	@cp -a configs $(DIST_DIR)/installer/configs 2>/dev/null || true
 	@tar -czf $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz -C $(DIST_DIR)/installer .
 	@echo "Installer packaged at $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz"
