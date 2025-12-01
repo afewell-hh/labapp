@@ -17,11 +17,10 @@ VLAB_WORK_DIR="${VLAB_WORK_DIR:-/opt/hedgehog/vlab}"
 VLAB_TIMEOUT="${VLAB_TIMEOUT:-7200}"
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
-# Note: We intentionally do NOT use --ready wait because hhfab v0.43.x has a bug
-# where it panics when the K8s API server inside the control VM becomes temporarily
-# unreachable during switch registration. Instead, we start VLAB without waiting
-# and implement our own polling-based readiness check.
-HHFAB_CMD="hhfab vlab up --controls-restricted=false"
+# Use --ready wait so hhfab performs its built-in readiness verification.
+# Prior panic issues in older hhfab versions are assumed resolved; if they recur,
+# the tmux-run wrapper will surface the exit code and log output for debugging.
+HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
 
 # Telemetry Configuration - Alloy pushes metrics to Prometheus
 # The k3d docker bridge IP is 172.18.0.1 - this is where k3d exposes services
@@ -164,12 +163,13 @@ for doc in docs:
                 existing_sans.append(san)
         doc['spec']['config']['control']['tlsSAN'] = existing_sans
 
-        # Add Alloy config for telemetry (using hhfab v0.43+ schema)
-        # See: https://docs.githedgehog.com/24.09/install-upgrade/config/
+        # Add Alloy config for telemetry (schema aligned to Fabric/Alloy agents)
+        # See: docs/docs/install-upgrade/config.md and labapp issue #96
         doc['spec']['config']['fabric']['defaultAlloyConfig'] = {
             'agentScrapeIntervalSeconds': 120,
             'unixScrapeIntervalSeconds': 120,
             'unixExporterEnabled': True,
+            'collectSyslogEnabled': True,
             'prometheusTargets': {
                 'emc': {
                     'url': '${ALLOY_PROM_REMOTE_WRITE_URL}',
@@ -180,7 +180,10 @@ for doc in docs:
                         'cluster': '${ALLOY_PROM_LABEL_CLUSTER}'
                     }
                 }
-            }
+            },
+            'unixExporterCollectors': [
+                'cpu', 'filesystem', 'loadavg', 'meminfo', 'netdev', 'diskstats'
+            ]
         }
 
         print(f"Patched Fabricator document with {len(existing_sans)} TLS SANs")
@@ -269,6 +272,25 @@ init_vlab_workdir() {
         log_info "Generating VLAB wiring diagram..."
         if ! hhfab vlab gen >> "$LOG_FILE" 2>&1; then
             log_error "Failed to generate wiring diagram"
+            return 1
+        fi
+        # Accept any YAML emitted; rename first .yaml to wiring.yaml if needed
+        if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
+            candidate=""
+            if ls "$VLAB_WORK_DIR"/vlab*.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/vlab*.yaml | head -n1)
+            elif ls "$VLAB_WORK_DIR"/*.generated.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/*.generated.yaml | head -n1)
+            elif ls "$VLAB_WORK_DIR"/*.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/*.yaml | head -n1)
+            fi
+            if [ -n "$candidate" ]; then
+                log_warn "wiring.yaml missing; using $(basename "$candidate")"
+                cp "$candidate" "$VLAB_WORK_DIR/wiring.yaml"
+            fi
+        fi
+        if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
+            log_error "Wiring diagram not created after generation"
             return 1
         fi
         log_info "Wiring diagram generated successfully"
@@ -467,6 +489,36 @@ verify_vlab_health() {
     fi
 }
 
+# Verify switch/node count using kubeconfig exposed on the host
+verify_switch_count() {
+    log_info "Verifying VLAB switch registration via kubeconfig..."
+
+    local kubeconfig="$VLAB_WORK_DIR/vlab/kubeconfig"
+    local expected_switches=7
+
+    if [ ! -f "$kubeconfig" ]; then
+        log_warn "Kubeconfig not found at $kubeconfig - skipping switch count verification"
+        return 1
+    fi
+
+    # Use kubectl to count registered nodes (should match expected switches)
+    local node_count
+    if ! node_count=$(KUBECONFIG="$kubeconfig" kubectl get nodes --no-headers 2>>"$LOG_FILE" | wc -l); then
+        log_error "Failed to query node list via kubectl"
+        return 1
+    fi
+
+    log_info "Detected $node_count nodes (expected $expected_switches)"
+
+    if [ "$node_count" -lt "$expected_switches" ]; then
+        log_error "Expected $expected_switches switches, found $node_count"
+        return 1
+    fi
+
+    log_info "Switch registration verified"
+    return 0
+}
+
 # Create state marker
 create_state_marker() {
     log_info "Creating VLAB initialization state marker..."
@@ -516,20 +568,18 @@ main() {
         return 1
     fi
 
-    # Wait for VLAB VMs to boot (hhfab vlab up without --ready wait)
+    # Wait for VLAB VMs + hhfab readiness (handled inside hhfab via --ready wait)
     if ! wait_for_vlab_boot; then
         log_error "VLAB VM boot phase failed"
         log_error "Tmux session may still be running for debugging"
         return 1
     fi
 
-    # NOTE: We skip wait_for_switches_ready() and verify_vlab_health() because
-    # hhfab vlab inspect requires connectivity to the K8s API inside control-1,
-    # which is only accessible from within the QEMU VM network (127.0.0.1:6443).
-    # Since hhfab vlab up logs "VLAB is ready" when VMs are up, we trust that
-    # the VLAB is operational. Switches will continue registering in the background.
-    log_info "Skipping switch readiness check (hhfab vlab inspect requires QEMU network access)"
-    log_info "VLAB reported ready - switches will continue registering in background"
+    # Run an explicit post-start verification to confirm switches are registered
+    if ! verify_switch_count; then
+        log_error "VLAB switch verification failed"
+        return 1
+    fi
 
     if ! create_state_marker; then
         log_warn "Failed to create state marker (non-fatal)"
