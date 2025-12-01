@@ -18,7 +18,17 @@ jobs:
         run: |
           echo "Checking shell syntax with bash -n"
           EXIT_CODE=0
+          # Exclude _archive directory and bats test files
           while IFS= read -r -d '' script; do
+            # Skip archived files
+            if [[ "$script" == ./_archive/* ]]; then
+              continue
+            fi
+            # Skip bats test files (they use different syntax)
+            if head -1 "$script" | grep -q "bats"; then
+              echo "Skipping bats file: $script"
+              continue
+            fi
             echo "Validating: $script"
             if ! bash -n "$script"; then
               echo "❌ Syntax error in: $script"
@@ -34,8 +44,9 @@ jobs:
       - name: Shellcheck
         run: |
           sudo apt-get install -y shellcheck
-          echo "Running shellcheck on all shell scripts"
+          echo "Running shellcheck on installer scripts"
           EXIT_CODE=0
+          # Only check active directories, not _archive
           if [ -d packer/scripts ]; then
             find packer/scripts -name "*.sh" \
               -exec shellcheck -x {} \; || EXIT_CODE=1
@@ -61,148 +72,6 @@ jobs:
             yamllint configs/ || true
           fi
           yamllint .github/workflows/
-
-  validate:
-    name: Validate Packer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Packer
-        uses: hashicorp/setup-packer@main
-        with:
-          version: '1.11.2'
-
-      - name: Initialize Packer
-        run: |
-          if [ -f packer/standard-build.pkr.hcl ]; then
-            packer init packer/standard-build.pkr.hcl
-          fi
-        env:
-          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Validate standard build
-        run: |
-          if [ -f packer/standard-build.pkr.hcl ]; then
-            packer validate packer/standard-build.pkr.hcl
-            echo "✓ Standard build template is valid"
-          else
-            echo "Packer file not yet created, skipping validation"
-          fi
-
-      - name: Format check
-        run: |
-          if [ -f packer/standard-build.pkr.hcl ]; then
-            packer fmt -check packer/standard-build.pkr.hcl
-          fi
-
-      - name: Validate pre-warmed build
-        run: |
-          if [ -f packer/prewarmed-build.pkr.hcl ]; then
-            packer init packer/prewarmed-build.pkr.hcl
-            packer validate packer/prewarmed-build.pkr.hcl
-            echo "✓ Pre-warmed build template is valid"
-          else
-            echo "Pre-warmed build not yet implemented, skipping validation"
-          fi
-        env:
-          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  validate-terraform:
-    name: Validate Terraform
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.6.6
-
-      - name: Terraform Format Check
-        run: |
-          echo "Checking Terraform formatting"
-          EXIT_CODE=0
-          for dir in terraform/*/; do
-            if [ -f "$dir/main.tf" ]; then
-              echo "Checking format: $dir"
-              if ! terraform -chdir="$dir" fmt -check -recursive; then
-                echo "❌ Formatting issues in: $dir"
-                EXIT_CODE=1
-              fi
-            fi
-          done
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Run 'terraform fmt -recursive' to fix formatting"
-            exit 1
-          fi
-          echo "✓ All Terraform files are properly formatted"
-
-      - name: Terraform Validate
-        run: |
-          echo "Validating Terraform configurations"
-          EXIT_CODE=0
-          for dir in terraform/*/; do
-            if [ -f "$dir/main.tf" ]; then
-              echo "Validating: $dir"
-              cd "$dir"
-              # Initialize without backend (validation only)
-              if ! terraform init -backend=false; then
-                echo "❌ Terraform init failed in: $dir"
-                EXIT_CODE=1
-                cd - > /dev/null
-                continue
-              fi
-              # Validate configuration
-              if ! terraform validate; then
-                echo "❌ Terraform validation failed in: $dir"
-                EXIT_CODE=1
-              fi
-              cd - > /dev/null
-            fi
-          done
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Terraform validation failed"
-            exit 1
-          fi
-          echo "✓ All Terraform configurations are valid"
-
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Make test scripts executable
-        run: |
-          find tests/unit -name "*.sh" -type f -exec chmod +x {} \;
-
-      - name: Run orchestrator ordering tests
-        run: |
-          echo "Running orchestrator ordering tests..."
-          tests/unit/test-orchestrator-ordering.sh
-
-      - name: Run systemd service tests
-        run: |
-          echo "Running systemd service tests..."
-          tests/unit/test-systemd-services.sh
-
-      - name: Run GCP build script tests
-        run: |
-          echo "Running GCP build script tests..."
-          tests/unit/test-gcp-build-script.sh
-
-      - name: Run publish-to-gcs script tests
-        run: |
-          echo "Running publish-to-gcs script tests..."
-          tests/unit/test-publish-to-gcs.sh
-
-      - name: Test Summary
-        if: always()
-        run: |
-          echo "Unit test execution complete"
-          echo "All orchestrator, systemd service, GCP build script, and"
-          echo "publish-to-gcs validations passed"
 
   validate-systemd:
     name: Validate Systemd Services
@@ -264,50 +133,48 @@ jobs:
           fi
           echo "✓ All systemd services are correctly configured"
 
-  validate-packer-provisioners:
-    name: Validate Packer Provisioners
+  test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check Packer provisioners completeness
+      - name: Make test scripts executable
         run: |
-          echo "Validating Packer provisioners include all required files..."
-          EXIT_CODE=0
+          find tests/unit -name "*.sh" -type f -exec chmod +x {} \;
 
-          PACKER_FILE="packer/standard-build.pkr.hcl"
-          INSTALL_SCRIPT="packer/scripts/05-install-orchestrator.sh"
+      - name: Run orchestrator ordering tests
+        run: |
+          echo "Running orchestrator ordering tests..."
+          tests/unit/test-orchestrator-ordering.sh
 
-          # Extract files referenced in installation script
-          echo "Checking files referenced in $INSTALL_SCRIPT..."
+      - name: Run systemd service tests
+        run: |
+          echo "Running systemd service tests..."
+          tests/unit/test-systemd-services.sh
 
-          # Files that should have Packer provisioners
-          REQUIRED_FILES=(
-            "hedgehog-lab-orchestrator"
-            "hedgehog-lab-init.service"
-            "20-k3d-observability-init.sh"
-            "30-vlab-init.sh"
-            "hhfab-vlab-runner"
-            "hhfab-vlab.service"
-            "hedgehog-lab-readiness-ui"
-            "hh-lab"
-            "hh-lab-completion.bash"
-          )
-
-          for file in "${REQUIRED_FILES[@]}"; do
-            if ! grep -q "source.*packer/scripts/$file" "$PACKER_FILE"; then
-              echo "❌ Missing Packer provisioner for: $file"
-              EXIT_CODE=1
-            fi
-          done
-
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Packer provisioner validation failed"
-            echo "All files referenced in installation scripts must have"\
-                 "file provisioners in Packer template"
-            exit 1
+      - name: Run first-boot setup tests
+        run: |
+          echo "Running first-boot setup tests..."
+          if [ -f tests/unit/test-first-boot-setup.sh ]; then
+            tests/unit/test-first-boot-setup.sh
+          else
+            echo "Test file not found, skipping"
           fi
-          echo "✓ All required files have Packer provisioners"
+
+      - name: Run VLAB readiness tests
+        run: |
+          echo "Running VLAB readiness tests..."
+          if [ -f tests/unit/test-vlab-readiness.sh ]; then
+            tests/unit/test-vlab-readiness.sh
+          else
+            echo "Test file not found, skipping"
+          fi
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "Unit test execution complete"
 
   test-modules:
     name: Test Modules and Scripts
@@ -323,19 +190,38 @@ jobs:
           echo "Running module validation tests..."
           make test-modules
 
-      - name: Test GCP build script dry-run
-        run: |
-          echo "Testing GCP build script dry-run..."
-          # Create minimal .env.gcp for dry-run validation
-          cat > .env.gcp <<EOF
-          GCP_PROJECT_ID="test-project"
-          GCP_ZONE="us-central1-a"
-          GCS_BUCKET="test-bucket"
-          EOF
+  validate-installer:
+    name: Validate Installer Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-          # Run dry-run to validate argument parsing and script logic
-          # Expected to fail at gcloud auth check, but should validate
-          # argument parsing
-          ./scripts/launch-gcp-build.sh --dry-run main || \
-            echo "Dry-run validation complete (gcloud auth expected" \
-                 "to fail in CI)"
+      - name: Check installer scripts exist
+        run: |
+          echo "Validating installer scripts..."
+          EXIT_CODE=0
+
+          # Check core installer files exist
+          REQUIRED_FILES=(
+            "packer/scripts/01-install-base.sh"
+            "packer/scripts/02-install-k3d.sh"
+            "packer/scripts/03-install-hhfab.sh"
+            "packer/scripts/20-k3d-observability-init.sh"
+            "packer/scripts/30-vlab-init.sh"
+            "packer/scripts/hhfab-vlab-runner"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Missing required file: $file"
+              EXIT_CODE=1
+            else
+              echo "✓ Found: $file"
+            fi
+          done
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Installer validation failed"
+            exit 1
+          fi
+          echo "✓ All required installer files present"

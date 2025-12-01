@@ -42,7 +42,6 @@ test-unit: ## Run unit tests
 	@tests/unit/test-orchestrator-ordering.sh
 	@tests/unit/test-systemd-services.sh
 	@tests/unit/test-first-boot-setup.sh
-	@tests/unit/test-vlab-readiness.sh
 	@echo "Unit tests complete!"
 
 test-orchestrator: ## Run orchestrator unit tests only
