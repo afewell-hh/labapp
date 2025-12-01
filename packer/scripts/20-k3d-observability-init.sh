@@ -43,6 +43,13 @@ PROMETHEUS_NAMESPACE="monitoring"
 ARGOCD_NAMESPACE="argocd"
 GITEA_NAMESPACE="gitea"
 
+# Image pull secret names
+GHCR_SECRET_NAME="ghcr-registry-secret"
+DOCKERHUB_SECRET_NAME="dockerhub-registry-secret"
+
+# Credentials file (base64 encoded, contains GHCR_* and DOCKERHUB_* vars)
+CREDENTIALS_FILE="${CREDENTIALS_FILE:-/home/ubuntu/ghcr.config.dat}"
+
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -232,6 +239,93 @@ add_helm_repositories() {
     return 0
 }
 
+# Create image pull secrets in a namespace
+create_image_pull_secrets() {
+    local namespace="$1"
+    log_info "Creating image pull secrets in namespace: $namespace..."
+
+    # Check if credentials file exists
+    if [ ! -f "$CREDENTIALS_FILE" ]; then
+        log_warn "Credentials file not found at $CREDENTIALS_FILE"
+        log_warn "Image pull secrets will not be created. Images must be publicly accessible."
+        return 0
+    fi
+
+    # Source the credentials file
+    # shellcheck source=/dev/null
+    source "$CREDENTIALS_FILE"
+
+    # Verify required variables are set
+    if [ -z "${GHCR_USERNAME:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
+        log_warn "GHCR credentials not found in $CREDENTIALS_FILE"
+    else
+        # Create GHCR secret
+        log_info "Creating GHCR registry secret..."
+        if kubectl get secret "$GHCR_SECRET_NAME" -n "$namespace" &> /dev/null; then
+            log_info "GHCR secret already exists in namespace $namespace, updating..."
+            kubectl delete secret "$GHCR_SECRET_NAME" -n "$namespace" >> "$LOG_FILE" 2>&1 || true
+        fi
+
+        if ! kubectl create secret docker-registry "$GHCR_SECRET_NAME" \
+            --namespace "$namespace" \
+            --docker-server=ghcr.io \
+            --docker-username="$GHCR_USERNAME" \
+            --docker-password="$GHCR_TOKEN" >> "$LOG_FILE" 2>&1; then
+            log_warn "Failed to create GHCR secret in namespace $namespace"
+        else
+            log_info "Created GHCR secret in namespace $namespace"
+        fi
+    fi
+
+    if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+        log_warn "DockerHub credentials not found in $CREDENTIALS_FILE"
+    else
+        # Create DockerHub secret
+        log_info "Creating DockerHub registry secret..."
+        if kubectl get secret "$DOCKERHUB_SECRET_NAME" -n "$namespace" &> /dev/null; then
+            log_info "DockerHub secret already exists in namespace $namespace, updating..."
+            kubectl delete secret "$DOCKERHUB_SECRET_NAME" -n "$namespace" >> "$LOG_FILE" 2>&1 || true
+        fi
+
+        if ! kubectl create secret docker-registry "$DOCKERHUB_SECRET_NAME" \
+            --namespace "$namespace" \
+            --docker-server=docker.io \
+            --docker-username="$DOCKERHUB_USERNAME" \
+            --docker-password="$DOCKERHUB_TOKEN" >> "$LOG_FILE" 2>&1; then
+            log_warn "Failed to create DockerHub secret in namespace $namespace"
+        else
+            log_info "Created DockerHub secret in namespace $namespace"
+        fi
+    fi
+
+    # Patch default service account to use secrets (for pods that don't specify imagePullSecrets)
+    log_info "Patching default service account in namespace $namespace..."
+    local patch_json='{"imagePullSecrets": ['
+    local first=true
+
+    if kubectl get secret "$GHCR_SECRET_NAME" -n "$namespace" &> /dev/null; then
+        patch_json+="{\"name\": \"$GHCR_SECRET_NAME\"}"
+        first=false
+    fi
+
+    if kubectl get secret "$DOCKERHUB_SECRET_NAME" -n "$namespace" &> /dev/null; then
+        if [ "$first" = false ]; then
+            patch_json+=","
+        fi
+        patch_json+="{\"name\": \"$DOCKERHUB_SECRET_NAME\"}"
+    fi
+
+    patch_json+=']}'
+
+    if ! kubectl patch serviceaccount default -n "$namespace" -p "$patch_json" >> "$LOG_FILE" 2>&1; then
+        log_warn "Failed to patch default service account in namespace $namespace"
+    else
+        log_info "Patched default service account in namespace $namespace"
+    fi
+
+    return 0
+}
+
 # Install kube-prometheus-stack
 install_kube_prometheus_stack() {
     log_info "Installing kube-prometheus-stack..."
@@ -248,8 +342,23 @@ install_kube_prometheus_stack() {
         log_info "Created namespace $PROMETHEUS_NAMESPACE"
     fi
 
+    # Create image pull secrets
+    create_image_pull_secrets "$PROMETHEUS_NAMESPACE"
+
+    # Build imagePullSecrets array for Helm values
+    local image_pull_secrets=""
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        image_pull_secrets="
+# Image pull secrets for authenticated registries
+global:
+  imagePullSecrets:
+    - name: ${GHCR_SECRET_NAME}
+    - name: ${DOCKERHUB_SECRET_NAME}"
+    fi
+
     # Create values file for kube-prometheus-stack
     cat > /tmp/prometheus-values.yaml <<EOF
+${image_pull_secrets}
 # Grafana configuration
 grafana:
   enabled: true
@@ -349,8 +458,24 @@ install_argocd() {
         log_info "Created namespace $ARGOCD_NAMESPACE"
     fi
 
+    # Create image pull secrets
+    create_image_pull_secrets "$ARGOCD_NAMESPACE"
+
+    # Build imagePullSecrets array for Helm values
+    local image_pull_secrets=""
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        image_pull_secrets="
+# Image pull secrets for authenticated registries
+global:
+  imagePullSecrets:
+    - name: ${GHCR_SECRET_NAME}
+    - name: ${DOCKERHUB_SECRET_NAME}
+"
+    fi
+
     # Create values file for ArgoCD
     cat > /tmp/argocd-values.yaml <<EOF
+${image_pull_secrets}
 # Server configuration
 server:
   service:
@@ -454,8 +579,24 @@ install_gitea() {
         log_info "Created namespace $GITEA_NAMESPACE"
     fi
 
+    # Create image pull secrets
+    create_image_pull_secrets "$GITEA_NAMESPACE"
+
+    # Build imagePullSecrets array for Helm values
+    local image_pull_secrets=""
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        image_pull_secrets="
+# Image pull secrets for authenticated registries
+image:
+  pullSecrets:
+    - ${GHCR_SECRET_NAME}
+    - ${DOCKERHUB_SECRET_NAME}
+"
+    fi
+
     # Create values file for Gitea
     cat > /tmp/gitea-values.yaml <<EOF
+${image_pull_secrets}
 # Service configuration
 service:
   http:
