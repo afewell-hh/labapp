@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+- Reverted autoinstall storage configuration to simple LVM layout from PR #91, fixing 13+ consecutive build failures caused by complex manual GPT partitioning introduced in commit aeac1f2 (#93)
 - Install oras CLI plus qemu-utils/qemu-system-x86/socat during provisioning so hhfab and VLAB dependencies are present on first boot (#90, #92)
 - Ensure the `hhlab` account has required groups, SSH scaffolding, and copies Docker credentials from hh-lab setup so hhfab can pull private images (#92)
 - Expand LVM to consume 100% of the volume group, bump the virtual disk default to 300GB, and document the larger host/boot disk requirements (#90, #92)
