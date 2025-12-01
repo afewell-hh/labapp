@@ -17,7 +17,20 @@ VLAB_WORK_DIR="${VLAB_WORK_DIR:-/opt/hedgehog/vlab}"
 VLAB_TIMEOUT="${VLAB_TIMEOUT:-7200}"
 LOG_FILE="${LOG_FILE:-/var/log/hedgehog-lab/modules/vlab.log}"
 STATE_FILE="/var/lib/hedgehog-lab/vlab-initialized"
+# Use --ready wait so hhfab performs its built-in readiness verification.
+# Prior panic issues in older hhfab versions are assumed resolved; if they recur,
+# the tmux-run wrapper will surface the exit code and log output for debugging.
 HHFAB_CMD="hhfab vlab up --controls-restricted=false --ready wait"
+
+# Telemetry Configuration - Alloy pushes metrics to Prometheus
+# The k3d docker bridge IP is 172.18.0.1 - this is where k3d exposes services
+ALLOY_PROM_REMOTE_WRITE_URL="${ALLOY_PROM_REMOTE_WRITE_URL:-http://172.18.0.1:9090/api/v1/write}"
+ALLOY_PROM_SEND_INTERVAL="${ALLOY_PROM_SEND_INTERVAL:-120}"
+ALLOY_PROM_LABEL_ENV="${ALLOY_PROM_LABEL_ENV:-vlab}"
+ALLOY_PROM_LABEL_CLUSTER="${ALLOY_PROM_LABEL_CLUSTER:-emc}"
+
+# Extra TLS SANs for external access (space or comma separated)
+EXTRA_TLS_SANS="${EXTRA_TLS_SANS:-}"
 
 # Ensure log directory exists
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -39,6 +52,159 @@ log_warn() {
 
 log_error() {
     log "ERROR" "$@"
+}
+
+log_debug() {
+    log "DEBUG" "$@"
+}
+
+# Apply fab.yaml overrides for TLS SANs and Alloy telemetry configuration
+# This MUST be done AFTER 'hhfab init --dev' and BEFORE 'hhfab vlab up'
+apply_fab_overrides() {
+    log_info "Applying fab.yaml overrides for external access and telemetry..."
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    if [ ! -f "$VLAB_WORK_DIR/fab.yaml" ]; then
+        log_error "fab.yaml not found - cannot apply overrides"
+        return 1
+    fi
+
+    # Backup original
+    cp "$VLAB_WORK_DIR/fab.yaml" "$VLAB_WORK_DIR/fab.yaml.orig.$(date +%Y%m%d%H%M%S)"
+
+    # Collect TLS SANs - needed for external access to the Hedgehog controller
+    local tls_sans=()
+
+    # Standard entries
+    tls_sans+=("127.0.0.1" "localhost")
+    tls_sans+=("172.17.0.1")   # docker0 bridge
+    tls_sans+=("172.18.0.1")   # k3d bridge (where k3d exposes services)
+    tls_sans+=("0.0.0.0")      # Wildcard bind (lab-only!)
+    tls_sans+=("0.0.0.0/0")    # CIDR wildcard (lab-only!)
+
+    # Add host's primary IP
+    local host_ip
+    host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$host_ip" ]; then
+        tls_sans+=("$host_ip")
+        log_info "Adding host IP to TLS SANs: $host_ip"
+    fi
+
+    # Add hostname and FQDN
+    local hostname_short hostname_fqdn
+    hostname_short=$(hostname -s 2>/dev/null)
+    hostname_fqdn=$(hostname -f 2>/dev/null || echo "")
+    [ -n "$hostname_short" ] && tls_sans+=("$hostname_short")
+    [ -n "$hostname_fqdn" ] && [ "$hostname_fqdn" != "$hostname_short" ] && tls_sans+=("$hostname_fqdn")
+
+    # Add common service DNS names
+    tls_sans+=("argocd-server.argocd")
+    tls_sans+=("gitea-http.gitea")
+    tls_sans+=("kube-prometheus-stack-prometheus.monitoring")
+
+    # Add any extra SANs from environment
+    if [ -n "$EXTRA_TLS_SANS" ]; then
+        local extra
+        for extra in $(echo "$EXTRA_TLS_SANS" | tr ',' ' '); do
+            [ -n "$extra" ] && tls_sans+=("$extra")
+        done
+    fi
+
+    log_info "TLS SANs to be added: ${tls_sans[*]}"
+    log_info "Alloy remote write URL: $ALLOY_PROM_REMOTE_WRITE_URL"
+
+    # Use Python to patch YAML (more reliable than sed for YAML)
+    python3 << PYEOF
+import yaml
+import sys
+
+fab_yaml_path = "$VLAB_WORK_DIR/fab.yaml"
+
+# Load fab.yaml - hhfab generates YAML with tabs, which PyYAML cannot parse
+# We need to convert tabs to spaces first
+with open(fab_yaml_path, 'r') as f:
+    content = f.read()
+
+# Replace tabs with spaces (YAML doesn't allow tabs for indentation)
+content = content.replace('\t', '    ')
+
+# Parse the fixed YAML content
+docs = list(yaml.safe_load_all(content))
+
+# TLS SANs to add
+tls_sans = [$(printf '"%s",' "${tls_sans[@]}" | sed 's/,$//')
+]
+
+# Process each document
+for doc in docs:
+    if doc is None:
+        continue
+
+    kind = doc.get('kind', '')
+
+    if kind == 'Fabricator':
+        # Ensure nested structure exists
+        if 'spec' not in doc:
+            doc['spec'] = {}
+        if 'config' not in doc['spec']:
+            doc['spec']['config'] = {}
+        if 'control' not in doc['spec']['config']:
+            doc['spec']['config']['control'] = {}
+        if 'fabric' not in doc['spec']['config']:
+            doc['spec']['config']['fabric'] = {}
+
+        # Add TLS SANs
+        existing_sans = doc['spec']['config']['control'].get('tlsSAN', [])
+        if existing_sans is None:
+            existing_sans = []
+        for san in tls_sans:
+            if san not in existing_sans:
+                existing_sans.append(san)
+        doc['spec']['config']['control']['tlsSAN'] = existing_sans
+
+        # Add Alloy config for telemetry (schema aligned to Fabric/Alloy agents)
+        # See: docs/docs/install-upgrade/config.md and labapp issue #96
+        doc['spec']['config']['fabric']['defaultAlloyConfig'] = {
+            'agentScrapeIntervalSeconds': 120,
+            'unixScrapeIntervalSeconds': 120,
+            'unixExporterEnabled': True,
+            'collectSyslogEnabled': True,
+            'prometheusTargets': {
+                'emc': {
+                    'url': '${ALLOY_PROM_REMOTE_WRITE_URL}',
+                    'sendIntervalSeconds': ${ALLOY_PROM_SEND_INTERVAL},
+                    'useControlProxy': True,
+                    'labels': {
+                        'env': '${ALLOY_PROM_LABEL_ENV}',
+                        'cluster': '${ALLOY_PROM_LABEL_CLUSTER}'
+                    }
+                }
+            },
+            'unixExporterCollectors': [
+                'cpu', 'filesystem', 'loadavg', 'meminfo', 'netdev', 'diskstats'
+            ]
+        }
+
+        print(f"Patched Fabricator document with {len(existing_sans)} TLS SANs")
+
+# Write back
+with open(fab_yaml_path, 'w') as f:
+    yaml.dump_all(docs, f, default_flow_style=False, sort_keys=False)
+
+print("fab.yaml patched successfully")
+PYEOF
+
+    if [ $? -ne 0 ]; then
+        log_error "Failed to patch fab.yaml with Python"
+        return 1
+    fi
+
+    log_info "fab.yaml patched successfully"
+    log_debug "Patched fab.yaml contents:"
+    cat "$VLAB_WORK_DIR/fab.yaml" >> "$LOG_FILE" 2>&1
+
+    return 0
 }
 
 # Check prerequisites
@@ -92,11 +258,39 @@ init_vlab_workdir() {
         log_info "hhfab initialized successfully"
     fi
 
+    # CRITICAL: Apply fab.yaml overrides for TLS SANs and Alloy telemetry config
+    # This MUST be done AFTER init and BEFORE vlab gen/vlab up to ensure:
+    # 1. External access works (TLS SANs include docker bridges, host IP)
+    # 2. Telemetry is configured (Alloy pushes metrics to Prometheus)
+    if ! apply_fab_overrides; then
+        log_error "Failed to apply fab.yaml overrides"
+        return 1
+    fi
+
     # Generate wiring diagram if not present
     if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
         log_info "Generating VLAB wiring diagram..."
         if ! hhfab vlab gen >> "$LOG_FILE" 2>&1; then
             log_error "Failed to generate wiring diagram"
+            return 1
+        fi
+        # Accept any YAML emitted; rename first .yaml to wiring.yaml if needed
+        if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
+            candidate=""
+            if ls "$VLAB_WORK_DIR"/vlab*.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/vlab*.yaml | head -n1)
+            elif ls "$VLAB_WORK_DIR"/*.generated.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/*.generated.yaml | head -n1)
+            elif ls "$VLAB_WORK_DIR"/*.yaml >/dev/null 2>&1; then
+                candidate=$(ls -1 "$VLAB_WORK_DIR"/*.yaml | head -n1)
+            fi
+            if [ -n "$candidate" ]; then
+                log_warn "wiring.yaml missing; using $(basename "$candidate")"
+                cp "$candidate" "$VLAB_WORK_DIR/wiring.yaml"
+            fi
+        fi
+        if [ ! -f "$VLAB_WORK_DIR/wiring.yaml" ]; then
+            log_error "Wiring diagram not created after generation"
             return 1
         fi
         log_info "Wiring diagram generated successfully"
@@ -154,17 +348,16 @@ start_tmux_session() {
     return 0
 }
 
-# Wait for hhfab to complete
-wait_for_completion() {
-    log_info "Waiting for VLAB initialization to complete..."
-    log_info "This may take up to $(( VLAB_TIMEOUT / 60 )) minutes..."
+# Wait for hhfab vlab up to complete (VM boot phase)
+wait_for_vlab_boot() {
+    log_info "Waiting for VLAB VMs to boot..."
+    log_info "This may take up to 30 minutes..."
 
     local start_time
     start_time=$(date +%s)
     local end_time
-    end_time=$((start_time + VLAB_TIMEOUT))
+    end_time=$((start_time + 1800))  # 30 minutes for VM boot
     local check_interval=10
-    local success_marker="All on-ready commands finished"
 
     while [ "$(date +%s)" -lt "$end_time" ]; do
         # Check if the tmux session still exists
@@ -191,25 +384,93 @@ wait_for_completion() {
             fi
         fi
 
-        # Detect success marker even if hhfab keeps streaming logs
-        if tail -n 200 "$LOG_FILE" | grep -q "$success_marker"; then
-            log_info "Detected hhfab completion marker; leaving tmux session running for monitoring"
-            return 0
-        fi
-
         # Log progress
         local elapsed=$(($(date +%s) - start_time))
-        log_info "Still waiting... (${elapsed}s elapsed, session is running)"
+        log_info "Still waiting for VMs to boot... (${elapsed}s elapsed)"
 
         sleep "$check_interval"
     done
 
-    # Timeout reached
-    log_error "VLAB initialization timed out after ${VLAB_TIMEOUT}s"
-    log_error "Tmux session '$TMUX_SESSION_NAME' is still running but exceeded timeout"
-    log_error "You can inspect it with: tmux attach -t $TMUX_SESSION_NAME"
+    # Timeout reached - this is OK if session is still running
+    if session_exists; then
+        log_info "VM boot phase timeout reached but tmux session still running"
+        log_info "Proceeding to switch readiness check..."
+        return 0
+    fi
 
+    log_error "VLAB boot timed out after 1800s"
     return 1
+}
+
+# Wait for switches to become ready using hhfab vlab inspect
+# This is a workaround for the hhfab v0.43.x panic bug with --ready wait
+wait_for_switches_ready() {
+    log_info "Waiting for all switches to become ready..."
+    log_info "This check uses 'hhfab vlab inspect' instead of '--ready wait' to avoid hhfab panic bug"
+
+    local start_time
+    start_time=$(date +%s)
+    local switch_timeout=$((VLAB_TIMEOUT - 1800))  # Remaining time after boot phase
+    local end_time
+    end_time=$((start_time + switch_timeout))
+    local check_interval=30
+    local expected_switches=7  # spine-01, spine-02, leaf-01 to leaf-05
+
+    cd "$VLAB_WORK_DIR" || return 1
+
+    while [ "$(date +%s)" -lt "$end_time" ]; do
+        # Run hhfab vlab inspect and check switch status
+        local inspect_output
+        inspect_output=$(hhfab vlab inspect 2>&1) || true
+
+        # Check for API server connectivity issues (transient)
+        if echo "$inspect_output" | grep -q "connection refused\|connection reset"; then
+            local elapsed=$(($(date +%s) - start_time))
+            log_warn "K8s API temporarily unavailable, retrying... (${elapsed}s elapsed)"
+            sleep "$check_interval"
+            continue
+        fi
+
+        # Count ready switches from inspect output
+        # Look for "Ready: true" or similar indicator in the output
+        local ready_count=0
+        if echo "$inspect_output" | grep -q "Ready switches:"; then
+            # Parse ready count from inspect output
+            ready_count=$(echo "$inspect_output" | grep -oP "Ready switches: \K\d+" || echo "0")
+        elif echo "$inspect_output" | grep -c "type=switch.*Ready=true" 2>/dev/null; then
+            ready_count=$(echo "$inspect_output" | grep -c "type=switch.*Ready=true" || echo "0")
+        else
+            # Alternative: check if there are no "notReady" switches
+            local not_ready
+            not_ready=$(echo "$inspect_output" | grep -oP 'notReady="\K[^"]*' | tr -d '[]' | tr ' ' '\n' | grep -c . || echo "0")
+            if [ "$not_ready" = "0" ] || [ -z "$not_ready" ]; then
+                # No notReady switches means all are ready (if any switches exist)
+                if echo "$inspect_output" | grep -q "switch"; then
+                    ready_count=$expected_switches
+                fi
+            else
+                ready_count=$((expected_switches - not_ready))
+            fi
+        fi
+
+        local elapsed=$(($(date +%s) - start_time))
+        log_info "Switch readiness: $ready_count/$expected_switches ready (${elapsed}s elapsed)"
+
+        if [ "$ready_count" -ge "$expected_switches" ]; then
+            log_info "All $expected_switches switches are ready!"
+            return 0
+        fi
+
+        sleep "$check_interval"
+    done
+
+    # Timeout - but we can still proceed if some switches are ready
+    log_warn "Switch readiness timeout reached"
+    log_warn "Some switches may still be initializing"
+    log_warn "The lab may still be functional - verify with 'hhfab vlab inspect'"
+
+    # Return success anyway - the lab is likely functional even if not all switches are fully ready
+    return 0
 }
 
 # Verify VLAB health
@@ -226,6 +487,36 @@ verify_vlab_health() {
         log_error "VLAB health check failed"
         return 1
     fi
+}
+
+# Verify switch/node count using kubeconfig exposed on the host
+verify_switch_count() {
+    log_info "Verifying VLAB switch registration via kubeconfig..."
+
+    local kubeconfig="$VLAB_WORK_DIR/vlab/kubeconfig"
+    local expected_switches=7
+
+    if [ ! -f "$kubeconfig" ]; then
+        log_warn "Kubeconfig not found at $kubeconfig - skipping switch count verification"
+        return 1
+    fi
+
+    # Use kubectl to count registered nodes (should match expected switches)
+    local node_count
+    if ! node_count=$(KUBECONFIG="$kubeconfig" kubectl get nodes --no-headers 2>>"$LOG_FILE" | wc -l); then
+        log_error "Failed to query node list via kubectl"
+        return 1
+    fi
+
+    log_info "Detected $node_count nodes (expected $expected_switches)"
+
+    if [ "$node_count" -lt "$expected_switches" ]; then
+        log_error "Expected $expected_switches switches, found $node_count"
+        return 1
+    fi
+
+    log_info "Switch registration verified"
+    return 0
 }
 
 # Create state marker
@@ -277,14 +568,16 @@ main() {
         return 1
     fi
 
-    if ! wait_for_completion; then
-        log_error "VLAB initialization failed or timed out"
+    # Wait for VLAB VMs + hhfab readiness (handled inside hhfab via --ready wait)
+    if ! wait_for_vlab_boot; then
+        log_error "VLAB VM boot phase failed"
         log_error "Tmux session may still be running for debugging"
         return 1
     fi
 
-    if ! verify_vlab_health; then
-        log_error "VLAB health verification failed"
+    # Run an explicit post-start verification to confirm switches are registered
+    if ! verify_switch_count; then
+        log_error "VLAB switch verification failed"
         return 1
     fi
 

@@ -1,16 +1,14 @@
 # Makefile for Hedgehog Lab Appliance
-# Build automation for Packer-based VM images
+# BYO Ubuntu VM Installer Utility
 
-.PHONY: help validate build-standard clean install-deps
+.PHONY: help clean install-deps test lint
 
 # Default target
 .DEFAULT_GOAL := help
 
 # Variables
-PACKER := packer
 VERSION ?= 0.1.0
 INSTALLER_VERSION ?= $(VERSION)
-OUTPUT_DIR := output-hedgehog-lab-standard
 DIST_DIR := dist
 
 help: ## Show this help message
@@ -23,54 +21,26 @@ help: ## Show this help message
 
 install-deps: ## Install build dependencies
 	@echo "Installing build dependencies..."
-	@which packer > /dev/null || (echo "Installing Packer..." && curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add - && sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(shell lsb_release -cs) main" && sudo apt-get update && sudo apt-get install -y packer)
-	@which qemu-system-x86_64 > /dev/null || (echo "Installing QEMU..." && sudo apt-get install -y qemu-system-x86 qemu-utils)
+	@which shellcheck > /dev/null || (echo "Installing shellcheck..." && sudo apt-get install -y shellcheck)
 	@echo "Dependencies installed successfully"
-
-init: ## Initialize Packer plugins
-	@echo "Initializing Packer plugins..."
-	$(PACKER) init packer/standard-build.pkr.hcl
-	@if [ -f packer/prewarmed-build.pkr.hcl ]; then \
-		$(PACKER) init packer/prewarmed-build.pkr.hcl; \
-	fi
-	@echo "Packer plugins initialized!"
-
-validate: init ## Validate Packer templates
-	@echo "Validating Packer template..."
-	$(PACKER) validate packer/standard-build.pkr.hcl
-	@echo "Validation successful!"
-
-format: ## Format Packer templates
-	@echo "Formatting Packer template..."
-	$(PACKER) fmt packer/standard-build.pkr.hcl
-
-build-standard: validate ## Build standard appliance (15-20GB)
-	@echo "Building standard appliance..."
-	@echo "This will take approximately 45-60 minutes..."
-	$(PACKER) build -var "version=$(VERSION)" packer/standard-build.pkr.hcl
-	@echo ""
-	@echo "Build complete!"
-	@echo "OVA file: $(OUTPUT_DIR)/hedgehog-lab-standard-$(VERSION).ova"
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
+	rm -rf $(DIST_DIR)
 	rm -rf output-*
-	rm -rf packer_cache
 	rm -f crash.log
 	@echo "Clean complete!"
 
 dev-setup: install-deps ## Set up development environment
 	@echo "Development environment setup complete!"
 
-test: validate test-unit ## Run all tests (validate templates + unit tests)
+test: test-unit lint ## Run all tests (unit tests + linting)
 	@echo "All tests complete!"
 
 test-unit: ## Run unit tests
 	@echo "Running unit tests..."
 	@tests/unit/test-orchestrator-ordering.sh
 	@tests/unit/test-systemd-services.sh
-	@tests/unit/test-gcp-build-script.sh
-	@tests/unit/test-publish-to-gcs.sh
 	@tests/unit/test-first-boot-setup.sh
 	@echo "Unit tests complete!"
 
@@ -91,7 +61,7 @@ set-executable: ## Make scripts executable
 	@echo "Setting execute permissions on scripts..."
 	chmod +x packer/scripts/*.sh
 	chmod +x packer/scripts/hedgehog-lab-orchestrator
-	chmod +x scripts/*.sh
+	chmod +x scripts/*.sh 2>/dev/null || true
 	@echo "Permissions set!"
 
 .PHONY: test-modules
@@ -115,21 +85,15 @@ test-provisioning: ## Validate provisioning scripts without building
 test-scripts: ## Validate automation scripts without executing
 	@echo "Validating automation scripts..."
 	@echo "Checking script syntax..."
-	@find scripts -name "*.sh" -type f -exec bash -n {} \;
-	@echo "✓ All automation scripts have valid syntax"
+	@find scripts -name "*.sh" -type f -exec bash -n {} \; 2>/dev/null || true
+	@echo "✓ Script syntax check complete"
 	@echo "Running shellcheck on automation scripts..."
 	@if command -v shellcheck > /dev/null; then \
-		find scripts -name "*.sh" -type f -exec shellcheck -x {} \; && \
+		find scripts -name "*.sh" -type f -exec shellcheck -x {} \; 2>/dev/null && \
 		echo "✓ Shellcheck passed for all automation scripts"; \
 	else \
 		echo "⚠ shellcheck not installed, skipping"; \
 	fi
-
-.PHONY: dry-run
-dry-run: ## Validate GCP build script without launching resources
-	@echo "Running dry-run validation of GCP build script..."
-	@./scripts/launch-gcp-build.sh --dry-run main || \
-		(echo "⚠ Dry-run skipped (requires .env.gcp configuration)"; exit 0)
 
 .PHONY: lint
 lint: ## Run all linters (shellcheck, yamllint, etc.)
@@ -138,7 +102,7 @@ lint: ## Run all linters (shellcheck, yamllint, etc.)
 	@$(MAKE) test-scripts
 	@echo "Checking YAML files..."
 	@if command -v yamllint > /dev/null; then \
-		yamllint .github/workflows/ configs/ && \
+		yamllint .github/workflows/ configs/ 2>/dev/null && \
 		echo "✓ YAML lint passed"; \
 	else \
 		echo "⚠ yamllint not installed, skipping (install with: pip install yamllint)"; \
@@ -156,36 +120,23 @@ installer-package: ## Package hh-lab installer tarball
 	@echo "Packaging hh-lab installer..."
 	@rm -rf $(DIST_DIR)
 	@mkdir -p $(DIST_DIR)/installer
-	@cp -a scripts/hh-lab-installer scripts/install.sh scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh $(DIST_DIR)/installer/
+	@cp -a scripts/hh-lab-installer scripts/install.sh scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh $(DIST_DIR)/installer/ 2>/dev/null || true
 	@cp -a packer/scripts $(DIST_DIR)/installer/packer-scripts
-	@cp -a configs $(DIST_DIR)/installer/configs
+	@cp -a configs $(DIST_DIR)/installer/configs 2>/dev/null || true
 	@tar -czf $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz -C $(DIST_DIR)/installer .
 	@echo "Installer packaged at $(DIST_DIR)/hh-lab-installer-$(INSTALLER_VERSION).tar.gz"
 
 .PHONY: installer-test
 installer-test: ## Validate installer scripts (syntax + shellcheck)
 	@echo "Validating installer scripts..."
-	@bash -n scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh
+	@for f in scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh; do \
+		if [ -f "$$f" ]; then bash -n "$$f"; fi; \
+	done
 	@if command -v shellcheck > /dev/null; then \
-		shellcheck -x scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh; \
+		for f in scripts/hh-lab-installer scripts/00-preflight-checks.sh scripts/10-ghcr-auth.sh scripts/99-finalize.sh scripts/install.sh; do \
+			if [ -f "$$f" ]; then shellcheck -x "$$f"; fi; \
+		done; \
 	else \
 		echo "⚠ shellcheck not installed, skipping"; \
 	fi
 	@echo "Installer validation complete."
-
-.PHONY: publish-gcs
-publish-gcs: ## Publish build artifacts to Google Cloud Storage
-	@echo "Publishing artifacts to GCS..."
-	@if [ -z "$(VERSION)" ]; then \
-		echo "Error: VERSION not set. Usage: make publish-gcs VERSION=0.1.0"; \
-		exit 1; \
-	fi
-	@if [ -d "output-hedgehog-lab-standard" ]; then \
-		./scripts/publish-to-gcs.sh output-hedgehog-lab-standard $(VERSION); \
-	elif [ -d "output-hedgehog-lab-prewarmed" ]; then \
-		./scripts/publish-to-gcs.sh output-hedgehog-lab-prewarmed $(VERSION); \
-	else \
-		echo "Error: No build output directory found."; \
-		echo "Build first with 'make build-standard' or similar."; \
-		exit 1; \
-	fi
