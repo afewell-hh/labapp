@@ -46,9 +46,7 @@ write_files:
           qemu-kvm \
           socat \
           yq \
-          kustomize \
-          ubuntu-desktop \
-          xrdp
+          kustomize 
           
       echo "--- Installing kubectl and helm ---"
 
@@ -88,17 +86,21 @@ write_files:
 
 # 2. Execute the installation and setup steps
 runcmd:
-  # Update password
+  # RDP and System Access Setup
+  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
   - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
+  - echo xfce4-session > /etc/skel/.xsession
+  - echo "Xfce session set as default for new users."
+  - systemctl enable xrdp
+  - systemctl restart xrdp
 
   # Execute the combined installation script
   - /root/install_tools.sh
 
   # Install hhfab after the install_tools.sh to ensure dependencies are met
   - echo "Installing HHFAB..."
-  - curl -fsSL https://i.hhdev.io/hhfab | bash
-
-  # Enable xrdp service
-  - systemctl enable xrdp
-  - systemctl start xrdp
+  - 'HOME=/root curl -fsSL https://i.hhdev.io/hhfab | bash'
   
