@@ -1,4 +1,4 @@
-# Hedgehog Lab Appliance – Agent Playbook (Updated 2025-12-01)
+<!-- # Hedgehog Lab Appliance – Agent Playbook (Updated 2025-12-01)
 
 Read this before touching the repo. It supersedes any prior agent guidance and applies to **all** dev/CI agents.
 
@@ -170,4 +170,4 @@ make test
 make test-orchestrator
 ```
 
-Keep this document accurate. If reality changes, update CLAUDE.md (and AGENTS.md) **immediately** alongside your code.
+Keep this document accurate. If reality changes, update CLAUDE.md (and AGENTS.md) **immediately** alongside your code. -->

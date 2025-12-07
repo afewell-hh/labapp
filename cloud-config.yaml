@@ -1,0 +1,105 @@
+#cloud-config
+# SETUP: Educational, single-user VM for Hedgehog VLab on GCP.
+# Features: RDP/SSH access, static password, automatic root login, all dependencies.
+
+# 1. Write the final comprehensive installation script
+write_files:
+  - path: /root/install_tools.sh
+    permissions: '0755' # Make the script executable
+    owner: root:root
+    content: |
+      #!/bin/bash
+      
+      echo "--- Starting System Dependency and Utility Installation ---"
+      
+      # 1. Install all system dependencies and KVM/SOCAT non-interactively
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          build-essential \
+          software-properties-common \
+          apt-transport-https \
+          ca-certificates \
+          gnupg \
+          lsb-release \
+          curl \
+          wget \
+          git \
+          vim \
+          nano \
+          jq \
+          unzip \
+          zip \
+          tar \
+          gzip \
+          net-tools \
+          dnsutils \
+          iputils-ping \
+          traceroute \
+          tcpdump \
+          htop \
+          iotop \
+          iftop \
+          tmux \
+          screen \
+          tree \
+          rsync \
+          qemu-kvm \
+          socat \
+          yq \
+          kustomize
+          
+      echo "--- Installing kubectl and helm ---"
+
+      # 2. Install kubectl (via curl)
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      rm kubectl
+
+      # 3. Install helm (via official script)
+      curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 get_helm.sh
+      ./get_helm.sh
+      rm get_helm.sh
+      
+      echo "--- Kubernetes tooling installed ---"
+
+      # 4. Install Docker using the user's preferred script sequence
+      echo "Starting Docker installation..."
+      curl -fsSL https://get.docker.com -o /tmp/install-docker.sh
+      sh /tmp/install-docker.sh
+      
+      # 5. Add users to necessary groups (will take effect on first login)
+      usermod -aG docker ubuntu
+      usermod -aG kvm ubuntu
+      
+      echo "--- Group Membership Configured ---"
+      
+      # 6. Install ORAS
+      echo "Installing ORAS..."
+      curl -fsSL https://i.hhdev.io/oras | bash
+      
+      # 7. Install HHFAB
+      echo "Installing HHFAB..."
+      curl -fsSL https://i.hhdev.io/hhfab | bash
+      
+      # 8. Install K3d
+      echo "Installing K3d..."
+      curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
+      
+      echo "--- Installation finished ---"
+
+# 2. Execute the installation and setup steps
+runcmd:
+  # RDP and System Access Setup
+  - apt-get install -y ubuntu-desktop xrdp net-tools # Ensure GUI and RDP components are installed
+  - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
+  - systemctl enable xrdp
+  - systemctl restart xrdp
+
+  # Execute the combined installation script
+  - /root/install_tools.sh
+  
+  # Final Simplicity Step: Automatically switch to root user upon SSH login
+  # This provides the simple, no-permission-issues environment you requested.
+  - echo "sudo su -" >> /home/ubuntu/.bashrc
+  - chown ubuntu:ubuntu /home/ubuntu/.bashrc
