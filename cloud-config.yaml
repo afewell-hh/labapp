@@ -46,7 +46,9 @@ write_files:
           qemu-kvm \
           socat \
           yq \
-          kustomize
+          kustomize \
+          ubuntu-desktop \
+          xrdp
           
       echo "--- Installing kubectl and helm ---"
 
@@ -78,11 +80,7 @@ write_files:
       echo "Installing ORAS..."
       curl -fsSL https://i.hhdev.io/oras | bash
       
-      # 7. Install HHFAB
-      echo "Installing HHFAB..."
-      curl -fsSL https://i.hhdev.io/hhfab | bash
-      
-      # 8. Install K3d
+      # 7. Install K3d
       echo "Installing K3d..."
       curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
       
@@ -90,16 +88,17 @@ write_files:
 
 # 2. Execute the installation and setup steps
 runcmd:
-  # RDP and System Access Setup
-  - apt-get install -y ubuntu-desktop xrdp net-tools # Ensure GUI and RDP components are installed
+  # Update password
   - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
-  - systemctl enable xrdp
-  - systemctl restart xrdp
 
   # Execute the combined installation script
   - /root/install_tools.sh
+
+  # Install hhfab after the install_tools.sh to ensure dependencies are met
+  - echo "Installing HHFAB..."
+  - curl -fsSL https://i.hhdev.io/hhfab | bash
+
+  # Enable xrdp service
+  - systemctl enable xrdp
+  - systemctl start xrdp
   
-  # Final Simplicity Step: Automatically switch to root user upon SSH login
-  # This provides the simple, no-permission-issues environment you requested.
-  - echo "sudo su -" >> /home/ubuntu/.bashrc
-  - chown ubuntu:ubuntu /home/ubuntu/.bashrc
