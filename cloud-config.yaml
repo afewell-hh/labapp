@@ -102,5 +102,5 @@ runcmd:
 
   # Install hhfab after the install_tools.sh to ensure dependencies are met
   - echo "Installing HHFAB..."
-  - 'HOME=/root curl -fsSL https://i.hhdev.io/hhfab | bash'
+  - 'sudo -H sh -c "curl -fsSL https://i.hhdev.io/hhfab | bash"'
   
