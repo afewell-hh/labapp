@@ -42,6 +42,7 @@ apt:
     - xfce4-goodies
     - xrdp
     - firefox
+
 # Write the final comprehensive installation script
 write_files:
   - path: /root/install_tools.sh
@@ -89,7 +90,6 @@ write_files:
 
 # Modify the xrdp startup script using write_files
 # This directly replaces the content of /etc/xrdp/startwm.sh
-write_files:
   - path: /etc/xrdp/startwm.sh
     permissions: '0755' # Ensure it's executable
     content: |
@@ -135,7 +135,7 @@ runcmd:
   - echo "Installing HHFAB..."
   - 'sudo -H sh -c "curl -fsSL https://i.hhdev.io/hhfab | bash"'
   - echo "--- HHFAB installation finished ---"
-  
+
   # VS Code Installation (As discussed previously)
   - curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
   - sudo install -o root -g root -m 644 microsoft.gpg /etc/apt/trusted.gpg.d/
