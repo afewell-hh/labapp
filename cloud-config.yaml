@@ -2,7 +2,47 @@
 # SETUP: Educational, single-user VM for Hedgehog VLab on GCP.
 # Features: RDP/SSH access, static password, automatic root login, all dependencies.
 
-# 1. Write the final comprehensive installation script
+# 1. Install required packages (XFCE4 for desktop, xrdp, and tools)
+apt:
+  update: true
+  packages:
+    - vim
+    - git
+    - curl
+    - wget
+    - net-tools
+    - build-essential
+    - software-properties-common
+    - apt-transport-https
+    - ca-certificates 
+    - gnupg
+    - lsb-release
+    - jq
+    - unzip
+    - zip
+    - tar
+    - gzip
+    - dnsutils
+    - iputils-ping
+    - traceroute
+    - tcpdump
+    - htop
+    - iotop
+    - iftop
+    - tmux
+    - screen
+    - tree
+    - rsync
+    - qemu-kvm
+    - socat
+    - yq
+    - kustomize
+    - nano
+    - xfce4
+    - xfce4-goodies
+    - xrdp
+    - firefox
+# Write the final comprehensive installation script
 write_files:
   - path: /root/install_tools.sh
     permissions: '0755' # Make the script executable
@@ -10,52 +50,15 @@ write_files:
     content: |
       #!/bin/bash
       
-      echo "--- Starting System Dependency and Utility Installation ---"
-      
-      # 1. Install all system dependencies and KVM/SOCAT non-interactively
-      DEBIAN_FRONTEND=noninteractive apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          build-essential \
-          software-properties-common \
-          apt-transport-https \
-          ca-certificates \
-          gnupg \
-          lsb-release \
-          curl \
-          wget \
-          git \
-          vim \
-          nano \
-          jq \
-          unzip \
-          zip \
-          tar \
-          gzip \
-          net-tools \
-          dnsutils \
-          iputils-ping \
-          traceroute \
-          tcpdump \
-          htop \
-          iotop \
-          iftop \
-          tmux \
-          screen \
-          tree \
-          rsync \
-          qemu-kvm \
-          socat \
-          yq \
-          kustomize 
-          
+
       echo "--- Installing kubectl and helm ---"
 
-      # 2. Install kubectl (via curl)
+      # Install kubectl (via curl)
       curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
       sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
       rm kubectl
 
-      # 3. Install helm (via official script)
+      # Install helm (via official script)
       curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
       chmod 700 get_helm.sh
       ./get_helm.sh
@@ -63,34 +66,62 @@ write_files:
       
       echo "--- Kubernetes tooling installed ---"
 
-      # 4. Install Docker using the user's preferred script sequence
+      # Install Docker using the user's preferred script sequence
       echo "Starting Docker installation..."
       curl -fsSL https://get.docker.com -o /tmp/install-docker.sh
       sh /tmp/install-docker.sh
       
-      # 5. Add users to necessary groups (will take effect on first login)
+      # Add users to necessary groups (will take effect on first login)
       usermod -aG docker ubuntu
       usermod -aG kvm ubuntu
       
       echo "--- Group Membership Configured ---"
       
-      # 6. Install ORAS
+      # Install ORAS
       echo "Installing ORAS..."
       curl -fsSL https://i.hhdev.io/oras | bash
       
-      # 7. Install K3d
+      # Install K3d
       echo "Installing K3d..."
       curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
       
       echo "--- Installation finished ---"
 
+# Modify the xrdp startup script using write_files
+# This directly replaces the content of /etc/xrdp/startwm.sh
+write_files:
+  - path: /etc/xrdp/startwm.sh
+    permissions: '0755' # Ensure it's executable
+    content: |
+      #!/bin/sh
+      # xrdp X session start script (c) 2015, 2017, 2021 mirabilos
+      # published under The MirOS Licence
+
+      # Rely on /etc/pam.d/xrdp-sesman using pam_env to load both
+      # /etc/environment and /etc/default/locale to initialise the
+      # locale and the user environment properly.
+
+      if test -r /etc/profile; then
+              . /etc/profile
+      fi
+
+      if test -r ~/.profile; then
+              . ~/.profile
+      fi
+
+      # The following two lines are commented out/removed to force XFCE4
+      # test -x /etc/X11/Xsession && exec /etc/X11/Xsession
+      # exec /bin/sh /etc/X11/Xsession
+      
+      startxfce4
+
 # 2. Execute the installation and setup steps
 runcmd:
   # RDP and System Access Setup
-  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
+  # - 'DEBIAN_FRONTEND=noninteractive apt-get update'
+  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
+  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
+  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
   - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
   - echo xfce4-session > /etc/skel/.xsession
   - echo "Xfce session set as default for new users."
@@ -103,4 +134,11 @@ runcmd:
   # Install hhfab after the install_tools.sh to ensure dependencies are met
   - echo "Installing HHFAB..."
   - 'sudo -H sh -c "curl -fsSL https://i.hhdev.io/hhfab | bash"'
+  - echo "--- HHFAB installation finished ---"
   
+  # VS Code Installation (As discussed previously)
+  - curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+  - sudo install -o root -g root -m 644 microsoft.gpg /etc/apt/trusted.gpg.d/
+  - sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main" > /etc/apt/sources.list.d/vscode.list'
+  - sudo apt update
+  - sudo apt install -y code
