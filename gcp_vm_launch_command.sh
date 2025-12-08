@@ -1,6 +1,6 @@
 gcloud compute instances create labapp-0-9 \
     --project=teched-473722 \
-    --zone=us-west1-c \
+    --zone=us-central1-c \
     --machine-type=n1-standard-32 \
     --enable-nested-virtualization \
     --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
