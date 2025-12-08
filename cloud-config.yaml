@@ -38,10 +38,6 @@ apt:
     - yq
     - kustomize
     - nano
-    - xfce4
-    - xfce4-goodies
-    - xrdp
-    - firefox
 
 # Write the final comprehensive installation script
 write_files:
@@ -90,9 +86,17 @@ write_files:
 
 # Modify the xrdp startup script using write_files
 # This directly replaces the content of /etc/xrdp/startwm.sh
-  - path: /etc/xrdp/startwm.sh
-    permissions: '0755' # Ensure it's executable
+  - path: /root/config_rdp.sh
+    permissions: '0755'
+    owner: root:root
     content: |
+      #!/bin/bash
+      
+      echo "--- Configuring XRDP for XFCE4 Session ---"
+      
+      # Overwrite /etc/xrdp/startwm.sh to explicitly use startxfce4
+      # This prevents XRDP from trying to use the default Xsession which often fails
+      cat << EOF > /etc/xrdp/startwm.sh
       #!/bin/sh
       # xrdp X session start script (c) 2015, 2017, 2021 mirabilos
       # published under The MirOS Licence
@@ -114,14 +118,17 @@ write_files:
       # exec /bin/sh /etc/X11/Xsession
       
       startxfce4
+      EOF
 
 # 2. Execute the installation and setup steps
 runcmd:
   # RDP and System Access Setup
-  # - 'DEBIAN_FRONTEND=noninteractive apt-get update'
-  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
-  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
-  # - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
+  - /root/config_rdp.sh
+  - chmod +x /etc/xrdp/startwm.sh
   - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
   - echo xfce4-session > /etc/skel/.xsession
   - echo "Xfce session set as default for new users."
@@ -135,6 +142,10 @@ runcmd:
   - echo "Installing HHFAB..."
   - 'sudo -H sh -c "curl -fsSL https://i.hhdev.io/hhfab | bash"'
   - echo "--- HHFAB installation finished ---"
+
+  # Install firefox after xfce4 to ensure GUI compatibility
+  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y firefox'
 
   # VS Code Installation (As discussed previously)
   - curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
