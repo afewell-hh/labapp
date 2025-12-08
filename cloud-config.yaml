@@ -2,61 +2,42 @@
 # SETUP: Educational, single-user VM for Hedgehog VLab on GCP.
 # Features: RDP/SSH access, static password, automatic root login, all dependencies.
 
-# 1. Install required packages (XFCE4 for desktop, xrdp, and tools)
-apt:
-  update: true
-  packages:
-    - vim
-    - git
-    - curl
-    - wget
-    - net-tools
-    - build-essential
-    - software-properties-common
-    - apt-transport-https
-    - ca-certificates 
-    - gnupg
-    - lsb-release
-    - jq
-    - unzip
-    - zip
-    - tar
-    - gzip
-    - dnsutils
-    - iputils-ping
-    - traceroute
-    - tcpdump
-    - htop
-    - iotop
-    - iftop
-    - tmux
-    - screen
-    - tree
-    - rsync
-    - qemu-kvm
-    - socat
-    - yq
-    - kustomize
-    - nano
-    - gh
-
-# Write the final comprehensive installation script
 write_files:
-  - path: /root/install_tools.sh
-    permissions: '0755' # Make the script executable
+  - path: /root/install_core_packages.sh
+    permissions: '0755'
     owner: root:root
     content: |
       #!/bin/bash
+      set -ex
+
+      echo "--- Starting core package installation ---"
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      apt-get update
+
+      # Install packages that were inconsistently installed by the apt module
+      apt-get install -y \
+        vim git curl wget build-essential \
+        software-properties-common apt-transport-https \
+        ca-certificates gnupg lsb-release jq unzip zip tar gzip \
+        dnsutils iputils-ping traceroute tcpdump htop iotop iftop \
+        tmux screen tree rsync qemu-kvm socat yq kustomize nano gh
+
+      echo "--- Core package installation finished ---"
+
+  - path: /root/install_tools.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -ex
       
-
       echo "--- Installing kubectl and helm ---"
-
-      # Install kubectl (via curl)
       curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
       rm kubectl
 
-      # Install helm (via official script)
       curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
       chmod 700 get_helm.sh
       ./get_helm.sh
@@ -64,63 +45,44 @@ write_files:
       
       echo "--- Kubernetes tooling installed ---"
 
-      # Install Docker using the user's preferred script sequence
       echo "Starting Docker installation..."
       curl -fsSL https://get.docker.com -o /tmp/install-docker.sh
       sh /tmp/install-docker.sh
       
-      # Add users to necessary groups (will take effect on first login)
       usermod -aG docker ubuntu
       usermod -aG kvm ubuntu
       
       echo "--- Group Membership Configured ---"
       
-      # Install ORAS
       echo "Installing ORAS..."
       curl -fsSL https://i.hhdev.io/oras | bash
       
-      # Install K3d
       echo "Installing K3d..."
       curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
       
-      echo "--- Installation finished ---"
+      echo "--- Additional tools installation finished ---"
 
-# Modify the xrdp startup script using write_files
-# This directly replaces the content of /etc/xrdp/startwm.sh
   - path: /root/config_rdp.sh
     permissions: '0755'
     owner: root:root
     content: |
       #!/bin/bash
-      
+      set -ex
+
       echo "--- Configuring XRDP for XFCE4 Session ---"
-      
-      # Overwrite /etc/xrdp/startwm.sh to explicitly use startxfce4
-      # This prevents XRDP from trying to use the default Xsession which often fails
       cat << EOF > /etc/xrdp/startwm.sh
       #!/bin/sh
-      # xrdp X session start script (c) 2015, 2017, 2021 mirabilos
-      # published under The MirOS Licence
-
-      # Rely on /etc/pam.d/xrdp-sesman using pam_env to load both
-      # /etc/environment and /etc/default/locale to initialise the
-      # locale and the user environment properly.
-
       if test -r /etc/profile; then
-              . /etc/profile
+        . /etc/profile
       fi
-
       if test -r ~/.profile; then
-              . ~/.profile
+        . ~/.profile
       fi
-
-      # The following two lines are commented out/removed to force XFCE4
-      # test -x /etc/X11/Xsession && exec /etc/X11/Xsession
-      # exec /bin/sh /etc/X11/Xsession
-      
       startxfce4
       EOF
-  - path: /home/ubuntu/Desktop/Firefox.desktop
+      chmod +x /etc/xrdp/startwm.sh
+  
+  - path: /home/ubuntu/.local/share/applications/Firefox.desktop
     permissions: '0755'
     owner: ubuntu:ubuntu
     content: |
@@ -129,12 +91,13 @@ write_files:
       Type=Application
       Name=Firefox
       Comment=Access the Web
-      Exec=/usr/bin/firefox %u
+      Exec=bash -c 'source ~/.bashrc && firefox %u'
       Icon=firefox
       Categories=Network;WebBrowser;
       Terminal=false
       StartupNotify=true
-  - path: /home/ubuntu/Desktop/VSCode.desktop
+
+  - path: /home/ubuntu/.local/share/applications/VSCode.desktop
     permissions: '0755'
     owner: ubuntu:ubuntu
     content: |
@@ -148,6 +111,7 @@ write_files:
       Categories=Utility;TextEditor;Development;IDE;
       Terminal=false
       StartupNotify=true
+
   - path: /home/ubuntu/.config/mimeapps.list
     permissions: '0644'
     owner: ubuntu:ubuntu
@@ -159,28 +123,38 @@ write_files:
       x-scheme-handler/about=firefox.desktop
       x-scheme-handler/unknown=firefox.desktop
 
-# 2. Execute the installation and setup steps
 runcmd:
-  # RDP and System Access Setup
-  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies'
+  # Install core packages (the previously problematic ones)
+  - /root/install_core_packages.sh
+
+  # RDP and System Access Setup (restored to original working config)
+  - DEBIAN_FRONTEND=noninteractive apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y net-tools
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y xrdp
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies
   - /root/config_rdp.sh
-  - chmod +x /etc/xrdp/startwm.sh
-  - echo "ubuntu:HHLab.Admin!" | chpasswd # Set static password for RDP login
+  - echo "ubuntu:HHLab.Admin!" | chpasswd
   - echo xfce4-session > /etc/skel/.xsession
   - echo "Xfce session set as default for new users."
   - systemctl enable xrdp
   - systemctl restart xrdp
 
-  # FIX: Install Node.js from NodeSource for reliable npm/npx
-  # This uses the Node 20 LTS (or the current stable version)
+  # Install Node.js
   - 'curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -'
   - 'sudo apt-get update'
-  - 'sudo apt-get install -y nodejs' # Install the version from the NodeSource repo
+  - 'sudo apt-get install -y nodejs'
 
-  # Execute the combined installation script
+  # Install Firefox (from apt)
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y firefox'
+
+  # Install VS Code
+  - curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+  - sudo install -o root -g root -m 644 microsoft.gpg /etc/apt/trusted.gpg.d/
+  - sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main" > /etc/apt/sources.list.d/vscode.list'
+  - sudo apt update
+  - sudo apt install -y code
+
+  # Execute other combined installation scripts
   - /root/install_tools.sh
 
   # Install hhfab after the install_tools.sh to ensure dependencies are met
@@ -188,18 +162,9 @@ runcmd:
   - 'sudo -H sh -c "curl -fsSL https://i.hhdev.io/hhfab | bash"'
   - echo "--- HHFAB installation finished ---"
 
-  # Install firefox after xfce4 to ensure GUI compatibility
-  - 'DEBIAN_FRONTEND=noninteractive apt-get update'
-  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y firefox'
-
-  # VS Code Installation (As discussed previously)
-  - curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
-  - sudo install -o root -g root -m 644 microsoft.gpg /etc/apt/trusted.gpg.d/
-  - sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main" > /etc/apt/sources.list.d/vscode.list'
-  - sudo apt update
-  - sudo apt install -y code
-
   # Desktop Experience Improvements
   - update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper
-  - chown -R ubuntu:ubuntu /home/ubuntu/Desktop /home/ubuntu/.config
+  - sudo chown -R ubuntu:ubuntu /home/ubuntu/Desktop /home/ubuntu/.config
+  - echo 'export DISPLAY=:10.0' >> /home/ubuntu/.bashrc
+  - echo 'export XAUTHORITY=/home/ubuntu/.Xauthority' >> /home/ubuntu/.bashrc
   - sudo -u ubuntu xfconf-query -c xfwm4 -p /general/use_compositing -s false
