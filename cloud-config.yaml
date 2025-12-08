@@ -119,6 +119,44 @@ write_files:
       
       startxfce4
       EOF
+  - path: /home/ubuntu/Desktop/Firefox.desktop
+    permissions: '0755'
+    owner: ubuntu:ubuntu
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Firefox
+      Comment=Access the Web
+      Exec=/usr/bin/firefox %u
+      Icon=firefox
+      Categories=Network;WebBrowser;
+      Terminal=false
+      StartupNotify=true
+  - path: /home/ubuntu/Desktop/VSCode.desktop
+    permissions: '0755'
+    owner: ubuntu:ubuntu
+    content: |
+      [Desktop Entry]
+      Version=1.0
+      Type=Application
+      Name=Visual Studio Code
+      Comment=Code Editing. Redefined.
+      Exec=/usr/bin/code
+      Icon=vscode
+      Categories=Utility;TextEditor;Development;IDE;
+      Terminal=false
+      StartupNotify=true
+  - path: /home/ubuntu/.config/mimeapps.list
+    permissions: '0644'
+    owner: ubuntu:ubuntu
+    content: |
+      [Default Applications]
+      text/html=firefox.desktop
+      x-scheme-handler/http=firefox.desktop
+      x-scheme-handler/https=firefox.desktop
+      x-scheme-handler/about=firefox.desktop
+      x-scheme-handler/unknown=firefox.desktop
 
 # 2. Execute the installation and setup steps
 runcmd:
@@ -153,3 +191,8 @@ runcmd:
   - sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main" > /etc/apt/sources.list.d/vscode.list'
   - sudo apt update
   - sudo apt install -y code
+
+  # Desktop Experience Improvements
+  - update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper
+  - chown -R ubuntu:ubuntu /home/ubuntu/Desktop /home/ubuntu/.config
+  - sudo -u ubuntu xfconf-query -c xfwm4 -p /general/use_compositing -s false
