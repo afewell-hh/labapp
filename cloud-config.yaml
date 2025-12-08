@@ -38,6 +38,7 @@ apt:
     - yq
     - kustomize
     - nano
+    - gh
 
 # Write the final comprehensive installation script
 write_files:
@@ -172,6 +173,12 @@ runcmd:
   - echo "Xfce session set as default for new users."
   - systemctl enable xrdp
   - systemctl restart xrdp
+
+  # FIX: Install Node.js from NodeSource for reliable npm/npx
+  # This uses the Node 20 LTS (or the current stable version)
+  - 'curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -'
+  - 'sudo apt-get update'
+  - 'sudo apt-get install -y nodejs' # Install the version from the NodeSource repo
 
   # Execute the combined installation script
   - /root/install_tools.sh
