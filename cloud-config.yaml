@@ -164,7 +164,7 @@ runcmd:
 
   # Desktop Experience Improvements
   - update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper
-  - sudo chown -R ubuntu:ubuntu /home/ubuntu/Desktop /home/ubuntu/.config
+  - sudo chown -R ubuntu:ubuntu /home/ubuntu/
   - echo 'export DISPLAY=:10.0' >> /home/ubuntu/.bashrc
   - echo 'export XAUTHORITY=/home/ubuntu/.Xauthority' >> /home/ubuntu/.bashrc
   - sudo -u ubuntu xfconf-query -c xfwm4 -p /general/use_compositing -s false
