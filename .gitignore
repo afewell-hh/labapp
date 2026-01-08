@@ -52,3 +52,5 @@ test-results/
 ghcr.config.dat
 ghcr.config.dat.b64
 coverage/
+
+scratch.txt

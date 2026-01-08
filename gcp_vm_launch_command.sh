@@ -1,4 +1,4 @@
-gcloud compute instances create labapp-0-10 \
+gcloud compute instances create labapp-0-12 \
     --project=teched-473722 \
     --zone=us-west1-c \
     --machine-type=n1-standard-32 \
