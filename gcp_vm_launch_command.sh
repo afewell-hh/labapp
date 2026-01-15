@@ -19,3 +19,53 @@ gcloud compute instances create labapp-0-12 \
     --labels=goog-ec-src=vm_add-gcloud \
     --reservation-affinity=any \
     --metadata-from-file=user-data=./cloud-config.yaml 
+
+
+
+---
+
+
+gcloud compute instances create labapp-0-16 \
+    --project=teched-473722 \
+    --zone=us-west1-c \
+    --machine-type=n1-highmem-32 \
+    --enable-nested-virtualization \
+    --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
+    --maintenance-policy=MIGRATE \
+    --provisioning-model=STANDARD \
+    --instance-termination-action=STOP \
+    --max-run-duration=43200s \
+    --service-account=22685701361-compute@developer.gserviceaccount.com \
+    --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append \
+    --enable-display-device \
+    --tags=http-server,https-server,lb-health-check,rdp-access \
+    --create-disk=auto-delete=yes,boot=yes,device-name=instance-20251204-235708,image=hedgehog-lab-v20250113-complete,mode=rw,size=300,type=pd-balanced \
+    --no-shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --labels=goog-ec-src=vm_add-gcloud \
+    --reservation-affinity=any
+
+    gcloud compute instances create labapp-0-21 \
+    --project=teched-473722 \
+    --zone=us-west1-c \
+    --machine-type=n1-standard-32 \
+    --enable-nested-virtualization \
+    --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
+    --maintenance-policy=MIGRATE \
+    --provisioning-model=STANDARD \
+    --instance-termination-action=STOP \
+    --max-run-duration=43200s \
+    --service-account=22685701361-compute@developer.gserviceaccount.com \
+    --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append \
+    --enable-display-device \
+    --tags=http-server,https-server,lb-health-check,rdp-access,permit-vaidc-ports \
+    --create-disk=auto-delete=yes,boot=yes,device-name=instance-20251204-235708,image=hedgehog-vaidc-v20260114,mode=rw,size=300,type=pd-balanced \
+    --no-shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --labels=goog-ec-src=vm_add-gcloud \
+    --reservation-affinity=any
+
+
+  
