@@ -1,0 +1,19 @@
+# Test deployment configuration for Hedgehog vAIDC
+# Use this to test the Deployment Manager template locally before Marketplace submission
+#
+# Usage:
+#   gcloud deployment-manager deployments create test-vaidc \
+#       --config test_config.yaml \
+#       --project YOUR_PROJECT_ID
+
+imports:
+- path: hedgehog-vaidc.jinja
+
+resources:
+- name: test-vaidc
+  type: hedgehog-vaidc.jinja
+  properties:
+    zone: us-west1-c
+    machineType: n1-standard-32
+    network: global/networks/default
+    bootDiskSizeGb: 300

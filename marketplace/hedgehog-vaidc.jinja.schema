@@ -1,0 +1,79 @@
+info:
+  title: Hedgehog Virtual AI Data Center (vAIDC)
+  author: Hedgehog
+  description: |
+    Pre-configured lab environment for Hedgehog Fabric training.
+    Includes VLAB with 7 SONiC switches, Grafana, Prometheus, ArgoCD, and Gitea.
+  version: 1.0.0
+
+imports:
+- path: hedgehog-vaidc.jinja
+
+required:
+- zone
+- machineType
+
+properties:
+  zone:
+    type: string
+    default: us-west1-c
+    description: GCP zone for deployment (must support nested virtualization)
+    x-googleProperty:
+      type: GCE_ZONE
+
+  machineType:
+    type: string
+    default: n1-standard-32
+    description: Machine type (must support nested virtualization, minimum 16 vCPUs, 32GB RAM)
+    x-googleProperty:
+      type: GCE_MACHINE_TYPE
+      zoneProperty: zone
+      gceMachineType:
+        minCpu: 16
+        minRamGb: 32
+
+  network:
+    type: string
+    default: global/networks/default
+    description: Network for the VM
+    x-googleProperty:
+      type: GCE_NETWORK
+
+  subnetwork:
+    type: string
+    description: Subnetwork for the VM (optional, leave blank for default)
+    x-googleProperty:
+      type: GCE_SUBNETWORK
+      zoneProperty: zone
+      gceSubnetwork:
+        networkProperty: network
+
+  bootDiskSizeGb:
+    type: integer
+    default: 300
+    minimum: 200
+    maximum: 1000
+    description: Boot disk size in GB (minimum 200GB recommended for lab exercises)
+
+outputs:
+  vmName:
+    type: string
+    description: Name of the created VM instance
+  vmSelfLink:
+    type: string
+    description: Self link to the VM instance
+  vmExternalIP:
+    type: string
+    description: External IP address of the VM
+  grafanaUrl:
+    type: string
+    description: URL to access Grafana dashboards
+  giteaUrl:
+    type: string
+    description: URL to access Gitea repository
+  argocdUrl:
+    type: string
+    description: URL to access ArgoCD
+  prometheusUrl:
+    type: string
+    description: URL to access Prometheus

@@ -1,0 +1,156 @@
+description:
+  title: Hedgehog Virtual AI Data Center (vAIDC)
+  author:
+    title: Hedgehog
+    descriptionHtml: >
+      <p>Hedgehog provides modern network fabric solutions for AI/ML data centers.</p>
+  tagline: Pre-configured lab environment for Hedgehog Fabric training
+  descriptionHtml: |
+    <p>The Hedgehog Virtual AI Data Center (vAIDC) is a complete, pre-configured lab environment
+    for learning Hedgehog Fabric network operations.</p>
+
+    <h3>Included Components</h3>
+    <ul>
+      <li><strong>VLAB:</strong> 7 virtual SONiC switches (2 spines, 5 leaves), 10 virtual servers, 1 control node</li>
+      <li><strong>Grafana:</strong> Monitoring dashboards with Hedgehog-specific views</li>
+      <li><strong>Prometheus:</strong> Metrics collection and alerting</li>
+      <li><strong>ArgoCD:</strong> GitOps-based configuration management</li>
+      <li><strong>Gitea:</strong> Git repository for infrastructure as code</li>
+      <li><strong>Loki:</strong> Log aggregation</li>
+    </ul>
+
+    <h3>Requirements</h3>
+    <ul>
+      <li>Machine type with nested virtualization support (n1-standard-32 recommended)</li>
+      <li>Minimum 16 vCPUs and 32GB RAM</li>
+      <li>300GB boot disk (default)</li>
+    </ul>
+
+    <h3>Access Information</h3>
+    <p>After deployment (allow 5-10 minutes for services to start), access services at:</p>
+    <ul>
+      <li><strong>Grafana:</strong> http://[VM_IP]:3000 (admin/admin)</li>
+      <li><strong>Gitea:</strong> http://[VM_IP]:3001 (student01/hedgehog123)</li>
+      <li><strong>ArgoCD:</strong> http://[VM_IP]:8080 (admin/[retrieve via SSH])</li>
+      <li><strong>Prometheus:</strong> http://[VM_IP]:9090</li>
+    </ul>
+
+    <h3>Getting Started</h3>
+    <ol>
+      <li>Deploy this solution to your GCP project</li>
+      <li>Wait 5-10 minutes for all services to initialize</li>
+      <li>Access the Grafana dashboard to verify the environment is ready</li>
+      <li>Follow the course materials at hedgehog.cloud/learn</li>
+    </ol>
+
+  eulaUrl: https://hedgehog.cloud/vaidc-terms
+  documentations:
+  - title: Getting Started Guide
+    url: https://docs.hedgehog.cloud/vaidc/getting-started
+    description: Quick start guide for the vAIDC environment
+  - title: Course Materials
+    url: https://hedgehog.cloud/learn
+    description: Hedgehog Fabric training courses
+  - title: vAIDC Documentation
+    url: https://docs.hedgehog.cloud/vaidc
+    description: Complete vAIDC technical documentation
+
+  support:
+  - title: Documentation
+    url: https://docs.hedgehog.cloud/vaidc
+    description: Technical documentation and troubleshooting guides
+  - title: Community Support
+    url: https://hedgehog.cloud/community
+    description: Community forums and discussions
+
+  softwareGroups:
+  - type: SOFTWARE_GROUP_OS
+    software:
+    - title: Ubuntu
+      version: "24.04 LTS"
+  - software:
+    - title: Hedgehog Fabric VLAB
+      version: "latest"
+    - title: Grafana
+      version: "11.x"
+    - title: Prometheus
+      version: "2.x"
+    - title: ArgoCD
+      version: "2.x"
+    - title: Gitea
+      version: "1.22.x"
+    - title: Loki
+      version: "latest"
+
+input:
+  sections:
+  - name: DEPLOYMENT
+    title: Deployment Configuration
+    tooltip: Configure the VM deployment settings
+
+  properties:
+  - name: zone
+    title: Zone
+    section: DEPLOYMENT
+    tooltip: Select a zone that supports nested virtualization
+  - name: machineType
+    title: Machine Type
+    section: DEPLOYMENT
+    tooltip: n1-standard-32 recommended for optimal performance
+  - name: network
+    title: Network
+    section: DEPLOYMENT
+  - name: subnetwork
+    title: Subnetwork
+    section: DEPLOYMENT
+  - name: bootDiskSizeGb
+    title: Boot Disk Size (GB)
+    section: DEPLOYMENT
+    tooltip: 300GB recommended, minimum 200GB
+
+runtime:
+  deployingMessage: Deploying Hedgehog vAIDC. This may take 5-10 minutes for all services to initialize...
+  applicationTable:
+    rows:
+    - label: VM Instance
+      value: '{{ outputs().vmName }}'
+    - label: External IP
+      value: '{{ outputs().vmExternalIP }}'
+    - label: Grafana
+      value: '<a href="{{ outputs().grafanaUrl }}">{{ outputs().grafanaUrl }}</a>'
+      showIf: '{{ outputs().vmExternalIP }}'
+    - label: Gitea
+      value: '<a href="{{ outputs().giteaUrl }}">{{ outputs().giteaUrl }}</a>'
+      showIf: '{{ outputs().vmExternalIP }}'
+    - label: ArgoCD
+      value: '<a href="{{ outputs().argocdUrl }}">{{ outputs().argocdUrl }}</a>'
+      showIf: '{{ outputs().vmExternalIP }}'
+    - label: Prometheus
+      value: '<a href="{{ outputs().prometheusUrl }}">{{ outputs().prometheusUrl }}</a>'
+      showIf: '{{ outputs().vmExternalIP }}'
+  primaryButton:
+    label: SSH to VM
+    type: TYPE_GCE_VM_SSH
+    action: '{{ outputs().vmSelfLink }}'
+  suggestedActions:
+  - heading: Access Grafana Dashboards
+    description: Monitor the Hedgehog Fabric environment
+    snippet: |
+      Open {{ outputs().grafanaUrl }} in your browser.
+      Login with username: admin, password: admin
+  - heading: Access Gitea Repository
+    description: View and modify GitOps configurations
+    snippet: |
+      Open {{ outputs().giteaUrl }} in your browser.
+      Login with username: student01, password: hedgehog123
+  - heading: Get ArgoCD Password
+    description: Retrieve the ArgoCD admin password
+    snippet: |
+      gcloud compute ssh {{ outputs().vmName }} --zone={{ properties().zone }} --command="kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d && echo"
+  - heading: SSH to VM
+    description: Connect via SSH for command-line access
+    snippet: gcloud compute ssh {{ outputs().vmName }} --zone={{ properties().zone }}
+  - heading: Check VLAB Status
+    description: Verify all switches are operational
+    snippet: |
+      gcloud compute ssh {{ outputs().vmName }} --zone={{ properties().zone }} --command="cd ~/hhfab && hhfab vlab inspect"

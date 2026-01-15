@@ -1,0 +1,99 @@
+{% set deployment = env["deployment"] %}
+{% set project = env["project"] %}
+{% set zone = properties["zone"] %}
+{% set machineType = properties["machineType"] %}
+{% set network = properties["network"] %}
+{% set subnetwork = properties["subnetwork"] %}
+{% set bootDiskSizeGb = properties["bootDiskSizeGb"] %}
+
+{#
+  Hedgehog Virtual AI Data Center (vAIDC) Deployment Template
+
+  UPDATE IMAGE NAME HERE if using a different image:
+#}
+{% set vaidcImage = "projects/teched-473722/global/images/hedgehog-vaidc-v20260114" %}
+
+resources:
+- name: {{ deployment }}-vm
+  type: compute.v1.instance
+  properties:
+    zone: {{ zone }}
+    machineType: zones/{{ zone }}/machineTypes/{{ machineType }}
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: {{ vaidcImage }}
+        diskSizeGb: {{ bootDiskSizeGb }}
+        diskType: zones/{{ zone }}/diskTypes/pd-balanced
+    networkInterfaces:
+    - network: {{ network }}
+      {% if subnetwork %}
+      subnetwork: {{ subnetwork }}
+      {% endif %}
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+        networkTier: PREMIUM
+    tags:
+      items:
+      - vaidc-instance
+      - http-server
+      - https-server
+    metadata:
+      items:
+      - key: enable-oslogin
+        value: "TRUE"
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          echo "Hedgehog vAIDC instance started at $(date)" >> /var/log/vaidc-startup.log
+    scheduling:
+      automaticRestart: true
+      onHostMaintenance: MIGRATE
+    serviceAccounts:
+    - email: default
+      scopes:
+      - https://www.googleapis.com/auth/devstorage.read_only
+      - https://www.googleapis.com/auth/logging.write
+      - https://www.googleapis.com/auth/monitoring.write
+    minCpuPlatform: "Intel Cascade Lake"
+    advancedMachineFeatures:
+      enableNestedVirtualization: true
+
+- name: {{ deployment }}-firewall
+  type: compute.v1.firewall
+  properties:
+    network: {{ network }}
+    targetTags:
+    - vaidc-instance
+    sourceRanges:
+    - 0.0.0.0/0
+    allowed:
+    - IPProtocol: TCP
+      ports:
+      - "80"
+      - "443"
+      - "3000"
+      - "3001"
+      - "8080"
+      - "9090"
+    description: Allow access to Hedgehog vAIDC services
+
+outputs:
+- name: vmName
+  value: $(ref.{{ deployment }}-vm.name)
+- name: vmSelfLink
+  value: $(ref.{{ deployment }}-vm.selfLink)
+- name: vmExternalIP
+  value: $(ref.{{ deployment }}-vm.networkInterfaces[0].accessConfigs[0].natIP)
+- name: grafanaUrl
+  value: http://$(ref.{{ deployment }}-vm.networkInterfaces[0].accessConfigs[0].natIP):3000
+- name: giteaUrl
+  value: http://$(ref.{{ deployment }}-vm.networkInterfaces[0].accessConfigs[0].natIP):3001
+- name: argocdUrl
+  value: http://$(ref.{{ deployment }}-vm.networkInterfaces[0].accessConfigs[0].natIP):8080
+- name: prometheusUrl
+  value: http://$(ref.{{ deployment }}-vm.networkInterfaces[0].accessConfigs[0].natIP):9090

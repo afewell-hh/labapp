@@ -1,0 +1,8 @@
+{
+  "defaultDeploymentType": "SINGLE_VM",
+  "imageName": "hedgehog-vaidc-v20260114",
+  "projectId": "teched-473722",
+  "templateName": "hedgehog-vaidc",
+  "solutionId": "hedgehog-vaidc",
+  "partnerId": "hedgehog"
+}
