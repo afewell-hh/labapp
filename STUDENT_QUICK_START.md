@@ -87,8 +87,8 @@ gcloud services enable compute.googleapis.com
 
 ```bash
 gcloud compute instances create hedgehog-lab \
-  --zone=us-west1-c \
-  --machine-type=n1-standard-32 \
+  --zone=us-central1-a \
+  --machine-type=n2-standard-32 \
   --image=hedgehog-vaidc-v20260114 \
   --image-project=teched-473722 \
   --boot-disk-size=300GB \
@@ -111,7 +111,7 @@ gcloud compute firewall-rules create allow-vaidc-services \
 
 ```bash
 gcloud compute instances describe hedgehog-lab \
-  --zone=us-west1-c \
+  --zone=us-central1-a \
   --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
 ```
 
@@ -131,13 +131,13 @@ After deployment (allow 5-10 minutes for services to initialize):
 ### Get ArgoCD Password
 
 ```bash
-gcloud compute ssh hedgehog-lab --zone=us-west1-c --command="kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d && echo"
+gcloud compute ssh hedgehog-lab --zone=us-central1-a --command="kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d && echo"
 ```
 
 ### SSH to Your VM
 
 ```bash
-gcloud compute ssh hedgehog-lab --zone=us-west1-c
+gcloud compute ssh hedgehog-lab --zone=us-central1-a
 ```
 
 ### RDP Access (Desktop)
@@ -172,7 +172,7 @@ kubectl get pods -A
 
 | Resource | Cost |
 |----------|------|
-| VM running (n1-standard-32) | ~$1.10/hour |
+| VM running (n2-standard-32) | ~$1.10/hour |
 | VM stopped (disk only) | ~$51/month |
 | VM deleted | $0 |
 
@@ -205,7 +205,7 @@ This removes:
 
 ### VM Won't Start
 - Ensure your project has billing enabled
-- Check you have sufficient quota for n1-standard-32 machines
+- Check you have sufficient quota for n2-standard-32 machines
 - Try a different zone: `./deploy-lab.sh YOUR_PROJECT_ID us-central1-a`
 
 ### Can't Access Services

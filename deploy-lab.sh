@@ -7,7 +7,7 @@
 set -e
 
 PROJECT_ID="${1:?Error: Please provide your GCP project ID as the first argument}"
-ZONE="${2:-us-west1-c}"
+ZONE="${2:-us-central1-a}"
 VM_NAME="hedgehog-lab"
 IMAGE_NAME="hedgehog-vaidc-v20260114"
 IMAGE_PROJECT="teched-473722"
@@ -29,7 +29,7 @@ gcloud services enable compute.googleapis.com --quiet
 echo "[3/4] Creating VM instance (this may take 2-3 minutes)..."
 gcloud compute instances create "$VM_NAME" \
   --zone="$ZONE" \
-  --machine-type=n1-standard-32 \
+  --machine-type=n2-standard-32 \
   --image="$IMAGE_NAME" \
   --image-project="$IMAGE_PROJECT" \
   --boot-disk-size=300GB \

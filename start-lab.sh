@@ -3,10 +3,10 @@
 # Usage: ./start-lab.sh YOUR_PROJECT_ID [ZONE]
 #
 # Starts a previously stopped VM.
-# Example: ./start-lab.sh my-gcp-project us-west1-c
+# Example: ./start-lab.sh my-gcp-project us-central1-a
 
 PROJECT_ID="${1:?Error: Please provide your GCP project ID as the first argument}"
-ZONE="${2:-us-west1-c}"
+ZONE="${2:-us-central1-a}"
 VM_NAME="hedgehog-lab"
 
 echo "=== Starting Hedgehog vAIDC Lab ==="

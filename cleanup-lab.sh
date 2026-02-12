@@ -3,12 +3,12 @@
 # Usage: ./cleanup-lab.sh YOUR_PROJECT_ID [ZONE]
 #
 # This script removes all resources created by deploy-lab.sh
-# Example: ./cleanup-lab.sh my-gcp-project us-west1-c
+# Example: ./cleanup-lab.sh my-gcp-project us-central1-a
 
 set -e
 
 PROJECT_ID="${1:?Error: Please provide your GCP project ID as the first argument}"
-ZONE="${2:-us-west1-c}"
+ZONE="${2:-us-central1-a}"
 VM_NAME="hedgehog-lab"
 FIREWALL_RULE="allow-vaidc-services"
 
