@@ -7,19 +7,21 @@ Read this before touching the repo. It supersedes any prior agent guidance and a
 ## 1. Mission Snapshot
 
 - **Product:** A pre-configured GCP VM image with a fully functional Hedgehog VLAB environment, plus tooling to automate the setup process on fresh Ubuntu VMs.
-- **Distribution Model:** Two delivery paths:
-  1. **Pre-built Image (Primary Focus):** A ready-to-use GCP Marketplace image with VLAB pre-installed
+- **Production Use:** Labapp is already a production GCP VM image. It is used for Hedgehog LMS lab exercises at hedgehog.cloud/learn and for demos. Students run the VM alongside course content in a separate terminal/window; it is not directly embedded in the LMS.
+- **Current Production Image:** Built through a combination of automated setup (cloud-init) and manual configuration.
+- **Delivery Paths:**
+  1. **Pre-built Image (Primary Focus):** A ready-to-use GCP VM image with VLAB pre-installed
   2. **Automated Installer (Future):** Scripts that transform a fresh Ubuntu 24.04 VM into the same configured state
 
 ### Current Priority
 
-**Manually building and publishing a pre-configured VM image** to GCP Marketplace. This provides users with an immediately usable solution while the fully automated installer is developed.
+**An efficient, reproducible, automated Packer image build** that replaces the partially manual production build process, developed with a lead / Claude worker / Codex reviewer workflow. GCP Marketplace publication is not the current primary objective (see recorded decisions in #136 and #137). Until the Packer build exists, the manual workflow below remains the documented way to build an image.
 
 ### Near-Term Objectives
 
 1. **Refine cloud-config.yaml** - Automate as much of the base system setup as cloud-init can handle (packages, Docker, XRDP, dev tools)
 2. **Manual VLAB installation** - Complete remaining setup steps manually on cloud-init-provisioned VMs
-3. **Image creation & publishing** - Save configured VMs as GCP images and publish to Marketplace
+3. **Image creation** - Save configured VMs as GCP images (Marketplace publication is not currently a primary objective)
 4. **Incremental automation** - Progressively move manual steps into cloud-config or installer scripts
 
 ### Longer-Term Goals
