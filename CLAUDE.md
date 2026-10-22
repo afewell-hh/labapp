@@ -152,12 +152,15 @@ Pilot: `build/provision/install-k3d.sh` installs a pinned k3d release binary (v5
 ```bash
 # Install (override K3D_INSTALL_DIR to isolate; default /usr/local/bin)
 K3D_INSTALL_DIR=/tmp/k3d-test bash build/provision/install-k3d.sh
-# Disposable Ubuntu 24.04 container test of the real module (needs docker + network)
+# Disposable Ubuntu 24.04 container test of the real module (needs docker + network).
+# Runs the suite in 2 separate fresh containers by default (pass N to change), printing
+# base image id/digest, os-release, per-check PASS/FAIL and per-run timing. Containers
+# mount only build/provision read-only: no Docker socket or host credentials.
 bash build/provision/test-install-k3d.sh
 # Static checks
 bash -n build/provision/*.sh && shellcheck -x build/provision/*.sh
 ```
-The test covers clean install, idempotent rerun, bad-digest and unavailable-download failures that preserve an existing binary, and unsupported-architecture failure. It does not verify Docker, a k3d cluster, systemd, cloud-init, nested KVM or VLAB.
+The download is bounded: 120s per attempt (K3D_DOWNLOAD_MAX_TIME), aborted under 1 KiB/s for 30s, 3 retries, 600s hard cap overall (K3D_DOWNLOAD_TOTAL_TIMEOUT). The test covers clean install, idempotent rerun, repair of a preseeded non-executable (0644) matching binary, bad-digest, unavailable-download and stalled-download failures that preserve an existing binary, and unsupported-architecture failure. It does not verify Docker, a k3d cluster, systemd, cloud-init, nested KVM or VLAB.
 
 ### Committing changes
 ```bash
