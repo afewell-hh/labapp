@@ -158,6 +158,13 @@ Closes #N"
 git push origin feature/description
 ```
 
+### Claude and Codex GitHub automation
+- `.github/workflows/claude.yml` runs Claude when an issue or PR comment contains `@claude`; Codex separately reviews PRs when they are opened or when `@codex review` is commented.
+- `claude_args --allowedTools` enables `WebSearch` and `WebFetch` for source research, plus only `gh issue view/comment` and `gh pr create/view/diff/checks/comment` as additional shell commands. GitHub token permissions and all other shell permissions are unchanged, and merge/approval commands are not allowed.
+- Research workers must consult current primary sources and cite evidence in their issue/PR. If source access is denied, report the blocker and mark conclusions provisional rather than presenting unverified research as complete.
+- Known limitation: in tag mode the action may restrict Claude to a single comment and may default to a branch plus prefilled PR link. The extra tool permissions do not override its injected instructions.
+- Unverified until a fresh Claude run after merge: PR creation via `gh pr create` and bot-authored review handoff comments. Record run evidence rather than assuming they work.
+
 ### Important reminders
 - Delete test VMs when done (500GB persistent disk quota)
 - Never commit secrets or credentials

@@ -46,5 +46,13 @@ jobs:
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          # Allow source research and scoped issue/PR review handoffs.
+          # Keep other shell and GitHub token permissions unchanged.
+          claude_args: >-
+            --allowedTools
+            "WebSearch" "WebFetch"
+            "Bash(gh issue view:*)" "Bash(gh issue comment:*)"
+            "Bash(gh pr create:*)" "Bash(gh pr view:*)"
+            "Bash(gh pr diff:*)" "Bash(gh pr checks:*)"
+            "Bash(gh pr comment:*)"
 
