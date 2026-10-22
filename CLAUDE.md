@@ -147,6 +147,18 @@ cat /var/log/cloud-init.log
 - Keep installations idempotent where possible
 - Document any packages that consistently fail in cloud-init
 
+### Packer-ready provisioning modules (`build/provision/`)
+Pilot: `build/provision/install-k3d.sh` installs a pinned k3d release binary (v5.7.4, linux/amd64, SHA256 verified, noninteractive). It is the one file used both for development and, later, Packer shell provisioning. `cloud-config.yaml` is unchanged during the pilot.
+```bash
+# Install (override K3D_INSTALL_DIR to isolate; default /usr/local/bin)
+K3D_INSTALL_DIR=/tmp/k3d-test bash build/provision/install-k3d.sh
+# Disposable Ubuntu 24.04 container test of the real module (needs docker + network)
+bash build/provision/test-install-k3d.sh
+# Static checks
+bash -n build/provision/*.sh && shellcheck -x build/provision/*.sh
+```
+The test covers clean install, idempotent rerun, bad-digest and unavailable-download failures that preserve an existing binary, and unsupported-architecture failure. It does not verify Docker, a k3d cluster, systemd, cloud-init, nested KVM or VLAB.
+
 ### Committing changes
 ```bash
 git checkout -b feature/description
