@@ -117,26 +117,32 @@ Do not touch production resources, create images or cloud resources, or run
 deployment scripts unless the task explicitly authorizes it. Don't rewrite
 `_archive/` or `archive2/` unless asked. Never commit secrets.
 
-## Observed integration behavior (as of 2026-10-23)
+## Dispatch, tool access and handoff operations
 
-Verified from issues #139, #140, #146, #148 and PR #149:
+Current status, permission and CI baselines, and evidence live in GitHub, not
+here: see #145 (parent), #139 and #140.
 
-- The Claude worker (GitHub Action, tag mode) can read issues and research
-  sources, edit files, push a branch and create PRs, under the scoped
-  `--allowedTools` in `.github/workflows/claude.yml`.
-- Some test commands (`bash -n`, `shellcheck`, `docker`) were denied to the
-  worker. The lead-managed verifier ran them, and that is the evidence of
-  record. Check the workflow file for current permissions rather than this list.
-- Codex automatic PR review works and runs when a PR is opened or on
-  `@codex review`. Lead-managed independent reviewers are also used.
-- Tag mode may limit the worker to updating a single comment, so separate
-  handoff comments are not guaranteed. Make the handoff explicit in that
-  comment and the PR body.
-- Not established: automatic bot-to-bot triggering, multi-round automatic
-  review/fix loops, or continuous lead monitoring outside an active session.
-  See "Lead follow-up" below.
-- The workflow triggers on `@claude` in newly opened issues, so issue
-  templates must not contain live mentions; the lead dispatches separately.
+- **Dispatch.** The lead dispatches work with an explicit `@claude` or
+  `@codex review` comment on the issue or PR. Issue and PR templates must not
+  contain live mentions, because the workflow triggers on `@claude` in newly
+  opened issues.
+- **Check capabilities first.** Before work that depends on a tool (shell
+  checks, `docker`, web fetch, `gh` subcommands, PR creation), the worker
+  checks what it is actually allowed to run. The authority is the current
+  `--allowedTools` in `.github/workflows/claude.yml` plus what the run
+  permits, not memory or older comments.
+- **Denied means handoff, not pass.** If a command is denied, the worker does
+  not substitute a claim. It records the exact command and denial, supplies
+  the correct command for someone else to run, and marks the dependent
+  conclusion unverified.
+- **Lead arranges verification.** The lead runs or assigns denied or
+  independent checks and reviews, and records results in the issue or PR.
+- **Confirm bot handoffs.** Tag mode may limit a worker to one comment, and
+  bot-to-bot triggering is not assumed. Treat a handoff or review request as
+  delivered only after an actual acknowledgement or run appears, and state the
+  handoff explicitly in the PR comment and body.
+- Multi-round automatic review/fix loops and monitoring outside an active
+  session are not assumed; see "Lead follow-up" below.
 
 ## Lead follow-up
 
