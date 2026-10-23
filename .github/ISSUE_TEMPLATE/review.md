@@ -15,17 +15,22 @@ separately.
 ## Target
 <!-- PR / report link and exact head commit SHA or comment URL. Task issue: #N -->
 
+(fill in)
+
 ## Criteria to assess
 <!-- Copy or link the task's acceptance criteria; the review must give a result for each. -->
-- [ ]
+
+- [ ] (criterion)
 
 ## Significant-defect focus
 <!-- Correctness, security, scope creep, unintended file changes, doc accuracy. -->
--
+
+- (fill in)
 
 ## Evidence to check
 <!-- Claimed commands/results, cited sources, and whether denied/unrun checks were reported honestly. -->
--
+
+- (fill in)
 
 ## Output
 Per-criterion result (met / not met / could not assess, with reason), then
@@ -34,4 +39,5 @@ not show every criterion was assessed. State what you could not verify.
 Do not approve or merge.
 
 ## Dependencies
-- Depends on: #
+
+- Depends on: #N

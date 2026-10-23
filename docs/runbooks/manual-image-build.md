@@ -1,7 +1,11 @@
-# Manual Lab VM Image Build (current documented process)
+# Manual Lab VM Image Build (historical fallback runbook)
 
 This is the documented way to build a Lab VM image until an automated Packer
-build exists. It was moved here from the former root `AGENTS.md`/`CLAUDE.md`
+build exists. It is a historical manual fallback, not the default development
+iteration process; for day-to-day changes use the cheapest-representative
+testing layers in
+[agent-workflow.md](../contributing/agent-workflow.md#testing-cheapest-representative-first).
+It was moved here from the former root `AGENTS.md`/`CLAUDE.md`
 without changing the commands. An automated Packer build does **not** exist
 yet; progress is tracked in issue #145.
 
@@ -105,7 +109,12 @@ cat /var/log/cloud-init.log
 
 ### Updating cloud-config.yaml
 
-- Test changes by launching a fresh VM and monitoring cloud-init logs.
+- Test with the cheapest representative layer first (schema/syntax and
+  component tests; see
+  [testing layers](../contributing/agent-workflow.md#testing-cheapest-representative-first)).
+  Launch a fresh VM and monitor cloud-init logs when the changed behavior
+  requires an actual boot or VM check. Final clean image build, boot/reboot
+  and student gates remain required for appliance releases.
 - Keep installations idempotent where possible.
 - Document any packages that consistently fail in cloud-init (in the
   relevant GitHub issue until a stable limit is confirmed, then here).

@@ -17,8 +17,14 @@ K3D_INSTALL_DIR=/tmp/k3d-test bash build/provision/install-k3d.sh
 # base image id/digest, os-release, per-check PASS/FAIL and per-run timing. Containers
 # mount only build/provision read-only: no Docker socket or host credentials.
 bash build/provision/test-install-k3d.sh
-# Static checks
-bash -n build/provision/*.sh && shellcheck -x build/provision/*.sh
+```
+
+Static checks. `bash -n` parses only its first file argument (later names
+become positional arguments), so run it once per file:
+
+```bash
+for f in build/provision/*.sh; do bash -n "$f" || exit 1; done
+shellcheck -x build/provision/*.sh
 ```
 
 The download is bounded: 120s per attempt (K3D_DOWNLOAD_MAX_TIME), aborted

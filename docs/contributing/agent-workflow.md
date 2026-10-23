@@ -133,10 +133,22 @@ Verified from issues #139, #140, #146, #148 and PR #149:
   handoff comments are not guaranteed. Make the handoff explicit in that
   comment and the PR body.
 - Not established: automatic bot-to-bot triggering, multi-round automatic
-  review/fix loops, or the lead continuously monitoring. The lead dispatches
-  and checks each step.
+  review/fix loops, or continuous lead monitoring outside an active session.
+  See "Lead follow-up" below.
 - The workflow triggers on `@claude` in newly opened issues, so issue
   templates must not contain live mentions; the lead dispatches separately.
+
+## Lead follow-up
+
+- While an authorized session is active and jobs or reviews are pending, the
+  lead checks roughly every 2 minutes and routes results and next work without
+  waiting for the owner to ask for status.
+- Bring product, scope and budget choices, blockers and meaningful milestones
+  to the owner.
+- After a turn or session ends, continuous monitoring requires a separately
+  verified scheduled-task or event mechanism. Do not claim a timer or webhook
+  exists unless one is configured and verified.
+- Temporary task status stays in GitHub issues and PRs.
 
 ## Worker handoff (end of task)
 

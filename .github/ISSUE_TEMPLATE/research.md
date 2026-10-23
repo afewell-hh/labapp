@@ -15,21 +15,27 @@ the worker in a separate comment after the issue exists.
 ## Question and decision to inform
 <!-- What the lead needs to decide. Parent: #N -->
 
+(fill in)
+
 ## Constraints
 <!-- Research only unless stated: no repo edits, cloud resources, or production access. -->
--
+
+- (fill in)
 
 ## Required sources
 <!-- Official/maintainer sources to consult first; add others as found. -->
--
+
+- (fill in)
 
 ## Deliverable
 <!-- Where the report is posted (this issue), and its required sections, e.g.
 options with criteria, what each test layer cannot prove, assumptions,
 unanswered questions, proposed follow-up tasks. -->
--
+
+- (fill in)
 
 ## Acceptance criteria
+
 - [ ] Each consequential claim cites a primary source with URL, access date and version scope
 - [ ] Verified behavior, historical reports and unknowns are separated
 - [ ] Unexecuted commands are labeled documented, not tested; no benchmark is invented
@@ -37,8 +43,9 @@ unanswered questions, proposed follow-up tasks. -->
 - [ ] Ends with assumptions, open questions and proposed follow-ups
 
 ## Dependencies
-- Parent / epic: #
-- Depends on: #
+
+- Parent / epic: #N
+- Depends on: #N
 
 ## Handoff
 Report in this issue. Lead arranges independent review. Do not create

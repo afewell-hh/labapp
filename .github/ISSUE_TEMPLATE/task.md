@@ -19,22 +19,27 @@ starts a job immediately).
 
 ## Scope
 In scope:
--
+
+- (fill in)
 
 Out of scope (cloud/production access, other components, refactors):
--
+
+- (fill in)
 
 ## Deliverables
 <!-- Concrete files/PR outputs. Name the docs to update, or say none needed. -->
--
+
+- (fill in)
 
 ## Acceptance criteria
 <!-- Each must be checkable by an independent reviewer. -->
-- [ ]
-- [ ]
+
+- [ ] (criterion)
+- [ ] (criterion)
 
 ## Verification plan and limits
 <!-- Cheapest representative layer per criterion, exact commands, and what each cannot prove. -->
+
 | Check | Command / method | Cannot prove |
 |---|---|---|
 | | | |
@@ -43,12 +48,14 @@ A failed, denied or unrun check is reported as such, not as passing.
 
 ## Sources and compatibility
 <!-- Official docs / issues / code to read first, with the version scope that applies. -->
--
+
+- (fill in)
 
 ## Dependencies
-- Parent / epic: #
-- Depends on: #
-- Blocks: #
+
+- Parent / epic: #N
+- Depends on: #N
+- Blocks: #N
 
 ## Iteration bound and handoff
 Max two focused revision rounds after review, then escalate to the lead with
