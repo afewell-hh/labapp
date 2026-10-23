@@ -1,32 +1,63 @@
 ---
-name: Task
-about: General development task
-title: ''
+name: Development task
+about: Scoped implementation or documentation task for one worker
+title: '[TASK] '
 labels: 'kind/task'
 assignees: ''
 ---
 
-## Description
-<!-- What needs to be done? -->
+<!--
+Process rules (roles, onboarding, testing, handoff) live in
+docs/contributing/agent-workflow.md. Link to it; do not copy it here.
+Do not write an agent mention in this body. The lead dispatches the worker in a
+separate comment after the issue exists (a mention in a newly opened issue
+starts a job immediately).
+-->
 
-## Acceptance Criteria
-- [ ]
-- [ ]
+## Goal
+<!-- One or two sentences: the outcome and why. Parent: #N -->
 
-## Technical Notes
-<!-- Implementation details, references, etc. -->
+## Scope
+In scope:
 
-## Related Issues
-<!-- Part of epic or depends on other issues -->
-- Epic: #
-- Depends on: #
+- (fill in)
 
-## Estimate
-<!-- Story points or time estimate -->
-Points:
+Out of scope (cloud/production access, other components, refactors):
 
-## Priority
-- [ ] Critical
-- [ ] High
-- [ ] Medium
-- [ ] Low
+- (fill in)
+
+## Deliverables
+<!-- Concrete files/PR outputs. Name the docs to update, or say none needed. -->
+
+- (fill in)
+
+## Acceptance criteria
+<!-- Each must be checkable by an independent reviewer. -->
+
+- [ ] (criterion)
+- [ ] (criterion)
+
+## Verification plan and limits
+<!-- Cheapest representative layer per criterion, exact commands, and what each cannot prove. -->
+
+| Check | Command / method | Cannot prove |
+|---|---|---|
+| | | |
+
+A failed, denied or unrun check is reported as such, not as passing.
+
+## Sources and compatibility
+<!-- Official docs / issues / code to read first, with the version scope that applies. -->
+
+- (fill in)
+
+## Dependencies
+
+- Parent / epic: #N
+- Depends on: #N
+- Blocks: #N
+
+## Iteration bound and handoff
+Max two focused revision rounds after review, then escalate to the lead with
+the exact blocker. Handoff in the PR: head SHA, criteria met/unmet, checks run
+and denied, docs updated, uncertainties. Do not merge or close.
