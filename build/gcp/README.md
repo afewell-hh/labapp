@@ -166,13 +166,18 @@ for lead cleanup. It never recursively deletes a guest mount. Diagnostics never
 relay command output. SIGTERM/SIGINT trigger cleanup; SIGKILL or VM loss still
 requires the existing independent resource cleanup and lead staging cleanup.
 
-Tests use mocked commands and synthetic files only, including an unchanged
-collector run against a fake mount. They establish command/validation/cleanup
-behavior, not kernel mount semantics or real source-image layout. A tiny synthetic
-ext4 image in an authorized disposable non-cloud mount-capable environment and
-a harmless authenticated access/transfer pilot are later checks before raw
-guest recovery. Do not use a public workflow artifact or serial output for raw
-transfer. Existing lifecycle deadlines are never extended by this wrapper.
+The offline suite uses mocked commands and synthetic files, including an
+unchanged collector run against a fake mount. It establishes command/validation/
+cleanup behavior, not kernel mount semantics or source-image layout. Actual
+execution is separate evidence: see the [inspector kernel and private-transfer
+proof](https://github.com/afewell-hh/labapp/issues/170#issuecomment-6388863729) and
+[whole-wrapper source collection](https://github.com/afewell-hh/labapp/issues/170#issuecomment-6389012668).
+The resulting [reviewed source inventory](https://github.com/afewell-hh/labapp/issues/151#issuecomment-6388996007)
+is a separate metadata-only publication.
+The synthetic loop proof does not establish whole-wrapper source-layout
+acceptance; each source inspection still requires its own identity/layout and
+clean-state validation. Never use a public workflow artifact or serial output
+for raw transfer. Existing lifecycle deadlines are never extended by this wrapper.
 
 Sources consulted2026-10-24: [kernel ext4](https://docs.kernel.org/admin-guide/ext4.html)
 (RO alone may replay journals; `noload`/`norecovery` skips replay),
@@ -180,7 +185,9 @@ Sources consulted2026-10-24: [kernel ext4](https://docs.kernel.org/admin-guide/e
 [unshare](https://man7.org/linux/man-pages/man1/unshare.1.html), and
 [Ubuntu24.04 debugfs](https://manpages.ubuntu.com/manpages/noble/man8/debugfs.8.html)
 (e2fsprogs1.47.0; default read-only and fixed inode stat). These describe
-upstream behavior; actual Ubuntu24.04 mount/tool compatibility is not yet tested.
+upstream behavior. Offline tests do not establish Ubuntu tool/kernel
+compatibility; the linked real inspector evidence records its actual tool/kernel
+scope and cannot guarantee compatibility with every Ubuntu revision.
 
 ### Synthetic inspector kernel proof
 
@@ -224,8 +231,9 @@ Primary references consulted 2026-10-24: Python
 (Debian bookworm manual, not an Ubuntu guest version claim), and
 [systemd.service command syntax](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
 (current upstream 262; the collector deliberately implements only discovery,
-not that parser). Synthetic tests establish isolation and bounds, not behavior
-of the saved appliance or a real mount.
+not that parser). Synthetic tests establish isolation and bounds. Real mount
+and immutable-source inventory evidence is linked above; neither proves runtime
+behavior of the saved appliance.
 
 - `bootstrap-access.sh`: owner-run keyless access setup (see
   [`docs/runbooks/gcp-build-access.md`](../../docs/runbooks/gcp-build-access.md)).
