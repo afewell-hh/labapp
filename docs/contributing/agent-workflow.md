@@ -39,6 +39,39 @@ document, or files it links.
 - A page that 404'd or was only partly read is stated as such.
 - A command described in docs but not executed is "documented", not "tested".
 
+## Active CI checks
+
+CI uses Ubuntu 24.04 distribution packages for Bash/ShellCheck, yamllint and
+cloud-init schema validation. It checks every tracked active `.sh` file
+(excluding `_archive/` and `archive2/`), active YAML and the embedded
+`write_files` shell scripts in `cloud-config.yaml` without executing them.
+The schema check validates configuration structure, not installation or boot.
+The YAML rules permit indentless sequences, the cloud-config header and long
+embedded commands; syntax, duplicate keys and whitespace are still checked.
+
+From the repository root, after installing `shellcheck`, `yamllint`,
+`cloud-init` and `python3-yaml` through apt:
+
+```bash
+git ls-files -z '*.sh' ':(exclude)_archive/**' ':(exclude)archive2/**' > /tmp/labapp-active-shell
+mapfile -d '' -t scripts < /tmp/labapp-active-shell
+for script in "${scripts[@]}"; do bash -n "$script" || exit 1; done
+shellcheck -x "${scripts[@]}"
+yamllint .yamllint.yml .github marketplace cloud-config.yaml wiringd.yaml
+cloud-init --version
+cloud-init schema --config-file cloud-config.yaml --annotate
+```
+
+A separate 10-minute CI job runs the existing k3d install/failure suite in two
+fresh Ubuntu containers, with an eight-minute command timeout. It mounts only
+`build/provision` read-only and gives guests no Docker socket or credentials.
+It verifies installation, not a Docker daemon, cluster or appliance boot.
+Historical launch recipes are `gcp_vm_launch_command.txt`, not a runnable script.
+
+New lifecycle/controller code must add its actual offline test command to CI
+in the same PR that introduces it; shell checks alone cannot cover lifecycle
+invariants. Do not add placeholder test steps that pass when tests are absent.
+
 ## Testing: cheapest representative first
 
 Choose the cheapest layer that can catch the failure class, and say what it
