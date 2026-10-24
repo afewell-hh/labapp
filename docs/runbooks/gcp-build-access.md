@@ -18,8 +18,11 @@ The owner bootstraps GitHub OIDC → Google Workload Identity Federation (WIF)
   `afewell-hh/labapp/.github/workflows/labapp-cloud.yml@refs/heads/main`.
 
 The checked-in workflow has no inputs and only reads the selected image's
-metadata. Action revisions and Cloud CLI version are pinned. It checks out
-trusted main; it does not execute repository scripts or accept commands, SHAs,
+metadata. Action revisions and Cloud CLI version are pinned. It executes the
+trusted main workflow without checking out repository files. It creates the
+workspace directory before auth so the pinned auth action can write temporary
+credentials; no later checkout can delete that file. It does not execute
+repository scripts or accept commands, SHAs,
 image names, or service accounts from a task comment. General Claude jobs and
 Codex environments receive no cloud credentials. Protect main and review changes
 to this workflow, because reviewed main code is this trust boundary.
@@ -168,7 +171,10 @@ Official sources consulted 2026-10-24:
 - [Google WIF deployment pipelines](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines):
   numeric repository/owner attributes and conditions, service-account federation.
 - [Google auth action v3](https://github.com/google-github-actions/auth):
-  short-lived credentials, checkout ordering, cleanup and permissions.
+  short-lived credentials, cleanup and permissions. The
+  [pinned auth source](https://github.com/google-github-actions/auth/blob/7c6bc770dae815cd3e89ee6cdf493a5fab2cc093/src/main.ts#L150-L157)
+  explicitly supports legitimate use without checkout; the workspace directory
+  must exist for its temporary credentials file.
 - [Google setup-gcloud v3](https://github.com/google-github-actions/setup-gcloud):
   pinned CLI version; WIF requires CLI ≥363.0.0.
 - [CLI 540.0.0 release announcement](https://groups.google.com/g/google-cloud-sdk-announce/c/pRR1RNN3_AM):
