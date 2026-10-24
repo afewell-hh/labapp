@@ -116,6 +116,8 @@ duplicate assignments and resets produce fixed gap codes. Repeated/reset
 directives are omitted rather than assigning invented precedence. Backslashes
 refuse the entire unit's settings because continuation/escape semantics are
 unsupported; this is deliberately not a systemd parser.
+CRLF is normalized to LF; lone CR and Unicode whitespace/separators refuse
+the unit subset rather than creating apparent directives inside private text.
 
 Captured helpers yield a reusable script only when the whole body matches a
 public checked-in recipe: currently `hhbr_ip_131.txt`, from issue#131. Only

@@ -48,10 +48,15 @@ def normalized_body(text):
 
 
 def unit_settings(text):
+    text = text.replace('\r\n', '\n')
+    # Python's splitlines/strip recognize Unicode separators that must never
+    # invent systemd directives from the middle of an omitted private value.
+    if '\r' in text or any(c.isspace() and c not in ' \t\n' for c in text):
+        return {}, ['unsupported_syntax']
     fields, gaps, seen, blocked = {}, set(), set(), set()
     section = None
-    for line in text.splitlines():
-        stripped = line.strip()
+    for line in text.split('\n'):
+        stripped = line.strip(' \t')
         if not stripped or stripped.startswith(('#', ';')):
             continue
         # Do not consume a continued line as a separate directive.
@@ -63,7 +68,7 @@ def unit_settings(text):
                 gaps.add('unknown_section')
             continue
         key, sep, value = stripped.partition('=')
-        key, value = key.strip(), value.strip()
+        key, value = key.strip(' \t'), value.strip(' \t')
         if not sep or section is None:
             gaps.add('unsupported_syntax')
             continue

@@ -119,6 +119,19 @@ Type=PRIVATE_TYPE
         _, gaps = startup.unit_settings('[Unit]\nAfter=docker.service PRIVATE.service\n')
         self.assertEqual(gaps, ['unsupported_value'])
 
+    def test_unicode_separators_never_invent_directives(self):
+        for separator in ('\u0085', '\u2028', '\u2029', '\u00a0', '\r', '\v', '\f'):
+            text = '[Service]\nDescription=PRIVATE' + separator + 'ExecStart=/usr/local/bin/hhbr-ip-setup.sh\n'
+            self.assertEqual(startup.unit_settings(text), ({}, ['unsupported_syntax']))
+            with tempfile.TemporaryDirectory() as tmp:
+                # Collector intentionally refuses ASCII nontext first.
+                output = startup.derive(self.fixture(Path(tmp), text))
+            self.assertNotIn('PRIVATE', json.dumps(output))
+            self.assertFalse(any(u['settings'].get('Service', {}).get('ExecStart')
+                                 for u in output['persisted_startup']['units']))
+        self.assertEqual(startup.unit_settings(UNIT.replace('\n', '\r\n')),
+                         startup.unit_settings(UNIT))
+
     def test_whole_helper_matching_preserves_semantic_changes(self):
         self.assertEqual(startup.normalized_body(startup.HHBR_RECIPE.replace('\n', '\r\n')),
                          startup.normalized_body(startup.HHBR_RECIPE))
