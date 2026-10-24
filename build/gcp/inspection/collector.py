@@ -61,6 +61,10 @@ class Guest:
                     info = os.stat(part, dir_fd=current, follow_symlinks=False)
                     if stat.S_ISLNK(info.st_mode):
                         raise Gap("symlink_skipped")
+                    if i == len(parts) - 1 and not directory and not stat.S_ISREG(info.st_mode):
+                        # Avoid even opening guest device nodes or FIFOs. The
+                        # post-open fstat remains necessary for replacement races.
+                        raise Gap("not_regular")
                     next_fd = os.open(part, flags, dir_fd=current)
                 except FileNotFoundError:
                     raise Gap("missing") from None

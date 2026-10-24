@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -125,6 +126,16 @@ class CollectorTests(unittest.TestCase):
         path.parent.mkdir()
         os.mkfifo(path)
         self.assertEqual(self.record("/etc/os-release")["status"], "not_regular")
+
+    def test_device_rejected_before_any_open(self):
+        guest = Guest(self.root)
+        self.addCleanup(guest.close)
+        for mode in (stat.S_IFCHR, stat.S_IFBLK):
+            with patch("inspection.collector.os.stat", return_value=SimpleNamespace(st_mode=mode)), \
+                    patch("inspection.collector.os.open") as opened:
+                with self.assertRaisesRegex(Gap, "not_regular"):
+                    guest.text("/device")
+                opened.assert_not_called()
 
     def test_malicious_references_never_followed(self):
         unit = "\n".join("ExecStart=" + command for command in (
