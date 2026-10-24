@@ -77,12 +77,16 @@ def private_directory(path):
     return path
 
 
-def validate_namespace(run):
+def validate_namespace(run, private_dir):
     if os.readlink("/proc/self/ns/mnt") == os.readlink("/proc/1/ns/mnt"):
         raise Refused("private_namespace_required")
     root = one_filesystem(run([TOOLS["findmnt"], "--json", "--target", "/",
                                "--output", "MAJ:MIN,PROPAGATION"]))
     if root.get("propagation") != "private" or not re.fullmatch(r"[0-9]+:[0-9]+", str(root.get("maj:min"))):
+        raise Refused("private_namespace_required")
+    containing = one_filesystem(run([TOOLS["findmnt"], "--json", "--target", str(private_dir),
+                                     "--output", "PROPAGATION"]))
+    if containing.get("propagation") != "private":
         raise Refused("private_namespace_required")
     return root["maj:min"]
 
@@ -153,7 +157,7 @@ def collect_mounted(disk, partition, disk_number, partition_number, private_dir,
         raise Refused("invalid_device")
     if any(private_dir.iterdir()):
         raise Refused("private_directory_not_empty")
-    boot_number = validate_namespace(run)
+    boot_number = validate_namespace(run, private_dir)
     device_number(disk, disk_number)
     device_number(partition, partition_number)
     validate_layout(run([TOOLS["lsblk"], "--json", "--paths", "--output",

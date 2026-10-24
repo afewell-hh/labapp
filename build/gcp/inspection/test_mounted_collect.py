@@ -102,6 +102,16 @@ class MountWrapperTests(unittest.TestCase):
             self.execute(run=run)
         self.assertFalse(self.collected)
 
+    def test_private_root_shared_destination_refused_before_mount(self):
+        def run(argv):
+            if "--target" in argv and str(self.private) in argv:
+                return json.dumps({"filesystems": [{"propagation": "shared"}]})
+            return self.fake_run(argv)
+        with self.assertRaisesRegex(wrapper.Refused, "private_namespace_required"):
+            self.execute(run=run)
+        self.assertFalse(any(Path(c[0]).name == "mount" for c in self.calls))
+        self.assertFalse(self.collected)
+
     def test_identity_mismatch_never_mounts(self):
         with patch.object(wrapper, "device_number", side_effect=wrapper.Refused("device_identity_mismatch")), self.assertRaises(wrapper.Refused):
             self.execute()

@@ -91,8 +91,9 @@ does not share raw paths/content with them. No separate recipient/account or
 arbitrary retention interval is required. Remove raw/intermediate data promptly
 after reviewed recovery or abandonment; publish only reviewed sanitized output.
 
-The wrapper requires a private namespace different from PID1's and private root
-mount propagation. Fixed inspector tools (`findmnt`, `lsblk`, `dumpe2fs`,
+The wrapper requires a private namespace different from PID1's and private
+propagation for both the root and the mount containing the private output
+directory, checked before any mount. Fixed inspector tools (`findmnt`, `lsblk`, `dumpe2fs`,
 `mount`, `umount`) must already exist. Device paths must be direct nonsymlink
 block nodes under `/dev`, with the supplied exact numbers. Structured `lsblk`
 evidence must show one read-only disk with at most four unmounted partitions,
