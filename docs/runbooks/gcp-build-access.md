@@ -280,6 +280,10 @@ Official sources consulted 2026-10-24:
   and [resource attributes](https://docs.cloud.google.com/iam/docs/conditions-resource-attributes):
   supported existing Instance/Disk type and name conditions; no claim that they
   constrain resource creation.
+- [Subnet IAM binding CLI](https://docs.cloud.google.com/sdk/gcloud/reference/compute/networks/subnets/add-iam-policy-binding):
+  the subnet command accepts member/role/region but no condition flag; the one
+  subnet-use grant is unconditional at that subnet, unlike the conditional
+  project delete binding. Also checked with local CLI `--help` (no API call).
 - [Storage IAM roles](https://docs.cloud.google.com/storage/docs/access-control/iam-roles):
   bucket-level Object User permissions and overwrite requirements.
 - [Bucket creation](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/create)

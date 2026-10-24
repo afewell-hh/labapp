@@ -227,7 +227,7 @@ def setup(gc):
                  f"--member=serviceAccount:{ident['email']}", "--role=roles/storage.objectUser", "--condition=None")
     gc.write("compute", "networks", "subnets", "add-iam-policy-binding", "default", f"--region={REGION}",
              f"--member=serviceAccount:{identity('creator')['email']}",
-             "--role=" + role_name("labappLifecycleSubnet"), "--condition=None")
+             "--role=" + role_name("labappLifecycleSubnet"))
     print("Access setup complete; no workflow, VM, slot object, image or key created.")
 
 

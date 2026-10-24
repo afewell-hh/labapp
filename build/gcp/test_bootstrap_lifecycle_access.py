@@ -74,6 +74,9 @@ class FakeGcloud:
 
     def write(self, *args):
         assert self.apply
+        if args[:4] == ("compute", "networks", "subnets", "add-iam-policy-binding"):
+            assert args[4] == "default"
+            assert all(arg.startswith(("--region=", "--member=", "--role=")) for arg in args[5:]), "Unsupported subnet IAM flag"
         if args[:2] == ("projects", "add-iam-policy-binding"):
             for arg in args:
                 if arg.startswith("--condition-from-file="):
@@ -128,6 +131,16 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(sum(x[:3] == ("iam", "service-accounts", "create") for x in gc.writes), 2)
         self.assertEqual(sum(x[:4] == ("iam", "workload-identity-pools", "providers", "create-oidc") for x in gc.writes), 2)
         self.assertEqual(sum(x[:3] == ("storage", "buckets", "create") for x in gc.writes), 1)
+
+    def test_subnet_grant_matches_cli_without_condition_flag(self):
+        gc = FakeGcloud(True)
+        a.setup(gc)
+        subnet = next(x for x in gc.writes if x[:4] == ("compute", "networks", "subnets", "add-iam-policy-binding"))
+        self.assertEqual(subnet, ("compute", "networks", "subnets", "add-iam-policy-binding", "default",
+                                 "--region=us-central1", "--member=serviceAccount:" + a.identity("creator")["email"],
+                                 "--role=" + a.role_name("labappLifecycleSubnet")))
+        with self.assertRaisesRegex(AssertionError, "Unsupported subnet IAM flag"):
+            gc.write(*subnet, "--condition=None")
 
     def test_unexpected_provider_fails_before_any_grant(self):
         gc = FakeGcloud(True)
