@@ -44,6 +44,16 @@ Codex does not document an import mechanism, so this file uses plain links;
 
 - No cloud commands, production access, or image builds unless the task
   explicitly authorizes them. Delete any test VMs you create.
+- Authorized build/test work allows at most three VM slots, including stopped
+  and cleanup-pending resources; default to one job. Required runtime limits
+  and verified child-resource cleanup are in the
+  [GCP access runbook](docs/runbooks/gcp-build-access.md). No VM launches until
+  those lifecycle gates are implemented, reviewed and tested (#153).
+- Build/test work uses `teched-473722`, which also holds the published image;
+  protect that image and every preexisting resource. Builder IAM is a separate
+  review, and no broad project Compute/storage administration is approved.
+- Use the trusted metadata workflow for cloud reads; never give general worker
+  jobs cloud credentials. Access setup is separate from build authorization.
 - Never commit secrets. Do not merge or close issues; the lead accepts work.
 - A failed, denied or unrun check is not passing evidence; report it exactly.
 - Update this file and the workflow doc when the workflow changes.
