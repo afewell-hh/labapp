@@ -35,7 +35,7 @@ Codex does not document an import mechanism, so this file uses plain links;
 ## Where things are
 
 - `cloud-config.yaml`, `gcp_vm_launch_command.txt`: base system setup and historical VM launch recipes
-- `build/gcp/`: access bootstrap and offline VM lease primitives ([README](build/gcp/README.md))
+- `build/gcp/`: access bootstrap, fixed lifecycle runner and offline collector ([README](build/gcp/README.md))
 - `build/provision/`: Packer-ready modules and tests ([README](build/provision/README.md))
 - `docs/runbooks/`: manual image build and troubleshooting
 - `docs/`: other docs ([index](docs/README.md)); `STUDENT_QUICK_START.md`: student guide
@@ -53,8 +53,10 @@ Codex does not document an import mechanism, so this file uses plain links;
 - Build/test work uses `teched-473722`, which also holds the published image;
   protect that image and every preexisting resource. Builder IAM is a separate
   review, and no broad project Compute/storage administration is approved.
-- Use the trusted metadata workflow for cloud reads; never give general worker
-  jobs cloud credentials. Access setup is separate from build authorization.
+- Use the fixed trusted-main workflows for authorized metadata reads and serial
+  lifecycle pilots; see the [GCP access runbook](docs/runbooks/gcp-build-access.md).
+  Never give general worker jobs cloud credentials. Access setup and lifecycle
+  pilots do not authorize routine Packer builds or guest recovery.
 - Never commit secrets. Do not merge or close issues; the lead accepts work.
 - A failed, denied or unrun check is not passing evidence; report it exactly.
 - Update this file and the workflow doc when the workflow changes.
