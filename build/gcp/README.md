@@ -125,6 +125,42 @@ Sources consulted2026-10-24: [kernel ext4](https://docs.kernel.org/admin-guide/e
 [unshare](https://man7.org/linux/man-pages/man1/unshare.1.html). These describe
 upstream behavior; actual Ubuntu24.04 mount/tool compatibility is not yet tested.
 
+### Synthetic inspector kernel proof
+
+Before source-copy mounting, the lead can run the fixed no-input
+`inspection/synthetic_ext4.py` on the separately authorized clean inspector:
+
+```bash
+sudo unshare --mount --propagation private -- \
+  /usr/bin/python3 -E -s -m build.gcp.inspection.synthetic_ext4
+```
+
+Use Python3.12 and already-present trusted `mkfs.ext4`, `losetup`, `blockdev`,
+`udevadm` plus the wrapper tools above, from the exact reviewed code SHA. No
+install/download fallback. It creates its own0700 `/run` directory,32MiB file
+and harmless fixture, formats that file before read-only loop attachment, and
+verifies the exact backing inode/device, zero offset, size limit, loop device
+number and RO state. It neither accepts source paths nor scans/adopts disks.
+
+This separately proves actual private ext4 `ro,noload,nodev,nosuid,noexec`
+mount semantics and runs the unchanged collector. The production validator
+must refuse the observed `TYPE=loop`; its `TYPE=disk` requirement stays intact.
+Thus success is **not** positive whole-wrapper integration or source-layout
+acceptance. Dirty-state parser refusal uses synthetic evidence; an actual
+dirty ext4 journal is not generated or tested. Source-copy layout and clean
+state remain separate gates, including an unformatted BIOS boot partition
+(which normally has no filesystem type); unexpected types still refuse.
+
+The harness unmounts and verifies no exact-target mount, revalidates ownership
+before detach, waits for udev, requires the owned loop mapping absent and the
+backing-file hash unchanged, then deletes only explicit generated files and
+empty directories. Uncertain cleanup preserves evidence and fails; the lead
+must resolve it before source inspection or slot reuse. It never recursively
+deletes through a mountpoint. Output is fixed status/count/hash evidence only.
+Offline tests cover mapping-identity refusal, not actual kernel mounts or all
+cleanup failure paths. Record actual execution/tool versions and remaining
+limits in the issue; no live execution is implied by this module's presence.
+
 Primary references consulted 2026-10-24: Python
 [3.12 descriptor-relative filesystem APIs](https://docs.python.org/3.12/library/os.html),
 [dpkg-query database/installed package fields](https://manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html)
