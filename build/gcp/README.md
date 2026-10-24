@@ -171,7 +171,9 @@ unchanged collector run against a fake mount. It establishes command/validation/
 cleanup behavior, not kernel mount semantics or source-image layout. Actual
 execution is separate evidence: see the [inspector kernel and private-transfer
 proof](https://github.com/afewell-hh/labapp/issues/170#issuecomment-6388863729) and
-[reviewed source collection](https://github.com/afewell-hh/labapp/issues/151#issuecomment-6388996007).
+[whole-wrapper source collection](https://github.com/afewell-hh/labapp/issues/170#issuecomment-6389012668).
+The resulting [reviewed source inventory](https://github.com/afewell-hh/labapp/issues/151#issuecomment-6388996007)
+is a separate metadata-only publication.
 The synthetic loop proof does not establish whole-wrapper source-layout
 acceptance; each source inspection still requires its own identity/layout and
 clean-state validation. Never use a public workflow artifact or serial output
