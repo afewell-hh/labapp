@@ -24,19 +24,22 @@ image names, or service accounts from a task comment. General Claude jobs and
 Codex environments receive no cloud credentials. Protect main and review changes
 to this workflow, because reviewed main code is this trust boundary.
 
-The inspector has no build-project resource roles from this bootstrap. A
-per-image `roles/compute.imageUser` grant, if needed, permits **read and use** of
-that image; it is broader than metadata access. The workflow itself performs
-only a metadata read. No builder/runtime identities or build privileges are
+This phase reads metadata for the image already shared with authenticated
+users. The inspector receives no project/resource roles or image IAM grants.
+The workflow performs only the fixed image metadata read. Project/platform
+administrators and inherited permissions may still provide other impersonation
+paths: this setup does not promise exclusive workflow access to the inspector.
+No builder/runtime identities or build privileges are
 created here. Do not attach the inspector identity to a VM. In this shared
 project, future builder IAM must protect the published/source image and all
 preexisting resources; broad Compute/storage administration is not approved.
 
 ## Owner setup in Cloud Shell
 
-The project administrator needs permissions to enable the listed APIs, create
+The owner uses their existing project access to enable the listed APIs, create
 service accounts and WIF pools/providers, and edit the inspector's IAM policy.
-Only the optional source-image step requires source-image IAM administration.
+No separate administrator or organization-wide policy access is required for
+this metadata-only phase.
 Do not solve missing permissions by granting Owner/Editor or production project
 roles to an agent. Use the owner's existing administrative session; do not copy
 Cloud Shell credentials or tokens into agent sessions.
@@ -49,8 +52,8 @@ cd labapp
 export LABAPP_BUILD_PROJECT='teched-473722'
 # Default is read-only inspection; failure is not permission to mutate.
 bash build/gcp/bootstrap-access.sh
-# First audit effective access as described below; then acknowledge it.
-export LABAPP_EFFECTIVE_ACCESS_AUDITED=yes
+# Review project access and its visibility limits below; then acknowledge it.
+export LABAPP_PROJECT_ACCESS_REVIEWED=yes
 # Explicit setup: APIs, inspector, dedicated pool/provider, WIF binding.
 bash build/gcp/bootstrap-access.sh --apply
 ```
@@ -65,19 +68,30 @@ rather than being overwritten. The reserved pool must contain only the one
 reviewed provider. Failed partial setup can be rerun; inspect failures before
 retrying. IAM/API propagation may require waiting.
 
-Before `--apply`, the administrator must verify both sides of effective access:
-roles held by the inspector, and principals that can impersonate or attach it,
-including inherited project/folder/organization roles and group membership.
-Record that audit in #152, then set `LABAPP_EFFECTIVE_ACCESS_AUDITED=yes`.
+Before `--apply`, the owner reviews the visible project policy and records in
+#152 the inspector's intended scope, known privileged project/platform paths,
+and any inherited-policy visibility limits. Then set
+`LABAPP_PROJECT_ACCESS_REVIEWED=yes`. This acknowledgment is limited to fixed
+public-image metadata with no project/resource grants; it is not certification
+that every inherited impersonation or group path has been audited.
+
+A visible organization name does not prove access to its IAM policy. If
+organization/folder policy reads are denied, record that limit rather than
+claiming the project has no organization or that inherited access is absent.
+Existing owners, default service accounts or platform service agents can have
+privileged paths. The lead accepts those known paths and visibility limits for
+this narrowly scoped phase; do not remove existing platform bindings. Any
+builder privileges or access to private resources require a separate review of
+effective roles and impersonation/attachment paths before being granted.
 The script rejects direct project roles held by the inspector. It reads the
 service account's own IAM policy and rejects every binding except the exact,
 unconditional reviewed WIF role/member; an empty policy is also valid for first
 setup. It rejects any user-managed keys, including disabled keys, by listing
 key metadata only. It never reads key material, deletes keys, or removes IAM
 bindings. Unexpected configuration requires administrator investigation before
-retrying. These checks cannot establish all inherited effective access offline;
-do not reuse an inspector with builder/administrative access or alternate
-impersonators.
+retrying. These direct checks remain mandatory; the limited acknowledgment
+does not waive them or permit direct alternate impersonators, keys, or
+builder/administrative roles on the inspector.
 
 Set these repository **Actions Variables** (identifiers, not secrets), using
 Settings → Secrets and variables → Actions → Variables, or an authenticated `gh`:
@@ -111,19 +125,11 @@ broaden a worker's general shell permissions to run arbitrary workflows. Record
 the run URL, commit, selected image's immutable ID and metadata result in #152.
 A successful setup or auth step alone does not prove image access.
 
-First try without changing production image IAM: it may already be shared with
-all authenticated users. If the metadata read is denied, distinguish auth/API
-errors from image permission errors. An authorized source-image administrator
-may then explicitly grant this inspector read/use of **only that image**:
-
-```bash
-bash build/gcp/bootstrap-access.sh --apply --share-source-image
-```
-
-This option updates source-image IAM and is not required if access already
-works. Never grant source-project Owner, Editor or broad Compute roles. Rerun
-the same metadata workflow and record its actual result. Do not grant builder
-roles or start VM jobs to diagnose an image metadata failure.
+If the metadata read is denied, distinguish authentication/API errors from
+image permissions and report the evidence. Do not change image IAM to diagnose
+this phase: `--share-source-image` is rejected. Source-image read/use grants,
+private-image access and builder roles require separately reviewed scope; the
+limited project acknowledgment cannot authorize them.
 
 Optional local impersonation is a separate access decision: it would require
 `roles/iam.serviceAccountTokenCreator` on this inspector for a named human and
@@ -168,7 +174,7 @@ Official sources consulted 2026-10-24:
 - [CLI 540.0.0 release announcement](https://groups.google.com/g/google-cloud-sdk-announce/c/pRR1RNN3_AM):
   selected known released CLI version, not a claim it is latest.
 - [Custom image access](https://docs.cloud.google.com/compute/docs/images/managing-access-custom-images):
-  per-image `roles/compute.imageUser`, avoiding project-wide grants.
+  authenticated-user image sharing; no additional image grant in this phase.
 
 - [Service-account IAM policy](https://docs.cloud.google.com/sdk/gcloud/reference/iam/service-accounts/get-iam-policy)
   and [key metadata listing](https://docs.cloud.google.com/sdk/gcloud/reference/iam/service-accounts/keys/list):

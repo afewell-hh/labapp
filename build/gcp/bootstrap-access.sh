@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Run as an authenticated project administrator (e.g. Cloud Shell), not root.
+# Run in the authenticated owner session (e.g. Cloud Shell), not as root.
 # Dependencies: bash, gcloud, jq. No cwd assumptions; no credentials are printed.
 # Default: inspect only. --apply creates/validates the inspector access setup.
-# No VMs, builder roles, networks, quotas, keys, or user impersonation grants.
+# No VMs, resource roles, image IAM, keys, or user impersonation grants.
 set -euo pipefail
 apply=false
-share=false
 for arg in "$@"; do
   case "$arg" in
     --apply) apply=true ;;
-    --share-source-image) share=true ;;
+    --share-source-image)
+      echo 'Image IAM changes require a separately reviewed access phase.' >&2
+      exit 2 ;;
     *) printf 'Unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
-if "$share" && ! "$apply"; then
-  echo '--share-source-image requires --apply.' >&2; exit 2
-fi
 for tool in gcloud jq; do
   command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 1; }
 done
@@ -23,8 +21,6 @@ done
 [[ "$LABAPP_BUILD_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || {
   echo 'Expected a GCP project ID, not a project number.' >&2; exit 2;
 }
-source_project=teched-473722
-source_image=hedgehog-vaidc-v20260114
 pool=labapp-github
 provider=trusted-main
 workflow='afewell-hh/labapp/.github/workflows/labapp-cloud.yml@refs/heads/main'
@@ -47,10 +43,10 @@ if ! "$apply"; then
   echo 'Use --apply only after reviewing the runbook and target project.'
   exit 0
 fi
-# Validate effective access before exposing the identity through federation.
-# This catches direct project grants, but not folder/org/group access or impersonation effects.
-[[ "${LABAPP_EFFECTIVE_ACCESS_AUDITED:-}" == yes ]] || {
-  echo 'Set LABAPP_EFFECTIVE_ACCESS_AUDITED=yes after the runbook audit.' >&2
+# Project-scoped review for public-image metadata only. Inherited/platform
+# administrators may still impersonate this account; see the runbook boundary.
+[[ "${LABAPP_PROJECT_ACCESS_REVIEWED:-}" == yes ]] || {
+  echo 'Set LABAPP_PROJECT_ACCESS_REVIEWED=yes after the runbook review.' >&2
   exit 1
 }
 policy=$(gcloud projects get-iam-policy "$LABAPP_BUILD_PROJECT" --format=json)
@@ -140,12 +136,6 @@ fi
 gcloud iam service-accounts add-iam-policy-binding "$inspector" \
   --project="$LABAPP_BUILD_PROJECT" --member="$principal" \
   --role=roles/iam.workloadIdentityUser --condition=None --quiet
-if "$share"; then
-  # Explicit opt-in only, after metadata access was denied. This role allows
-  # image read/use; it does not mean a metadata-only IAM role.
-  gcloud compute images add-iam-policy-binding "$source_image" \
-    --project="$source_project" --member="serviceAccount:$inspector" \
-    --role=roles/compute.imageUser --condition=None --quiet
-fi
+
 echo 'Inspector setup complete. No VM/build capabilities were granted.'
-echo 'Audit effective access, set Actions Variables, then dispatch metadata workflow.'
+echo 'Set Actions Variables, then dispatch the fixed public-image metadata workflow.'
