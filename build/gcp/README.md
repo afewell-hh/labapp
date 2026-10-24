@@ -3,14 +3,14 @@
 - `bootstrap-access.sh`: owner-run keyless access setup (see
   [`docs/runbooks/gcp-build-access.md`](../../docs/runbooks/gcp-build-access.md)).
 - `lifecycle/`: offline-testable single-slot VM lease primitives for #153.
-  **Library and tests only.** No workflow uses it, it contains no real cloud
-  or storage client, grants no IAM and launches no VM.
+  **Library and tests only.** Includes an opt-in GCS store adapter; no workflow
+  invokes it. It grants no IAM and launches no VM.
 
 ## Lifecycle module contract
 
-Python 3.12 standard library only; no network, no credentials, no repo-cwd
-dependence. State and cloud access are injected, so the same code can later run
-unchanged against Cloud Storage and Compute adapters.
+Python 3.12 standard library only. The controller/spec and offline tests need
+no network or credentials. State and cloud access are injected; real adapters
+perform network access only when explicitly called.
 
 | File | Role |
 |---|---|
@@ -77,10 +77,30 @@ unchanged against Cloud Storage and Compute adapters.
 python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
 ```
 
+## GCS slot adapter
+
+`lifecycle/gcs.py` implements `SlotStore`; construct
+`GcsSlotStore(bucket, token_provider=...)` with an existing private ledger
+bucket. Only `slots/slot-1.json` is allowed by default. The shared
+`auth_http.py` transport gets short-lived credentials from the trusted runner's
+existing `gcloud` identity; it never logs tokens, follows redirects or retries
+writes. Tests inject fake HTTP and credentials and make no cloud calls.
+
+Reads fetch metadata then the body pinned to that generation. A revision lost
+between requests triggers a bounded fresh read; it never becomes absence in
+that call. Writes use `ifGenerationMatch`; HTTP 412 raises `PreconditionFailed`.
+Other HTTP, malformed-data or network failures raise `StoreError`, blocking
+progress. After an uncertain write, re-read and re-evaluate the controller
+state; do not blindly repeat a transition. The adapter cannot delete objects
+or manage buckets/IAM. See its module docstring for official API references.
+
+The lifecycle discovery command above includes the HTTP-contract tests.
+Mocked tests establish request/response handling, not live bucket/IAM behavior.
+
 ## Not covered yet (gates before any VM)
 
-- No Cloud Storage or Compute adapter, so none of the real API behavior is
-  exercised: `requestId` retention/idempotence, `terminationTime` plus
+- The GCS adapter has mocked HTTP tests only; no Compute adapter is included
+  yet. None of the live API behavior is exercised: `requestId` retention/idempotence, `terminationTime` plus
   `DELETE` removing `autoDelete` disks, whether disk labels from
   `initializeParams` propagate, whether an inline source-image disk is
   accepted with `READ_ONLY` mode (no writable fallback exists; if the API
