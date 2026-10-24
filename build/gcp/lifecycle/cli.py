@@ -96,6 +96,15 @@ class Preflight:
         project, region, *images = records
         if project.get("name") != spec.PROJECT or region.get("name") != spec.REGION:
             raise Refused("preflight scope mismatch")
+        metadata = project.get("commonInstanceMetadata", {}).get("items", [])
+        if (not isinstance(metadata, list) or
+                any(not isinstance(item, dict) or not isinstance(item.get("key"), str)
+                    for item in metadata)):
+            raise Refused("invalid inherited project metadata")
+        executable = {"startup-script", "startup-script-url", "shutdown-script",
+                      "shutdown-script-url", "user-data", "user-data-encoding"}
+        if any(item["key"] in executable for item in metadata):
+            raise Refused("inherited project execution metadata blocks pilot")
         self._quota(project, {"CPUS_ALL_REGIONS": 2})
         self._quota(region, {"CPUS": 2, "E2_CPUS": 2, "DISKS_TOTAL_GB": 310})
         for actual, (path, image_id, minimum) in zip(images, IMAGES):

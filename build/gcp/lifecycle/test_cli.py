@@ -44,6 +44,27 @@ def preflight_records():
 
 
 class CliTests(unittest.TestCase):
+    def test_main_constructs_fixed_five_minute_runtime_and_sanitizes_failures(self):
+        env, event = event_env()
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / 'event.json'
+            event_path.write_text(json.dumps(event))
+            env['GITHUB_EVENT_PATH'] = str(event_path)
+            with patch.dict(os.environ, env), patch.object(cli, 'Controller') as factory, \
+                    patch.object(cli, 'execute', return_value={'status': 'fixture'}), \
+                    patch('builtins.print'):
+                self.assertEqual(cli.main(['inspect']), 0)
+                cfg = factory.call_args.args[2]
+                self.assertEqual(cfg.lease_minutes, 5)
+                self.assertEqual(cfg.min_submit_minutes, 1)
+                self.assertEqual(cfg.boot_image, cli.BOOT_IMAGE)
+                self.assertEqual(cfg.baseline, {})
+            with patch.dict(os.environ, env), \
+                    patch.object(cli, 'execute', side_effect=Exception('secret token payload')), \
+                    patch('builtins.print') as output:
+                self.assertEqual(cli.main(['inspect']), 1)
+                self.assertNotIn('secret', str(output.call_args_list))
+
     def test_trusted_events(self):
         for kind in ('schedule', 'workflow_dispatch', 'workflow_run'):
             env, event = event_env(kind)
@@ -154,7 +175,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(all(call.args[0] == 'GET' for call in http.request.call_args_list))
 
     def test_preflight_rejects_bad_identity_quota_and_http(self):
-        for change in ('global_quota', 'e2_quota', 'disk_quota', 'missing', 'nan', 'duplicate', 'image', 'status', 'size'):
+        for change in ('global_quota', 'e2_quota', 'disk_quota', 'missing', 'nan', 'duplicate', 'image', 'status', 'size', 'inherited_script'):
             records = preflight_records()
             if change == 'global_quota': records[0]['quotas'][0]['usage'] = 95
             if change == 'e2_quota': records[1]['quotas'][1]['limit'] = 1
@@ -162,6 +183,8 @@ class CliTests(unittest.TestCase):
             if change == 'missing': records[1]['quotas'].pop()
             if change == 'nan': records[1]['quotas'][0]['usage'] = float('nan')
             if change == 'duplicate': records[1]['quotas'].append(records[1]['quotas'][0])
+            if change == 'inherited_script':
+                records[0]['commonInstanceMetadata'] = {'items': [{'key': 'startup-script-url', 'value': 'secret'}]}
             if change == 'image': records[2]['id'] = 'replacement'
             if change == 'status': records[3]['status'] = 'PENDING'
             if change == 'size': records[3]['diskSizeGb'] = '301'
