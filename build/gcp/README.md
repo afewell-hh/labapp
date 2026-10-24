@@ -58,6 +58,39 @@ shell profiles, binary versions, charts, environment files, recursive helpers,
 effective systemd configuration and runtime recovery unimplemented. These need
 separate slices; this command cannot recover the complete appliance baseline.
 
+### Private inventory candidate
+
+After the separately authorized transfer, the lead can derive a smaller private
+candidate on the trusted lead host without executing any report content:
+
+```bash
+python3 -m build.gcp.inspection.candidate \
+  --private-input /private/inspection/inventory.json \
+  --private-output /private/inspection/candidate.json
+```
+
+Both parent directories must already be owned mode0700; input must be an owned
+regular mode0600 file, and output is exclusive-create0600. No raw file body,
+execution/environment string, OS release body, unknown package name or dynamic
+drop-in filename is copied. The candidate contains fixed kind/status counts,
+installed versions only for the fixed `candidate.PACKAGES` catalog, and status/
+SHA-256 entries only for compile-time named unit/helper paths. Captured text
+hashes are checked against their private bodies before releasing hash metadata.
+OS release is represented by status counts only; gaps are not proof of absence.
+
+Schema1, exact keys/types, known paths/statuses, bounded sizes and duplicate JSON
+keys are validated before output. Unknown data fails closed. The source image
+is **not** inferred from guest claims: provenance remains
+`lead-verification-required` until the lead separately binds the accepted cloud
+image/disk/lease evidence. stdout contains only fixed status, counts and candidate
+hash. No automatic GitHub publication or credential scanner is supplied. The
+candidate remains private until lead and independent review approve its exact
+hash; this tool does not claim arbitrary version strings or hashes are safe
+for publication without that review. Keep raw/intermediate retention and cleanup
+under the private-transfer contract; delete promptly after accepted recovery or
+an abandoned attempt. Unit/helper configuration recovery is a separate reviewed
+slice; metadata inventory does not recover effective settings or runtime.
+
 ### Fixed mount wrapper
 
 `inspection/mounted_collect.py` adds local ext4 mount/collect/unmount only.
