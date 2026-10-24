@@ -139,22 +139,40 @@ class CliTests(unittest.TestCase):
 
     def test_creator_wait_is_read_only_bounded_and_checks_identity(self):
         controller = Mock()
-        controller.store.read.return_value = ({'request_id': 'lease', 'ids': {'instance': '123'},
-                                               'names': {'instance': 'vm'}, 'deadline': '2026-10-24T23:05:00Z'}, 1)
+        controller.store.read.return_value = ({'request_id': 'lease', 'ids': {'instance': '123', 'boot': 'b', 'data': 'd'},
+                                               'names': {'instance': 'vm', 'boot': 'boot', 'data': 'data'}, 'deadline': '2026-10-24T23:05:00Z'}, 1)
         controller.cfg.now.return_value = datetime(2026, 10, 24, 23, tzinfo=timezone.utc)
-        controller.cloud.call.side_effect = [{'id': '123'}, cli.NotFound()]
+        disks = [{'id': value, 'sourceImageId': image[1]}
+                 for value, image in zip(('b', 'd'), cli.IMAGES)]
+        controller.cloud.call.side_effect = disks + [{'id': '123'}, cli.NotFound()]
         with patch('builtins.print'):
             self.assertIn('vm-absent', cli.wait_for_absence(controller, 'lease')['status'])
         controller.cfg.sleep.assert_called_once_with(5)
-        controller.cloud.call.side_effect = None
-        controller.cloud.call.return_value = {'id': '123'}
+        controller.cloud.call.side_effect = lambda resource, verb, name: (
+            disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': '123'})
         controller.cloud.call.reset_mock()
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'fixed wait bound'):
             cli.wait_for_absence(controller, 'lease')
-        self.assertEqual(controller.cloud.call.call_count, 85)
-        controller.cloud.call.return_value = {'id': 'changed'}
+        self.assertEqual(controller.cloud.call.call_count, 87)
+        controller.cloud.call.side_effect = lambda resource, verb, name: (
+            disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': 'changed'})
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'identity changed'):
             cli.wait_for_absence(controller, 'lease')
+
+    def test_actual_disk_provenance_mismatch_preserves_cleanup_record(self):
+        for field in ('sourceImageId', 'id'):
+            controller = Mock()
+            record = {'ids': {'boot': 'b', 'data': 'd'}, 'names': {'boot': 'boot', 'data': 'data'}}
+            original = deepcopy(record)
+            disk = {'id': 'b', 'sourceImageId': cli.IMAGES[0][1]}
+            disk[field] = 'replacement'
+            controller.cloud.call.return_value = disk
+            with self.assertRaisesRegex(Refused, 'provenance mismatch'):
+                cli.verify_disk_provenance(controller, record)
+            self.assertEqual(record, original)
+            controller.store.write.assert_not_called()
+            self.assertTrue(all(call.args[:2] == ('disks', 'get')
+                                for call in controller.cloud.call.call_args_list))
 
     def test_incomplete_cleanup_is_failure(self):
         env, event = event_env('schedule')

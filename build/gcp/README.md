@@ -138,7 +138,8 @@ points require trusted GitHub event context and accept no cloud parameters.
 
 Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
 cannot delete; cleanup cannot create. After confirming the insert and persisting
-all three resource IDs, creator prints only IDs/deadline and polls for VM absence
+all three resource IDs, creator checks each actual disk's `sourceImageId`
+against the pinned image ID, then prints only IDs/deadline and polls for VM absence
 until the immutable deadline plus two minutes. That observation does not release
 the ledger or establish disk cleanup. The independent cleanup workflow handles
 completed creator runs, including failure/cancellation, only after validating
@@ -163,6 +164,7 @@ Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
 [workflow_run trust and default-branch semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run),
 [projects.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/projects/get),
 [images.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/get),
+[disks.get sourceImageId](https://docs.cloud.google.com/compute/docs/reference/rest/v1/disks/get),
 [project-level startup scripts](https://docs.cloud.google.com/compute/docs/instances/startup-scripts/linux),
 and Google's [current discovery schema](https://github.com/googleapis/google-api-python-client/blob/main/googleapiclient/discovery_cache/documents/compute.v1.json)
 for regions.get and numeric quota fields (the regions reference page timed out).

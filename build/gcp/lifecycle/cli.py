@@ -131,12 +131,22 @@ class Preflight:
                 raise Refused("insufficient or invalid quota")
 
 
+def verify_disk_provenance(controller, record):
+    """Check actual cloned image IDs; names alone cannot pin incarnations."""
+    for kind, (_, image_id, _) in zip(("boot", "data"), IMAGES):
+        disk = controller.cloud.call("disks", "get", name=record["names"][kind])
+        if (not record["ids"].get(kind) or disk.get("id") != record["ids"][kind] or
+                disk.get("sourceImageId") != image_id):
+            raise Refused("created disk image provenance mismatch; independent cleanup required")
+
+
 def wait_for_absence(controller, request_id):
     """Read-only bounded wait; deletion/release belongs to cleanup identity."""
     record, _ = controller.store.read(controller.cfg.key)
     if (not record or record.get("request_id") != request_id or
             not record.get("ids", {}).get("instance")):
         raise Refused("created lease identity unavailable")
+    verify_disk_provenance(controller, record)
     # The fixed five-minute lease plus two-minute cloud convergence allowance.
     # An iteration bound also stops clock changes extending the wait.
     print(json.dumps({"status": "created", "ids": record["ids"],
