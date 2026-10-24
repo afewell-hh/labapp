@@ -109,15 +109,22 @@ class Controller:
         except NotFound:
             return None
 
-    def _wait(self, op_name: str) -> Optional[dict]:
+    def _wait(self, op_name: str, *, deadline: Optional[float] = None) -> Optional[dict]:
         for _ in range(self.cfg.poll_attempts):
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             try:
                 op = self.cloud.call("zoneOperations", "get", name=op_name)
             except NotFound:
                 return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             if op.get("status") == "DONE":
                 return op
-            self.cfg.sleep(self.cfg.poll_seconds)
+            pause = self.cfg.poll_seconds
+            if deadline is not None:
+                pause = min(pause, max(0.0, deadline - time.monotonic()))
+            self.cfg.sleep(pause)
         return None
 
     def _verify(self, kind: str, res: dict, rec: dict,
@@ -378,14 +385,24 @@ class Controller:
                 continue
         return Outcome("uncertain", "could not record the operation")
 
-    def confirm_created(self, request_id: str) -> Outcome:
-        """Wait for the insert and persist VM + both disk IDs."""
+    def confirm_created(self, request_id: str, *, timeout_seconds: Optional[int] = None) -> Outcome:
+        """Wait for the insert and persist IDs; optional elapsed polling budget.
+
+        The budget spans CAS retries and includes time spent in API calls.
+        It is checked between calls: one in-flight read can overrun it, and
+        post-operation identity reads still run. Workflow timeout is the final
+        runner bound. Cleanup operation waits retain their existing defaults.
+        """
+        if timeout_seconds is not None and (type(timeout_seconds) is not int or
+                                            not 1 <= timeout_seconds <= 3600):
+            raise Refused("confirmation timeout must be an integer from 1 to 3600")
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         for _ in range(self.cfg.cas_retries):
             rec, gen = self.store.read(self.cfg.key)
             if rec is None or rec["state"] != ACTIVE or \
                     rec["request_id"] != request_id:
                 raise Refused("no ACTIVE lease with this request id")
-            done = self._wait(rec["operation"])
+            done = self._wait(rec["operation"], deadline=deadline)
             if done is None:
                 return Outcome("pending-operation", rec["operation"])
             if done.get("error"):

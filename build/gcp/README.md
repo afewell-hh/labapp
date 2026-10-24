@@ -91,7 +91,7 @@ perform network access only when explicitly called.
 
 - `Config.lease_minutes` defaults to 60 and may shorten the lease to an
   integer from 1 to 60. `min_submit_minutes` must be shorter than that lease;
-  a fixed five-minute pilot uses a one-minute submission margin. Admission
+  the fixed ten-minute pilot uses a one-minute submission margin. Admission
   rechecks these bounds before writing intent; an existing deadline is never
   extended.
 - **Every** transition (admit, submit, ID capture, failure, release) is a
@@ -196,7 +196,7 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 ## Fixed lifecycle runner
 
 The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
-with no inputs. Its first pilot uses a fixed **five-minute** absolute lease,
+with no inputs. The pilot uses a fixed **ten-minute** absolute lease,
 `e2-standard-2`, a 10GB stock Ubuntu boot disk and a 300GB read-only source-copy
 `pd-standard` disk. Both images are checked against pinned immutable IDs before
 admission. Project-global CPU and regional shared CPU/standard-disk quotas must have
@@ -212,6 +212,23 @@ It does not check out archived gitlinks, execute triggering-run code, download
 artifacts or overwrite auth credentials. The CLI is invoked from that temporary
 module directory as `python3 -m lifecycle.cli inspect` or `cleanup`; these entry
 points require trusted GitHub event context and accept no cloud parameters.
+
+Creator confirmation polls the insert operation for up to six elapsed minutes,
+with at most 72 polls at five-second intervals. Time spent in requests counts
+against that polling budget, and CAS conflicts do not restart it. The budget is
+checked between requests: one in-flight read can finish after it, and subsequent
+ownership/provenance reads take additional time. The creator job has a sixteen-
+minute timeout, leaving four minutes beyond the ten-minute lease plus two-minute
+absence grace for setup and preflight; that overhead is allowance, not a
+provisioning-time guarantee. No deadline is extended. Slow or uncertain creation
+still fails closed and independent cleanup retains the occupied lease.
+
+The controller's optional `confirm_created(..., timeout_seconds=...)` argument
+sets this elapsed polling budget. Calls that omit it and all cleanup operation
+waits retain their existing attempt/interval defaults. Creator uses 72 attempts;
+the cleanup CLI retains 30 attempts at five-second intervals. The absence wait
+also has an iteration ceiling covering the full ten-minute lease plus two-minute
+grace, so early provisioning does not exhaust its observation window first.
 
 Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
 cannot delete; cleanup cannot create. After confirming the insert and persisting
@@ -241,6 +258,10 @@ image availability, Compute expiry behavior, cancellation delivery or disk
 removal. Those require the separately authorized lead-run pilots after review.
 
 Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
+[Compute asynchronous operation polling](https://docs.cloud.google.com/compute/docs/api/how-tos/api-requests-responses#handling_api_responses),
+[GitHub job timeout](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idtimeout-minutes),
+[Python monotonic clock](https://docs.python.org/3/library/time.html#time.monotonic)
+(stable since Python 3.3; local tests use Python 3.10, CI uses Ubuntu 24.04),
 [disk auto-delete settings](https://docs.cloud.google.com/compute/docs/disks/modify-persistent-disk#autodelete)
 (explicit read-only restriction; the REST boolean schema alone does not express it),
 [GitHub Contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content),
