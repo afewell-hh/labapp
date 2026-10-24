@@ -47,7 +47,7 @@ def validate_loop_layout(raw, loop, number):
             or entries[0].get("name") != loop or entries[0].get("maj:min") != number
             or entries[0].get("type") != "loop" or entries[0].get("fstype") != "ext4"
             or entries[0].get("ro") not in (True, 1)
-            or entries[0].get("mountpoints") != [None] or entries[0].get("children")):
+            or entries[0].get("mountpoints") not in ([], [None]) or entries[0].get("children")):
         raise Refused("dirty_fixture_layout_mismatch")
 
 
