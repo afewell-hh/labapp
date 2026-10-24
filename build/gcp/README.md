@@ -144,10 +144,11 @@ of the saved appliance or a real mount.
 
 For separately authorized owner access to an inspector, see the
 [IAP access plan](../../docs/runbooks/gcp-build-access.md#owner-iap-access-to-an-owned-inspector).
-The current create body remains untagged: the existing owner may add the one
-dedicated tag after confirmed immutable IDs using the current fingerprint and
-exact readback. The restrictive firewall is separately recorded lead-managed
-access infrastructure, not an untracked per-lease child. This plan adds no
+The create body stays untagged. Reuse an effective protected existing SSH rule
+without adopting, modifying or deleting it; do not add a redundant firewall or
+tag. Bind the clean inspector public host key through privately captured
+authenticated serial evidence and its exact confirmed immutable ID, then use
+strict host checking and short-lived owner OS Login keys. This plan adds no
 creator IAM, cloud endpoint, guest execution or raw-data publication path.
 
 ## Lifecycle module contract
