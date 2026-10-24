@@ -233,3 +233,124 @@ class MountWrapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RootBootRoleTests(unittest.TestCase):
+    fake_run = MountWrapperTests.fake_run
+    fake_collect = MountWrapperTests.fake_collect
+
+    def setUp(self):
+        MountWrapperTests.setUp(self)
+        children = self.layout["blockdevices"][0]["children"]
+        children.append({"name": "/dev/sdb16", "maj:min": "259:1", "type": "part",
+                         "fstype": "ext4", "ro": True, "mountpoints": [None]})
+        self.probes = []
+
+    def probe(self, device, path):
+        self.probes.append((device, path))
+        expected = wrapper.ROOT_MARKERS if device == "/dev/sdb1" else wrapper.BOOT_MARKERS
+        return expected.get(path, "absent")
+
+    def execute(self, **kwargs):
+        options = dict(boot_partition="/dev/sdb16", boot_partition_number="259:1",
+                       run=self.fake_run, collector=self.fake_collect, stat_probe=self.probe)
+        options.update(kwargs)
+        return wrapper.collect_mounted("/dev/sdb", "/dev/sdb1", "8:16", "8:17",
+                                       self.private, **options)
+
+    def test_exact_roles_mount_only_root_and_recheck_layout(self):
+        self.assertEqual(self.execute(), {"records": 1})
+        mounts = [call for call in self.calls if Path(call[0]).name == "mount"]
+        self.assertEqual(len(mounts), 1)
+        self.assertEqual(mounts[0][-2], "/dev/sdb1")
+        self.assertEqual(len(self.probes), 10)
+        self.assertEqual(sum(Path(c[0]).name == "lsblk" for c in self.calls), 2)
+        self.assertEqual([c[-1] for c in self.calls if Path(c[0]).name == "dumpe2fs"],
+                         ["/dev/sdb1", "/dev/sdb16"])
+
+    def test_unpaired_or_colliding_boot_identity(self):
+        for options in ({"boot_partition": None}, {"boot_partition_number": None},
+                        {"boot_partition": "/dev/sdb1"}, {"boot_partition_number": "8:17"}):
+            with self.subTest(options=options), self.assertRaises(wrapper.Refused):
+                self.execute(**options)
+        self.assertFalse(self.calls)
+
+    def test_unknown_swapped_or_symlink_role_refuses_before_mount(self):
+        for device, path, value in (("/dev/sdb1", "/etc", "symlink"),
+                                    ("/dev/sdb1", "/usr", "absent"),
+                                    ("/dev/sdb16", "/etc", "directory"),
+                                    ("/dev/sdb16", "/grub/grub.cfg", "directory")):
+            def probe(dev, request):
+                return value if (dev, request) == (device, path) else self.probe(dev, request)
+            with self.subTest(device=device, path=path), self.assertRaises(wrapper.Refused):
+                self.execute(stat_probe=probe)
+        self.assertFalse(any(Path(c[0]).name == "mount" for c in self.calls))
+
+    def test_unknown_probe_failure_not_absence(self):
+        with self.assertRaises(wrapper.Refused):
+            self.execute(stat_probe=lambda dev, path: (_ for _ in ()).throw(wrapper.Refused("unknown_role_evidence")))
+        self.assertFalse(any(Path(c[0]).name == "mount" for c in self.calls))
+
+    def test_dirty_boot_refuses_before_probe(self):
+        def run(argv):
+            if Path(argv[0]).name == "dumpe2fs" and argv[-1] == "/dev/sdb16":
+                return "Filesystem state: clean\nFilesystem features: needs_recovery\n"
+            return self.fake_run(argv)
+        with self.assertRaises(wrapper.Refused):
+            self.execute(run=run)
+        self.assertFalse(self.probes)
+
+    def test_changed_postprobe_layout_refuses(self):
+        def probe(dev, path):
+            self.layout["blockdevices"][0]["children"][1]["ro"] = False
+            return self.probe(dev, path)
+        with self.assertRaises(wrapper.Refused):
+            self.execute(stat_probe=probe)
+        self.assertFalse(any(Path(c[0]).name == "mount" for c in self.calls))
+
+    def test_extra_ext4_wrong_boot_number_and_boot_collision_refuse(self):
+        original = copy.deepcopy(self.layout)
+        for mutation in ("extra", "wrong", "protected", "mounted"):
+            self.layout = copy.deepcopy(original)
+            boot = self.layout["blockdevices"][0]["children"][1]
+            if mutation == "extra":
+                self.layout["blockdevices"][0]["children"].append(copy.deepcopy(boot))
+            if mutation == "wrong": boot["maj:min"] = "259:2"
+            if mutation == "protected": boot["maj:min"] = "8:1"
+            if mutation == "mounted": boot["mountpoints"] = ["/other"]
+            with self.subTest(mutation=mutation), self.assertRaises(wrapper.Refused):
+                self.execute()
+        self.assertFalse(self.probes)
+
+
+class DebugfsStatTests(unittest.TestCase):
+    banner = "debugfs 1.47.0 (5-Feb-2023)\n"
+
+    def test_directory_regular_and_symlink(self):
+        for kind in ("directory", "regular", "symlink"):
+            self.assertEqual(wrapper.parse_stat(f"Inode: 12   Type: {kind}    Mode: 0755\nmetadata\n",
+                                                self.banner, "/etc"), kind)
+
+    def test_exact_absence_only(self):
+        self.assertEqual(wrapper.parse_stat("", self.banner +
+                         "/etc: File not found by ext2_lookup \n", "/etc"), "absent")
+        for stdout, stderr in (("", self.banner), ("", self.banner + "Input/output error\n"),
+                               ("", self.banner + "/usr: File not found by ext2_lookup\n"),
+                               ("unexpected", self.banner + "/etc: File not found by ext2_lookup\n"),
+                               ("Inode: 1 Type: directory Mode: 0755\n", self.banner + "warning\n")):
+            with self.subTest(stderr=stderr), self.assertRaises(wrapper.Refused):
+                wrapper.parse_stat(stdout, stderr, "/etc")
+
+    def test_fixed_command_and_error_suppression(self):
+        result = SimpleNamespace(returncode=0, stdout=b"Inode: 1 Type: directory Mode: 0755\n",
+                                 stderr=self.banner.encode())
+        with patch.object(wrapper.subprocess, "run", return_value=result) as call:
+            self.assertEqual(wrapper.debugfs_stat("/dev/sdb1", "/etc"), "directory")
+            self.assertEqual(call.call_args.args[0], ["/usr/sbin/debugfs", "-R", "stat /etc", "/dev/sdb1"])
+        with patch.object(wrapper.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=b"PRIVATE", stderr=b"PRIVATE")):
+            with self.assertRaisesRegex(wrapper.Refused, "unknown_role_evidence") as error:
+                wrapper.debugfs_stat("/dev/sdb1", "/etc")
+            self.assertNotIn("PRIVATE", str(error.exception))
+        with self.assertRaises(wrapper.Refused):
+            wrapper.debugfs_stat("/dev/sdb1", "/unreviewed")
