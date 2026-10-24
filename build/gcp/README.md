@@ -261,8 +261,9 @@ This separately proves actual private ext4 `ro,noload,nodev,nosuid,noexec`
 mount semantics and runs the unchanged collector. The production validator
 must refuse the observed `TYPE=loop`; its `TYPE=disk` requirement stays intact.
 Thus success is **not** positive whole-wrapper integration or source-layout
-acceptance. Dirty-state parser refusal uses synthetic evidence; an actual
-dirty ext4 journal is not generated or tested. Source-copy layout and clean
+acceptance. Dirty-state refusal in this clean harness uses synthetic evidence;
+it does not generate an actual dirty journal. Use the separate pending-journal
+proof below for real on-disk refusal. Source-copy layout and clean
 state remain separate gates, including an unformatted BIOS boot partition
 (which normally has no filesystem type); unexpected types still refuse.
 
@@ -275,6 +276,56 @@ deletes through a mountpoint. Output is fixed status/count/hash evidence only.
 Offline tests cover mapping-identity refusal, not actual kernel mounts or all
 cleanup failure paths. Record actual execution/tool versions and remaining
 limits in the issue; no live execution is implied by this module's presence.
+
+### Actual pending-journal refusal proof
+
+On the same separately authorized clean inspector, before source inspection,
+the lead can run the fixed no-input proof from reviewed code:
+
+```bash
+sudo unshare --mount --propagation private -- \
+  /usr/bin/python3 -E -s -m build.gcp.inspection.dirty_ext4
+```
+
+It requires Python3.12+ and already-present trusted `mkfs.ext4`, `debugfs`,
+`dumpe2fs`, `losetup`, `blockdev`, `lsblk`, `findmnt` and `udevadm`; no downloads
+or install fallback. It creates only a new owned32MiB regular file in a0700
+`/run` directory. Preparation formats4096-byte blocks, then fixed debugfs
+`journal_open`, `journal_write -b 7000 /dev/zero`, `journal_close` commands write
+one committed journal transaction to that file. `/dev/zero` supplies one fixed
+block of harmless data. No superblock flag is forged, no original/source image
+is accepted and no filesystem is mounted writable or snapshotted.
+
+After preparation it hashes the file and attaches only that exact file as a
+read-only loop. The existing loop verifier binds backing inode/device, offset,
+size limit, kernel device number and RO state. Actual `dumpe2fs -h` must report
+`needs_recovery` and nonzero journal start; default-read-only `debugfs logdump`
+must show the expected pending descriptor and commit. Then the unchanged
+production `validate_clean` must refuse that actual evidence. The fixture is
+**never mounted**, repaired or replayed; journal_run/fsck are absent. This
+proves the cleanliness guard against a real userspace-generated transaction,
+not whole-wrapper disk-layout acceptance or a kernel-crash scenario. Production
+loop-device refusal remains unchanged.
+
+Cleanup revalidates exact owned read-only/unmounted loop identity, detaches it,
+waits for udev, confirms its mapping absent and post-preparation hash unchanged,
+then removes only explicit generated files and the empty owned directory.
+Unknown mapping or failed cleanup preserves evidence and refuses success. Lead
+must resolve it before source collection or slot reuse. Signals get the same
+cleanup; SIGKILL/VM loss still need lead/resource cleanup. Output is fixed
+status only. Offline mocks cover success, failed probe and failed detach;
+the actual loop/kernel path requires separate lead execution on the existing
+bounded inspector. No additional VM or lease extension is implied.
+
+Primary recipe checked2026-10-24: e2fsprogs
+[j_short_trans_64bit](https://github.com/tytso/e2fsprogs/blob/8fd79523d051d5ea881237f27eb1c664486e0078/tests/j_short_trans_64bit/script)
+uses jo/jw/jc; its later fsck/replay steps are deliberately excluded.
+[do_journal.c](https://github.com/tytso/e2fsprogs/blob/8fd79523d051d5ea881237f27eb1c664486e0078/debugfs/do_journal.c)
+marks recovery required after committing the transaction, and
+[debugfs manual](https://man7.org/linux/man-pages/man8/debugfs.8.html) documents
+these journal commands. Actual userspace preparation/probe/refusal/hash/cleanup
+passed with e2fsprogs1.47.2 in a credential-free Debian13 container without
+host devices or mount capability; that is not kernel-loop proof.
 
 Primary references consulted 2026-10-24: Python
 [3.12 descriptor-relative filesystem APIs](https://docs.python.org/3.12/library/os.html),
