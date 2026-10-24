@@ -106,7 +106,8 @@ class Preflight:
         if any(item["key"] in executable for item in metadata):
             raise Refused("inherited project execution metadata blocks pilot")
         self._quota(project, {"CPUS_ALL_REGIONS": 2})
-        self._quota(region, {"CPUS": 2, "E2_CPUS": 2, "DISKS_TOTAL_GB": 310})
+        # E2 shares the regional CPUS pool with N1 (not E2_CPUS).
+        self._quota(region, {"CPUS": 2, "DISKS_TOTAL_GB": 310})
         for actual, (path, image_id, minimum) in zip(images, IMAGES):
             if (actual.get("id") != image_id or
                     actual.get("name") != path.rsplit("/", 1)[-1] or

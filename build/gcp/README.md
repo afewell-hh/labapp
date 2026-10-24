@@ -124,9 +124,10 @@ The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
 with no inputs. Its first pilot uses a fixed **five-minute** absolute lease,
 `e2-standard-2`, a 10GB stock Ubuntu boot disk and a 300GB read-only source-copy
 `pd-standard` disk. Both images are checked against pinned immutable IDs before
-admission. Project-global CPU and regional CPU/E2/standard-disk quotas must have
+admission. Project-global CPU and regional shared CPU/standard-disk quotas must have
 headroom; reads are snapshots, not reservations. Inherited project execution
-metadata (startup/shutdown scripts or cloud-init user-data) blocks this pilot. Existing unknown resources
+metadata (startup/shutdown scripts or cloud-init user-data) blocks this pilot.
+E2 uses the regional `CPUS` pool shared with N1; no `E2_CPUS` entry is required. Existing unknown resources
 still block admission through the controller census. There is no guest script,
 package download, SSH, serial output or filesystem extraction in this pilot.
 
@@ -164,6 +165,7 @@ removal. Those require the separately authorized lead-run pilots after review.
 Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
 [GitHub Contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content),
 [workflow_run trust and default-branch semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run),
+[CPU quota pools](https://docs.cloud.google.com/compute/resource-usage#cpu_quota),
 [projects.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/projects/get),
 [images.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/get),
 [disks.get sourceImageId](https://docs.cloud.google.com/compute/docs/reference/rest/v1/disks/get),

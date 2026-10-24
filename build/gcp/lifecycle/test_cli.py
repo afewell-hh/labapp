@@ -41,7 +41,7 @@ def preflight_records():
         {'name': spec.PROJECT, 'quotas': [{'metric': 'CPUS_ALL_REGIONS', 'limit': 96, 'usage': 0}]},
         {'name': spec.REGION, 'quotas': [
             {'metric': metric, 'limit': limit, 'usage': 0}
-            for metric, limit in [('CPUS', 200), ('E2_CPUS', 24), ('DISKS_TOTAL_GB', 4096)]]},
+            for metric, limit in [('CPUS', 200), ('DISKS_TOTAL_GB', 4096)]]},
         *[{'id': image_id, 'name': path.rsplit('/', 1)[-1], 'status': 'READY',
            'diskSizeGb': str(minimum)} for path, image_id, minimum in cli.IMAGES]]
 
@@ -210,6 +210,7 @@ class CliTests(unittest.TestCase):
         http = Mock()
         http.request.side_effect = [HttpResponse(200, json.dumps(r).encode()) for r in preflight_records()]
         cli.Preflight(http, lambda: 'fake-token').check()
+        self.assertNotIn('E2_CPUS', str(preflight_records()))
         urls = [call.args[1] for call in http.request.call_args_list]
         base = 'https://compute.googleapis.com/compute/v1/'
         self.assertEqual(urls, [base + f'projects/{spec.PROJECT}',
@@ -218,11 +219,11 @@ class CliTests(unittest.TestCase):
         self.assertTrue(all(call.args[0] == 'GET' for call in http.request.call_args_list))
 
     def test_preflight_rejects_bad_identity_quota_and_http(self):
-        for change in ('global_quota', 'e2_quota', 'disk_quota', 'missing', 'nan', 'duplicate', 'image', 'status', 'size', 'inherited_script'):
+        for change in ('global_quota', 'shared_cpu_quota', 'disk_quota', 'missing', 'nan', 'duplicate', 'image', 'status', 'size', 'inherited_script'):
             records = preflight_records()
             if change == 'global_quota': records[0]['quotas'][0]['usage'] = 95
-            if change == 'e2_quota': records[1]['quotas'][1]['limit'] = 1
-            if change == 'disk_quota': records[1]['quotas'][2]['limit'] = 309
+            if change == 'shared_cpu_quota': records[1]['quotas'][0]['limit'] = 1
+            if change == 'disk_quota': records[1]['quotas'][1]['limit'] = 309
             if change == 'missing': records[1]['quotas'].pop()
             if change == 'nan': records[1]['quotas'][0]['usage'] = float('nan')
             if change == 'duplicate': records[1]['quotas'].append(records[1]['quotas'][0])
