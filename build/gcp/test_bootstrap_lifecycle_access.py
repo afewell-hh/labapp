@@ -142,7 +142,13 @@ class AccessTests(unittest.TestCase):
         self.assertIn("attribute.workflow_ref/afewell-hh/labapp/", creator["principal"])
         self.assertNotIn("schedule", creator["condition"])
         self.assertIn("schedule", cleanup["condition"])
-        self.assertNotIn("workflow_run", cleanup["condition"])
+        self.assertIn("workflow_run", cleanup["condition"])
+        self.assertNotIn("workflow_run", creator["condition"])
+        self.assertNotIn("compute.instances.create", a.ROLES["labappLifecycleReader"])
+        self.assertNotIn("compute.disks.create", a.ROLES["labappLifecycleReader"])
+        self.assertEqual(a.expected_project_bindings("cleanup"), [
+            (a.role_name("labappLifecycleReader"), None),
+            (a.role_name("labappLifecycleDelete"), a.DELETE_CONDITION)])
 
     def test_existing_credentials_and_trust_fail_closed(self):
         ident = a.identity("creator")

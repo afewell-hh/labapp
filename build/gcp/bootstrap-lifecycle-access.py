@@ -60,7 +60,8 @@ def identity(kind):
                  "assertion.ref == 'refs/heads/main' && "
                  f"assertion.workflow_ref == '{workflow_ref}' && ")
     events = ("assertion.event_name == 'workflow_dispatch'" if kind == "creator" else
-              "(assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch')")
+              "(assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch' || "
+              "assertion.event_name == 'workflow_run')")
     return {"account": account, "email": f"{account}@{PROJECT}.iam.gserviceaccount.com",
             "pool": account, "base": base, "condition": condition + events,
             "principal": f"principalSet://iam.googleapis.com/{base}/attribute.workflow_ref/{workflow_ref}"}

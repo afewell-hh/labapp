@@ -201,7 +201,7 @@ has been proven. No separate organization-administrator handoff is required.
 | Identity | Dedicated pool | Allowed future workflow / events |
 |---|---|---|
 | `labapp-lc-creator` | `labapp-lc-creator` | `labapp-lifecycle-inspect.yml`, dispatch only |
-| `labapp-lc-cleanup` | `labapp-lc-cleanup` | `labapp-lifecycle-cleanup.yml`, schedule or dispatch |
+| `labapp-lc-cleanup` | `labapp-lc-cleanup` | `labapp-lifecycle-cleanup.yml`, completed creator run, schedule or dispatch |
 
 Both require the existing numeric repository/owner IDs, `refs/heads/main`, and
 the exact workflow ref. Each SA binding also selects that workflow ref within
@@ -210,6 +210,18 @@ identity from impersonating the other through a pool-wide repository selector.
 No generic worker job gets these credentials. The referenced workflows are not
 installed by this bootstrap; future workflow implementation must preserve these
 fixed refs and contain no arbitrary input/command execution.
+
+The cleanup provider also allows `workflow_run` for immediate cleanup after the
+trusted creator finishes, including cancellation, without giving the creator
+Actions-write or delete privileges. The future cleanup workflow must trigger on
+`completed` runs of the fixed creator workflow, then validate its expected
+workflow name/path, head repository, `head_branch == main`, and original event
+`workflow_dispatch` before using lifecycle credentials. Its own workflow code
+must come from trusted main. Read the durable ledger and validate ownership;
+never execute triggering-run code, commands, artifacts or event-supplied scripts.
+Schedule and manual dispatch remain fallback paths. Provider event permission
+alone does not implement or prove these trigger checks; the actual workflows
+still require independent review before enabling cloud work.
 
 Custom IAM roles separate creation/read from deletion:
 
