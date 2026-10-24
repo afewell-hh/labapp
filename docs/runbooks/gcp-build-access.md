@@ -264,7 +264,7 @@ Custom IAM roles separate creation/read from deletion:
 - Creator subnet use: only `default` in `us-central1`, via a separate subnet-level
   custom role. No network, firewall, external-IP, snapshot, image administration,
   service-account attachment/`actAs`, or service-account-key privilege is granted.
-  Public Ubuntu/source images supply image read/use; no image IAM is changed.
+  Public Debian/source images supply image read/use; no image IAM is changed.
 
 The private ledger is exactly
 `gs://labapp-lifecycle-ledger-22685701361`, regional `us-central1`, STANDARD,
@@ -301,7 +301,8 @@ python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py
 ## Owner IAP access to an owned inspector
 
 This is a lead-run access plan for #173/#170/#151, not an automated bootstrap
-or permission to access a preexisting appliance. The shared create request and
+or permission to access a preexisting appliance. The fixed create request
+enables guest attributes at initial creation;
 creator/cleanup roles stay unchanged. Current lifecycle-only pilots stay
 untagged. Only the existing owner `art@githedgehog.com`, using the current
 trusted lead host, prepares access to a separately authorized inspector after
@@ -312,7 +313,8 @@ Before setup, verify the authenticated account and its effective permissions.
 Google documents that project Owner can use IAP TCP forwarding; this is not
 evidence that an account currently has Owner or that deny/organization policies
 permit access. Check `iap.tunnelInstances.accessViaIAP`, Compute instance
-get/list and project get, plus OS Login and `compute.instances.osAdminLogin`
+get/list, project get and `compute.instances.getGuestAttributes`, plus OS Login
+and `compute.instances.osAdminLogin`
 for the later privileged mount wrapper. Prove OS Login/admin access in the
 synthetic pilot instead of automatically granting IAP/OS Admin Login roles.
 Service Account User is unnecessary for this no-SA VM. Keep instance
@@ -325,7 +327,8 @@ Read the existing network/subnet and effective firewall policy before access.
 If a protected existing rule already permits IAP TCP22, use it without adding
 rules or tags. An additional narrow allow does not override a broader allow.
 Do not adopt, modify or delete preexisting infrastructure. The shared creation
-body, creator permissions and persisted lease intent remain unchanged. Record
+body remains fixed; creator permissions and lifecycle ownership rules remain
+unchanged. Record
 actual policy evidence in the task issue; reachability still requires a
 harmless live test. If blocked, diagnose the effective denial before proposing
 new access infrastructure through a separate reviewed change.
@@ -334,34 +337,72 @@ Before any connection, require terminal insert success and all three confirmed
 immutable IDs in the current ledger. Immediately verify the exact VM's
 project/zone, labels, unchanged deadline, OS Login metadata, no service account
 or external IP, and exactly the intended boot/source-copy attachments and disk
-IDs. Verify both pinned source-image IDs. Serialize owner access against lease
+IDs. Require initial `enable-guest-attributes=TRUE` and verify both pinned
+source-image IDs. Serialize owner access against lease
 changes and recheck identities after establishing host-key evidence. Cleanup
 retains priority; neither access nor a failed connection renews the deadline.
 
 ### Bind the clean inspector's SSH host key
 
-The clean Ubuntu boot's cloud-init normally emits public host keys and their
-fingerprints to its console. This is a host-identity channel for the clean
-inspector only: the appliance source copy is attached read-only and never
-booted. Never put source data or collection reports on serial output.
+The pinned clean Debian13 stock boot uses the Google guest agent to publish
+host public keys to guest attributes. The fixed instance request sets
+`enable-guest-attributes=TRUE` before first boot; do not enable it later or at
+project scope. No cloud-init console-key block is assumed. Source-copy content
+is never used for host identity and no appliance code is booted or executed.
 
-Privately capture the authenticated API/CLI response without printing its
-contents or diagnostics into logs or GitHub:
+Guest attributes are writable by **any process inside that VM**, including
+unprivileged processes. The authenticated API identifies the VM whose values
+were read; it does not attest an uncompromised guest or the agent that wrote
+them. This channel relies on the pinned trusted stock boot, no inherited
+execution metadata, no untrusted guest execution and verified stock root/mount
+identities. It is unsuitable for establishing trust in the saved appliance.
+Do not store private keys, credentials or raw collection data in guest attributes.
+
+Privately capture the authenticated existing-owner API/CLI response without
+printing its contents or diagnostics into logs or GitHub:
 
 ```bash
 # Lead only, after the immutable identity/lease checks above. Capture privately.
-gcloud compute instances get-serial-port-output EXACT_LEDGER_INSTANCE \
-  --project=teched-473722 --zone=us-central1-a --port=1 --start=0
+gcloud compute instances get-guest-attributes EXACT_LEDGER_INSTANCE \
+  --project=teched-473722 --zone=us-central1-a \
+  --query-path=hostkeys/ssh-ed25519 --format=json
+```
+
+The CLI's JSON output is a list of entries, each with `namespace`, `key` and
+`value`; `value` is the base64 SSH wire-format blob, without the `ssh-ed25519`
+prefix or a comment. The equivalent REST request is a GET with an empty body:
+
+```text
+https://compute.googleapis.com/compute/v1/projects/teched-473722/zones/us-central1-a/instances/EXACT_LEDGER_INSTANCE/getGuestAttributes?queryPath=hostkeys%2Fssh-ed25519
+```
+
+REST wraps that list in `queryValue.items` and also returns `kind`, `queryPath`
+and optional resource fields. The CLI selects `queryValue.items` before JSON
+formatting. Do not confuse these response shapes or silently fall back between
+them. The pure `build.gcp.inspection.hostkey.extract_ed25519(raw_bytes)` helper
+accepts only the documented CLI list, bounded to4096bytes, checks duplicate JSON
+fields and the ED25519 wire algorithm/key lengths, and returns one canonical
+public-key line. It performs no cloud calls, file access or identity binding.
+For example, after privately capturing the successful CLI output above, call
+it from the reviewed checkout in the lead's private processing code:
+
+```python
+from build.gcp.inspection.hostkey import extract_ed25519
+# cli_response_bytes comes from the authenticated bounded capture above.
+public_key_line = extract_ed25519(cli_response_bytes)
+# Save privately with exclusive creation/mode0600; do not print it to logs.
 ```
 
 Use an in-memory bounded capture or exclusive0600 file under a lead-owned0700
-directory. The API retains at most1MiB per port; unavailable/truncated output
-is not evidence. Require one complete `SSH HOST KEY KEYS` block and exactly one
-valid `ssh-ed25519` public key in it; validate that key with `ssh-keygen -lf
--E sha256` and, when available, match its console fingerprint. Do not accept
-arbitrary key-looking lines from other log regions. Missing, conflicting or
-ambiguous evidence blocks connection. Re-read the VM and lease and require
-unchanged immutable identities/deadline before pinning. These before/after
+directory. Require a successful bounded response containing exactly one
+`hostkeys` / `ssh-ed25519` entry with a valid base64 ED25519 public-key payload;
+reject unexpected namespaces/keys, duplicates, malformed keys or responses.
+Construct the public-key line with the fixed `ssh-ed25519` type and validate it
+using `ssh-keygen -lf PUBLIC_KEY_FILE -E sha256`. Retain the fingerprint with the
+private identity evidence. Missing, conflicting or ambiguous evidence blocks
+connection; bounded waiting for first-boot publication never extends the lease.
+Re-read the exact VM, both disks and lease and require unchanged immutable
+identities, pinned provenance and deadline before pinning. These before/after
 checks are serialized lead checks, not an atomic incarnation precondition.
 
 Write the verified public key to a dedicated0600 known_hosts with alias
@@ -369,10 +410,10 @@ Write the verified public key to a dedicated0600 known_hosts with alias
 `StrictHostKeyChecking=yes`, the dedicated `UserKnownHostsFile`,
 `GlobalKnownHostsFile=/dev/null`, `HostKeyAlgorithms=ssh-ed25519` and
 `UpdateHostKeys=no`. Use a fixed IAP tunnel and explicit project/zone/VM; do
-not substitute a raw IP. No keyscan is needed when the public key is available.
-A candidate keyscan without an independently authenticated matching
-fingerprint is not host identity. Do not enable interactive serial access,
-metadata-key fallback or guest attributes merely to bypass missing evidence.
+not substitute a raw IP. Do not use keyscan, first-use acceptance, serial-key
+fallback, interactive serial access or metadata SSH keys to bypass missing
+guest-attribute evidence. This owner read does not add guest-attribute API
+access to the creator/cleanup transport or grant new worker permissions.
 
 An ephemeral local owner SSH key can be imported with
 `gcloud compute os-login ssh-keys add --key-file=PUBLIC_KEY_FILE --ttl=30m`.
@@ -412,9 +453,10 @@ VPCs and subnets.
 Sources read 2026-10-24 (documented, not live-tested here):
 [IAP TCP forwarding](https://docs.cloud.google.com/iap/docs/using-tcp-forwarding),
 [OS Login setup](https://docs.cloud.google.com/compute/docs/oslogin/set-up-oslogin),
-[serial output API](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/getSerialPortOutput),
-[cloud-init console keys](https://cloudinit.readthedocs.io/en/stable/reference/yaml_examples/ssh.html),
-[cloud-init key-output helper](https://github.com/canonical/cloud-init/blob/main/tools/write-ssh-key-fingerprints),
+[host-key guest attributes](https://docs.cloud.google.com/solutions/connecting-securely),
+[guest-attribute trust/permissions](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes),
+[guest-attribute API](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/getGuestAttributes),
+[CLI query](https://docs.cloud.google.com/sdk/gcloud/reference/compute/instances/get-guest-attributes),
 [OS Login key TTL](https://docs.cloud.google.com/sdk/gcloud/reference/compute/os-login/ssh-keys/add),
 [OpenSSH host checks](https://www.man7.org/linux/man-pages/man5/ssh_config.5.html),
 and [gcloud SSH host checks](https://docs.cloud.google.com/sdk/gcloud/reference/compute/ssh).
