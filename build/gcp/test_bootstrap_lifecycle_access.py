@@ -226,6 +226,12 @@ class AccessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             a.validate_bucket_policy({"bindings": [{"role": "roles/storage.objectUser", "members": ["allAuthenticatedUsers"]}]})
 
+    def test_project_wide_operation_census_has_only_required_read_addition(self):
+        for key in ("labappLifecycleCreator", "labappLifecycleReader"):
+            self.assertIn("compute.globalOperations.list", a.ROLES[key])
+            self.assertNotIn("compute.regionOperations.list", a.ROLES[key])
+        self.assertNotIn("compute.globalOperations.list", a.ROLES["labappLifecycleDelete"])
+
     def test_no_image_network_admin_actas_or_extra_deletes(self):
         permissions = {x for values in a.ROLES.values() for x in values}
         self.assertEqual({p for p in permissions if p.endswith(".delete")},

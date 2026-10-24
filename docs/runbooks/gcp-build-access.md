@@ -235,7 +235,8 @@ Custom IAM roles separate creation/read from deletion:
   prefix-limited creation: they do not enforce VM count, shape, runtime, no-SA,
   no-external-IP or ownership. Metadata/label permissions can affect other VMs
   or disks, so fixed trusted code, preflight and lifecycle review are essential.
-- Cleanup: instance/disk/zone-operation reads, plus a separate delete-only role
+- Cleanup: instance/disk/zone-operation reads and the project-wide operation
+  list needed for census, plus a separate delete-only role
   conditioned on Compute Instance/Disk type and the exact `us-central1-a`
   `labapp-lc-` name prefixes. The creator has no delete role; normal cleanup
   and the janitor must both run under the cleanup identity. Prefix IAM alone
@@ -278,6 +279,9 @@ python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py
 
 Official sources consulted 2026-10-24:
 
+- [GA aggregated operation list](https://docs.cloud.google.com/compute/docs/reference/rest/v1/globalOperations/aggregatedList#iam-permissions):
+  project-wide census requires `compute.globalOperations.list`; both lifecycle
+  read sets include it, without adding region-operation permissions.
 - [GA instance insert](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert):
   field-specific creation/metadata/label permissions; actual complete pilot
   sufficiency remains to be verified.

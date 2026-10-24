@@ -20,7 +20,8 @@ MAPPING = {"google.subject": "assertion.sub", **{
     f"attribute.{key}": f"assertion.{key}" for key in (
         "repository_id", "repository_owner_id", "ref", "workflow_ref", "event_name")}}
 READ = ["compute.instances.get", "compute.instances.list", "compute.disks.get",
-        "compute.disks.list", "compute.zoneOperations.get", "compute.zoneOperations.list"]
+        "compute.disks.list", "compute.zoneOperations.get", "compute.zoneOperations.list",
+        "compute.globalOperations.list"]
 ROLES = {
     "labappLifecycleCreator": READ + [
         "compute.instances.create", "compute.disks.create", "compute.instances.setMetadata",
