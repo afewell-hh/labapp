@@ -115,11 +115,13 @@ def validate_bucket(bucket):
 def validate_bucket_policy(policy):
     services = {f"serviceAccount:{identity(k)['email']}" for k in ("creator", "cleanup")}
     legacy = {"roles/storage.legacyBucketOwner": {f"projectOwner:{PROJECT}", f"projectEditor:{PROJECT}"},
-              "roles/storage.legacyBucketReader": {f"projectViewer:{PROJECT}"}}
+              "roles/storage.legacyBucketReader": {f"projectViewer:{PROJECT}"},
+              "roles/storage.legacyObjectOwner": {f"projectOwner:{PROJECT}", f"projectEditor:{PROJECT}"},
+              "roles/storage.legacyObjectReader": {f"projectViewer:{PROJECT}"}}
     for binding in policy.get("bindings", []):
         members = set(binding.get("members", []))
         allowed = services if binding.get("role") == "roles/storage.objectUser" else legacy.get(binding.get("role"), set())
-        require(bool(members) and members <= allowed and not binding.get("condition"),
+        require(bool(members) and members <= allowed and "condition" not in binding,
                 "Unexpected direct ledger bucket access; no grant attempted")
 
 
