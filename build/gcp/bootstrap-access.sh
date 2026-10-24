@@ -130,6 +130,7 @@ else
     (.[0].disabled != true) and .[0].attributeCondition == $condition and
     .[0].attributeMapping == $mapping and
     .[0].oidc.issuerUri == "https://token.actions.githubusercontent.com" and
+    ((.[0].oidc.jwksJson // "") == "") and
     ((.[0].oidc.allowedAudiences // []) | length == 0)
   ' <<<"$providers" >/dev/null || {
     echo 'Existing provider differs from reviewed trust; no update attempted.' >&2

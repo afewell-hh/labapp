@@ -59,7 +59,8 @@ The script validates the project ID format and prints nonsecret identifiers.
 It accepts `teched-473722`; a separate or empty project is not required.
 It never creates keys, VMs, networks, disks, quota changes, or user Token Creator
 grants. It describes existing configuration before reuse: disabled/deleted
-resources, unexpected providers, or mismatched provider trust stop the script
+resources, unexpected providers, uploaded OIDC signing keys, or mismatched
+provider trust stop the script
 rather than being overwritten. The reserved pool must contain only the one
 reviewed provider. Failed partial setup can be rerun; inspect failures before
 retrying. IAM/API propagation may require waiting.
