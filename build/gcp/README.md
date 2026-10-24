@@ -26,7 +26,8 @@ separate reviewed transfer and field-redaction pass before any public use;
 neither allowlisting nor a future pattern scanner proves publication safety.
 
 Schema 1 records guest path, kind, status and (for captured files) SHA-256.
-OS release, six named units and their `.conf` drop-ins are captured privately.
+OS release at both fixed `/etc/os-release` and `/usr/lib/os-release` paths,
+six named units and their `.conf` drop-ins are captured privately.
 The names are `hhfab-vlab-resume`, `vlab-netfilter`, `hhbr-ip`,
 `kubeconfig-merge`, `argocd-port-fix`, `hhfab-vlab`; these are historical leads,
 not evidence that the saved image has them. Installed package name/version
@@ -90,6 +91,54 @@ for publication without that review. Keep raw/intermediate retention and cleanup
 under the private-transfer contract; delete promptly after accepted recovery or
 an abandoned attempt. Unit/helper configuration recovery is a separate reviewed
 slice; metadata inventory does not recover effective settings or runtime.
+
+### Private persisted startup candidate
+
+The lead can derive reusable selected startup configuration using the same
+private file/mode/hash checks and review/publication boundary:
+
+```bash
+python3 -m build.gcp.inspection.startup \
+  --private-input /private/inspection/inventory.json \
+  --private-output /private/inspection/startup.json
+```
+
+This preserves the inventory fields and adds `persisted_startup` schema1.
+Named base units yield selected `[Unit]`, `[Service]` and `[Install]` settings
+plus a pure formatted unit containing only those recovered settings. Dependency,
+identity, directory, boolean and service-mode values use compile-time public
+catalogs. Literal second values are integers from 0 through3600. Startup
+commands must match complete public literal commands in `startup.COMMANDS`,
+including the historical #130 inline netfilter command. No arbitrary command
+arguments, environment values, descriptions, documentation URLs or unknown
+directive/section names enter the output. Unknown directives/values/syntax,
+duplicate assignments and resets produce fixed gap codes. Repeated/reset
+directives are omitted rather than assigning invented precedence. Backslashes
+refuse the entire unit's settings because continuation/escape semantics are
+unsupported; this is deliberately not a systemd parser.
+
+Captured helpers yield a reusable script only when the whole body matches a
+public checked-in recipe: currently `hhbr_ip_131.txt`, from issue#131. Only
+CRLF and one final newline are normalized; comments, shebang, quoted content
+and whitespace remain significant. A mismatch yields `recipe: unknown`.
+Historical recipes are not proof of saved-image configuration until matched.
+
+`literal_subset_complete` means no unrecognized execution-related assignment
+was encountered in that base file; it does not mean the formatted subset is a
+complete effective service. Description/documentation are intentionally omitted.
+Drop-ins are not composed; aliases/masks, generators, enabled state and runtime
+remain unknown, and `effective` is always false. Correct recovered fields can
+still be reviewed and reused with these limits; gaps require further recovery.
+No guest code or systemd command executes. The optional canonical os-release
+record is recognized by both candidate commands; older schema1 reports still
+derive the original inventory without changes. `/lib` aliases are not followed;
+the existing fixed `/usr/lib/systemd/system` reads provide canonical evidence.
+
+The offline discovery suite above tests known reusable unit/script output,
+mixed secret/unknown input, reset/repetition, unsupported quoting/specifiers,
+canonical symlink refusal and old/new inventory compatibility. These tests
+cannot prove actual image configuration, boot behavior or helper equivalence
+outside the exact recipe match.
 
 ### Fixed mount wrapper
 

@@ -57,7 +57,7 @@ def derive(report):
         require(path not in seen and status in STATUSES)
         seen.add(path)
         if kind == 'os_release':
-            valid = path == '/etc/os-release'
+            valid = path in ('/etc/os-release', '/usr/lib/os-release')
         elif kind == 'packages':
             valid = path == '/var/lib/dpkg/status'
         elif kind == 'helper':
@@ -131,7 +131,7 @@ def private_parent(path):
     return parent / path.name
 
 
-def write_candidate(source, destination):
+def write_candidate(source, destination, *, deriver=derive):
     source, destination = private_parent(source), private_parent(destination)
     # Check type before opening to avoid guest-like device/FIFO behavior.
     info = source.lstat()
@@ -144,7 +144,7 @@ def write_candidate(source, destination):
                 and stat.S_IMODE(info.st_mode) == 0o600)
         data = stream.read(collector.REPORT_LIMIT + 1)
     require(len(data) <= collector.REPORT_LIMIT)
-    candidate = derive(json.loads(data, object_pairs_hook=pairs))
+    candidate = deriver(json.loads(data, object_pairs_hook=pairs))
     output = (json.dumps(candidate, sort_keys=True, ensure_ascii=True) + '\n').encode('ascii')
     require(len(output) <= collector.REPORT_LIMIT)
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

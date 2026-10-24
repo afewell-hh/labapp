@@ -183,6 +183,8 @@ def collect(root):
     try:
         capture("/etc/os-release", "os_release")
         capture("/var/lib/dpkg/status", "packages", DPKG_LIMIT)
+        # Fixed canonical alternative only: never resolve the guest's symlink.
+        capture("/usr/lib/os-release", "os_release")
         for directory in UNIT_DIRS:
             for name in UNIT_NAMES:
                 path = f"{directory}/{name}.service"
