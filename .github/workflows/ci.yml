@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   lint:
-    name: Active shell, YAML and cloud-init checks
+    name: Active shell, YAML, cloud-init and bootstrap checks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -25,6 +25,10 @@ jobs:
           shellcheck --version
           yamllint --version
           cloud-init --version
+      - name: Test lifecycle access bootstrap without cloud credentials
+        run: |
+          test -f build/gcp/test_bootstrap_lifecycle_access.py
+          python3 -m unittest discover -s build/gcp -p test_bootstrap_lifecycle_access.py -v
       - name: Check every active shell script
         shell: bash
         run: |
