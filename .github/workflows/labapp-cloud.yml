@@ -37,11 +37,8 @@ jobs:
           pattern='^projects/[0-9]+/locations/global/'
           pattern+='workloadIdentityPools/labapp-github/providers/trusted-main$'
           [[ "$WIF_PROVIDER" =~ $pattern ]]
-      - name: Checkout trusted main workflow commit
-        # actions/checkout v4; auth needs checkout before credentials creation.
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
+          # Auth writes temporary credentials here; no repo files are needed.
+          mkdir -p "$GITHUB_WORKSPACE"
       - name: Authenticate short-lived inspector identity
         # google-github-actions/auth v3
         # yamllint disable-line rule:line-length
