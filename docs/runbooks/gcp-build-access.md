@@ -256,8 +256,11 @@ to be a minimal custom role. Overwriting a CAS ledger object requires create
 and delete. No project-wide Storage role, bucket administration or automatic
 slot expiry is granted. A reused bucket must belong to this project, remain
 private, and have no object lifecycle deletion or retention hold that could
-invalidate slot semantics. Existing owner/editor/viewer legacy bucket bindings
-are recognized platform paths; inherited access is not disproven by this check.
+invalidate slot semantics. Existing own-project owner/editor legacy bucket
+and object owner bindings, and viewer legacy bucket and object reader bindings,
+are recognized platform defaults for uniform bucket access. This does not
+disprove inherited access; public, foreign-project, extra-user, unknown-role
+and conditional direct bindings remain rejected.
 
 The later controller starts with one persistent slot object and generation-matched
 CAS for **every** transition; it must not release a slot before confirmed VM and
@@ -279,6 +282,10 @@ python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py
 
 Official sources consulted 2026-10-24:
 
+- [Cloud Storage basic-role convenience values](https://docs.cloud.google.com/storage/docs/access-control/iam-roles):
+  a new uniform-access bucket gives project owners/editors both legacy bucket
+  owner and object owner roles, and viewers both legacy bucket reader and object
+  reader roles. These are existing platform access paths, not bootstrap grants.
 - [GA aggregated operation list](https://docs.cloud.google.com/compute/docs/reference/rest/v1/globalOperations/aggregatedList#iam-permissions):
   project-wide census requires `compute.globalOperations.list`; both lifecycle
   read sets include it, without adding region-operation permissions.

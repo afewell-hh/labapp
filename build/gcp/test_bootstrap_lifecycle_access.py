@@ -27,6 +27,17 @@ def bucket():
                                  "publicAccessPrevention": "enforced"}}
 
 
+def default_bucket_policy():
+    """Observed uniform-access bucket defaults; project convenience values."""
+    return {"bindings": [
+        {"role": "roles/storage.legacyBucketOwner", "members": [
+            f"projectEditor:{a.PROJECT}", f"projectOwner:{a.PROJECT}"]},
+        {"role": "roles/storage.legacyBucketReader", "members": [f"projectViewer:{a.PROJECT}"]},
+        {"role": "roles/storage.legacyObjectOwner", "members": [
+            f"projectEditor:{a.PROJECT}", f"projectOwner:{a.PROJECT}"]},
+        {"role": "roles/storage.legacyObjectReader", "members": [f"projectViewer:{a.PROJECT}"]}]}
+
+
 class FakeGcloud:
     """Model a complete previous bootstrap to test safe reuse/grant boundaries."""
     def __init__(self, apply=False):
@@ -69,8 +80,10 @@ class FakeGcloud:
             assert "--raw" in args
             return bucket()
         if args[:3] == ("storage", "buckets", "get-iam-policy"):
-            return {"bindings": [{"role": "roles/storage.objectUser", "members": [
-                f"serviceAccount:{a.identity(kind)['email']}" for kind in ("creator", "cleanup")]}]}
+            policy = default_bucket_policy()
+            policy["bindings"].append({"role": "roles/storage.objectUser", "members": [
+                f"serviceAccount:{a.identity(kind)['email']}" for kind in ("creator", "cleanup")]})
+            return policy
         raise AssertionError(f"Unexpected read: {args}")
 
     def write(self, *args):
@@ -225,6 +238,47 @@ class AccessTests(unittest.TestCase):
                 a.validate_bucket({**bucket(), **change})
         with self.assertRaises(ValueError):
             a.validate_bucket_policy({"bindings": [{"role": "roles/storage.objectUser", "members": ["allAuthenticatedUsers"]}]})
+
+    def test_observed_uniform_bucket_default_policy_is_accepted(self):
+        a.validate_bucket_policy(default_bucket_policy())
+        gc = FakeGcloud(True)
+        a.setup(gc)
+        self.assertEqual(sum(args[:3] == ("storage", "buckets", "add-iam-policy-binding")
+                             for args in gc.writes), 2)
+
+    def test_default_bucket_roles_reject_unexpected_members_and_conditions(self):
+        for index in range(4):
+            for member in ("allUsers", "allAuthenticatedUsers", "projectOwner:foreign",
+                           "projectEditor:foreign", "projectViewer:foreign",
+                           "user:other@example.com", f"serviceAccount:{a.identity('creator')['email']}"):
+                with self.subTest(index=index, member=member):
+                    policy = default_bucket_policy()
+                    policy["bindings"][index]["members"].append(member)
+                    with self.assertRaises(ValueError):
+                        a.validate_bucket_policy(policy)
+            for condition in ({"expression": "true"}, {}, None):
+                with self.subTest(index=index, condition=condition):
+                    policy = default_bucket_policy()
+                    policy["bindings"][index]["condition"] = condition
+                    with self.assertRaises(ValueError):
+                        a.validate_bucket_policy(policy)
+        for role, member in (("roles/storage.legacyObjectOwner", f"projectViewer:{a.PROJECT}"),
+                             ("roles/storage.legacyObjectReader", f"projectOwner:{a.PROJECT}"),
+                             ("roles/storage.admin", f"projectOwner:{a.PROJECT}")):
+            with self.subTest(role=role, member=member), self.assertRaises(ValueError):
+                a.validate_bucket_policy({"bindings": [{"role": role, "members": [member]}]})
+
+    def test_invalid_bucket_default_blocks_all_grants_on_partial_setup(self):
+        class Unexpected(FakeGcloud):
+            def read(self, *args, **kwargs):
+                result = super().read(*args, **kwargs)
+                if args[:3] == ("storage", "buckets", "get-iam-policy"):
+                    result["bindings"][2]["members"].append("projectOwner:foreign")
+                return result
+        gc = Unexpected(True)
+        with self.assertRaises(ValueError):
+            a.setup(gc)
+        self.assertEqual(gc.writes, [])
 
     def test_project_wide_operation_census_has_only_required_read_addition(self):
         for key in ("labappLifecycleCreator", "labappLifecycleReader"):
