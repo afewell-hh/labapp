@@ -191,6 +191,8 @@ class T(unittest.TestCase):
             w.ctl.admit(2, 1, U2)
         # The VM lands late; cleanup deletes it and both disks, then releases.
         w.raw.finish_pending(success=True)
+        terminal_insert = next(op for op in w.raw.ops.values() if op.get("clientOperationId") == U1)
+        self.assertEqual(terminal_insert["targetId"], w.raw.instances[spec.names(1, 1)["instance"]]["id"])
         self.assertEqual(w.ctl.reconcile(U1).status, "released")
         self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
 
@@ -288,6 +290,7 @@ class T(unittest.TestCase):
     def test_confirm_records_vm_and_both_disk_ids(self):
         w = World()
         rec = w.started()
+        self.assertEqual(rec["ids"]["instance"], w.raw.ops[rec["operation"]]["targetId"])
         for kind in ("instance", "boot", "data"):
             self.assertTrue(rec["ids"][kind], kind)
         self.assertEqual(rec["deadline"],
@@ -583,6 +586,66 @@ class T(unittest.TestCase):
             op["clientOperationId"] = U2
         self.assertEqual(w.ctl.confirm_created(U1).status, "operation-mismatch")
         self.assertIsNone(w.record()["ids"]["instance"])
+
+    def test_confirm_rejects_replaced_vm_before_any_ids_recorded(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        operation = w.raw.ops[w.record()["operation"]]
+        original_id = operation["targetId"]
+        inst = w.raw.instances[spec.names(1, 1)["instance"]]
+        self.assertEqual(inst["id"], original_id)
+        inst["id"] = w.raw._id()  # same name/labels/timestamp, new incarnation
+        self.assertEqual(operation["targetId"], original_id)  # evidence immutable
+        out = w.ctl.confirm_created(U1)
+        self.assertEqual(out.status, "identity-mismatch")
+        self.assertIn("operation-target-id", out.detail)
+        self.assertTrue(all(value is None for value in w.record()["ids"].values()))
+        self.assertEqual(w.deletes(), [])
+
+    def test_cleanup_rejects_replaced_vm_before_any_ids_recorded(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        inst = w.raw.instances[spec.names(1, 1)["instance"]]
+        original_id = w.raw.ops[w.record()["operation"]]["targetId"]
+        inst["id"] = w.raw._id()
+        self.assertNotEqual(inst["id"], original_id)
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.status, "cleanup-failed")
+        self.assertIn("operation-target-id", out.detail)
+        self.assertTrue(all(value is None for value in w.record()["ids"].values()))
+        self.assertEqual(w.deletes(), [])
+        self.assertNotEqual(w.record()["state"], FREE)
+
+    def test_missing_insert_target_id_never_authorizes_adoption_or_deletion(self):
+        for action in ("confirm_created", "reconcile"):
+            for missing in (None, ""):
+                w = World()
+                w.ctl.admit(1, 1, U1)
+                w.ctl.submit(U1)
+                operation = w.raw.ops[w.record()["operation"]]
+                if missing is None:
+                    del operation["targetId"]
+                else:
+                    operation["targetId"] = missing
+                out = getattr(w.ctl, action)(U1)
+                self.assertIn(out.status, ("operation-mismatch", "cleanup-failed"))
+                self.assertTrue(all(value is None for value in w.record()["ids"].values()))
+                self.assertEqual(w.deletes(), [])
+                self.assertNotEqual(w.record()["state"], FREE)
+
+    def test_conflicting_current_request_target_ids_block_cleanup(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        other = w.raw._op("insert", spec.names(1, 1)["instance"], client_id=U1)
+        other["targetId"] = w.raw._id()
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.status, "cleanup-failed")
+        self.assertIn("conflicting-insert-target-ids", out.detail)
+        self.assertEqual(w.deletes(), [])
+        self.assertTrue(all(value is None for value in w.record()["ids"].values()))
 
     def test_confirm_refuses_unowned_attachment_and_records_nothing(self):
         w = World()

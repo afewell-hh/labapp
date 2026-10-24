@@ -121,12 +121,13 @@ class Controller:
         return None
 
     def _verify(self, kind: str, res: dict, rec: dict,
-                proof: bool) -> Optional[str]:
+                proof: Optional[str]) -> Optional[str]:
         """Return None if res provably belongs to this lease, else a reason.
 
         A resource whose immutable id is not yet recorded is accepted only
-        with ``proof``: a completed insert operation carrying this lease's
-        clientOperationId. Matching labels alone are never enough.
+        with ``proof``: the immutable targetId from this request's completed
+        insert. The fetched VM must match that exact incarnation; labels and
+        a matching target name alone are never enough.
         """
         if res.get("name") != rec["names"][kind] or \
                 not spec.is_owned_name(res.get("name", "")):
@@ -135,6 +136,8 @@ class Controller:
             return "lease-label"
         if res.get("zone", "").rsplit("/", 1)[-1] != rec["zone"]:
             return "zone"
+        if kind == "instance" and proof is not None and res.get("id") != proof:
+            return "operation-target-id"
         known = rec["ids"].get(kind)
         if known:
             if res.get("id") != known:
@@ -146,6 +149,24 @@ class Controller:
                     _parse(rec["reserved_at"]):
                 return "predates-lease"
         return None
+
+    def _insert_target_id(self, rec: dict, operations: list):
+        """Keep current-request immutable target evidence, not a truthy flag."""
+        successful = [op for op in operations if not op.get("error")]
+        if not successful:
+            return None, None  # failed/no retained insert gives no adoption proof
+        ids = set()
+        for op in successful:
+            target_id = op.get("targetId")
+            if op.get("status") != "DONE" or op.get("operationType") != "insert" or \
+                    op.get("clientOperationId") != rec["request_id"] or \
+                    op.get("targetLink", "").rsplit("/", 1)[-1] != rec["names"]["instance"] or \
+                    not isinstance(target_id, str) or not target_id:
+                return None, "missing-or-mismatched-insert-target"
+            ids.add(target_id)
+        if len(ids) != 1:
+            return None, "conflicting-insert-target-ids"
+        return ids.pop(), None
 
     def _inventory(self, inst: dict, rec: dict) -> Optional[str]:
         """The VM must carry exactly the two intended disks, nothing else.
@@ -179,7 +200,7 @@ class Controller:
                 return "attachment-mode"
         return None
 
-    def _inspect(self, rec: dict, proof: bool):
+    def _inspect(self, rec: dict, proof: Optional[str]):
         """Fetch and verify the lease's three resources without changing any.
 
         Returns (reason, found). reason is None only when every resource that
@@ -371,8 +392,11 @@ class Controller:
                     done.get("targetLink", "").rsplit("/", 1)[-1] != \
                     rec["names"]["instance"]:
                 return Outcome("operation-mismatch", rec["operation"])
+            proof, error = self._insert_target_id(rec, [done])
+            if error:
+                return Outcome("operation-mismatch", error)
             try:
-                reason, found = self._inspect(rec, proof=True)
+                reason, found = self._inspect(rec, proof)
                 if reason:
                     return Outcome("identity-mismatch", reason)
                 for kind, _resource in KINDS:
@@ -480,7 +504,9 @@ class Controller:
         own_inserts = [op for op in related
                        if op.get("operationType") == "insert"
                        and op.get("clientOperationId") == rec["request_id"]]
-        proof = any(not op.get("error") for op in own_inserts)
+        proof, error = self._insert_target_id(rec, own_inserts)
+        if error:
+            return self._fail(rec, gen, f"operation-mismatch:{error}", ev)
         # Preflight: verify the VM's whole attachment inventory and every
         # child identity BEFORE any delete, because deleting the VM also
         # deletes its autoDelete disks.

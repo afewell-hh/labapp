@@ -83,7 +83,7 @@ class FakeCloud:
         self.ops[name] = op
         return op
 
-    def _materialize(self, body: dict) -> None:
+    def _materialize(self, body: dict) -> str:
         inst = self._make(body["name"], body["labels"])
         inst["disks"] = []
         for d in body["disks"]:
@@ -96,13 +96,14 @@ class FakeCloud:
                 "autoDelete": d["autoDelete"], "boot": d["boot"],
                 "mode": d["mode"], "deviceName": d["deviceName"]})
         self.instances[inst["name"]] = inst
+        return inst["id"]
 
     def finish_pending(self, success: bool = True) -> None:
         """Late completion of a create that the caller saw time out."""
         for opname, body in list(self._pending_bodies.items()):
             if success:
-                self._materialize(body)
-                self.ops[opname]["status"] = "DONE"
+                target_id = self._materialize(body)
+                self.ops[opname].update(status="DONE", targetId=target_id)
             else:
                 self.ops[opname].update(status="DONE", error={"errors": [1]})
             del self._pending_bodies[opname]
@@ -201,7 +202,7 @@ class FakeCloud:
             self._pending_bodies[op["name"]] = body
             raise Uncertain("timeout; request may be applied")
         op = self._op("insert", body["name"], "DONE", request_id)
-        self._materialize(body)
+        op["targetId"] = self._materialize(body)
         return dict(op)
 
     def _instances_delete(self, name, *_):
