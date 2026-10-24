@@ -49,7 +49,7 @@ def preflight_records():
 
 
 class CliTests(unittest.TestCase):
-    def test_main_constructs_fixed_ten_minute_runtime_and_sanitizes_failures(self):
+    def test_main_constructs_fixed_thirty_minute_runtime_and_sanitizes_failures(self):
         env, event = event_env()
         with tempfile.TemporaryDirectory() as tmp:
             event_path = Path(tmp) / 'event.json'
@@ -60,7 +60,7 @@ class CliTests(unittest.TestCase):
                     patch('builtins.print'):
                 self.assertEqual(cli.main(['inspect']), 0)
                 cfg = factory.call_args.args[2]
-                self.assertEqual(cfg.lease_minutes, 10)
+                self.assertEqual(cfg.lease_minutes, 30)
                 self.assertEqual(cfg.poll_attempts, 72)
                 self.assertEqual(cfg.poll_seconds, 5)
                 self.assertEqual(cfg.min_submit_minutes, 1)
@@ -76,6 +76,24 @@ class CliTests(unittest.TestCase):
                     patch('builtins.print') as output:
                 self.assertEqual(cli.main(['inspect']), 1)
                 self.assertNotIn('secret', str(output.call_args_list))
+
+    def test_duration_and_command_inputs_refused_before_adapter_construction(self):
+        for inputs in ({'lease_minutes': 60}, {'duration': '30'},
+                       {'command': 'true'}, {'purpose': 'source-inspection'}):
+            with self.subTest(inputs=inputs), tempfile.TemporaryDirectory() as tmp:
+                env, event = event_env()
+                event['inputs'] = inputs
+                path = Path(tmp) / 'event.json'
+                path.write_text(json.dumps(event))
+                env['GITHUB_EVENT_PATH'] = str(path)
+                with patch.dict(os.environ, env), patch.object(cli, 'Controller') as factory, \
+                        patch.object(cli, 'GcsSlotStore') as store, \
+                        patch.object(cli, 'ComputeRestTransport') as compute, \
+                        patch('builtins.print'):
+                    self.assertEqual(cli.main(['inspect']), 1)
+                factory.assert_not_called()
+                store.assert_not_called()
+                compute.assert_not_called()
 
     def test_trusted_events(self):
         for kind in ('schedule', 'workflow_dispatch', 'workflow_run'):
@@ -165,7 +183,7 @@ class CliTests(unittest.TestCase):
         controller.cloud.call.reset_mock()
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'fixed wait bound'):
             cli.wait_for_absence(controller, 'lease')
-        self.assertEqual(controller.cloud.call.call_count, 147)
+        self.assertEqual(controller.cloud.call.call_count, cli.ABSENCE_POLL_ATTEMPTS + 2)
         controller.cloud.call.side_effect = lambda resource, verb, name: (
             disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': 'changed'})
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'identity changed'):
@@ -293,7 +311,7 @@ class PilotBudgetTests(unittest.TestCase):
         deadline = datetime.fromisoformat(record['deadline'].replace('Z', '+00:00'))
         self.assertGreater((deadline - controller.cfg.now()).total_seconds(), 240)
         reserved = datetime.fromisoformat(record['reserved_at'].replace('Z', '+00:00'))
-        self.assertEqual((deadline - reserved).total_seconds(), 600)
+        self.assertEqual((deadline - reserved).total_seconds(), 1800)
         self.assertEqual(record['body_hash'], lease['body_hash'])
 
     def test_slow_confirmation_keeps_occupied_lease_and_original_deadline(self):
@@ -341,12 +359,12 @@ class PilotBudgetTests(unittest.TestCase):
         self.assertEqual(controller.cloud.mock_calls, [])
         self.assertEqual(controller.store.mock_calls, [])
 
-    def test_early_creation_observation_reaches_ten_minute_expiry(self):
+    def test_early_creation_observation_reaches_thirty_minute_expiry(self):
         clock = FakeClock()
         controller = Mock()
         record = {'request_id': 'lease', 'ids': {'instance': 'i', 'boot': 'b', 'data': 'd'},
                   'names': {'instance': 'vm', 'boot': 'boot', 'data': 'data'},
-                  'deadline': spec.rfc3339(clock.now() + timedelta(minutes=10))}
+                  'deadline': spec.rfc3339(clock.now() + timedelta(minutes=30))}
         controller.store.read.return_value = (record, 1)
         controller.cfg.now.side_effect = clock.now
         controller.cfg.sleep.side_effect = lambda seconds: clock.advance(seconds / 60)
@@ -355,14 +373,40 @@ class PilotBudgetTests(unittest.TestCase):
             if resource == 'disks':
                 index = 0 if name == 'boot' else 1
                 return {'id': ('b', 'd')[index], 'sourceImageId': cli.IMAGES[index][1]}
-            if (clock.now() - start).total_seconds() >= 600:
+            if (clock.now() - start).total_seconds() >= 1800:
                 raise cli.NotFound()
             return {'id': 'i'}
         controller.cloud.call.side_effect = get
         with patch('builtins.print'):
             self.assertIn('vm-absent', cli.wait_for_absence(controller, 'lease')['status'])
-        self.assertEqual((clock.now() - start).total_seconds(), 600)
-        self.assertEqual(controller.cfg.sleep.call_count, 120)
+        self.assertEqual((clock.now() - start).total_seconds(), 1800)
+        self.assertEqual(controller.cfg.sleep.call_count, 360)
+
+    def test_observation_stops_at_original_deadline_grace_without_extending_lease(self):
+        for stalled in (False, True):
+            with self.subTest(stalled=stalled):
+                clock = FakeClock()
+                start = clock.now()
+                controller = Mock()
+                deadline = spec.rfc3339(start + timedelta(minutes=30))
+                record = {'request_id': 'lease', 'ids': {'instance': 'i'},
+                          'names': {'instance': 'vm'}, 'deadline': deadline}
+                controller.store.read.return_value = (record, 1)
+                controller.cfg.now.side_effect = clock.now
+                if not stalled:
+                    controller.cfg.sleep.side_effect = lambda seconds: clock.advance(seconds / 60)
+                controller.cloud.call.return_value = {'id': 'i'}
+                with patch.object(cli, 'verify_disk_provenance'), patch('builtins.print'):
+                    with self.assertRaises(Refused):
+                        cli.wait_for_absence(controller, 'lease')
+                self.assertEqual(record['deadline'], deadline)
+                self.assertEqual(controller.store.mock_calls, [unittest.mock.call.read(controller.cfg.key)])
+                if stalled:
+                    self.assertEqual(controller.cfg.sleep.call_count, cli.ABSENCE_POLL_ATTEMPTS)
+                    self.assertEqual(clock.now(), start)
+                else:
+                    self.assertEqual((clock.now() - start).total_seconds(), 1920)
+                    self.assertEqual(controller.cfg.sleep.call_count, 384)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -380,7 +424,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(workflow['permissions'], {'contents': 'read', 'id-token': 'write'})
             job = workflow['jobs'][mode]
             if mode == 'inspect':
-                self.assertEqual(job['timeout-minutes'], 16)
+                self.assertEqual(job['timeout-minutes'], 36)
                 self.assertGreaterEqual(job['timeout-minutes'] * 60,
                                         cli.PILOT_LEASE_MINUTES * 60 + cli.ABSENCE_GRACE_SECONDS + 240)
                 self.assertLessEqual(cli.CONFIRM_TIMEOUT_SECONDS + 240, cli.PILOT_LEASE_MINUTES * 60)

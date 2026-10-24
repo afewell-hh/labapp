@@ -31,7 +31,7 @@ CREATOR_PATH = ".github/workflows/labapp-lifecycle-inspect.yml"
 BUCKET = "labapp-lifecycle-ledger-22685701361"
 BOOT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
 # Fixed reviewed budgets; no workflow or environment overrides.
-PILOT_LEASE_MINUTES = 10
+PILOT_LEASE_MINUTES = 30
 CONFIRM_TIMEOUT_SECONDS = 360
 CONFIRM_POLL_ATTEMPTS = 72
 POLL_SECONDS = 5
@@ -155,7 +155,7 @@ def wait_for_absence(controller, request_id):
             not record.get("ids", {}).get("instance")):
         raise Refused("created lease identity unavailable")
     verify_disk_provenance(controller, record)
-    # The fixed ten-minute lease plus two-minute cloud convergence allowance.
+    # The fixed thirty-minute lease plus two-minute cloud convergence allowance.
     # An iteration bound also stops clock changes extending the wait.
     print(json.dumps({"status": "created", "ids": record["ids"],
                       "deadline": record["deadline"]}, sort_keys=True), flush=True)
