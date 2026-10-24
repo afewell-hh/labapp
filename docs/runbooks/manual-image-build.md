@@ -11,8 +11,9 @@ yet; progress is tracked in issue #145.
 
 These steps create cloud resources and images. Run them only as the
 lead/owner or when a task explicitly authorizes cloud commands. Workers must
-not run them otherwise. Delete test VMs when done (500GB persistent disk
-quota). Never commit secrets or credentials.
+not run them otherwise. Delete test VMs when done.
+Check current CPU and storage quotas before launch; never increase them implicitly.
+Never commit secrets or credentials.
 
 ## Reviewed immutable-source baseline
 
