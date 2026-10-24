@@ -940,6 +940,11 @@ class T(unittest.TestCase):
         body = spec.build_body(boot_image=BOOT_IMAGE, request_id=U1, run_id=5,
                                attempt=1, deadline=deadline)
         self.assertEqual(body["serviceAccounts"], [])
+        self.assertEqual(body["metadata"], {"items": [
+            {"key": "block-project-ssh-keys", "value": "TRUE"},
+            {"key": "enable-oslogin", "value": "TRUE"},
+            {"key": "enable-guest-attributes", "value": "TRUE"},
+            {"key": "labapp-stage", "value": "none"}]})
         self.assertNotIn("accessConfigs", body["networkInterfaces"][0])
         self.assertTrue(body["machineType"].endswith("/e2-standard-2"))
         self.assertEqual(body["scheduling"]["terminationTime"],
@@ -973,6 +978,15 @@ class T(unittest.TestCase):
                 accessConfigs=[{"type": "ONE_TO_ONE_NAT"}]),
             "service account": lambda b: b.update(
                 serviceAccounts=[{"email": "x", "scopes": []}]),
+            "missing metadata": lambda b: b.pop("metadata"),
+            "missing guest attributes": lambda b: b["metadata"]["items"].pop(2),
+            "disabled guest attributes": lambda b: b["metadata"]["items"][2].update(value="FALSE"),
+            "disabled OS Login": lambda b: b["metadata"]["items"][1].update(value="FALSE"),
+            "project SSH keys": lambda b: b["metadata"]["items"][0].update(value="FALSE"),
+            "duplicate metadata": lambda b: b["metadata"]["items"].append(
+                {"key": "enable-guest-attributes", "value": "FALSE"}),
+            "startup script": lambda b: b["metadata"]["items"].append(
+                {"key": "startup-script", "value": "true"}),
             "gpu": lambda b: b.update(guestAccelerators=[{}]),
             "autoDelete off": lambda b: b["disks"][0].update(autoDelete=False),
             "read-only autoDelete on": lambda b: b["disks"][1].update(autoDelete=True),

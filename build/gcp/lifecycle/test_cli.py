@@ -49,6 +49,13 @@ def preflight_records():
 
 
 class CliTests(unittest.TestCase):
+    def test_fixed_debian_boot_pin_preserves_source_pin(self):
+        self.assertEqual(cli.IMAGES, (
+            ("projects/debian-cloud/global/images/debian-13-trixie-v20261023",
+             "1840322579453583118", 10),
+            ("projects/teched-473722/global/images/hedgehog-vaidc-v20260114",
+             "7638370619126112785", 300)))
+
     def test_main_constructs_fixed_thirty_minute_runtime_and_sanitizes_failures(self):
         env, event = event_env()
         with tempfile.TemporaryDirectory() as tmp:

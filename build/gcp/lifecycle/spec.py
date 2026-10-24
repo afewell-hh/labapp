@@ -107,6 +107,9 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
         "metadata": {"items": [
             {"key": "block-project-ssh-keys", "value": "TRUE"},
             {"key": "enable-oslogin", "value": "TRUE"},
+            # Trusted stock guest agent publishes host PUBLIC keys on first
+            # boot; owner-only authenticated reads bind subsequent SSH access.
+            {"key": "enable-guest-attributes", "value": "TRUE"},
             # Guest extraction is a later, separately reviewed stage.
             {"key": "labapp-stage", "value": "none"},
         ]},
@@ -125,6 +128,12 @@ def validate_body(body: dict) -> None:
             raise ValueError(f"forbidden field {forbidden}")
     if body.get("serviceAccounts") != []:
         raise ValueError("a service account must not be attached")
+    if body.get("metadata") != {"items": [
+            {"key": "block-project-ssh-keys", "value": "TRUE"},
+            {"key": "enable-oslogin", "value": "TRUE"},
+            {"key": "enable-guest-attributes", "value": "TRUE"},
+            {"key": "labapp-stage", "value": "none"}]}:
+        raise ValueError("metadata must match the fixed access-only settings")
     if not body.get("machineType", "").endswith(f"/machineTypes/{MACHINE_TYPE}"):
         raise ValueError("machine type outside the reviewed shape")
     nics = body.get("networkInterfaces", [])

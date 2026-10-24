@@ -2,7 +2,7 @@
 
 ## Offline private filesystem collector
 
-`inspection/collector.py` is a Python 3.12 standard-library command for an
+`inspection/collector.py` is a Python 3.12+ standard-library command for an
 **already mounted, stable, read-only guest root on Linux**. It does not mount,
 repair, chroot, execute/source guest code, or use cloud credentials. No workflow
 invokes it against a guest. Mounting, private authenticated transfer/storage,
@@ -250,7 +250,7 @@ sudo unshare --mount --propagation private -- \
   /usr/bin/python3 -E -s -m build.gcp.inspection.synthetic_ext4
 ```
 
-Use Python3.12 and already-present trusted `mkfs.ext4`, `losetup`, `blockdev`,
+Use Python3.12+ and already-present trusted `mkfs.ext4`, `losetup`, `blockdev`,
 `udevadm` plus the wrapper tools above, from the exact reviewed code SHA. No
 install/download fallback. It creates its own0700 `/run` directory,32MiB file
 and harmless fixture, formats that file before read-only loop attachment, and
@@ -299,13 +299,13 @@ For separately authorized owner access to an inspector, see the
 The create body stays untagged. Reuse an effective protected existing SSH rule
 without adopting, modifying or deleting it; do not add a redundant firewall or
 tag. Bind the clean inspector public host key through privately captured
-authenticated serial evidence and its exact confirmed immutable ID, then use
-strict host checking and short-lived owner OS Login keys. This plan adds no
-creator IAM, cloud endpoint, guest execution or raw-data publication path.
+authenticated owner guest-attribute evidence and its exact confirmed immutable
+ID, then use strict host checking and short-lived owner OS Login keys. This plan adds no
+creator/cleanup IAM or API capability, guest execution or raw-data publication path.
 
 ## Lifecycle module contract
 
-Python 3.12 standard library only. The controller/spec and offline tests need
+Python 3.12+ standard library only. The controller/spec and offline tests need
 no network or credentials. State and cloud access are injected; real adapters
 perform network access only when explicitly called.
 
@@ -430,14 +430,37 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
 The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
 with no inputs. The inspector uses a fixed **thirty-minute** absolute lease,
-`e2-standard-2`, a 10GB stock Ubuntu boot disk and a 300GB read-only source-copy
+`e2-standard-2`, a 10GB stock Debian13 boot disk and a 300GB read-only source-copy
 `pd-standard` disk. Both images are checked against pinned immutable IDs before
-admission. Project-global CPU and regional shared CPU/standard-disk quotas must have
+admission. The fixed boot pin is
+`projects/debian-cloud/global/images/debian-13-trixie-v20261023`, immutable ID
+`1840322579453583118`; the appliance source pin remains unchanged. Initial
+instance metadata contains only OS Login, project SSH-key blocking,
+`enable-guest-attributes=TRUE` and `labapp-stage=none`; the spec validator
+rejects missing, duplicate, changed or extra settings. Guest attributes permit
+trusted-stock host-public-key publication on first boot; owner access follows
+the linked runbook, with no creator/cleanup guest-attribute read capability.
+Project-global CPU and regional shared CPU/standard-disk quotas must have
 headroom; reads are snapshots, not reservations. Inherited project execution
 metadata (startup/shutdown scripts or cloud-init user-data) blocks this pilot.
 E2 uses the regional `CPUS` pool shared with N1; no `E2_CPUS` entry is required. Existing unknown resources
 still block admission through the controller census. There is no guest script,
 package download, SSH, serial output or filesystem extraction in this pilot.
+
+Debian's supplier AMD64 fstab/GRUB configuration selects root and ESP by
+build-generated PARTUUID, without a separate `/boot` filesystem. This avoids
+the Ubuntu source's `BOOT` label selector; it is a design rationale, not proof
+of this exact image's boot behavior. Before source collection, the lead must
+verify actual stock cmdline/fstab/effective mount units and exact root/ESP
+ancestry, no unexpected/pending automounts, required Python/tools, OS Login and
+host-key publication. Immediately before and after the unchanged wrapper,
+require every source child unmounted plus exact RO/identity and both ext4
+clean-state checks. Unexpected or reappearing mounts refuse collection. Never
+change source labels/UUIDs or relax the wrapper to accommodate an ambient mount.
+The guest-attribute channel assumes a trusted stock guest: any guest process can
+write it, so it is not attestation against malicious guest code. A clean boot
+and actual kernel mount proof remain lead-only gates after review; container
+compatibility does not establish them.
 
 The fixed window applies to every new inspector dispatch; there is no duration
 input or environment override. It remains below the 60-minute inspection limit
@@ -512,3 +535,14 @@ Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
 [project-level startup scripts](https://docs.cloud.google.com/compute/docs/instances/startup-scripts/linux),
 and Google's [current discovery schema](https://github.com/googleapis/google-api-python-client/blob/main/googleapiclient/discovery_cache/documents/compute.v1.json)
 for regions.get and numeric quota fields (the regions reference page timed out).
+
+Inspector identity sources checked2026-10-24: Google's
+[Debian OS details](https://docs.cloud.google.com/compute/docs/images/os-details#debian)
+(10GB/GPT/ESP, guest environment and OS Login), Debian cloud-image
+[AMD64 fstab](https://salsa.debian.org/cloud-team/debian-cloud-images/-/blob/9ea44ee81fd04d1944127f33f07adf15a3608136/config_space/13/files/etc/fstab/AMD64),
+[UUID generation](https://salsa.debian.org/cloud-team/debian-cloud-images/-/blob/9ea44ee81fd04d1944127f33f07adf15a3608136/config_space/13/class/BASE.var)
+and [GRUB selectors](https://salsa.debian.org/cloud-team/debian-cloud-images/-/blob/9ea44ee81fd04d1944127f33f07adf15a3608136/config_space/13/files/etc/default/grub.d/10_cloud.cfg/SYSTEM_BOOT).
+Supplier source describes the intended layout, not exact published-image
+attestation; actual pinned-image identities and mount behavior require the
+bounded lead proof. Guest-attribute sources and trust limits are in the access
+runbook. The dirty-journal refusal fixture remains separate from this pin change.

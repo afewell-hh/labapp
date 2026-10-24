@@ -29,7 +29,7 @@ OWNER_ID = 193945001
 CREATOR_NAME = "Labapp bounded lifecycle inspection"
 CREATOR_PATH = ".github/workflows/labapp-lifecycle-inspect.yml"
 BUCKET = "labapp-lifecycle-ledger-22685701361"
-BOOT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
+BOOT_IMAGE = "projects/debian-cloud/global/images/debian-13-trixie-v20261023"
 # Fixed reviewed budgets; no workflow or environment overrides.
 PILOT_LEASE_MINUTES = 30
 CONFIRM_TIMEOUT_SECONDS = 360
@@ -37,7 +37,7 @@ CONFIRM_POLL_ATTEMPTS = 72
 POLL_SECONDS = 5
 ABSENCE_GRACE_SECONDS = 120
 ABSENCE_POLL_ATTEMPTS = (PILOT_LEASE_MINUTES * 60 + ABSENCE_GRACE_SECONDS) // POLL_SECONDS + 1
-IMAGES = ((BOOT_IMAGE, "4575951068918267275", 10),
+IMAGES = ((BOOT_IMAGE, "1840322579453583118", 10),
           (spec.SOURCE_IMAGE, "7638370619126112785", 300))
 
 
