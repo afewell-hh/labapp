@@ -136,9 +136,11 @@ of the saved appliance or a real mount.
 
 - `bootstrap-access.sh`: owner-run keyless access setup (see
   [`docs/runbooks/gcp-build-access.md`](../../docs/runbooks/gcp-build-access.md)).
-- `lifecycle/`: offline-testable single-slot VM lease primitives for #153.
-  **Library and tests only.** Includes an opt-in GCS store adapter; no workflow
-  invokes it. It grants no IAM and launches no VM.
+- `lifecycle/`: single-slot controller, GCS/Compute adapters and trusted-runner
+  CLI used by the [fixed lifecycle workflows](#fixed-lifecycle-runner).
+  Offline tests inject fake storage/cloud transports and require no credentials.
+  Real execution uses separate creator/cleanup identities configured by
+  `bootstrap-lifecycle-access.py`; the CLI does not create IAM or the bucket.
 
 For separately authorized owner access to an inspector, see the
 [IAP access plan](../../docs/runbooks/gcp-build-access.md#owner-iap-access-to-an-owned-inspector).
@@ -158,7 +160,8 @@ perform network access only when explicitly called.
 |---|---|
 | `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
-| `cloud.py` | `PolicyCloud`: the only call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
+| `cloud.py` | `PolicyCloud`: the controller's mutation/inventory call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
+| `cli.py` | Trusted-runner entrypoint for the fixed workflows; validates events and performs four fixed read-only project/region/image preflight requests separately from `PolicyCloud`, then invokes creator or cleanup transitions |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
 | `fakes.py`, `test_lifecycle.py` | Fake cloud with failure injection and the invariant tests |
 
@@ -247,7 +250,7 @@ or manage buckets/IAM. See its module docstring for official API references.
 The lifecycle discovery command above includes the HTTP-contract tests.
 Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
-## Not covered yet (gates before any VM)
+## Validation scope and remaining integrations
 
 - Offline tests do not prove successful live creation or cleanup:
   `requestId` retention/idempotence, `terminationTime` plus
@@ -258,8 +261,10 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
   rejects it the design must change, not the check), the shape of
   `aggregatedList` warnings, org-policy effects, quota behavior and operation listing latency.
   The fake is a model, not evidence.
-- The fixed workflows require review and authorized live evidence; no guest
-  extraction stage or private output channel is implemented.
+- Changes to the fixed workflows require independent review and authorized
+  live evidence. They perform lifecycle/resource checks only; the offline
+  collector and mount wrapper are not invoked by these workflows. Guest
+  access, private transfer and recovery require separately reviewed integration.
 - The separately reviewed lifecycle-access bootstrap must be applied and
   verified before dispatch; workflow files do not create IAM or the bucket.
 - The fixed boot image is checked by immutable ID. Any later guest stage

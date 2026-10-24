@@ -123,8 +123,10 @@ gh run list --workflow labapp-cloud.yml --repo afewell-hh/labapp --limit 5
 gh run view RUN_ID --repo afewell-hh/labapp --log
 ```
 
-Only this named workflow on `main` is approved for cloud dispatch here. Do not
-broaden a worker's general shell permissions to run arbitrary workflows. Record
+Use this named workflow on `main` for the metadata-only scope described above.
+The separately scoped [fixed lifecycle runner](../../build/gcp/README.md#fixed-lifecycle-runner)
+supports lead-dispatched serial VM pilots and independent cleanup. Neither path
+permits arbitrary workflows/commands or general worker cloud credentials. Record
 the run URL, commit, selected image's immutable ID and metadata result in #152.
 A successful setup or auth step alone does not prove image access.
 
@@ -166,18 +168,19 @@ and confirm 404. A missing VM alone never releases capacity. The VM's absolute
 deadline does not bound data-disk retention; independent scheduled cleanup is
 best-effort, and failed cleanup remains capacity-blocking until resolved.
 
-Check CPU/storage quotas before allocation; the historical 500 GB disk quota
-may prevent three appliance VMs. Do not raise quotas or machine sizes
-implicitly. No GPUs are needed. These are policy requirements, **not yet an
-enforced VM lifecycle implementation**. GitHub concurrency only serializes this
-metadata workflow. No VMs may start until the allocation, runtime and cleanup
-gates in #153 have been reviewed and tested, with builder IAM separately
-reviewed. This access phase neither grants nor implements VM creation.
+Check current CPU/storage quotas before allocation; quota reads are snapshots,
+not reservations. Do not raise quotas or machine sizes implicitly. No GPUs are
+needed. The [fixed lifecycle runner](../../build/gcp/README.md#fixed-lifecycle-runner)
+implements one reusable CAS slot, project-wide census, absolute expiry and
+shared verified normal/janitor cleanup through GCS/Compute adapters. GitHub
+concurrency is only a workflow throttle, not capacity enforcement. The metadata
+workflow remains read-only and grants no VM creation capability.
 
-Offline lease primitives for these gates (single reusable slot, CAS
-transitions, shared normal/janitor cleanup) are in
-[`build/gcp/README.md`](../../build/gcp/README.md). They are library code and
-tests only: they do not enable a workflow, adapter, IAM setup or VM execution.
+The fixed creator/cleanup workflows support the serial lifecycle pilot, not
+routine Packer builds, a three-slot allocator or guest recovery. New scope
+requires its own reviewed/tested lifecycle and IAM gates. Keep overall #153/#161
+acceptance and live evidence in GitHub rather than inferring them from access
+setup or these instructions.
 
 ## Lifecycle identity and ledger bootstrap
 
@@ -185,8 +188,9 @@ tests only: they do not enable a workflow, adapter, IAM setup or VM execution.
 metadata inspector. It does not modify `labapp-inspector` or its pool. This is
 access setup only: no controller adapter, workflow, VM, attached service account,
 slot object or resource cleanup is executed. Keep the existing image and all
-preexisting resources protected. Review/merge this bootstrap before applying it;
-review the controller and fixed workflows separately before launching anything.
+preexisting resources protected. Apply only the reviewed bootstrap from trusted
+main under the lead's authorized scope; access setup does not authorize a VM
+launch. Controller/workflow changes require separate review and validation.
 
 Run from the authenticated owner's session with Python 3 and Google Cloud CLI;
 the Compute, IAM, STS, IAM Credentials and Storage APIs must already be enabled.
@@ -213,7 +217,7 @@ known limits in #153. The acknowledgment means this new privilege scope was
 reviewed, not that workflow-exclusive identity or complete inherited visibility
 has been proven. No separate organization-administrator handoff is required.
 
-| Identity | Dedicated pool | Allowed future workflow / events |
+| Identity | Dedicated pool | Allowed trusted-main workflow / events |
 |---|---|---|
 | `labapp-lc-creator` | `labapp-lc-creator` | `labapp-lifecycle-inspect.yml`, dispatch only |
 | `labapp-lc-cleanup` | `labapp-lc-cleanup` | `labapp-lifecycle-cleanup.yml`, completed creator run, schedule or dispatch |
@@ -223,20 +227,22 @@ the exact workflow ref. Each SA binding also selects that workflow ref within
 its own pool. Keeping separate pools prevents a provider intended for one
 identity from impersonating the other through a pool-wide repository selector.
 No generic worker job gets these credentials. The referenced workflows are not
-installed by this bootstrap; future workflow implementation must preserve these
-fixed refs and contain no arbitrary input/command execution.
+installed by this bootstrap; their checked-in implementations preserve these
+fixed refs and contain no arbitrary input/command execution. See the
+[fixed runner contract](../../build/gcp/README.md#fixed-lifecycle-runner).
 
 The cleanup provider also allows `workflow_run` for immediate cleanup after the
 trusted creator finishes, including cancellation, without giving the creator
-Actions-write or delete privileges. The future cleanup workflow must trigger on
-`completed` runs of the fixed creator workflow, then validate its expected
+Actions-write or delete privileges. The checked-in cleanup workflow triggers on
+`completed` runs of the fixed creator workflow, then validates its expected
 workflow name/path, head repository, `head_branch == main`, and original event
-`workflow_dispatch` before using lifecycle credentials. Its own workflow code
-must come from trusted main. Read the durable ledger and validate ownership;
-never execute triggering-run code, commands, artifacts or event-supplied scripts.
-Schedule and manual dispatch remain fallback paths. Provider event permission
-alone does not implement or prove these trigger checks; the actual workflows
-still require independent review before enabling cloud work.
+`workflow_dispatch` before using lifecycle credentials. It fetches allowlisted
+code at its own trusted-main SHA, reads the durable ledger and requires the
+triggering run ID/attempt to match before forced cleanup. It never executes
+triggering-run code, commands, artifacts or event-supplied scripts. Manual
+main dispatch forces the current lease; scheduled cleanup handles due leases
+and remains best-effort. Provider event permission alone does not establish
+these checks; retain them and independent review when changing the workflows.
 
 Custom IAM roles separate creation/read from deletion:
 
@@ -272,12 +278,13 @@ are recognized platform defaults for uniform bucket access. This does not
 disprove inherited access; public, foreign-project, extra-user, unknown-role
 and conditional direct bindings remain rejected.
 
-The later controller starts with one persistent slot object and generation-matched
-CAS for **every** transition; it must not release a slot before confirmed VM and
-both disk deletion. This bootstrap deliberately does not initialize or delete
+The controller uses one persistent slot object and generation-matched CAS for
+**every** transition; it does not release a slot before confirmed VM and both
+disk deletion. This bootstrap deliberately does not initialize or delete
 slot objects. A private bucket and IAM setup are not a capacity/runtime/cleanup
-implementation; #153 still requires reviewed adapters, fixed workflows, quota
-checks and live evidence before any VM starts. Conditional deletion is sourced
+implementation. The fixed runner supplies reviewed adapters, trusted workflows
+and quota checks; live acceptance evidence and any wider #153 scope remain
+separate requirements. Conditional deletion is sourced
 from supported Compute resource attributes, but actual IAM sufficiency and
 allowed/denied behavior must be verified without attempting production deletes.
 
@@ -501,4 +508,5 @@ Official sources consulted 2026-10-24:
 
 Offline shell/YAML checks cannot establish effective IAM, organization policy,
 API propagation, image availability or successful federation. Those require the
-actual authorized setup and trusted metadata workflow; record results in GitHub.
+actual authorized setup and the relevant fixed metadata/lifecycle workflows;
+record results in GitHub.

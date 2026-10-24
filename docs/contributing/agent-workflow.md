@@ -153,9 +153,15 @@ deployment scripts unless the task explicitly authorizes it. Don't rewrite
 ## Authorized cloud work
 
 Use the [GCP access runbook](../runbooks/gcp-build-access.md) for the trusted
-keyless runner boundary. A lead may dispatch only the fixed metadata workflow
-on `main`; no arbitrary task commands, PR code or build identity enter it.
-Cloud credentials stay out of general worker jobs. Use the existing Labapp
+keyless runner boundary. For explicitly authorized scope, the lead may dispatch
+`labapp-cloud.yml` for fixed image metadata reads, or the fixed
+`labapp-lifecycle-inspect.yml` and `labapp-lifecycle-cleanup.yml` for serial
+lifecycle pilots, all on `main` with no inputs. The cleanup workflow also handles
+validated completed creator runs and scheduled due-lease reconciliation; see
+[runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner).
+No arbitrary commands, refs, PR code or triggering-run artifacts enter these
+workflows. Lifecycle creator and cleanup use separate identities; cloud
+credentials stay out of general worker jobs. Use the existing Labapp
 project `teched-473722`; protect its published/source image and all preexisting
 resources. Builder IAM requires separate review and must preserve those assets;
 no broad project Compute/storage administration is implied.
@@ -167,9 +173,12 @@ Default VM bounds: 60 minutes for component/inspection work, 120 minutes for a
 full build, no silent extension. Require cloud-side bounds at creation,
 normal/cancelled/failed-job cleanup and independent expiry cleanup, with exact
 ownership and immutable IDs. Check quotas before launch; do not increase them
-implicitly. These policies do not themselves enforce capacity or cleanup:
-#153 must deliver reviewed/tested lifecycle gates before any VM job starts.
-No production changes or broad IAM are implied by build/test authorization.
+implicitly. The fixed serial lifecycle uses its CAS ledger and project census
+for admission, an immutable cloud deadline, and verified VM/both-disk cleanup.
+New cloud behavior still requires reviewed/tested lifecycle gates and separately
+reviewed IAM before launch; routine Packer builds and guest recovery are separate
+scope. Overall acceptance and live evidence remain in #153/#161. No production
+changes or broad IAM are implied by build/test authorization.
 
 ## Dispatch, tool access and handoff operations
 
