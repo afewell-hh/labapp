@@ -109,3 +109,18 @@ jobs:
         run: |
           test -f build/gcp/lifecycle/test_lifecycle.py
           python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
+
+  bridge-ipv4:
+    name: Bridge IPv4 offline and disposable namespace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run required synthetic runtime tests
+        run: |
+          test -f build/provision/test_ensure_bridge_ipv4.py
+          python3 -m unittest discover -s build/provision -p test_ensure_bridge_ipv4.py -v
+          test -f build/provision/test_bridge_ipv4_harness.py
+          python3 -m unittest discover -s build/provision -p test_bridge_ipv4_harness.py -v
+      - name: Test unchanged helper with NET_ADMIN in an isolated namespace
+        run: timeout --kill-after=60s 8m bash build/provision/test-bridge-ipv4.sh
