@@ -164,6 +164,11 @@ metadata workflow. No VMs may start until the allocation, runtime and cleanup
 gates in #153 have been reviewed and tested, with builder IAM separately
 reviewed. This access phase neither grants nor implements VM creation.
 
+Offline lease primitives for these gates (single reusable slot, CAS
+transitions, shared normal/janitor cleanup) are in
+[`build/gcp/README.md`](../../build/gcp/README.md). They are library code and
+tests only: no workflow, adapter, IAM or VM exists yet.
+
 ## Sources and validation scope
 
 Official sources consulted 2026-10-24:
