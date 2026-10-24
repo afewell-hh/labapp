@@ -99,6 +99,26 @@ class T(unittest.TestCase):
         w.ctl.admit(2, 1, U2)  # a generation-zero-only claim would deadlock
         self.assertEqual(w.record()["epoch"], 2)
 
+    def test_fixed_short_pilot_lease_keeps_submission_margin(self):
+        w = World(lease_minutes=5, min_submit_minutes=1)
+        rec = w.started()
+        self.assertEqual(rec["deadline"],
+                         spec.rfc3339(w.clock.now() + timedelta(minutes=5)))
+
+    def test_lease_bound_and_margin_reject_invalid_configuration(self):
+        for duration in (0, -1, 61, True, "5", 5.5):
+            with self.subTest(duration=duration), self.assertRaises(ValueError):
+                World(lease_minutes=duration, min_submit_minutes=0)
+        with self.assertRaises(ValueError):
+            World(lease_minutes=5)
+
+    def test_modified_lease_bound_is_checked_before_admission(self):
+        w = World()
+        w.cfg.lease_minutes = 61
+        with self.assertRaises(ValueError):
+            w.ctl.admit(1, 1, U1)
+        self.assertEqual(w.store.writes, [])
+
     def test_occupied_slot_refuses_every_state(self):
         w = World()
         w.ctl.admit(1, 1, U1)
@@ -583,7 +603,10 @@ class T(unittest.TestCase):
         self.assertEqual(w.ctl.reconcile(U1).status, "settling")
         self.assertNotEqual(w.record()["state"], FREE)
         w.clock.advance(61)
-        self.assertEqual(w.ctl.reconcile().status, "released")
+        self.assertEqual(w.ctl.reconcile().status, "blocked")
+        self.assertNotEqual(w.record()["state"], FREE)
+        with self.assertRaises(Refused):
+            w.ctl.admit(2, 1, U2)
 
     def test_vm_appearing_after_preflight_is_not_deleted(self):
         w = World()

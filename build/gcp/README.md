@@ -14,7 +14,7 @@ unchanged against Cloud Storage and Compute adapters.
 
 | File | Role |
 |---|---|
-| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`, both `autoDelete: true`, the copy attached `READ_ONLY`), no external IP, no service account, absolute 60 min `scheduling.terminationTime` with `DELETE`. Builds, validates and hashes the exact `instances.insert` body |
+| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`, both `autoDelete: true`, the copy attached `READ_ONLY`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
 | `cloud.py` | `PolicyCloud`: the only call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
@@ -22,6 +22,11 @@ unchanged against Cloud Storage and Compute adapters.
 
 ### Safety contract
 
+- `Config.lease_minutes` defaults to 60 and may shorten the lease to an
+  integer from 1 to 60. `min_submit_minutes` must be shorter than that lease;
+  a fixed five-minute pilot uses a one-minute submission margin. Admission
+  rechecks these bounds before writing intent; an existing deadline is never
+  extended.
 - **Every** transition (admit, submit, ID capture, failure, release) is a
   compare-and-swap on the slot generation, for the creator, normal cleanup
   and the janitor alike. The slot object is never deleted, so a released slot

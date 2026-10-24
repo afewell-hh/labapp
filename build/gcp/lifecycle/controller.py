@@ -64,12 +64,24 @@ class Config:
     max_vm_slots: int = 3
     max_pages: int = 100
     max_submit_attempts: int = 1  # same-UUID retry semantics are unverified
+    lease_minutes: int = spec.LEASE_MINUTES
     min_submit_minutes: int = 10
     poll_attempts: int = 30
     poll_seconds: float = 5.0
     cas_retries: int = 5
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+
+    def __post_init__(self) -> None:
+        self.validate_lease()
+
+    def validate_lease(self) -> None:
+        if (type(self.lease_minutes) is not int or
+                not 1 <= self.lease_minutes <= spec.LEASE_MINUTES):
+            raise ValueError("lease_minutes must be an integer from 1 to 60")
+        if (type(self.min_submit_minutes) is not int or
+                not 0 <= self.min_submit_minutes < self.lease_minutes):
+            raise ValueError("submission margin must be shorter than the lease")
 
 
 def _parse(ts: str) -> datetime:
@@ -262,6 +274,7 @@ class Controller:
     def admit(self, run_id: int, attempt: int, request_id: str) -> dict:
         """Persist the full intent (UUID, body hash, names, deadline) first."""
         cfg = self.cfg
+        cfg.validate_lease()
         rec, gen = self.store.read(cfg.key)
         if rec is None:
             free = {"schema": 1, "slot": cfg.key, "state": FREE, "epoch": 0}
@@ -274,7 +287,7 @@ class Controller:
             raise Refused(f"slot is {rec['state']}")
         self._census()
         now = cfg.now()
-        deadline = now + timedelta(minutes=spec.LEASE_MINUTES)
+        deadline = now + timedelta(minutes=cfg.lease_minutes)
         body = spec.build_body(boot_image=cfg.boot_image, request_id=request_id,
                                run_id=run_id, attempt=attempt, deadline=deadline)
         lease = {
