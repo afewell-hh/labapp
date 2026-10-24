@@ -184,7 +184,7 @@ class T(unittest.TestCase):
         w.raw.finish_pending(success=False)  # operation DONE with error
         self.assertEqual(w.ctl.reconcile(U1).status, "released")
 
-    def test_http_500_or_timeout_without_operation_settles_until_deadline(self):
+    def test_http_500_or_timeout_without_operation_never_released_by_time(self):
         for mode in ("http500", "timeout_nothing"):
             w = World()
             w.raw.insert_mode = mode
@@ -192,8 +192,47 @@ class T(unittest.TestCase):
             self.assertEqual(w.ctl.submit(U1).status, "uncertain")
             self.assertEqual(w.ctl.reconcile(U1).status, "settling")
             self.assertEqual(w.record()["state"], RESERVED)
-            w.clock.advance(61)  # past terminationTime: a late create is rejected
-            self.assertEqual(w.ctl.reconcile().status, "released")
+            w.clock.advance(61)  # deadline alone is not terminal evidence
+            self.assertEqual(w.ctl.reconcile().status, "blocked")
+            self.assertNotEqual(w.record()["state"], FREE)
+            with self.assertRaises(Refused):
+                w.ctl.admit(2, 1, U2)
+
+    def test_pending_operation_missing_across_deadline_stays_occupied(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.raw.insert_mode = "timeout_pending"
+        w.ctl.submit(U1)
+        ops, w.raw.ops = w.raw.ops, {}  # operation aged out / not listed
+        w.clock.advance(61)
+        self.assertEqual(w.ctl.reconcile().status, "blocked")
+        self.assertNotEqual(w.record()["state"], FREE)
+        # The create lands late and the operation is visible again: cleanup
+        # deletes VM and both disks, then releases on terminal evidence.
+        w.raw.ops = ops
+        w.raw.finish_pending(success=True)
+        self.assertEqual(w.ctl.reconcile().status, "released")
+        self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
+        self.assertEqual(w.record()["state"], FREE)
+
+    def test_pending_operation_across_deadline_stays_pending(self):
+        w = World()
+        w.raw.insert_mode = "timeout_pending"
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        w.clock.advance(61)
+        self.assertEqual(w.ctl.reconcile().status, "pending-operation")
+        self.assertNotEqual(w.record()["state"], FREE)
+
+    def test_terminal_current_request_failure_releases_without_resources(self):
+        w = World()
+        w.raw.insert_mode = "timeout_pending"
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        w.raw.finish_pending(success=False)
+        w.clock.advance(61)
+        self.assertEqual(w.ctl.reconcile().status, "released")
+        self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
 
     def test_bounded_retry_reuses_same_uuid_and_body(self):
         w = World(max_submit_attempts=2)

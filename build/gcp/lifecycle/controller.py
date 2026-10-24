@@ -482,11 +482,16 @@ class Controller:
                 return blocked
         create_resolved = (
             rec["submit_attempts"] == 0 or rec["ids"]["instance"] is not None
-            or bool(own_inserts) or cfg.now() >= _parse(rec["deadline"]))
+            or bool(own_inserts))
         if not create_resolved:
-            # 404 / empty operation list is not proof a create failed: it may
-            # still land. The past-deadline terminationTime rejects late ones.
-            return Outcome("settling", "create outcome unproven before deadline")
+            # 404, an empty/aged-out operation list or elapsed time is not
+            # proof the create failed: an accepted async create may still land.
+            # Only a terminal insert tied to this request id resolves it; until
+            # then stay occupied (blocked past the deadline: needs the lead).
+            if cfg.now() >= _parse(rec["deadline"]):
+                return Outcome("blocked", "submitted create has no terminal "
+                               "current-request operation; manual review")
+            return Outcome("settling", "create outcome unproven")
         if foreign_pending:
             return Outcome("blocked", "unexpected pending operation in zone")
         free = {"schema": 1, "slot": rec["slot"], "state": FREE,

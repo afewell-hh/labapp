@@ -56,9 +56,12 @@ unchanged against Cloud Storage and Compute adapters.
   - A 404, timeout or HTTP error on create is not proof the create failed. A
     lease with submit attempts but no insert operation for **its own request
     id** and no VM is held (an operation that only targets the same name does
-    not count)
-    until the absolute deadline (a late create is rejected after
-    `terminationTime`).
+    not count) is held. Elapsed time and the deadline never release it: past
+    the deadline it reports `blocked` until a terminal current-request insert
+    operation is seen and VM and both disks are verified absent. If the
+    operation has aged out of the list, the slot stays blocked for manual
+    review (conservative; whether Compute rejects a late create after
+    `terminationTime` is an unverified assumption, not relied on).
   - `reconcile(request_id)` is the owner's forced cleanup and leaves a newer
     lease alone (`superseded`). `reconcile()` is the janitor: it acts only on
     expired, stopped or previously failed leases.
