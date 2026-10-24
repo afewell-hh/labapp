@@ -191,6 +191,19 @@ class ComputeContracts(unittest.TestCase):
             call(adapter, "instances", "delete", name=spec.names(1, 1)["instance"], page_token="not-allowed")
         self.assertEqual(http.calls, [])
 
+    def test_shared_auth_uses_injected_fresh_tokens_without_gcloud(self):
+        issued = []
+        def tokens():
+            issued.append(True)
+            return f"valid-dummy-token-{len(issued)}"
+        http = HttpStub(response({"id": "1"}), response({"id": "2"}))
+        adapter = ComputeRestTransport(http, token_provider=tokens)
+        call(adapter, "instances", "get", name="one")
+        call(adapter, "instances", "get", name="two")
+        self.assertEqual(len(issued), 2)
+        self.assertEqual(http.calls[1][2]["headers"]["Authorization"], "Bearer valid-dummy-token-2")
+        self.assertNotIn("Authorization", adapter.__dict__)
+
     def test_headers_are_obtained_per_request_and_not_persisted(self):
         supplied = []
         def headers():
