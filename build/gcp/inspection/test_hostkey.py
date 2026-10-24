@@ -43,7 +43,8 @@ class HostKeyTests(unittest.TestCase):
                 extract_ed25519(json.dumps([dict(item, value=value)]).encode())
 
     def test_bounds_invalid_json_and_error_suppression(self):
-        for raw in (b'', b'private secret', b'\xff', b'x' * (MAX_RESPONSE_BYTES + 1), 'not bytes'):
+        for raw in (b'', b'private secret', b'\xff', b'x' * (MAX_RESPONSE_BYTES + 1),
+                    b'[' * 1100 + b'0' + b']' * 1100, 'not bytes'):
             with self.subTest(raw=type(raw)), self.assertRaisesRegex(ValueError, '^host-key guest attribute refused$'):
                 extract_ed25519(raw)
 

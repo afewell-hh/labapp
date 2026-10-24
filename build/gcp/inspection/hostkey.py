@@ -42,5 +42,5 @@ def extract_ed25519(raw: bytes) -> str:
                 or base64.b64encode(wire).decode("ascii") != encoded):
             raise ValueError()
         return "ssh-ed25519 " + encoded + "\n"
-    except (ValueError, TypeError, UnicodeError, binascii.Error):
+    except (ValueError, TypeError, UnicodeError, binascii.Error, RecursionError):
         raise ValueError("host-key guest attribute refused") from None
