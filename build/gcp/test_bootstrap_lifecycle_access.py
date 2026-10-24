@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("bootstrap-lifecycle-access.py")
 spec = importlib.util.spec_from_file_location("access", SCRIPT)
@@ -85,6 +86,41 @@ class FakeGcloud:
 
 
 class AccessTests(unittest.TestCase):
+    def test_optional_bucket_accepts_observed_cli_not_found(self):
+        error = ("ERROR: (gcloud.storage.buckets.describe) "
+                 f"gs://{a.BUCKET} not found: 404.\n")
+        result = subprocess.CompletedProcess([], 1, stdout="", stderr=error)
+        with mock.patch.object(a.subprocess, "run", return_value=result):
+            self.assertIsNone(a.Gcloud(False).read(
+                "storage", "buckets", "describe", f"gs://{a.BUCKET}",
+                "--raw", optional=True))
+
+    def test_optional_bucket_preserves_other_failures(self):
+        errors = [
+            f"ERROR: (gcloud.storage.buckets.describe) gs://{a.BUCKET} not found: 403.",
+            f"ERROR: (gcloud.storage.buckets.describe) gs://{a.BUCKET} not found: 500.",
+            f"ERROR: (gcloud.storage.buckets.describe) gs://{a.BUCKET} Permission denied: 403.",
+            "ERROR: (gcloud.storage.buckets.describe) gs://other-bucket not found: 404.",
+        ]
+        for error in errors:
+            with self.subTest(error=error):
+                result = subprocess.CompletedProcess([], 1, stdout="", stderr=error)
+                with mock.patch.object(a.subprocess, "run", return_value=result):
+                    with self.assertRaises(RuntimeError):
+                        a.Gcloud(False).read("storage", "buckets", "describe",
+                                             f"gs://{a.BUCKET}", optional=True)
+
+    def test_observed_bucket_404_requires_optional_and_exact_command(self):
+        error = ("ERROR: (gcloud.storage.buckets.describe) "
+                 f"gs://{a.BUCKET} not found: 404.")
+        result = subprocess.CompletedProcess([], 1, stdout="", stderr=error)
+        with mock.patch.object(a.subprocess, "run", return_value=result):
+            with self.assertRaises(RuntimeError):
+                a.Gcloud(False).read("storage", "buckets", "describe", f"gs://{a.BUCKET}")
+            with self.assertRaises(RuntimeError):
+                a.Gcloud(False).read("storage", "buckets", "get-iam-policy",
+                                     f"gs://{a.BUCKET}", optional=True)
+
     def test_default_offline_plan_needs_no_gcloud(self):
         result = subprocess.run([sys.executable, str(SCRIPT)], env={"PATH": ""},
                                 capture_output=True, text=True, check=True)

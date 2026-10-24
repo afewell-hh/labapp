@@ -130,7 +130,14 @@ class Gcloud:
         result = subprocess.run(["gcloud", *args, f"--project={PROJECT}", "--format=json"],
                                 text=True, capture_output=True, check=False)
         if result.returncode:
-            if optional and ("HTTPError 404" in result.stderr or "NOT_FOUND:" in result.stderr):
+            # gcloud storage also reports a missing bucket without HTTPError.
+            # Match only this exact resource/diagnostic, never a generic 404.
+            bucket_missing = (
+                args[:4] == ("storage", "buckets", "describe", f"gs://{BUCKET}") and
+                result.stderr.strip() ==
+                f"ERROR: (gcloud.storage.buckets.describe) gs://{BUCKET} not found: 404.")
+            if optional and ("HTTPError 404" in result.stderr or
+                             "NOT_FOUND:" in result.stderr or bucket_missing):
                 return None
             raise RuntimeError(f"Read failed: {' '.join(args[:4])}: {result.stderr.strip()}")
         return json.loads(result.stdout)
