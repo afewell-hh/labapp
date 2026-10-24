@@ -164,9 +164,131 @@ metadata workflow. No VMs may start until the allocation, runtime and cleanup
 gates in #153 have been reviewed and tested, with builder IAM separately
 reviewed. This access phase neither grants nor implements VM creation.
 
+## Lifecycle identity and ledger bootstrap
+
+`build/gcp/bootstrap-lifecycle-access.py` prepares access separately from the
+metadata inspector. It does not modify `labapp-inspector` or its pool. This is
+access setup only: no controller adapter, workflow, VM, attached service account,
+slot object or resource cleanup is executed. Keep the existing image and all
+preexisting resources protected. Review/merge this bootstrap before applying it;
+review the controller and fixed workflows separately before launching anything.
+
+Run from the authenticated owner's session with Python 3 and Google Cloud CLI;
+the Compute, IAM, STS, IAM Credentials and Storage APIs must already be enabled.
+The target is fixed to project `teched-473722` / number `22685701361`:
+
+```bash
+# Offline plan, requires no gcloud/credentials and makes no network calls.
+python3 build/gcp/bootstrap-lifecycle-access.py
+# Optional read-only inventory/validation; missing resources are not created.
+python3 build/gcp/bootstrap-lifecycle-access.py --inspect
+# After reviewing the documented privilege scope and visibility limits:
+export LABAPP_LIFECYCLE_ACCESS_REVIEWED=yes
+python3 build/gcp/bootstrap-lifecycle-access.py --apply
+```
+
+`--apply` creates/reuses these exact resources, validates reused configuration
+instead of overwriting it, and fails on unexpected direct roles, account trust,
+keys, pool providers, signing keys, audiences, or ledger policy. Failed partial
+setup can be rerun after investigation; it never removes unexpected resources,
+keys or bindings. The script requires existing APIs rather than automatically
+resolving access/API errors. Existing organization/platform administration and
+inherited impersonation remain possible; record visible project policy and
+known limits in #153. The acknowledgment means this new privilege scope was
+reviewed, not that workflow-exclusive identity or complete inherited visibility
+has been proven. No separate organization-administrator handoff is required.
+
+| Identity | Dedicated pool | Allowed future workflow / events |
+|---|---|---|
+| `labapp-lc-creator` | `labapp-lc-creator` | `labapp-lifecycle-inspect.yml`, dispatch only |
+| `labapp-lc-cleanup` | `labapp-lc-cleanup` | `labapp-lifecycle-cleanup.yml`, completed creator run, schedule or dispatch |
+
+Both require the existing numeric repository/owner IDs, `refs/heads/main`, and
+the exact workflow ref. Each SA binding also selects that workflow ref within
+its own pool. Keeping separate pools prevents a provider intended for one
+identity from impersonating the other through a pool-wide repository selector.
+No generic worker job gets these credentials. The referenced workflows are not
+installed by this bootstrap; future workflow implementation must preserve these
+fixed refs and contain no arbitrary input/command execution.
+
+The cleanup provider also allows `workflow_run` for immediate cleanup after the
+trusted creator finishes, including cancellation, without giving the creator
+Actions-write or delete privileges. The future cleanup workflow must trigger on
+`completed` runs of the fixed creator workflow, then validate its expected
+workflow name/path, head repository, `head_branch == main`, and original event
+`workflow_dispatch` before using lifecycle credentials. Its own workflow code
+must come from trusted main. Read the durable ledger and validate ownership;
+never execute triggering-run code, commands, artifacts or event-supplied scripts.
+Schedule and manual dispatch remain fallback paths. Provider event permission
+alone does not implement or prove these trigger checks; the actual workflows
+still require independent review before enabling cloud work.
+
+Custom IAM roles separate creation/read from deletion:
+
+- Creator: instance/disk creation, inline metadata/labels, inventory/operations,
+  serial read and quota/subnet metadata. These project grants are **not**
+  prefix-limited creation: they do not enforce VM count, shape, runtime, no-SA,
+  no-external-IP or ownership. Metadata/label permissions can affect other VMs
+  or disks, so fixed trusted code, preflight and lifecycle review are essential.
+- Cleanup: instance/disk/zone-operation reads, plus a separate delete-only role
+  conditioned on Compute Instance/Disk type and the exact `us-central1-a`
+  `labapp-lc-` name prefixes. The creator has no delete role; normal cleanup
+  and the janitor must both run under the cleanup identity. Prefix IAM alone
+  does not prove ownership: deletion still requires ledger and immutable-ID
+  checks, and no preexisting resource may be deleted.
+- Creator subnet use: only `default` in `us-central1`, via a separate subnet-level
+  custom role. No network, firewall, external-IP, snapshot, image administration,
+  service-account attachment/`actAs`, or service-account-key privilege is granted.
+  Public Ubuntu/source images supply image read/use; no image IAM is changed.
+
+The private ledger is exactly
+`gs://labapp-lifecycle-ledger-22685701361`, regional `us-central1`, STANDARD,
+with uniform bucket access and enforced public-access prevention. Each identity
+gets `roles/storage.objectUser` **on this bucket only**. This pragmatic predefined
+role includes object create/get/delete/list/update and more; it is not claimed
+to be a minimal custom role. Overwriting a CAS ledger object requires create
+and delete. No project-wide Storage role, bucket administration or automatic
+slot expiry is granted. A reused bucket must belong to this project, remain
+private, and have no object lifecycle deletion or retention hold that could
+invalidate slot semantics. Existing owner/editor/viewer legacy bucket bindings
+are recognized platform paths; inherited access is not disproven by this check.
+
+The later controller starts with one persistent slot object and generation-matched
+CAS for **every** transition; it must not release a slot before confirmed VM and
+both disk deletion. This bootstrap deliberately does not initialize or delete
+slot objects. A private bucket and IAM setup are not a capacity/runtime/cleanup
+implementation; #153 still requires reviewed adapters, fixed workflows, quota
+checks and live evidence before any VM starts. Conditional deletion is sourced
+from supported Compute resource attributes, but actual IAM sufficiency and
+allowed/denied behavior must be verified without attempting production deletes.
+
+Offline checks:
+
+```bash
+python3 -m py_compile build/gcp/bootstrap-lifecycle-access.py
+python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py' -v
+```
+
 ## Sources and validation scope
 
 Official sources consulted 2026-10-24:
+
+- [GA instance insert](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert):
+  field-specific creation/metadata/label permissions; actual complete pilot
+  sufficiency remains to be verified.
+- [Compute prefix access conditions](https://docs.cloud.google.com/iam/docs/configuring-resource-based-access)
+  and [resource attributes](https://docs.cloud.google.com/iam/docs/conditions-resource-attributes):
+  supported existing Instance/Disk type and name conditions; no claim that they
+  constrain resource creation.
+- [Subnet IAM binding CLI](https://docs.cloud.google.com/sdk/gcloud/reference/compute/networks/subnets/add-iam-policy-binding):
+  the subnet command accepts member/role/region but no condition flag; the one
+  subnet-use grant is unconditional at that subnet, unlike the conditional
+  project delete binding. Also checked with local CLI `--help` (no API call).
+- [Storage IAM roles](https://docs.cloud.google.com/storage/docs/access-control/iam-roles):
+  bucket-level Object User permissions and overwrite requirements.
+- [Bucket creation](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/create)
+  and [raw metadata](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/describe):
+  region, uniform access, public-access prevention and raw ownership validation.
 
 - [Google WIF deployment pipelines](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines):
   numeric repository/owner attributes and conditions, service-account federation.
