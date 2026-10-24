@@ -58,6 +58,72 @@ shell profiles, binary versions, charts, environment files, recursive helpers,
 effective systemd configuration and runtime recovery unimplemented. These need
 separate slices; this command cannot recover the complete appliance baseline.
 
+### Fixed mount wrapper
+
+`inspection/mounted_collect.py` adds local ext4 mount/collect/unmount only.
+It has no cloud, SSH, transfer, IAM or firewall behavior. The lead first binds
+the local source-copy disk/partition and their major:minor device numbers to
+the exact lease/cloud disk incarnation. It does not guess device names or make
+that cloud identity binding itself. Caller-supplied numbers are an assertion
+to verify against local evidence, not cloud provenance proof.
+
+On the trusted clean Linux inspector, from the reviewed code directory, run as
+root in a fresh mount namespace. These are example device identities, **not
+values to assume for an appliance**:
+
+```bash
+sudo unshare --mount --propagation private -- \
+  env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /usr/bin/python3 -E -s -m build.gcp.inspection.mounted_collect \
+  --disk /dev/sdb --partition /dev/sdb1 \
+  --disk-number 8:16 --partition-number 8:17 \
+  --private-dir /run/labapp-inspection-output
+```
+
+The output directory must already exist, be empty, nonsymlink, owned by the
+caller and mode0700. Prepare private staging and its cleanup before running;
+the wrapper does not create a tmpfs or configure swap/core-dump policy. The
+collector writes only `inventory.json` there, mode0600 and bounded to8MiB.
+Use a private0700/0600 lead-host destination for later authenticated transfer.
+Same-UID permissions are not isolation from other same-UID processes: general
+workers are trusted contributors instructed not to read raw data, and the lead
+does not share raw paths/content with them. No separate recipient/account or
+arbitrary retention interval is required. Remove raw/intermediate data promptly
+after reviewed recovery or abandonment; publish only reviewed sanitized output.
+
+The wrapper requires a private namespace different from PID1's and private root
+mount propagation. Fixed inspector tools (`findmnt`, `lsblk`, `dumpe2fs`,
+`mount`, `umount`) must already exist. Device paths must be direct nonsymlink
+block nodes under `/dev`, with the supplied exact numbers. Structured `lsblk`
+evidence must show one read-only disk with at most four unmounted partitions,
+exactly one ext4 candidate matching the supplied partition, and only empty or
+vfat filesystems on other partitions. A boot-filesystem match, LVM/RAID/encryption,
+unexpected layout, dirty ext4 state or `needs_recovery` refuses collection.
+
+It mounts only explicit ext4 with `ro,noload,nodev,nosuid,noexec`, disables
+external mount helpers, and verifies resulting source/number/type/options/private
+propagation before calling the unchanged collector. It neither uses guest fstab
+nor repairs, activates, replays journals or executes guest code. Every attempted
+mount gets an unmount attempt; collector failure/cancellation removes the known
+partial report. Unmount failure refuses success and leaves the private mountpoint
+for lead cleanup. It never recursively deletes a guest mount. Diagnostics never
+relay command output. SIGTERM/SIGINT trigger cleanup; SIGKILL or VM loss still
+requires the existing independent resource cleanup and lead staging cleanup.
+
+Tests use mocked commands and synthetic files only, including an unchanged
+collector run against a fake mount. They establish command/validation/cleanup
+behavior, not kernel mount semantics or real source-image layout. A tiny synthetic
+ext4 image in an authorized disposable non-cloud mount-capable environment and
+a harmless authenticated access/transfer pilot are later checks before raw
+guest recovery. Do not use a public workflow artifact or serial output for raw
+transfer. Existing lifecycle deadlines are never extended by this wrapper.
+
+Sources consulted2026-10-24: [kernel ext4](https://docs.kernel.org/admin-guide/ext4.html)
+(RO alone may replay journals; `noload`/`norecovery` skips replay),
+[util-linux mount](https://man7.org/linux/man-pages/man8/mount.8.html) and
+[unshare](https://man7.org/linux/man-pages/man1/unshare.1.html). These describe
+upstream behavior; actual Ubuntu24.04 mount/tool compatibility is not yet tested.
+
 Primary references consulted 2026-10-24: Python
 [3.12 descriptor-relative filesystem APIs](https://docs.python.org/3.12/library/os.html),
 [dpkg-query database/installed package fields](https://manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html)
