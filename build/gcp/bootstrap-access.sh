@@ -19,12 +19,9 @@ fi
 for tool in gcloud jq; do
   command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 1; }
 done
-: "${LABAPP_BUILD_PROJECT:?Set the existing dedicated build project ID}"
+: "${LABAPP_BUILD_PROJECT:?Set the existing Labapp project ID}"
 [[ "$LABAPP_BUILD_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || {
   echo 'Expected a GCP project ID, not a project number.' >&2; exit 2;
-}
-[[ "$LABAPP_BUILD_PROJECT" != teched-473722 ]] || {
-  echo 'The source/production project cannot be the build project.' >&2; exit 2;
 }
 source_project=teched-473722
 source_image=hedgehog-vaidc-v20260114
@@ -51,7 +48,7 @@ if ! "$apply"; then
   exit 0
 fi
 # Validate effective access before exposing the identity through federation.
-# This catches direct project grants, but not folder/org/group policy effects.
+# This catches direct project grants, but not folder/org/group access or impersonation effects.
 [[ "${LABAPP_EFFECTIVE_ACCESS_AUDITED:-}" == yes ]] || {
   echo 'Set LABAPP_EFFECTIVE_ACCESS_AUDITED=yes after the runbook audit.' >&2
   exit 1
@@ -63,7 +60,7 @@ jq -e --arg member "serviceAccount:$inspector" '
   echo 'Inspector already has project roles; resolve before federation.' >&2
   exit 1
 }
-# Enable only access/metadata APIs in the dedicated project. Errors stop the run.
+# Enable only access/metadata APIs in the Labapp project. Errors stop the run.
 gcloud services enable compute.googleapis.com iam.googleapis.com \
   iamcredentials.googleapis.com sts.googleapis.com \
   --project="$LABAPP_BUILD_PROJECT" --quiet
@@ -80,6 +77,24 @@ else
     exit 1
   }
 fi
+# Audit credentials held by others before extending this identity's access.
+# Read IAM and key metadata only; never request private key material.
+sa_policy=$(gcloud iam service-accounts get-iam-policy "$inspector" \
+  --project="$LABAPP_BUILD_PROJECT" --format=json)
+jq -e --arg principal "$principal" '
+  all(.bindings[]?;
+    .role == "roles/iam.workloadIdentityUser" and
+    (.condition // null) == null and .members == [$principal])
+' <<<"$sa_policy" >/dev/null || {
+  echo 'Unexpected inspector IAM binding; no trust/access grant attempted.' >&2
+  exit 1
+}
+keys=$(gcloud iam service-accounts keys list --iam-account="$inspector" \
+  --project="$LABAPP_BUILD_PROJECT" --managed-by=user --format=json)
+jq -e 'type == "array" and length == 0' <<<"$keys" >/dev/null || {
+  echo 'Inspector has user-managed key credentials; inspect manually.' >&2
+  exit 1
+}
 pools=$(gcloud iam workload-identity-pools list --project="$LABAPP_BUILD_PROJECT" \
   --location=global --show-deleted --format=json)
 existing=$(jq -c --arg name "$base" '[.[] | select(.name == $name)]' <<<"$pools")

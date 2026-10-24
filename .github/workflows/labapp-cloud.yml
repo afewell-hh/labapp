@@ -32,7 +32,6 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUILD_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]
-          [[ "$BUILD_PROJECT" != teched-473722 ]]
           [[ "$INSPECTOR_SA" == \
             "labapp-inspector@${BUILD_PROJECT}.iam.gserviceaccount.com" ]]
           pattern='^projects/[0-9]+/locations/global/'

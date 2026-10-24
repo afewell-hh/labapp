@@ -1,15 +1,16 @@
 # Keyless GCP access for trusted runner work
 
-Use a dedicated, existing, billing-enabled build project with no production
-resources. The source project is `teched-473722`; it must never be the build
-project. The selected source is
+Use the existing, billing-enabled Labapp project `teched-473722`, which the
+owner created for this work. It also holds the published production VM image;
+that image and all other preexisting resources remain protected. The selected
+source is
 `projects/teched-473722/global/images/hedgehog-vaidc-v20260114`.
 Its current accessibility and metadata must be verified, not assumed.
 
 ## Access boundary
 
 The owner bootstraps GitHub OIDC → Google Workload Identity Federation (WIF)
-→ `labapp-inspector` in the build project. The provider requires all of:
+→ `labapp-inspector` in the same Labapp project. The provider requires all of:
 
 - Repository ID `1089062808`, owner ID `193945001`.
 - Ref `refs/heads/main` and event `workflow_dispatch`.
@@ -27,7 +28,9 @@ The inspector has no build-project resource roles from this bootstrap. A
 per-image `roles/compute.imageUser` grant, if needed, permits **read and use** of
 that image; it is broader than metadata access. The workflow itself performs
 only a metadata read. No builder/runtime identities or build privileges are
-created here. Do not attach the inspector identity to a VM.
+created here. Do not attach the inspector identity to a VM. In this shared
+project, future builder IAM must protect the published/source image and all
+preexisting resources; broad Compute/storage administration is not approved.
 
 ## Owner setup in Cloud Shell
 
@@ -43,7 +46,7 @@ After reviewing and merging the access change, obtain a trusted main checkout:
 ```bash
 git clone https://github.com/afewell-hh/labapp.git
 cd labapp
-export LABAPP_BUILD_PROJECT='YOUR_DEDICATED_BUILD_PROJECT_ID'
+export LABAPP_BUILD_PROJECT='teched-473722'
 # Default is read-only inspection; failure is not permission to mutate.
 bash build/gcp/bootstrap-access.sh
 # First audit effective access as described below; then acknowledge it.
@@ -52,19 +55,28 @@ export LABAPP_EFFECTIVE_ACCESS_AUDITED=yes
 bash build/gcp/bootstrap-access.sh --apply
 ```
 
-The script checks the target project ID and prints nonsecret identifiers.
+The script validates the project ID format and prints nonsecret identifiers.
+It accepts `teched-473722`; a separate or empty project is not required.
 It never creates keys, VMs, networks, disks, quota changes, or user Token Creator
 grants. It describes existing configuration before reuse: disabled/deleted
 resources, unexpected providers, or mismatched provider trust stop the script
 rather than being overwritten. The reserved pool must contain only the one
 reviewed provider. Failed partial setup can be rerun; inspect failures before
-retrying. IAM/API propagation may require waiting. Before `--apply`, the administrator must verify the inspector has no
-unexpected effective privileges (including inherited organization/folder/group
-policies) and that the build project contains no production resources. Record
-that audit in #152, then set `LABAPP_EFFECTIVE_ACCESS_AUDITED=yes`. The script
-also rejects direct build-project IAM bindings for the inspector before any
-WIF binding, but cannot establish all effective access offline. Do not reuse an
-inspector that has builder or administrative access.
+retrying. IAM/API propagation may require waiting.
+
+Before `--apply`, the administrator must verify both sides of effective access:
+roles held by the inspector, and principals that can impersonate or attach it,
+including inherited project/folder/organization roles and group membership.
+Record that audit in #152, then set `LABAPP_EFFECTIVE_ACCESS_AUDITED=yes`.
+The script rejects direct project roles held by the inspector. It reads the
+service account's own IAM policy and rejects every binding except the exact,
+unconditional reviewed WIF role/member; an empty policy is also valid for first
+setup. It rejects any user-managed keys, including disabled keys, by listing
+key metadata only. It never reads key material, deletes keys, or removes IAM
+bindings. Unexpected configuration requires administrator investigation before
+retrying. These checks cannot establish all inherited effective access offline;
+do not reuse an inspector with builder/administrative access or alternate
+impersonators.
 
 Set these repository **Actions Variables** (identifiers, not secrets), using
 Settings → Secrets and variables → Actions → Variables, or an authenticated `gh`:
@@ -131,8 +143,8 @@ time. Runtime termination is not complete cleanup: Packer disks can have
 `autoDelete=false`; account for disks, addresses, temporary images/snapshots,
 and failed/cancelled jobs. Require scoped project/run/issue/slot ownership and
 immutable IDs, success/failure/cancellation cleanup, and independent expiry
-cleanup. Never delete source/production or unowned resources. Accepted release
-images need a separate retention decision.
+cleanup. Never delete source/published/preexisting or unowned resources in this
+shared project. Accepted release images need a separate retention decision.
 
 Check CPU/storage quotas before allocation; the historical 500 GB disk quota
 may prevent three appliance VMs. Do not raise quotas or machine sizes
@@ -156,6 +168,10 @@ Official sources consulted 2026-10-24:
   selected known released CLI version, not a claim it is latest.
 - [Custom image access](https://docs.cloud.google.com/compute/docs/images/managing-access-custom-images):
   per-image `roles/compute.imageUser`, avoiding project-wide grants.
+
+- [Service-account IAM policy](https://docs.cloud.google.com/sdk/gcloud/reference/iam/service-accounts/get-iam-policy)
+  and [key metadata listing](https://docs.cloud.google.com/sdk/gcloud/reference/iam/service-accounts/keys/list):
+  account resource policy and `--managed-by=user` credential checks.
 
 Offline shell/YAML checks cannot establish effective IAM, organization policy,
 API propagation, image availability or successful federation. Those require the

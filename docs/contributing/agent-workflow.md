@@ -122,7 +122,10 @@ deployment scripts unless the task explicitly authorizes it. Don't rewrite
 Use the [GCP access runbook](../runbooks/gcp-build-access.md) for the trusted
 keyless runner boundary. A lead may dispatch only the fixed metadata workflow
 on `main`; no arbitrary task commands, PR code or build identity enter it.
-Cloud credentials stay out of general worker jobs.
+Cloud credentials stay out of general worker jobs. Use the existing Labapp
+project `teched-473722`; protect its published/source image and all preexisting
+resources. Builder IAM requires separate review and must preserve those assets;
+no broad project Compute/storage administration is implied.
 
 For explicitly authorized build/test tasks, maximum three project VM slots
 includes stopped, reserved and cleanup-pending resources; default to one job.

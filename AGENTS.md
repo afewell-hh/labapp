@@ -49,6 +49,9 @@ Codex does not document an import mechanism, so this file uses plain links;
   and verified child-resource cleanup are in the
   [GCP access runbook](docs/runbooks/gcp-build-access.md). No VM launches until
   those lifecycle gates are implemented, reviewed and tested (#153).
+- Build/test work uses `teched-473722`, which also holds the published image;
+  protect that image and every preexisting resource. Builder IAM is a separate
+  review, and no broad project Compute/storage administration is approved.
 - Use the trusted metadata workflow for cloud reads; never give general worker
   jobs cloud credentials. Access setup is separate from build authorization.
 - Never commit secrets. Do not merge or close issues; the lead accepts work.
