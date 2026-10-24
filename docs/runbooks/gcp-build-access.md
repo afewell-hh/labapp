@@ -288,6 +288,167 @@ python3 -m py_compile build/gcp/bootstrap-lifecycle-access.py
 python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py' -v
 ```
 
+## Owner IAP access to an owned inspector
+
+This is a lead-run access plan for #173/#170/#151, not an automated bootstrap
+or permission to access a preexisting appliance. The shared create request and
+creator/cleanup roles stay unchanged. Current lifecycle-only pilots stay
+untagged. Only the existing owner `art@githedgehog.com`, using the current
+trusted lead host, prepares access to a separately authorized inspector after
+its creation and ownership checks. No new principal, receiver, VM service
+account, external IP, metadata SSH key or worker credential is needed.
+
+Before setup, verify the authenticated account and its effective permissions.
+Google documents that project Owner can use IAP TCP forwarding; this is not
+evidence that an account currently has Owner or that deny/organization policies
+permit access. Check `iap.tunnelInstances.accessViaIAP`, Compute instance
+get/list and project get, plus OS Login and `compute.instances.osAdminLogin`
+for the later privileged mount wrapper. Prove OS Login/admin access in the
+synthetic pilot instead of automatically granting IAP/OS Admin Login roles.
+Service Account User is unnecessary for this no-SA VM. Keep instance
+`enable-oslogin=TRUE` and `block-project-ssh-keys=TRUE`; never fall back to
+project/instance SSH metadata keys. Source collector content remains private.
+
+### Dedicated access firewall infrastructure
+
+The lead owns one dedicated rule, configured once for the inspection series,
+with explicit teardown at series end. It is **access infrastructure, not a
+per-lease child**: the current controller/janitor owns only VM/boot/data disk
+cleanup and cannot claim firewall deletion. Record the rule's name, immutable
+ID, creation operation and exact configuration in a nonsecret issue receipt,
+with the lead responsible for teardown even on failure/cancellation. Do not
+silently leave a temporary rule for the controller to collect.
+
+Fixed contract: project `teched-473722`, existing VPC `global/networks/default`,
+rule and target network tag `labapp-inspector-iap-ssh`, ingress allow only
+`tcp:22` from `35.235.240.0/20`, priority 1000. The default VPC and its
+`us-central1/default` subnet are **preexisting protected infrastructure**, not
+owned resources. Verify that subnet's actual network link matches this VPC;
+the name `default` alone proves neither identity nor ownership. Inventory all
+VMs in the project and confirm no preexisting/unowned VM has the reserved tag.
+Review effective firewall policy: this narrow allow does not negate broader
+existing rules or override denies. Report conflicting rules without modifying
+them. Network tags scope this firewall, not IAP IAM authorization.
+
+The following are documented commands for the lead's reviewed setup, not
+commands executed by this change:
+
+```bash
+gcloud compute firewall-rules describe labapp-inspector-iap-ssh \
+  --project=teched-473722 --format=json
+# Only after confirmed absence, verified VPC/subnet/tag inventory and recorded intent:
+gcloud compute firewall-rules create labapp-inspector-iap-ssh \
+  --project=teched-473722 --network=default --direction=INGRESS \
+  --priority=1000 --action=ALLOW --rules=tcp:22 \
+  --source-ranges=35.235.240.0/20 --target-tags=labapp-inspector-iap-ssh \
+  --description='Lead-managed inspector IAP SSH access; teardown after inspection series'
+gcloud compute firewall-rules describe labapp-inspector-iap-ssh \
+  --project=teched-473722 --format=json
+```
+
+Authentication/API errors are not absence. A same-name rule without the prior
+ownership receipt, or with any conflicting ID/configuration, blocks setup;
+never overwrite or adopt it by name. On readback require the exact network,
+direction, priority, source range, target tag and TCP22-only allow; no extra
+ports/protocols, source tags/service accounts, target service accounts or deny
+entries, and `disabled=false`. Broader fields or incomplete visibility block
+the access pilot. This plan does not enable APIs or change firewall/IAM policy
+automatically.
+
+### Owner adds the tag after creation
+
+Do not add tags to the shared creation body: the v1 insert API requires
+`compute.instances.setTags` for that field, which the creator role lacks.
+No creator role expansion or generic transport endpoint is proposed here.
+The existing owner performs this separate administrative access mutation only
+after insert is terminal, controller confirmation has persisted all three IDs,
+and there is sufficient time before the unchanged absolute deadline. Do not
+mutate an in-flight or superseded lease, change its saved body hash, or renew
+its deadline. Coordinate with normal/janitor cleanup; cleanup retains priority.
+
+Use the exact instance name from the current ledger, never a prefix-selected
+or preexisting VM. Immediately before mutation, get the instance and verify
+project/zone, immutable VM ID, lease/run/owner labels, unchanged deadline,
+no service account/external IP, OS Login metadata and exactly the two intended
+attachments and immutable disk IDs (boot read-write/auto-delete, source copy
+read-only/retained). Verify both disks' pinned source-image IDs. Require the
+existing tag list empty; unexpected tags block rather than being removed.
+Record only nonsecret identities/configuration in the access receipt.
+
+Use the **current** `tags.fingerprint` from that same instance read for the
+reviewed owner-authenticated Compute v1 request. This is a request template,
+not a command that supplies credentials or bypasses the preceding checks:
+
+```text
+GET https://compute.googleapis.com/compute/v1/projects/teched-473722/zones/us-central1-a/instances/EXACT_LEDGER_INSTANCE
+# Verify response.id equals the ledger's confirmed VM ID and all checks above.
+POST https://compute.googleapis.com/compute/v1/projects/teched-473722/zones/us-central1-a/instances/EXACT_LEDGER_INSTANCE/setTags
+{
+  "items": ["labapp-inspector-iap-ssh"],
+  "fingerprint": "CURRENT_FINGERPRINT_FROM_VERIFIED_GET"
+}
+```
+
+Await the returned operation's terminal success, bind its target ID/link to
+that exact VM, then re-read and require unchanged ID/lease/deadline/attachments
+and exactly the dedicated tag. A fingerprint conflict means stop and
+re-evaluate ownership, not unconditional retry. The fingerprint protects tag
+updates, **not an atomic immutable-VM-ID precondition**. Serialize owner actions;
+an ID replacement or concurrent lifecycle change blocks access and requires
+lead adjudication. A tag is a VM field, not a separate cloud resource; it goes
+away when the VM is deleted. It does not establish ownership or weaken any
+existing protected-resource census/deletion check.
+
+### Synthetic access, transfer and teardown
+
+Before any raw extraction, the owner proves SSH/OS Login/admin access and
+private transfer using harmless synthetic marker data only. Bind SSH host-key
+evidence to the exact confirmed inspector incarnation using a trusted channel
+before connection; unresolved host identity blocks the pilot. Use IAP and
+`--strict-host-key-checking=yes` explicitly (gcloud's first-connection default
+is `no`). Do not use unauthenticated keyscan or first-use acceptance as proof.
+Keep owner SSH keys/credentials on the trusted host and out of the VM, repo,
+GitHub artifacts and general worker sessions.
+
+Pull only the known bounded synthetic file by authenticated SFTP/SCP into an
+exclusive-create mode0600 file in the lead's mode0700 temporary directory.
+Verify recipient UID, size and checksum, with only fixed status/count/hash
+receipts; no raw content, shell tracing or stdout transfer. Same-UID trusted
+contributors are not adversarially isolated by these modes. Synthetic success
+does not authorize an unreviewed mount or collector change. Delete private
+staging promptly and invoke the existing lifecycle cleanup on success/failure/
+cancellation; require VM and both disks 404 before slot reuse.
+
+At series end, the lead re-reads the dedicated firewall and compares its
+immutable ID and complete configuration with the recorded owned receipt.
+Confirm no remaining inspector uses it, then delete only that exact rule:
+
+```bash
+# Only after the immediately preceding ownership/configuration checks:
+gcloud compute firewall-rules delete labapp-inspector-iap-ssh \
+  --project=teched-473722
+gcloud compute firewall-rules describe labapp-inspector-iap-ssh \
+  --project=teched-473722 --format=json
+```
+
+Wait for the deletion operation and require confirmed not-found; errors are
+not successful cleanup. Firewall deletion is name-addressed, with no atomic
+ID guard: serialize teardown, stop on replacement/mismatch and record any
+cleanup failure. Do not delete the default VPC/subnet, preexisting rules or
+another VM's tags. Firewall teardown, private-file cleanup and VM/disk cleanup
+have separate receipts; none implies the others succeeded.
+
+Sources read 2026-10-24 (documented, not live-tested here):
+[IAP TCP forwarding](https://docs.cloud.google.com/iap/docs/using-tcp-forwarding),
+[OS Login setup](https://docs.cloud.google.com/compute/docs/oslogin/set-up-oslogin),
+[network tags](https://docs.cloud.google.com/vpc/docs/add-remove-network-tags),
+[v1 insert tags permission](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert),
+[v1 setTags fingerprint](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/setTags),
+[firewall create flags](https://docs.cloud.google.com/sdk/gcloud/reference/compute/firewall-rules/create),
+and [gcloud SSH host checks](https://docs.cloud.google.com/sdk/gcloud/reference/compute/ssh).
+Effective owner permissions, firewall reachability, host-key binding, OS Login
+and private transfer still need the separately authorized synthetic pilot.
+
 ## Sources and validation scope
 
 Official sources consulted 2026-10-24:
