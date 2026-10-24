@@ -17,7 +17,7 @@ quota). Never commit secrets or credentials.
 ## Step 1: Launch VM with cloud-config
 
 ```bash
-# See gcp_vm_launch_command.sh for the full command
+# See gcp_vm_launch_command.txt for the full command
 gcloud compute instances create hedgehog-lab-YYYYMMDD \
   --project=YOUR_PROJECT \
   --zone=us-central1-a \
@@ -123,7 +123,8 @@ cat /var/log/cloud-init.log
 
 ```bash
 # Launch new VM with cloud-config
-./gcp_vm_launch_command.sh
+# Historical recipes only; select and adapt ONE command:
+cat gcp_vm_launch_command.txt
 
 # SSH into VM
 gcloud compute ssh INSTANCE_NAME --zone=us-central1-a

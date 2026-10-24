@@ -20,7 +20,7 @@ echo "This will DELETE the following resources:"
 echo "  - VM instance: $VM_NAME"
 echo "  - Firewall rule: $FIREWALL_RULE"
 echo ""
-read -p "Are you sure you want to proceed? (y/N): " confirm
+read -r -p "Are you sure you want to proceed? (y/N): " confirm
 
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
     echo "Cleanup cancelled."

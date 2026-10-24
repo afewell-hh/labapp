@@ -12,14 +12,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${1:-}" != "--inside" ]]; then
   runs="${1:-2}"
-  docker pull ubuntu:24.04 > /dev/null
-  echo "base image: $(docker image inspect ubuntu:24.04 --format '{{.Id}} {{join .RepoDigests ","}}')"
+  image="${K3D_TEST_IMAGE:-ubuntu:24.04}"
+  docker pull "$image" > /dev/null
+  echo "base image: $(docker image inspect "$image" --format '{{.Id}} {{join .RepoDigests ","}}')"
   overall=0
   for i in $(seq 1 "${runs}"); do
     echo "=== fresh container run ${i}/${runs} ($(date -u +%FT%TZ)) ==="
     start=${SECONDS}
     rc=0
-    docker run --rm -v "${here}:/provision:ro" ubuntu:24.04 \
+    docker run --rm -v "${here}:/provision:ro" "$image" \
       bash -c 'grep -E "^(PRETTY_NAME|VERSION_ID)=" /etc/os-release; apt-get update -qq && apt-get install -y -qq curl ca-certificates python3 > /dev/null && bash /provision/test-install-k3d.sh --inside' || rc=$?
     echo "=== run ${i} exit ${rc} in $((SECONDS - start))s ==="
     [[ "${rc}" -eq 0 ]] || overall=1
