@@ -99,19 +99,68 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
 ## Not covered yet (gates before any VM)
 
-- The GCS adapter has mocked HTTP tests only; no Compute adapter is included
-  yet. None of the live API behavior is exercised: `requestId` retention/idempotence, `terminationTime` plus
+- The GCS and Compute adapters have mocked HTTP tests only. None of the
+  live API behavior is exercised: `requestId` retention/idempotence, `terminationTime` plus
   `DELETE` removing `autoDelete` disks, whether disk labels from
   `initializeParams` propagate, whether an inline source-image disk is
   accepted with `READ_ONLY` mode (no writable fallback exists; if the API
   rejects it the design must change, not the check), the shape of
   `aggregatedList` warnings, org-policy effects, quota behavior and operation listing latency.
   The fake is a model, not evidence.
-- No workflow, guest extraction stage, or private output channel.
-- No IAM: custom roles, scoped create versus delete permissions, the ledger
-  bucket and separate trusted identities need separate review.
-- The boot image must be a pinned stock Ubuntu 24.04 image id (supplied by the
-  lead, not a family), with required guest tools verified in it because the
-  VM has no internet access.
+- The fixed workflows require review and authorized live evidence; no guest
+  extraction stage or private output channel is implemented.
+- The separately reviewed lifecycle-access bootstrap must be applied and
+  verified before dispatch; workflow files do not create IAM or the bucket.
+- The fixed boot image is checked by immutable ID. Any later guest stage
+  requires its tools verified in that image because the VM has no internet
+  access; this lifecycle-only pilot runs no guest commands.
 - Three-slot allocation is intentionally absent; the counter would need its
   own race tests first.
+
+## Fixed lifecycle runner
+
+The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
+with no inputs. Its first pilot uses a fixed **five-minute** absolute lease,
+`e2-standard-2`, a 10GB stock Ubuntu boot disk and a 300GB read-only source-copy
+`pd-standard` disk. Both images are checked against pinned immutable IDs before
+admission. Project-global CPU and regional CPU/E2/standard-disk quotas must have
+headroom; reads are snapshots, not reservations. Existing unknown resources
+still block admission through the controller census. There is no guest script,
+package download, SSH, serial output or filesystem extraction in this pilot.
+
+The runner fetches only the nine required Python module files through GitHub's
+Contents API at the trusted workflow's `github.sha`, before WIF authentication.
+It does not check out archived gitlinks, execute triggering-run code, download
+artifacts or overwrite auth credentials. The CLI is invoked from that temporary
+module directory as `python3 -m lifecycle.cli inspect` or `cleanup`; these entry
+points require trusted GitHub event context and accept no cloud parameters.
+
+Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
+cannot delete; cleanup cannot create. After confirming the insert and persisting
+all three resource IDs, creator prints only IDs/deadline and polls for VM absence
+until the immutable deadline plus two minutes. That observation does not release
+the ledger or establish disk cleanup. The independent cleanup workflow handles
+completed creator runs, including failure/cancellation, only after validating
+the fixed name/path, original dispatch, repository/owner, main branch, and the
+ledger's run ID and attempt. Late completions cannot force another lease's
+cleanup. Manual cleanup dispatch forces the current lease; scheduled cleanup
+only handles due leases. Both use the same CAS reconciliation and verify the VM
+and both disks absent before release. Schedules remain best-effort; initial
+Compute `terminationTime` plus `DELETE` is the independent cloud-side bound.
+
+The lead can exercise normal cleanup by dispatching manual cleanup after the
+creator logs confirmed IDs; cancellation by cancelling the creator and checking
+its independent completed-run cleanup; and expiry by allowing the fixed lease
+to expire. Run these serially and inspect cleanup/ledger evidence before another
+dispatch. Missing confirmation, API/IAM failure or ambiguous cleanup keeps capacity
+blocked. This module's offline tests do not prove live identity federation,
+image availability, Compute expiry behavior, cancellation delivery or disk
+removal. Those require the separately authorized lead-run pilots after review.
+
+Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
+[GitHub Contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content),
+[workflow_run trust and default-branch semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run),
+[projects.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/projects/get),
+[images.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/get),
+and Google's [current discovery schema](https://github.com/googleapis/google-api-python-client/blob/main/googleapiclient/discovery_cache/documents/compute.v1.json)
+for regions.get and numeric quota fields (the regions reference page timed out).

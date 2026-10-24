@@ -1,0 +1,107 @@
+---
+name: Labapp lifecycle cleanup
+
+'on':
+  workflow_dispatch:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_run:
+    workflows: ['Labapp bounded lifecycle inspection']
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+# The persistent CAS ledger enforces capacity; this only throttles this workflow.
+concurrency:
+  group: labapp-lifecycle-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: >-
+      github.repository_id == '1089062808' &&
+      github.repository_owner_id == '193945001' &&
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_run' &&
+         github.event.action == 'completed' &&
+         github.event.workflow_run.status == 'completed' &&
+         github.event.workflow_run.name == 'Labapp bounded lifecycle inspection' &&
+         github.event.workflow_run.path == '.github/workflows/labapp-lifecycle-inspect.yml' &&
+         github.event.workflow_run.event == 'workflow_dispatch' &&
+         github.event.workflow_run.head_branch == 'main' &&
+         github.event.workflow_run.head_repository.id == 1089062808 &&
+         github.event.workflow_run.head_repository.full_name == 'afewell-hh/labapp' &&
+         github.event.workflow_run.head_repository.owner.id == 193945001)
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch allowlisted trusted main modules
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYFETCH'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import urllib.request
+
+          sha = os.environ["TRUSTED_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("Invalid trusted main SHA")
+          root = Path(os.environ["RUNNER_TEMP"]) / "labapp-trusted-lifecycle"
+          root.mkdir(mode=0o700)
+          module = root / "lifecycle"
+          module.mkdir(mode=0o700)
+          files = ("__init__.py", "auth_http.py", "cloud.py", "compute.py",
+                   "controller.py", "gcs.py", "spec.py", "store.py", "cli.py")
+          for name in files:
+              path = "build/gcp/lifecycle/" + name
+              url = "https://api.github.com/repos/afewell-hh/labapp/contents/" + path + "?ref=" + sha
+              req = urllib.request.Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "X-GitHub-Api-Version": "2022-11-28"})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  raw = response.read(200001)
+              if len(raw) > 200000:
+                  raise SystemExit("Trusted source exceeds bound")
+              blob = json.loads(raw)
+              if (blob.get("type") != "file" or blob.get("path") != path or
+                      blob.get("encoding") != "base64" or type(blob.get("size")) is not int or
+                      not 0 <= blob["size"] <= 100000):
+                  raise SystemExit("Invalid trusted source metadata")
+              data = base64.b64decode(blob["content"].replace("\n", ""), validate=True)
+              if len(data) != blob["size"]:
+                  raise SystemExit("Invalid trusted source size")
+              (module / name).write_bytes(data)
+          PYFETCH
+      - name: Authenticate short-lived cleanup identity
+        # google-github-actions/auth v3; credentials are outside fetched code.
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          project_id: teched-473722
+          workload_identity_provider: projects/22685701361/locations/global/workloadIdentityPools/labapp-lc-cleanup/providers/trusted-main
+          service_account: labapp-lc-cleanup@teched-473722.iam.gserviceaccount.com
+      - name: Install pinned Google Cloud CLI
+        # google-github-actions/setup-gcloud v3
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          version: '540.0.0'
+      - name: Run fixed lifecycle cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/labapp-trusted-lifecycle"
+          python3 -m lifecycle.cli cleanup
