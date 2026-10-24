@@ -30,6 +30,13 @@ CREATOR_NAME = "Labapp bounded lifecycle inspection"
 CREATOR_PATH = ".github/workflows/labapp-lifecycle-inspect.yml"
 BUCKET = "labapp-lifecycle-ledger-22685701361"
 BOOT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
+# Fixed reviewed budgets; no workflow or environment overrides.
+PILOT_LEASE_MINUTES = 10
+CONFIRM_TIMEOUT_SECONDS = 360
+CONFIRM_POLL_ATTEMPTS = 72
+POLL_SECONDS = 5
+ABSENCE_GRACE_SECONDS = 120
+ABSENCE_POLL_ATTEMPTS = (PILOT_LEASE_MINUTES * 60 + ABSENCE_GRACE_SECONDS) // POLL_SECONDS + 1
 IMAGES = ((BOOT_IMAGE, "4575951068918267275", 10),
           (spec.SOURCE_IMAGE, "7638370619126112785", 300))
 
@@ -148,12 +155,12 @@ def wait_for_absence(controller, request_id):
             not record.get("ids", {}).get("instance")):
         raise Refused("created lease identity unavailable")
     verify_disk_provenance(controller, record)
-    # The fixed five-minute lease plus two-minute cloud convergence allowance.
+    # The fixed ten-minute lease plus two-minute cloud convergence allowance.
     # An iteration bound also stops clock changes extending the wait.
     print(json.dumps({"status": "created", "ids": record["ids"],
                       "deadline": record["deadline"]}, sort_keys=True), flush=True)
-    cutoff = datetime.fromisoformat(record["deadline"].replace("Z", "+00:00")) + timedelta(seconds=120)
-    for _ in range(85):
+    cutoff = datetime.fromisoformat(record["deadline"].replace("Z", "+00:00")) + timedelta(seconds=ABSENCE_GRACE_SECONDS)
+    for _ in range(ABSENCE_POLL_ATTEMPTS):
         if controller.cfg.now() >= cutoff:
             break
         try:
@@ -162,7 +169,7 @@ def wait_for_absence(controller, request_id):
             return {"status": "vm-absent-awaiting-independent-disk-verification"}
         if instance.get("id") != record["ids"]["instance"]:
             raise Refused("instance identity changed during wait")
-        controller.cfg.sleep(5)
+        controller.cfg.sleep(POLL_SECONDS)
     raise Refused("VM absence not confirmed within fixed wait bound")
 
 
@@ -178,7 +185,7 @@ def execute(mode, controller, preflight, env, event):
         submitted = controller.submit(lease["request_id"])
         if submitted.status != "accepted":
             raise Refused("create not confirmed; independent cleanup required")
-        confirmed = controller.confirm_created(lease["request_id"])
+        confirmed = controller.confirm_created(lease["request_id"], timeout_seconds=CONFIRM_TIMEOUT_SECONDS)
         if confirmed.status != "created":
             raise Refused("creation not confirmed; independent cleanup required")
         # Deliberately no serial output, guest content, or raw API diagnostics.
@@ -206,7 +213,10 @@ def main(argv=None):
         trusted_event(args.mode, os.environ, event)
         controller = Controller(GcsSlotStore(BUCKET),
                                 PolicyCloud(ComputeRestTransport(), spec.PROJECT, spec.ZONE),
-                                Config(boot_image=BOOT_IMAGE, lease_minutes=5, min_submit_minutes=1))
+                                Config(boot_image=BOOT_IMAGE, lease_minutes=PILOT_LEASE_MINUTES,
+                                       min_submit_minutes=1,
+                                       poll_attempts=CONFIRM_POLL_ATTEMPTS if args.mode == "inspect" else 30,
+                                       poll_seconds=POLL_SECONDS))
         result = execute(args.mode, controller, Preflight(), os.environ, event)
         print(json.dumps(result, sort_keys=True))
         return 0

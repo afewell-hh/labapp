@@ -1,7 +1,7 @@
 """Offline trust/composition/preflight and actual inline source-loader tests."""
 import base64
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 import yaml
+
+from . import controller as controller_module
 
 from . import cli, spec
 from .auth_http import HttpResponse
@@ -47,7 +49,7 @@ def preflight_records():
 
 
 class CliTests(unittest.TestCase):
-    def test_main_constructs_fixed_five_minute_runtime_and_sanitizes_failures(self):
+    def test_main_constructs_fixed_ten_minute_runtime_and_sanitizes_failures(self):
         env, event = event_env()
         with tempfile.TemporaryDirectory() as tmp:
             event_path = Path(tmp) / 'event.json'
@@ -58,10 +60,17 @@ class CliTests(unittest.TestCase):
                     patch('builtins.print'):
                 self.assertEqual(cli.main(['inspect']), 0)
                 cfg = factory.call_args.args[2]
-                self.assertEqual(cfg.lease_minutes, 5)
+                self.assertEqual(cfg.lease_minutes, 10)
+                self.assertEqual(cfg.poll_attempts, 72)
+                self.assertEqual(cfg.poll_seconds, 5)
                 self.assertEqual(cfg.min_submit_minutes, 1)
                 self.assertEqual(cfg.boot_image, cli.BOOT_IMAGE)
                 self.assertEqual(cfg.baseline, {})
+            with patch.dict(os.environ, env), patch.object(cli, 'Controller') as factory, \
+                    patch.object(cli, 'execute', return_value={'status': 'fixture'}), \
+                    patch('builtins.print'):
+                self.assertEqual(cli.main(['cleanup']), 0)
+                self.assertEqual(factory.call_args.args[2].poll_attempts, 30)
             with patch.dict(os.environ, env), \
                     patch.object(cli, 'execute', side_effect=Exception('secret token payload')), \
                     patch('builtins.print') as output:
@@ -110,7 +119,7 @@ class CliTests(unittest.TestCase):
             wait.assert_called_once_with(controller, 'lease')
         preflight.check.assert_called_once_with()
         controller.submit.assert_called_once_with('lease')
-        controller.confirm_created.assert_called_once_with('lease')
+        controller.confirm_created.assert_called_once_with('lease', timeout_seconds=360)
         controller.reset_mock()
         controller.submit.return_value = Outcome('uncertain', 'secret')
         with self.assertRaises(Refused): cli.execute('inspect', controller, preflight, env, event)
@@ -156,7 +165,7 @@ class CliTests(unittest.TestCase):
         controller.cloud.call.reset_mock()
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'fixed wait bound'):
             cli.wait_for_absence(controller, 'lease')
-        self.assertEqual(controller.cloud.call.call_count, 87)
+        self.assertEqual(controller.cloud.call.call_count, 147)
         controller.cloud.call.side_effect = lambda resource, verb, name: (
             disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': 'changed'})
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'identity changed'):
@@ -242,6 +251,120 @@ class CliTests(unittest.TestCase):
             cli.Preflight(http, lambda: 'fake-token').check()
 
 
+class PilotBudgetTests(unittest.TestCase):
+    def world(self, ready_after, latency=0):
+        clock = FakeClock()
+        elapsed, pauses = [0.0], []
+        def advance(seconds):
+            elapsed[0] += seconds
+            clock.advance(seconds / 60)
+        def sleep(seconds):
+            pauses.append(seconds)
+            advance(seconds)
+        raw = FakeCloud(clock)
+        controller = Controller(MemoryStore(), PolicyCloud(raw, spec.PROJECT, spec.ZONE),
+                                Config(boot_image=cli.BOOT_IMAGE,
+                                       lease_minutes=cli.PILOT_LEASE_MINUTES,
+                                       min_submit_minutes=1, poll_attempts=cli.CONFIRM_POLL_ATTEMPTS,
+                                       now=clock.now, sleep=sleep))
+        request = '11111111-1111-4111-8111-111111111111'
+        lease = controller.admit(100, 1, request)
+        self.assertEqual(controller.submit(request).status, 'accepted')
+        original_call = raw.call
+        def timed_call(resource, verb, **kwargs):
+            result = original_call(resource, verb, **kwargs)
+            if (resource, verb) == ('zoneOperations', 'get'):
+                advance(latency)
+                result['status'] = 'DONE' if elapsed[0] >= ready_after else 'RUNNING'
+            return result
+        raw.call = timed_call
+        return controller, raw, lease, elapsed, pauses, advance
+
+    def test_observed_four_minute_provisioning_confirms_with_headroom(self):
+        controller, raw, lease, elapsed, _, _ = self.world(251)
+        with patch.object(controller_module.time, 'monotonic', side_effect=lambda: elapsed[0]):
+            outcome = controller.confirm_created(lease['request_id'], timeout_seconds=360)
+        self.assertEqual(outcome.status, 'created')
+        self.assertGreater(elapsed[0], 150)
+        self.assertLess(elapsed[0], 360)
+        record, _ = controller.store.read(controller.cfg.key)
+        self.assertTrue(all(record['ids'].values()))
+        self.assertEqual(record['deadline'], lease['deadline'])
+        deadline = datetime.fromisoformat(record['deadline'].replace('Z', '+00:00'))
+        self.assertGreater((deadline - controller.cfg.now()).total_seconds(), 240)
+        reserved = datetime.fromisoformat(record['reserved_at'].replace('Z', '+00:00'))
+        self.assertEqual((deadline - reserved).total_seconds(), 600)
+        self.assertEqual(record['body_hash'], lease['body_hash'])
+
+    def test_slow_confirmation_keeps_occupied_lease_and_original_deadline(self):
+        controller, raw, lease, elapsed, _, _ = self.world(361)
+        with patch.object(controller_module.time, 'monotonic', side_effect=lambda: elapsed[0]):
+            outcome = controller.confirm_created(lease['request_id'], timeout_seconds=360)
+        self.assertEqual(outcome.status, 'pending-operation')
+        self.assertEqual(elapsed[0], 360)
+        record, _ = controller.store.read(controller.cfg.key)
+        self.assertEqual(record['state'], 'ACTIVE')
+        self.assertEqual(record['deadline'], lease['deadline'])
+        self.assertEqual(record['ids'], {'instance': None, 'boot': None, 'data': None})
+        self.assertFalse(any(call[1] == 'delete' for call in raw.calls))
+        self.assertEqual(sum(call[:2] == ('instances', 'insert') for call in raw.calls), 1)
+
+    def test_request_latency_consumes_budget_and_late_done_is_not_accepted(self):
+        for ready_after, latency, expected_calls, expected_pauses in ((999, 30, 11, 10), (0, 400, 1, 0)):
+            controller, raw, lease, elapsed, pauses, _ = self.world(ready_after, latency)
+            with patch.object(controller_module.time, 'monotonic', side_effect=lambda: elapsed[0]):
+                outcome = controller.confirm_created(lease['request_id'], timeout_seconds=360)
+            self.assertEqual(outcome.status, 'pending-operation')
+            self.assertEqual(sum(call[:2] == ('zoneOperations', 'get') for call in raw.calls), expected_calls)
+            self.assertEqual(len(pauses), expected_pauses)
+            self.assertLessEqual(elapsed[0], 360 + latency)
+            self.assertIsNone(controller.store.read(controller.cfg.key)[0]['ids']['instance'])
+
+    def test_cas_conflict_does_not_restart_confirmation_budget(self):
+        controller, raw, lease, elapsed, pauses, advance = self.world(251)
+        def competitor(key, _record):
+            current, gen = controller.store.read(key)
+            controller.store.write(key, current, if_generation_match=gen)
+            advance(106)
+        controller.store.before_write = competitor
+        with patch.object(controller_module.time, 'monotonic', side_effect=lambda: elapsed[0]):
+            self.assertEqual(controller.confirm_created(lease['request_id'], timeout_seconds=360).status,
+                             'pending-operation')
+        self.assertEqual(elapsed[0], 361)
+        self.assertIsNone(controller.store.read(controller.cfg.key)[0]['ids']['instance'])
+
+    def test_invalid_confirmation_budget_fails_without_cloud_or_ledger_access(self):
+        controller = Controller(Mock(), Mock(), Config(boot_image=cli.BOOT_IMAGE))
+        for timeout in (0, -1, True, 3601, 1.5):
+            with self.assertRaises(Refused):
+                controller.confirm_created('request', timeout_seconds=timeout)
+        self.assertEqual(controller.cloud.mock_calls, [])
+        self.assertEqual(controller.store.mock_calls, [])
+
+    def test_early_creation_observation_reaches_ten_minute_expiry(self):
+        clock = FakeClock()
+        controller = Mock()
+        record = {'request_id': 'lease', 'ids': {'instance': 'i', 'boot': 'b', 'data': 'd'},
+                  'names': {'instance': 'vm', 'boot': 'boot', 'data': 'data'},
+                  'deadline': spec.rfc3339(clock.now() + timedelta(minutes=10))}
+        controller.store.read.return_value = (record, 1)
+        controller.cfg.now.side_effect = clock.now
+        controller.cfg.sleep.side_effect = lambda seconds: clock.advance(seconds / 60)
+        start = clock.now()
+        def get(resource, verb, name):
+            if resource == 'disks':
+                index = 0 if name == 'boot' else 1
+                return {'id': ('b', 'd')[index], 'sourceImageId': cli.IMAGES[index][1]}
+            if (clock.now() - start).total_seconds() >= 600:
+                raise cli.NotFound()
+            return {'id': 'i'}
+        controller.cloud.call.side_effect = get
+        with patch('builtins.print'):
+            self.assertIn('vm-absent', cli.wait_for_absence(controller, 'lease')['status'])
+        self.assertEqual((clock.now() - start).total_seconds(), 600)
+        self.assertEqual(controller.cfg.sleep.call_count, 120)
+
+
 class WorkflowTests(unittest.TestCase):
     def workflows(self):
         return [yaml.safe_load((ROOT / '.github/workflows' / f'labapp-lifecycle-{m}.yml').read_text())
@@ -256,6 +379,11 @@ class WorkflowTests(unittest.TestCase):
         for workflow, mode, identity in ((inspect, 'inspect', 'creator'), (cleanup, 'cleanup', 'cleanup')):
             self.assertEqual(workflow['permissions'], {'contents': 'read', 'id-token': 'write'})
             job = workflow['jobs'][mode]
+            if mode == 'inspect':
+                self.assertEqual(job['timeout-minutes'], 16)
+                self.assertGreaterEqual(job['timeout-minutes'] * 60,
+                                        cli.PILOT_LEASE_MINUTES * 60 + cli.ABSENCE_GRACE_SECONDS + 240)
+                self.assertLessEqual(cli.CONFIRM_TIMEOUT_SECONDS + 240, cli.PILOT_LEASE_MINUTES * 60)
             self.assertIn("github.ref == 'refs/heads/main'", job['if'])
             steps = job['steps']
             self.assertEqual(steps[0]['env']['TRUSTED_SHA'], '${{ github.sha }}')
