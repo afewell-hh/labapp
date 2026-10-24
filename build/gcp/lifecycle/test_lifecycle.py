@@ -414,16 +414,18 @@ class T(unittest.TestCase):
 
         def pending(name, *args):
             op = original(name, *args)
-            w.raw.op_stuck.add(op["name"])
+            w.raw.ops[op["name"]]["status"] = "RUNNING"
             return op
 
         w.raw._disks_delete = pending
         self.assertEqual(w.ctl.reconcile(U1).status, "pending-operation")
         self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
         self.assertNotEqual(w.record()["state"], FREE)
+        self.assertEqual(w.ctl.reconcile(U1).status, "pending-operation")
         with self.assertRaises(Refused):
             w.ctl.admit(2, 1, U2)
-        w.raw.op_stuck.clear()
+        for op in w.raw.ops.values():
+            op["status"] = "DONE"
         self.assertEqual(w.ctl.reconcile(U1).status, "released")
 
     def test_failed_cleanup_retained_then_janitor_recovers(self):
