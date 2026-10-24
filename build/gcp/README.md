@@ -97,9 +97,31 @@ directory, checked before any mount. Fixed inspector tools (`findmnt`, `lsblk`, 
 `mount`, `umount`) must already exist. Device paths must be direct nonsymlink
 block nodes under `/dev`, with the supplied exact numbers. Structured `lsblk`
 evidence must show one read-only disk with at most four unmounted partitions,
-exactly one ext4 candidate matching the supplied partition, and only empty or
-vfat filesystems on other partitions. A boot-filesystem match, LVM/RAID/encryption,
-unexpected layout, dirty ext4 state or `needs_recovery` refuses collection.
+exactly one ext4 candidate matching the supplied partition by default, and only
+empty or vfat filesystems on other partitions. A boot-filesystem match,
+LVM/RAID/encryption, unexpected layout, dirty ext4 state or `needs_recovery`
+refuses collection.
+
+For a separately verified Ubuntu root plus separate ext4 boot layout, supply
+both `--boot-partition /dev/EXACT_BOOT_PARTITION` and
+`--boot-partition-number MAJOR:MINOR`. This accepts exactly two ext4 partitions
+matching the explicit root and boot identities under the same read-only parent;
+all existing partition-count, mounted-child, protected inspector-boot and
+identity guards remain. Both ext4 filesystems must be clean without
+`needs_recovery`. Existing trusted `/usr/sbin/debugfs` is additionally required;
+there is no install fallback.
+
+Before mounting either filesystem, the wrapper invokes only fixed default-RO
+`debugfs -R 'stat PATH'` requests. The root must have `/etc` and `/usr`
+directories plus regular `/var/lib/dpkg/status`, and positively lack `/grub`
+and `/grub/grub.cfg`. The companion must have `/grub` directory and regular
+`/grub/grub.cfg`, and positively lack every root marker. Missing lookup is
+accepted only as the exact known diagnostic; IO, corruption, unknown banners,
+unparsed metadata, symlinks or ambiguous roles refuse. Exit0 alone is not
+existence evidence. No contents, arbitrary labels or commands are used for
+role identification. Names, sizes and filesystem labels alone do not choose
+root. Device numbers/RO/layout are rechecked after probes. Only root is mounted;
+the verified boot companion stays unmounted and its contents are not collected.
 
 It mounts only explicit ext4 with `ro,noload,nodev,nosuid,noexec`, disables
 external mount helpers, and verifies resulting source/number/type/options/private
@@ -122,7 +144,9 @@ transfer. Existing lifecycle deadlines are never extended by this wrapper.
 Sources consulted2026-10-24: [kernel ext4](https://docs.kernel.org/admin-guide/ext4.html)
 (RO alone may replay journals; `noload`/`norecovery` skips replay),
 [util-linux mount](https://man7.org/linux/man-pages/man8/mount.8.html) and
-[unshare](https://man7.org/linux/man-pages/man1/unshare.1.html). These describe
+[unshare](https://man7.org/linux/man-pages/man1/unshare.1.html), and
+[Ubuntu24.04 debugfs](https://manpages.ubuntu.com/manpages/noble/man8/debugfs.8.html)
+(e2fsprogs1.47.0; default read-only and fixed inode stat). These describe
 upstream behavior; actual Ubuntu24.04 mount/tool compatibility is not yet tested.
 
 ### Synthetic inspector kernel proof
