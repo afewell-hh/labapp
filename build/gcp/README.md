@@ -52,8 +52,9 @@ perform network access only when explicitly called.
   two intended disks attached (boot read-write, source copy `READ_ONLY`). Any
   unexpected or mismatched child blocks the VM delete too, because VM delete
   also removes `autoDelete` disks. An id not yet recorded is adopted only with
-  proof (a completed insert whose `clientOperationId` is this lease's UUID, and
-  a creation time not before the reservation); labels alone never suffice. Then
+  proof (a completed insert whose `clientOperationId` is this lease's UUID,
+  whose `targetId` matches the VM incarnation, and a creation time not before
+  the reservation); labels alone never suffice. Then
   it deletes the VM, then each disk, by exact name, waits for the delete
   operation, and requires a 404 for **all three** before release.
   - An error, identity mismatch, still-existing resource or foreign pending

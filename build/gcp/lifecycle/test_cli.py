@@ -14,7 +14,10 @@ import yaml
 
 from . import cli, spec
 from .auth_http import HttpResponse
-from .controller import Outcome, Refused
+from .controller import Config, Controller, Outcome, Refused
+from .cloud import PolicyCloud
+from .fakes import FakeClock, FakeCloud
+from .store import MemoryStore
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -173,6 +176,28 @@ class CliTests(unittest.TestCase):
             controller.store.write.assert_not_called()
             self.assertTrue(all(call.args[:2] == ('disks', 'get')
                                 for call in controller.cloud.call.call_args_list))
+
+    def test_provenance_failure_after_real_controller_create_retains_owned_cleanup(self):
+        clock = FakeClock()
+        raw = FakeCloud(clock)
+        controller = Controller(MemoryStore(), PolicyCloud(raw, spec.PROJECT, spec.ZONE),
+                                Config(boot_image=cli.BOOT_IMAGE, lease_minutes=5,
+                                       min_submit_minutes=1, now=clock.now, sleep=clock.sleep))
+        env, event = event_env()
+        # FakeCloud deliberately has no sourceImageId: missing provenance must
+        # fail after recording identities, and must leave cleanup operational.
+        with self.assertRaisesRegex(Refused, 'provenance mismatch'):
+            cli.execute('inspect', controller, Mock(), env, event)
+        record, _ = controller.store.read(controller.cfg.key)
+        self.assertEqual(record['state'], 'ACTIVE')
+        self.assertTrue(all(record['ids'].values()))
+        deadline = datetime.fromisoformat(record['deadline'].replace('Z', '+00:00'))
+        reserved = datetime.fromisoformat(record['reserved_at'].replace('Z', '+00:00'))
+        self.assertEqual((deadline - reserved).total_seconds(), 300)
+        self.assertFalse(any(call[1] == 'delete' for call in raw.calls))
+        self.assertEqual(controller.reconcile(record['request_id']).status, 'released')
+        self.assertEqual(raw.instances, {})
+        self.assertEqual(raw.disks, {})
 
     def test_incomplete_cleanup_is_failure(self):
         env, event = event_env('schedule')
