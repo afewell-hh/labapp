@@ -2,8 +2,8 @@
 
 Everything here is a constant or a pure function so the exact request body can
 be hashed, persisted before submission and diffed in tests. Field names follow
-the Compute Engine v1 ``instances.insert`` resource as relayed in the #153 lead
-review; they have NOT been exercised against the live API (see README gates).
+the Compute Engine v1 ``instances.insert`` resource. A read-only attachment
+cannot auto-delete; its owned disk requires explicit cleanup (see README gates).
 """
 from __future__ import annotations
 
@@ -78,8 +78,9 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
             {
                 # A copy created inline from the source image, attached
                 # read-only; there is no writable fallback. The original
-                # image is never attached.
-                "boot": False, "autoDelete": True, "mode": "READ_ONLY",
+                # image is never attached. Compute rejects autoDelete on a
+                # READ_ONLY attachment; reconciliation deletes this copy.
+                "boot": False, "autoDelete": False, "mode": "READ_ONLY",
                 "deviceName": "src", "type": "PERSISTENT",
                 "initializeParams": {
                     "diskName": n["data"], "sourceImage": SOURCE_IMAGE,
@@ -144,10 +145,10 @@ def validate_body(body: dict) -> None:
         raise ValueError("first disk must be the read-write boot disk")
     if data.get("boot") is not False or data.get("mode") != "READ_ONLY":
         raise ValueError("source copy must be a non-boot READ_ONLY attachment")
+    if boot.get("autoDelete") is not True or data.get("autoDelete") is not False:
+        raise ValueError("autoDelete must be true on boot and false on the READ_ONLY copy")
     sizes = []
     for disk in disks:
-        if disk.get("autoDelete") is not True:
-            raise ValueError("autoDelete must be explicitly true on both disks")
         init = disk.get("initializeParams", {})
         if not is_owned_name(init.get("diskName", "")):
             raise ValueError("disk name outside the owned pattern")

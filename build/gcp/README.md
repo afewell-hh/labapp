@@ -14,7 +14,7 @@ perform network access only when explicitly called.
 
 | File | Role |
 |---|---|
-| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`, both `autoDelete: true`, the copy attached `READ_ONLY`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
+| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
 | `cloud.py` | `PolicyCloud`: the only call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
@@ -49,7 +49,8 @@ perform network access only when explicitly called.
 - `reconcile` is the only path to `FREE`. Before any delete it runs an
   all-or-nothing preflight: every existing resource must match name, lease
   label, zone and immutable id, and an existing VM must have **exactly** the
-  two intended disks attached (boot read-write, source copy `READ_ONLY`). Any
+  two intended disks attached (boot `READ_WRITE`/`autoDelete: true`, source
+  copy `READ_ONLY`/`autoDelete: false`). Any
   unexpected or mismatched child blocks the VM delete too, because VM delete
   also removes `autoDelete` disks. An id not yet recorded is adopted only with
   proof (a completed insert whose `clientOperationId` is this lease's UUID,
@@ -57,6 +58,12 @@ perform network access only when explicitly called.
   the reservation); labels alone never suffice. Then
   it deletes the VM, then each disk, by exact name, waits for the delete
   operation, and requires a 404 for **all three** before release.
+  - Compute forbids auto-delete on a read-only attachment. VM deletion, whether
+    explicit or at the absolute deadline, auto-deletes only the boot disk. The
+    source copy remains billable until the cleanup identity explicitly deletes
+    it. Independent janitor cleanup is required; the VM deadline alone cannot
+    bound data-disk retention. A failed or pending disk delete keeps capacity
+    occupied, even when the VM is absent.
   - An error, identity mismatch, still-existing resource or foreign pending
     operation keeps the slot occupied (`CLEANUP_FAILED` or `blocked`).
   - A 404, timeout or HTTP error on create is not proof the create failed. A
@@ -100,9 +107,10 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
 ## Not covered yet (gates before any VM)
 
-- The GCS and Compute adapters have mocked HTTP tests only. None of the
-  live API behavior is exercised: `requestId` retention/idempotence, `terminationTime` plus
-  `DELETE` removing `autoDelete` disks, whether disk labels from
+- Offline tests do not prove successful live creation or cleanup:
+  `requestId` retention/idempotence, `terminationTime` plus
+  `DELETE` removing the boot disk, explicit deletion of the retained data copy,
+  whether disk labels from
   `initializeParams` propagate, whether an inline source-image disk is
   accepted with `READ_ONLY` mode (no writable fallback exists; if the API
   rejects it the design must change, not the check), the shape of
@@ -152,6 +160,9 @@ only handles due leases, on an offset ten-minute schedule. This interval is
 best-effort and gives no ten-minute completion guarantee. Both use the same CAS reconciliation and verify the VM
 and both disks absent before release. Schedules remain best-effort; initial
 Compute `terminationTime` plus `DELETE` is the independent cloud-side bound.
+That bound requests VM deletion and boot-disk auto-deletion; it does not delete
+the `READ_ONLY` source-copy disk. The independent cleanup workflow must delete
+that owned disk explicitly and confirm absence before releasing the ledger.
 
 The lead can exercise normal cleanup by dispatching manual cleanup after the
 creator logs confirmed IDs; cancellation by cancelling the creator and checking
@@ -163,6 +174,8 @@ image availability, Compute expiry behavior, cancellation delivery or disk
 removal. Those require the separately authorized lead-run pilots after review.
 
 Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
+[disk auto-delete settings](https://docs.cloud.google.com/compute/docs/disks/modify-persistent-disk#autodelete)
+(explicit read-only restriction; the REST boolean schema alone does not express it),
 [GitHub Contents API](https://docs.github.com/en/rest/repos/contents#get-repository-content),
 [workflow_run trust and default-branch semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run),
 [CPU quota pools](https://docs.cloud.google.com/compute/resource-usage#cpu_quota),
