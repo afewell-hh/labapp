@@ -125,8 +125,11 @@ gh run view RUN_ID --repo afewell-hh/labapp --log
 
 Use this named workflow on `main` for the metadata-only scope described above.
 The separately scoped [fixed lifecycle runner](../../build/gcp/README.md#fixed-lifecycle-runner)
-supports lead-dispatched serial VM pilots and independent cleanup. Neither path
-permits arbitrary workflows/commands or general worker cloud credentials. Record
+supports lead-dispatched serial inspectors and independent cleanup. Each new
+inspector receives a fixed 30-minute cloud deadline and a 36-minute creator job
+budget, with no duration input. Dispatch does not authorize guest access or
+collection; those require the separately reviewed owner-access scope below.
+Neither path permits arbitrary workflows/commands or general worker cloud credentials. Record
 the run URL, commit, selected image's immutable ID and metadata result in #152.
 A successful setup or auth step alone does not prove image access.
 

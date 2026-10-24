@@ -169,7 +169,7 @@ perform network access only when explicitly called.
 
 - `Config.lease_minutes` defaults to 60 and may shorten the lease to an
   integer from 1 to 60. `min_submit_minutes` must be shorter than that lease;
-  the fixed ten-minute pilot uses a one-minute submission margin. Admission
+  the fixed thirty-minute inspector uses a one-minute submission margin. Admission
   rechecks these bounds before writing intent; an existing deadline is never
   extended.
 - **Every** transition (admit, submit, ID capture, failure, release) is a
@@ -276,7 +276,7 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 ## Fixed lifecycle runner
 
 The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
-with no inputs. The pilot uses a fixed **ten-minute** absolute lease,
+with no inputs. The inspector uses a fixed **thirty-minute** absolute lease,
 `e2-standard-2`, a 10GB stock Ubuntu boot disk and a 300GB read-only source-copy
 `pd-standard` disk. Both images are checked against pinned immutable IDs before
 admission. Project-global CPU and regional shared CPU/standard-disk quotas must have
@@ -285,6 +285,12 @@ metadata (startup/shutdown scripts or cloud-init user-data) blocks this pilot.
 E2 uses the regional `CPUS` pool shared with N1; no `E2_CPUS` entry is required. Existing unknown resources
 still block admission through the controller census. There is no guest script,
 package download, SSH, serial output or filesystem extraction in this pilot.
+
+The fixed window applies to every new inspector dispatch; there is no duration
+input or environment override. It remains below the 60-minute inspection limit
+and never changes an existing lease. Normal cleanup can end it early. Owner
+IAP access, synthetic mount validation and private collection require their
+separately reviewed authorization; the creator does not run guest commands.
 
 The runner fetches only the nine required Python module files through GitHub's
 Contents API at the trusted workflow's `github.sha`, before WIF authentication.
@@ -297,8 +303,8 @@ Creator confirmation polls the insert operation for up to six elapsed minutes,
 with at most 72 polls at five-second intervals. Time spent in requests counts
 against that polling budget, and CAS conflicts do not restart it. The budget is
 checked between requests: one in-flight read can finish after it, and subsequent
-ownership/provenance reads take additional time. The creator job has a sixteen-
-minute timeout, leaving four minutes beyond the ten-minute lease plus two-minute
+ownership/provenance reads take additional time. The creator job has a thirty-six-
+minute timeout, leaving four minutes beyond the thirty-minute lease plus two-minute
 absence grace for setup and preflight; that overhead is allowance, not a
 provisioning-time guarantee. No deadline is extended. Slow or uncertain creation
 still fails closed and independent cleanup retains the occupied lease.
@@ -307,7 +313,7 @@ The controller's optional `confirm_created(..., timeout_seconds=...)` argument
 sets this elapsed polling budget. Calls that omit it and all cleanup operation
 waits retain their existing attempt/interval defaults. Creator uses 72 attempts;
 the cleanup CLI retains 30 attempts at five-second intervals. The absence wait
-also has an iteration ceiling covering the full ten-minute lease plus two-minute
+also has an iteration ceiling covering the full thirty-minute lease plus two-minute
 grace, so early provisioning does not exhaust its observation window first.
 
 Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
