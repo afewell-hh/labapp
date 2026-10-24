@@ -66,6 +66,10 @@ A separate 10-minute CI job runs the existing k3d install/failure suite in two
 fresh Ubuntu containers, with an eight-minute command timeout. It mounts only
 `build/provision` read-only and gives guests no Docker socket or credentials.
 It verifies installation, not a Docker daemon, cluster or appliance boot.
+A separate bridge IPv4 job runs required Python synthetic tests and the unchanged
+runtime helper in a disposable Ubuntu 24.04 network namespace with NET_ADMIN
+only and no network access. Package preparation is separate; resource/time
+bounds and exact owned cleanup are documented in `build/provision/README.md`.
 Historical launch recipes are `gcp_vm_launch_command.txt`, not a runnable script.
 
 New lifecycle/controller code must add its actual offline test command to CI
@@ -104,8 +108,10 @@ cannot prove. Full VM builds are not required for every change.
 Provisioning logic is written once and run unchanged in development tests, and
 later in Packer. Each module must state, in its header and tests:
 
-- **Interpreter**: `#!/usr/bin/env bash` with `set -euo pipefail`; invoked as
-  `bash path`, not relying on the executable bit.
+- **Interpreter**: shell modules use `#!/usr/bin/env bash` with `set -euo pipefail`,
+  invoked as `bash path`, not relying on the executable bit. The standalone
+  bridge runtime artifact uses Ubuntu 24.04 Python 3.12 stdlib, invoked as
+  `python3 path`; it is not a provisioning framework or image integration.
 - **User/privilege**: who runs it (root vs `ubuntu`), and what needs `sudo`.
 - **Environment**: overrides it reads (with defaults), noninteractive, no TTY.
   Packer's shell provisioner does not give your login environment; pass
