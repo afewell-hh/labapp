@@ -117,6 +117,24 @@ Do not touch production resources, create images or cloud resources, or run
 deployment scripts unless the task explicitly authorizes it. Don't rewrite
 `_archive/` or `archive2/` unless asked. Never commit secrets.
 
+## Authorized cloud work
+
+Use the [GCP access runbook](../runbooks/gcp-build-access.md) for the trusted
+keyless runner boundary. A lead may dispatch only the fixed metadata workflow
+on `main`; no arbitrary task commands, PR code or build identity enter it.
+Cloud credentials stay out of general worker jobs.
+
+For explicitly authorized build/test tasks, maximum three project VM slots
+includes stopped, reserved and cleanup-pending resources; default to one job.
+Reuse requires confirmed deletion of the VM and owned temporary children.
+Default VM bounds: 60 minutes for component/inspection work, 120 minutes for a
+full build, no silent extension. Require cloud-side bounds at creation,
+normal/cancelled/failed-job cleanup and independent expiry cleanup, with exact
+ownership and immutable IDs. Check quotas before launch; do not increase them
+implicitly. These policies do not themselves enforce capacity or cleanup:
+#153 must deliver reviewed/tested lifecycle gates before any VM job starts.
+No production changes or broad IAM are implied by build/test authorization.
+
 ## Dispatch, tool access and handoff operations
 
 Current status, permission and CI baselines, and evidence live in GitHub, not

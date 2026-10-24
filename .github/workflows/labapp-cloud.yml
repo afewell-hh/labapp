@@ -1,0 +1,67 @@
+---
+name: Labapp source-image metadata
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# Serializes this workflow only; does not enforce project VM capacity.
+concurrency:
+  group: labapp-cloud
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: >-
+      github.repository_id == '1089062808' &&
+      github.repository_owner_id == '193945001' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BUILD_PROJECT: ${{ vars.LABAPP_BUILD_PROJECT }}
+      WIF_PROVIDER: ${{ vars.LABAPP_WIF_PROVIDER }}
+      INSPECTOR_SA: ${{ vars.LABAPP_INSPECTOR_SA }}
+    steps:
+      - name: Validate identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_PROJECT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]
+          [[ "$BUILD_PROJECT" != teched-473722 ]]
+          [[ "$INSPECTOR_SA" == \
+            "labapp-inspector@${BUILD_PROJECT}.iam.gserviceaccount.com" ]]
+          pattern='^projects/[0-9]+/locations/global/'
+          pattern+='workloadIdentityPools/labapp-github/providers/trusted-main$'
+          [[ "$WIF_PROVIDER" =~ $pattern ]]
+      - name: Checkout trusted main workflow commit
+        # actions/checkout v4; auth needs checkout before credentials creation.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Authenticate short-lived inspector identity
+        # google-github-actions/auth v3
+        # yamllint disable-line rule:line-length
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          project_id: ${{ env.BUILD_PROJECT }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.INSPECTOR_SA }}
+      - name: Install pinned Google Cloud CLI
+        # google-github-actions/setup-gcloud v3
+        # yamllint disable-line rule:line-length
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          version: '540.0.0'
+      - name: Read only selected source-image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud version
+          gcloud compute images describe hedgehog-vaidc-v20260114 \
+            --project=teched-473722 \
+            --format='json(id,name,status,creationTimestamp,diskSizeGb)'
