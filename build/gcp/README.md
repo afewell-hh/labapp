@@ -140,6 +140,14 @@ of the saved appliance or a real mount.
   **Library and tests only.** Includes an opt-in GCS store adapter; no workflow
   invokes it. It grants no IAM and launches no VM.
 
+For separately authorized owner access to an inspector, see the
+[IAP access plan](../../docs/runbooks/gcp-build-access.md#owner-iap-access-to-an-owned-inspector).
+The current create body remains untagged: the existing owner may add the one
+dedicated tag after confirmed immutable IDs using the current fingerprint and
+exact readback. The restrictive firewall is separately recorded lead-managed
+access infrastructure, not an untracked per-lease child. This plan adds no
+creator IAM, cloud endpoint, guest execution or raw-data publication path.
+
 ## Lifecycle module contract
 
 Python 3.12 standard library only. The controller/spec and offline tests need
