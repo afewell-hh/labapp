@@ -214,6 +214,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("github.ref == 'refs/heads/main'", job['if'])
             steps = job['steps']
             self.assertEqual(steps[0]['env']['TRUSTED_SHA'], '${{ github.sha }}')
+            self.assertIn('mkdir -p "$GITHUB_WORKSPACE"', steps[0]['run'])
             self.assertIn(f'labapp-lc-{identity}@', steps[1]['with']['service_account'])
             self.assertEqual(steps[2]['with']['version'], '540.0.0')
             for step in steps:
