@@ -17,6 +17,8 @@ K3D_INSTALL_DIR=/tmp/k3d-test bash build/provision/install-k3d.sh
 # base image id/digest, os-release, per-check PASS/FAIL and per-run timing. Containers
 # mount only build/provision read-only: no Docker socket or host credentials.
 bash build/provision/test-install-k3d.sh
+# Optional immutable base image; CI sets this to a verified Ubuntu 24.04 digest.
+K3D_TEST_IMAGE=ubuntu@sha256:YOUR_DIGEST bash build/provision/test-install-k3d.sh
 ```
 
 Static checks. `bash -n` parses only its first file argument (later names

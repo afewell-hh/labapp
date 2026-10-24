@@ -34,7 +34,7 @@ Codex does not document an import mechanism, so this file uses plain links;
 
 ## Where things are
 
-- `cloud-config.yaml`, `gcp_vm_launch_command.sh`: base system setup and VM launch
+- `cloud-config.yaml`, `gcp_vm_launch_command.txt`: base system setup and historical VM launch recipes
 - `build/gcp/`: access bootstrap and offline VM lease primitives ([README](build/gcp/README.md))
 - `build/provision/`: Packer-ready modules and tests ([README](build/provision/README.md))
 - `docs/runbooks/`: manual image build and troubleshooting

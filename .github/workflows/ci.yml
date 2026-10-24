@@ -7,221 +7,93 @@ name: CI
   push:
     branches: [main]
 
+# Offline/component checks only, without cloud identity.
+permissions:
+  contents: read
+
 jobs:
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    name: Active shell, YAML, cloud-init and bootstrap checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
-      - name: Bash Syntax Check
+      - name: Install Ubuntu validation tools
         run: |
-          echo "Checking shell syntax with bash -n"
-          EXIT_CODE=0
-          # Exclude _archive directory and bats test files
-          while IFS= read -r -d '' script; do
-            # Skip archived files
-            if [[ "$script" == ./_archive/* ]]; then
-              continue
-            fi
-            # Skip bats test files (they use different syntax)
-            if head -1 "$script" | grep -q "bats"; then
-              echo "Skipping bats file: $script"
-              continue
-            fi
+          sudo apt-get update
+          sudo apt-get install -y shellcheck yamllint cloud-init python3-yaml
+          shellcheck --version
+          yamllint --version
+          cloud-init --version
+      - name: Test lifecycle access bootstrap without cloud credentials
+        run: |
+          test -f build/gcp/test_bootstrap_lifecycle_access.py
+          python3 -m unittest discover -s build/gcp -p test_bootstrap_lifecycle_access.py -v
+      - name: Check every active shell script
+        shell: bash
+        run: |
+          set -euo pipefail
+          # New active .sh files are included; historical code stays untouched.
+          git ls-files -z '*.sh' ':(exclude)_archive/**' \
+            ':(exclude)archive2/**' > /tmp/active-shell-files
+          mapfile -d '' -t scripts < /tmp/active-shell-files
+          ((${#scripts[@]} > 0))
+          for script in "${scripts[@]}"; do
             echo "Validating: $script"
-            if ! bash -n "$script"; then
-              echo "❌ Syntax error in: $script"
-              EXIT_CODE=1
-            fi
-          done < <(find . -name "*.sh" -type f -print0)
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Shell syntax validation failed"
-            exit 1
-          fi
-          echo "✓ All shell scripts passed syntax validation"
-
-      - name: Shellcheck
-        run: |
-          sudo apt-get install -y shellcheck
-          echo "Running shellcheck on installer scripts"
-          EXIT_CODE=0
-          # Only check active directories, not _archive
-          if [ -d installer/modules ]; then
-            find installer/modules -name "*.sh" \
-              -exec shellcheck -x {} \; || EXIT_CODE=1
-          fi
-          if [ -d scripts ]; then
-            find scripts -name "*.sh" \
-              -exec shellcheck -x {} \; || EXIT_CODE=1
-          fi
-          if [ -d tests/e2e/scripts ]; then
-            find tests/e2e/scripts -name "*.sh" \
-              -exec shellcheck -x {} \; || EXIT_CODE=1
-          fi
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Shellcheck found issues"
-            exit 1
-          fi
-          echo "✓ All shell scripts passed shellcheck"
-
-      - name: YAML Lint
-        run: |
-          pip install yamllint
-          if [ -d configs ]; then
-            yamllint configs/ || true
-          fi
-          yamllint .github/workflows/
-
-  validate-systemd:
-    name: Validate Systemd Services
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check systemd service configurations
-        run: |
-          echo "Validating systemd service files..."
-          EXIT_CODE=0
-
-          # Check hhfab-vlab.service for critical settings
-          SERVICE_FILE="installer/modules/hhfab-vlab.service"
-
-          if [ ! -f "$SERVICE_FILE" ]; then
-            echo "❌ Service file not found: $SERVICE_FILE"
-            EXIT_CODE=1
-          else
-            echo "Checking $SERVICE_FILE..."
-
-            # Check for PrivateTmp=true (blocks tmux access)
-            if grep -q "^PrivateTmp=true" "$SERVICE_FILE"; then
-              echo "❌ Service uses PrivateTmp=true (blocks tmux socket access)"
-              EXIT_CODE=1
-            fi
-
-            # Check for Type=forking (causes blocking)
-            if grep -q "^Type=forking" "$SERVICE_FILE"; then
-              echo "❌ Service uses Type=forking (causes indefinite blocking)"
-              EXIT_CODE=1
-            fi
-
-            # Verify Type=oneshot is used
-            if ! grep -q "^Type=oneshot" "$SERVICE_FILE"; then
-              echo "❌ Service should use Type=oneshot"
-              EXIT_CODE=1
-            fi
-
-            # Verify TimeoutStartSec is set
-            if ! grep -q "^TimeoutStartSec=" "$SERVICE_FILE"; then
-              echo "❌ Service should have TimeoutStartSec set"
-              EXIT_CODE=1
-            fi
-
-            # Verify ConditionPathExists prevents re-runs
-            if ! grep -q "ConditionPathExists=!" "$SERVICE_FILE"; then
-              echo "❌ Service should have ConditionPathExists to prevent"\
-                   "re-initialization"
-              EXIT_CODE=1
-            fi
-
-            echo "✓ Service file validation passed"
-          fi
-
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Systemd service validation failed"
-            exit 1
-          fi
-          echo "✓ All systemd services are correctly configured"
-
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Make test scripts executable
-        run: |
-          find tests/unit -name "*.sh" -type f -exec chmod +x {} \;
-
-      - name: Run orchestrator ordering tests
-        run: |
-          echo "Running orchestrator ordering tests..."
-          tests/unit/test-orchestrator-ordering.sh
-
-      - name: Run systemd service tests
-        run: |
-          echo "Running systemd service tests..."
-          tests/unit/test-systemd-services.sh
-
-      - name: Run first-boot setup tests
-        run: |
-          echo "Running first-boot setup tests..."
-          if [ -f tests/unit/test-first-boot-setup.sh ]; then
-            tests/unit/test-first-boot-setup.sh
-          else
-            echo "Test file not found, skipping"
-          fi
-
-      - name: Run VLAB readiness tests
-        run: |
-          echo "Running VLAB readiness tests..."
-          if [ -f tests/unit/test-vlab-readiness.sh ]; then
-            tests/unit/test-vlab-readiness.sh
-          else
-            echo "Test file not found, skipping"
-          fi
-
-      - name: Test Summary
-        if: always()
-        run: |
-          echo "Unit test execution complete"
-
-  test-modules:
-    name: Test Modules and Scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Run module validation tests
-        run: |
-          echo "Running module validation tests..."
-          make test-modules
-
-  validate-installer:
-    name: Validate Installer Scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check installer scripts exist
-        run: |
-          echo "Validating installer scripts..."
-          EXIT_CODE=0
-
-          # Check core installer files exist
-          REQUIRED_FILES=(
-            "installer/modules/01-install-base.sh"
-            "installer/modules/02-install-k3d.sh"
-            "installer/modules/03-install-hhfab.sh"
-            "installer/modules/20-k3d-observability-init.sh"
-            "installer/modules/30-vlab-init.sh"
-            "installer/modules/hhfab-vlab-runner"
-          )
-
-          for file in "${REQUIRED_FILES[@]}"; do
-            if [ ! -f "$file" ]; then
-              echo "❌ Missing required file: $file"
-              EXIT_CODE=1
-            else
-              echo "✓ Found: $file"
-            fi
+            bash -n "$script"
           done
+          shellcheck -x "${scripts[@]}"
+      - name: Lint active YAML
+        run: |
+          yamllint .yamllint.yml .github marketplace cloud-config.yaml wiringd.yaml
+      - name: Validate cloud-init config schema
+        run: cloud-init schema --config-file cloud-config.yaml --annotate
+      - name: Check embedded cloud-init shell without executing it
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import tempfile
+          import yaml
 
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Installer validation failed"
-            exit 1
-          fi
-          echo "✓ All required installer files present"
+          config = yaml.safe_load(pathlib.Path("cloud-config.yaml").read_text())
+          count = 0
+          with tempfile.TemporaryDirectory() as directory:
+              for entry in config.get("write_files", []):
+                  if not entry["path"].endswith(".sh"):
+                      continue
+                  # Never use guest absolute paths as extraction targets.
+                  script = pathlib.Path(directory) / f"script-{count}.sh"
+                  script.write_text(entry["content"])
+                  print(f"Checking embedded script: {entry['path']}", flush=True)
+                  subprocess.run(["bash", "-n", str(script)], check=True)
+                  subprocess.run(["shellcheck", "-x", str(script)], check=True)
+                  count += 1
+          if count == 0:
+              raise SystemExit("Expected cloud-config write_files shell scripts")
+          print(f"Validated {count} embedded shell scripts (not executed)")
+          PY
+
+  k3d-install:
+    name: k3d install in two disposable Ubuntu containers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Ubuntu 24.04 manifest observed by the validated component test.
+      K3D_TEST_IMAGE: ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test module without guest Docker socket or credentials
+        run: timeout --kill-after=30s 8m bash build/provision/test-install-k3d.sh 2
+
+  lifecycle-offline:
+    name: GCP lifecycle offline suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run required lifecycle tests
+        run: |
+          test -f build/gcp/lifecycle/test_lifecycle.py
+          python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v

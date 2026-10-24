@@ -32,7 +32,7 @@ write_files:
     content: |
       #!/bin/bash
       set -ex
-      
+
       echo "--- Installing kubectl and helm ---"
       curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
       install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
@@ -42,24 +42,24 @@ write_files:
       chmod 700 get_helm.sh
       ./get_helm.sh
       rm get_helm.sh
-      
+
       echo "--- Kubernetes tooling installed ---"
 
       echo "Starting Docker installation..."
       curl -fsSL https://get.docker.com -o /tmp/install-docker.sh
       sh /tmp/install-docker.sh
-      
+
       usermod -aG docker ubuntu
       usermod -aG kvm ubuntu
-      
+
       echo "--- Group Membership Configured ---"
-      
+
       echo "Installing ORAS..."
       curl -fsSL https://i.hhdev.io/oras | bash
-      
+
       echo "Installing K3d..."
       curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
-      
+
       echo "--- Additional tools installation finished ---"
 
   - path: /root/config_rdp.sh
@@ -81,7 +81,7 @@ write_files:
       startxfce4
       EOF
       chmod +x /etc/xrdp/startwm.sh
-  
+
   - path: /home/ubuntu/.local/share/applications/Firefox.desktop
     permissions: '0755'
     owner: ubuntu:ubuntu

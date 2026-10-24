@@ -1,3 +1,6 @@
+# Historical launch recipes, not an executable script.
+# Select and adapt one command; do not run this whole file.
+
 gcloud compute instances create labapp-0-12 \
     --project=teched-473722 \
     --zone=us-west1-c \

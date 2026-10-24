@@ -1,0 +1,14 @@
+---
+extends: default
+rules:
+  # cloud-config needs its #cloud-config marker first; existing manifests omit ---.
+  document-start: disable
+  # Embedded scripts, GitHub expressions and pinned action SHAs are not prose.
+  line-length: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  comments:
+    # Includes the required #cloud-config header.
+    require-starting-space: false
+    min-spaces-from-content: 1
