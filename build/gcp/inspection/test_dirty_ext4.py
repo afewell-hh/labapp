@@ -20,6 +20,19 @@ ITEM = {"name": "/dev/loop99", "maj:min": "7:99", "type": "loop",
 
 
 class DirtyJournalTests(unittest.TestCase):
+    def test_only_known_unmounted_mountpoint_arrays_accepted(self):
+        for mountpoints in ([], [None]):
+            proof.validate_loop_layout(json.dumps({'blockdevices': [dict(ITEM, mountpoints=mountpoints)]}),
+                                       '/dev/loop99', '7:99')
+        for mountpoints in (None, '', {}, False, [False], [0], [''], ['/mnt'],
+                            [None, '/mnt'], [None, None]):
+            with self.subTest(mountpoints=mountpoints), self.assertRaises(Refused):
+                proof.validate_loop_layout(json.dumps({'blockdevices': [dict(ITEM, mountpoints=mountpoints)]}),
+                                           '/dev/loop99', '7:99')
+        missing = {key: value for key, value in ITEM.items() if key != 'mountpoints'}
+        with self.assertRaises(Refused):
+            proof.validate_loop_layout(json.dumps({'blockdevices': [missing]}), '/dev/loop99', '7:99')
+
     def test_committed_pending_transaction_and_unchanged_guard(self):
         proof.validate_dirty_evidence(HEADER, JOURNAL)
         for header, journal in ((HEADER.replace("needs_recovery", ""), JOURNAL),
