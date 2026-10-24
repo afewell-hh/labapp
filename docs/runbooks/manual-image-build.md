@@ -37,22 +37,52 @@ recommended upgrade targets or new-build pins.
 | `cloud-init` | `25.2-0ubuntu1~24.04.1` |
 | `ubuntu-minimal` | `1.539.2` |
 
-Captured fixed paths have SHA-256 receipts in the linked candidate:
+### Persisted startup literals
 
-- Five units under `/etc/systemd/system/`: `argocd-port-fix.service`,
-  `hhbr-ip.service`, `hhfab-vlab-resume.service`, `kubeconfig-merge.service`
-  and `vlab-netfilter.service`.
-- Three helpers under `/usr/local/bin/`: `fix-argocd-port.sh`,
-  `hhbr-ip-setup.sh` and `hhfab-vlab-resume.sh`.
+The [accepted startup candidate and separate lead attestation](https://github.com/afewell-hh/labapp/issues/151#issuecomment-6389492802)
+add selected persisted settings for the same immutable image ID
+`7638370619126112785`. Candidate SHA-256:
+`a1962de0ecd47b8baf0bb1ab37629b3557ad72407800fd25137835d472e2827a`.
+The canonical os-release check verifies exactly `ID=ubuntu`,
+`VERSION_ID=24.04` and `VERSION_CODENAME=noble`; it does not verify other
+os-release fields. The original inventory skipped the `/etc/os-release`
+symlink; canonical verification does not turn skipped paths into inspected
+ones.
 
-File presence and hashes establish neither enabled state nor effective unit
-arguments. The collector skipped symlinks, including `/etc/os-release` and the
-`/lib` paths; those paths remain unknown, not absent. Missing fixed paths do
-not prove no equivalent component exists elsewhere. This limited inventory
-does not recover hhfab's binary version, fabric/wiring inputs, chart versions,
-network/shell settings or runtime/student compatibility. Reproducing the image
+The five captured files are under `/etc/systemd/system/`. The table records
+recognized literal settings, not complete units to install. All five contain
+`RemainAfterExit=yes`; the first four also contain
+`WantedBy=multi-user.target`, which does not establish that they are enabled.
+
+| Unit | Recognized persisted settings | Literal recovery limits |
+| --- | --- | --- |
+| `argocd-port-fix.service` | `Requires=docker.service`; `Type=oneshot`; `ExecStart=/usr/local/bin/fix-argocd-port.sh`; `TimeoutStartSec=180` (180 seconds) | Unsupported directive and value withheld. |
+| `hhbr-ip.service` | `After=hhfab-vlab-resume.service`; `Wants=hhfab-vlab-resume.service`; `Type=oneshot`; `ExecStart=/usr/local/bin/hhbr-ip-setup.sh`; `Restart=on-failure`; `RestartSec=30` (30 seconds) | Only unit with a complete recognized literal subset; helper implementation remains unknown. |
+| `hhfab-vlab-resume.service` | `After=network-online.target`; `Wants=network-online.target`; `Type=forking`; `ExecStart=/usr/local/bin/hhfab-vlab-resume.sh`; `User=ubuntu`; `Group=ubuntu`; `WorkingDirectory=/home/ubuntu/hhfab`; `TimeoutStartSec=120` (120 seconds) | Unsupported directive withheld. |
+| `kubeconfig-merge.service` | `After=network-online.target hhfab-vlab-resume.service`; `Wants=network-online.target`; `Type=oneshot`; `Restart=no` | Unsupported value withheld; no command recovered in the accepted subset. |
+| `vlab-netfilter.service` | `DefaultDependencies=no`; `Type=oneshot` | Repeated assignment and unsupported value withheld; no command or install target recovered in the accepted subset. |
+
+All three referenced helpers have presence/hash receipts, but their
+implementations and behavior remain unknown: `/usr/local/bin/fix-argocd-port.sh`,
+`/usr/local/bin/hhbr-ip-setup.sh` and `/usr/local/bin/hhfab-vlab-resume.sh`.
+The [historical public recipe in #131](https://github.com/afewell-hh/labapp/issues/131)
+did not exactly match the source hhbr helper and must not substitute for it.
+
+Even the complete recognized hhbr literal subset does not establish complete
+or effective configuration, enablement, runtime state or successful startup.
+Drop-ins were not composed, masks and aliases were not resolved, generators
+and runtime were not inspected, and unknown fields were withheld. The
+collector skipped symlinked `/lib` paths; skipped paths remain unknown, not
+absent. Missing fixed paths do not prove no equivalent component exists
+elsewhere. These subsets must not be deployed as production-ready unit files.
+
+This baseline does not recover hhfab's binary version, fabric/wiring inputs,
+chart versions, network/shell settings or runtime/student compatibility.
+Remaining recovery is tracked in [#198](https://github.com/afewell-hh/labapp/issues/198)
+and [#151](https://github.com/afewell-hh/labapp/issues/151). Reproducing the image
 still requires reviewed configuration recovery and clean build, boot/reboot
-and student acceptance; historical commands below are not that proof.
+and student acceptance. The historical commands below are a separate manual
+workflow, not evidence that they reproduce this immutable source.
 
 ## Step 1: Launch VM with cloud-config
 
