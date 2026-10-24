@@ -12,6 +12,17 @@ permissions:
   contents: read
 
 jobs:
+  inspection-offline:
+    name: Private filesystem collector offline suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run required synthetic filesystem tests
+        run: |
+          test -f build/gcp/inspection/test_collector.py
+          python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
+
   lint:
     name: Active shell, YAML, cloud-init and bootstrap checks
     runs-on: ubuntu-24.04

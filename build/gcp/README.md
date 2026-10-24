@@ -1,5 +1,72 @@
 # GCP build access and VM lease primitives
 
+## Offline private filesystem collector
+
+`inspection/collector.py` is a Python 3.12 standard-library command for an
+**already mounted, stable, read-only guest root on Linux**. It does not mount,
+repair, chroot, execute/source guest code, or use cloud credentials. No workflow
+invokes it against a guest. Mounting, private authenticated transfer/storage,
+reviewer access, deletion deadlines and lifecycle authorization must be reviewed
+separately before actual guest use; this module does not supply those gates.
+
+Invoke unchanged from the repository root as an inspector user with read access
+to the mount and an existing, owned mode-0700 private output directory:
+
+```bash
+python3 -m build.gcp.inspection.collector \
+  --root /mnt/guest --private-output /private/inspection/inventory.json
+python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
+```
+
+The new output file is exclusive-create, mode 0600, outside the guest root,
+limited to 8 MiB. Never upload or print it. stdout contains only status counts
+and a report hash; errors do not include guest content. Raw units/helpers can
+contain secrets even at allowlisted paths. Private output still requires a
+separate reviewed transfer and field-redaction pass before any public use;
+neither allowlisting nor a future pattern scanner proves publication safety.
+
+Schema 1 records guest path, kind, status and (for captured files) SHA-256.
+OS release, six named units and their `.conf` drop-ins are captured privately.
+The names are `hhfab-vlab-resume`, `vlab-netfilter`, `hhbr-ip`,
+`kubeconfig-merge`, `argocd-port-fix`, `hhfab-vlab`; these are historical leads,
+not evidence that the saved image has them. Installed package name/version
+pairs come from the guest `/var/lib/dpkg/status` via a bounded stdlib parser,
+never the inspector's package database. Other dpkg fields are not copied.
+
+Helper discovery accepts only a simple first executable from `ExecStart`,
+`ExecStartPre` or `ExecStartPost`, with a fixed basename matching those six
+names (optionally `.sh`), `hhfab-vlab-runner`, `hhbr-ip-setup.sh` or
+`fix-argocd-port.sh` (the last two are historical #138 candidates), in `/usr/local/bin`,
+`/usr/local/sbin`, `/opt/hedgehog/bin`, `/home/ubuntu/bin` or `/home/hhlab/bin`.
+It does not interpret shell wrappers, expand systemd specifiers or recursively
+follow helpers. Unsupported references remain in private unit text for review.
+No arbitrary home/opt directory traversal, environment-file reads, token files,
+kubeconfigs, SSH keys, histories, databases, container data or VM disks occur.
+Legitimate helper names containing `kubeconfig` are allowed by exact name.
+
+Every guest path component is opened relative to a pinned directory fd with
+`O_NOFOLLOW`; **all symlinks are skipped and reported**, including legitimate
+`/etc/os-release` or `/lib` guest links. Files must be regular UTF-8 text, at
+most 256 KiB (16 MiB for dpkg). Drop-in enumeration is nonrecursive and bounded
+to 128 entries per directory; the report has a 256-capture ceiling. A gap is
+not evidence that a component is absent. This is filesystem evidence, not
+systemd effective configuration or runtime verification. It assumes a trusted
+inspector host and no concurrent mount replacement.
+
+The report explicitly marks network/sysctl/modules, fabric/wiring sanitization,
+shell profiles, binary versions, charts, environment files, recursive helpers,
+effective systemd configuration and runtime recovery unimplemented. These need
+separate slices; this command cannot recover the complete appliance baseline.
+
+Primary references consulted 2026-10-24: Python
+[3.12 descriptor-relative filesystem APIs](https://docs.python.org/3.12/library/os.html),
+[dpkg-query database/installed package fields](https://manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html)
+(Debian bookworm manual, not an Ubuntu guest version claim), and
+[systemd.service command syntax](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+(current upstream 262; the collector deliberately implements only discovery,
+not that parser). Synthetic tests establish isolation and bounds, not behavior
+of the saved appliance or a real mount.
+
 - `bootstrap-access.sh`: owner-run keyless access setup (see
   [`docs/runbooks/gcp-build-access.md`](../../docs/runbooks/gcp-build-access.md)).
 - `lifecycle/`: offline-testable single-slot VM lease primitives for #153.
