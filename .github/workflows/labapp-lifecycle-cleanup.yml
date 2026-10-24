@@ -4,7 +4,7 @@ name: Labapp lifecycle cleanup
 'on':
   workflow_dispatch:
   schedule:
-    - cron: '17,47 * * * *'
+    - cron: '7,17,27,37,47,57 * * * *'
   workflow_run:
     workflows: ['Labapp bounded lifecycle inspection']
     types: [completed]

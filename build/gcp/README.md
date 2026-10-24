@@ -147,7 +147,8 @@ completed creator runs, including failure/cancellation, only after validating
 the fixed name/path, original dispatch, repository/owner, main branch, and the
 ledger's run ID and attempt. Late completions cannot force another lease's
 cleanup. Manual cleanup dispatch forces the current lease; scheduled cleanup
-only handles due leases. Both use the same CAS reconciliation and verify the VM
+only handles due leases, on an offset ten-minute schedule. This interval is
+best-effort and gives no ten-minute completion guarantee. Both use the same CAS reconciliation and verify the VM
 and both disks absent before release. Schedules remain best-effort; initial
 Compute `terminationTime` plus `DELETE` is the independent cloud-side bound.
 

@@ -249,6 +249,7 @@ class WorkflowTests(unittest.TestCase):
     def test_workflow_boundary(self):
         inspect, cleanup = self.workflows()
         self.assertEqual(inspect['on'], {'workflow_dispatch': None})
+        self.assertEqual(cleanup['on']['schedule'], [{'cron': '7,17,27,37,47,57 * * * *'}])
         self.assertEqual(cleanup['on']['workflow_run'],
                          {'workflows': [cli.CREATOR_NAME], 'types': ['completed'], 'branches': ['main']})
         for workflow, mode, identity in ((inspect, 'inspect', 'creator'), (cleanup, 'cleanup', 'cleanup')):
