@@ -14,9 +14,9 @@ unchanged against Cloud Storage and Compute adapters.
 
 | File | Role |
 |---|---|
-| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`, both `autoDelete: true`), no external IP, no service account, absolute 60 min `scheduling.terminationTime` with `DELETE`. Builds, validates and hashes the exact `instances.insert` body |
+| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`, both `autoDelete: true`, the copy attached `READ_ONLY`), no external IP, no service account, absolute 60 min `scheduling.terminationTime` with `DELETE`. Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
-| `cloud.py` | `PolicyCloud`: the only call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
+| `cloud.py` | `PolicyCloud`: the only call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
 | `fakes.py`, `test_lifecycle.py` | Fake cloud with failure injection and the invariant tests |
 
@@ -33,17 +33,30 @@ unchanged against Cloud Storage and Compute adapters.
 - `submit` records the attempt before sending, reuses the persisted UUID and
   body, and never mints a new UUID. Default is one attempt
   (`max_submit_attempts`); retry semantics for `requestId` are not verified.
-- Admission fails closed: any instance or disk not in the lead-supplied
-  `baseline` (name → immutable id), or any non-DONE zone operation, blocks the
-  lease. Prefix lookalikes are unknown, not owned.
-- `reconcile` is the only path to `FREE`. It deletes the VM, then each disk, by
-  exact name only after verifying name, `labapp-lease` label, zone and
-  immutable id (or creation time for an id not yet captured), waits for the
-  delete operation, and requires a 404 for **all three** before release.
+- Admission fails closed over the **whole project** (every zone, all pages of
+  `aggregatedList`; a failed page, unreachable scope or runaway paging blocks):
+  any instance or disk not in the lead-supplied `baseline` (name → immutable
+  id), or any non-DONE operation, blocks the lease. Baseline VMs are protected
+  but still count: total VMs (running or stopped, any zone) plus the new lease
+  must not exceed `max_vm_slots` (3), so four baseline VMs never admit a fifth.
+  Prefix lookalikes are unknown, not owned. This is a serial one-slot gate, not
+  a multi-slot allocator.
+- `reconcile` is the only path to `FREE`. Before any delete it runs an
+  all-or-nothing preflight: every existing resource must match name, lease
+  label, zone and immutable id, and an existing VM must have **exactly** the
+  two intended disks attached (boot read-write, source copy `READ_ONLY`). Any
+  unexpected or mismatched child blocks the VM delete too, because VM delete
+  also removes `autoDelete` disks. An id not yet recorded is adopted only with
+  proof (a completed insert whose `clientOperationId` is this lease's UUID, and
+  a creation time not before the reservation); labels alone never suffice. Then
+  it deletes the VM, then each disk, by exact name, waits for the delete
+  operation, and requires a 404 for **all three** before release.
   - An error, identity mismatch, still-existing resource or foreign pending
     operation keeps the slot occupied (`CLEANUP_FAILED` or `blocked`).
   - A 404, timeout or HTTP error on create is not proof the create failed. A
-    lease with submit attempts but no related operation and no VM is held
+    lease with submit attempts but no insert operation for **its own request
+    id** and no VM is held (an operation that only targets the same name does
+    not count)
     until the absolute deadline (a late create is rejected after
     `terminationTime`).
   - `reconcile(request_id)` is the owner's forced cleanup and leaves a newer
@@ -61,8 +74,10 @@ python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
 - No Cloud Storage or Compute adapter, so none of the real API behavior is
   exercised: `requestId` retention/idempotence, `terminationTime` plus
   `DELETE` removing `autoDelete` disks, whether disk labels from
-  `initializeParams` propagate, inline source-image disks with `READ_WRITE`
-  mode, org-policy effects, quota behavior and operation listing latency.
+  `initializeParams` propagate, whether an inline source-image disk is
+  accepted with `READ_ONLY` mode (no writable fallback exists; if the API
+  rejects it the design must change, not the check), the shape of
+  `aggregatedList` warnings, org-policy effects, quota behavior and operation listing latency.
   The fake is a model, not evidence.
 - No workflow, guest extraction stage, or private output channel.
 - No IAM: custom roles, scoped create versus delete permissions, the ledger

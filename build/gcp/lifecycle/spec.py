@@ -76,9 +76,10 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
                 },
             },
             {
-                # A copy created inline from the source image; the guest
-                # mounts it ro,noload. Original image is never attached.
-                "boot": False, "autoDelete": True, "mode": "READ_WRITE",
+                # A copy created inline from the source image, attached
+                # read-only; there is no writable fallback. The original
+                # image is never attached.
+                "boot": False, "autoDelete": True, "mode": "READ_ONLY",
                 "deviceName": "src", "type": "PERSISTENT",
                 "initializeParams": {
                     "diskName": n["data"], "sourceImage": SOURCE_IMAGE,
@@ -138,6 +139,11 @@ def validate_body(body: dict) -> None:
     disks = body.get("disks", [])
     if len(disks) != 2:
         raise ValueError("exactly boot and source-copy disks are allowed")
+    boot, data = disks
+    if boot.get("boot") is not True or boot.get("mode") != "READ_WRITE":
+        raise ValueError("first disk must be the read-write boot disk")
+    if data.get("boot") is not False or data.get("mode") != "READ_ONLY":
+        raise ValueError("source copy must be a non-boot READ_ONLY attachment")
     sizes = []
     for disk in disks:
         if disk.get("autoDelete") is not True:

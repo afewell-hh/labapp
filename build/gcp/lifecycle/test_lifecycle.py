@@ -416,15 +416,256 @@ class T(unittest.TestCase):
         self.assertEqual(w.ctl.reconcile(U1).status, "cleanup-failed")
         self.assertEqual(w.deletes(), [])
 
-    def test_disk_identity_mismatch_stops_before_that_disk_is_deleted(self):
+    def _assert_nothing_deleted(self, w):
+        """Zero delete calls and every resource still present (autoDelete on)."""
+        self.assertEqual(w.deletes(), [])
+        names = spec.names(1, 1)
+        self.assertIn(names["instance"], w.raw.instances)
+        self.assertIn(names["boot"], w.raw.disks)
+        self.assertIn(names["data"], w.raw.disks)
+        self.assertEqual(w.record()["state"], CLEANUP_FAILED)
+        with self.assertRaises(Refused):
+            w.ctl.admit(2, 1, U2)
+
+    def test_disk_identity_mismatch_blocks_vm_delete_with_autodelete(self):
+        # Normal fake: deleting the VM WOULD remove its autoDelete disks, so
+        # the mismatch must be caught before the VM delete is issued.
+        for kind, mutate in (
+                ("data-label", lambda w, n: w.raw.disks[n["data"]][
+                    "labels"].update({spec.LABEL_LEASE: U2})),
+                ("boot-label", lambda w, n: w.raw.disks[n["boot"]][
+                    "labels"].update({spec.LABEL_LEASE: U2})),
+                ("data-id", lambda w, n: w.raw.disks[n["data"]].update(
+                    id="different-incarnation")),
+                ("boot-id", lambda w, n: w.raw.disks[n["boot"]].update(
+                    id="different-incarnation"))):
+            w = World()
+            w.started()
+            self.assertFalse(w.raw.leak_disks)
+            mutate(w, spec.names(1, 1))
+            out = w.ctl.reconcile(U1)
+            self.assertEqual(out.status, "cleanup-failed", kind)
+            self.assertTrue(out.detail.startswith("identity-mismatch:"), kind)
+            self._assert_nothing_deleted(w)
+
+    def test_unowned_extra_attachment_blocks_vm_delete(self):
         w = World()
         w.started()
-        w.raw.leak_disks = True  # keep disks after the VM delete
-        data = spec.names(1, 1)["data"]
-        w.raw.disks[data]["labels"][spec.LABEL_LEASE] = U2
-        self.assertEqual(w.ctl.reconcile(U1).status, "cleanup-failed")
-        self.assertNotIn(data, {c[2] for c in w.deletes()})
-        self.assertIn(data, w.raw.disks)
+        foreign = "protected-unowned-data"
+        w.raw.add_foreign("disks", foreign)
+        w.raw.instances[spec.names(1, 1)["instance"]]["disks"].append(
+            {"source": f"https://compute/zones/{spec.ZONE}/disks/{foreign}",
+             "autoDelete": True, "boot": False, "mode": "READ_ONLY"})
+        w.cfg.baseline[foreign] = w.raw.disks[foreign]["id"]
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.detail, "identity-mismatch:instance:attachments")
+        self._assert_nothing_deleted(w)
+        self.assertIn(foreign, w.raw.disks)
+
+    def test_swapped_or_wrong_mode_attachment_blocks_vm_delete(self):
+        foreign = "protected-unowned-data"
+        for label, mutate, reason in (
+                ("foreign source",
+                 lambda att, w: att[1].update(
+                     source=f"https://compute/zones/{spec.ZONE}/disks/"
+                            f"{foreign}"),
+                 "attachment-unexpected"),
+                ("writable data", lambda att, w: att[1].update(
+                    mode="READ_WRITE"), "attachment-mode"),
+                ("boot flag", lambda att, w: att[1].update(boot=True),
+                 "attachment-boot-flag"),
+                ("other zone", lambda att, w: att[1].update(
+                    source="https://compute/zones/europe-west1-b/disks/"
+                           + spec.names(1, 1)["data"]), "attachment-zone"),
+                ("duplicate", lambda att, w: att[1].update(
+                    source=att[0]["source"]), "attachment-unexpected"),
+                ("no inventory", lambda att, w: att.clear(), "attachments")):
+            w = World()
+            w.started()
+            w.raw.add_foreign("disks", foreign)
+            inst = w.raw.instances[spec.names(1, 1)["instance"]]
+            mutate(inst["disks"], w)
+            out = w.ctl.reconcile(U1)
+            self.assertEqual(out.detail, f"identity-mismatch:instance:{reason}",
+                             label)
+            self._assert_nothing_deleted(w)
+            self.assertIn(foreign, w.raw.disks, label)
+
+    def test_missing_identity_is_adopted_only_with_operation_proof(self):
+        # Runner died before ids were persisted. Matching labels and a fresh
+        # timestamp are not proof; the operation record is removed here (as if
+        # not retained), so nothing may be deleted.
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        w.raw.ops.clear()
+        self.assertIsNone(w.record()["ids"]["instance"])
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.detail,
+                         "identity-mismatch:instance:unproven-ownership")
+        self.assertEqual(w.deletes(), [])
+        self.assertIn(spec.names(1, 1)["instance"], w.raw.instances)
+
+    def test_proof_requires_this_requests_client_operation_id(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        for op in w.raw.ops.values():
+            op["clientOperationId"] = U2  # someone else's insert
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.status, "cleanup-failed")
+        self.assertEqual(w.deletes(), [])
+
+    def test_confirm_refuses_operation_for_another_request(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        for op in w.raw.ops.values():
+            op["clientOperationId"] = U2
+        self.assertEqual(w.ctl.confirm_created(U1).status, "operation-mismatch")
+        self.assertIsNone(w.record()["ids"]["instance"])
+
+    def test_confirm_refuses_unowned_attachment_and_records_nothing(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        w.raw.instances[spec.names(1, 1)["instance"]]["disks"].append(
+            {"source": "x/disks/other", "autoDelete": True})
+        self.assertEqual(w.ctl.confirm_created(U1).status, "identity-mismatch")
+        self.assertIsNone(w.record()["ids"]["instance"])
+
+    def test_target_only_insert_does_not_resolve_an_uncertain_create(self):
+        w = World()
+        w.raw.insert_mode = "timeout_nothing"
+        w.ctl.admit(1, 1, U1)
+        self.assertEqual(w.ctl.submit(U1).status, "uncertain")
+        # A retained DONE insert for the same (reused) name, older lease.
+        w.raw._op("insert", spec.names(1, 1)["instance"], client_id=U2)
+        self.assertEqual(w.ctl.reconcile(U1).status, "settling")
+        self.assertNotEqual(w.record()["state"], FREE)
+        w.clock.advance(61)
+        self.assertEqual(w.ctl.reconcile().status, "released")
+
+    def test_vm_appearing_after_preflight_is_not_deleted(self):
+        w = World()
+        w.ctl.admit(1, 1, U1)
+        w.ctl.submit(U1)
+        name = spec.names(1, 1)["instance"]
+        inst = w.raw.instances.pop(name)
+        original = w.ctl._inspect
+
+        def inspect(rec, proof):
+            result = original(rec, proof)
+            w.raw.instances[name] = inst  # lands right after the preflight
+            return result
+        w.ctl._inspect = inspect
+        out = w.ctl.reconcile(U1)
+        self.assertEqual(out.detail,
+                         "identity-mismatch:instance:appeared-during-cleanup")
+        self.assertEqual([c for c in w.deletes() if c[2] == name], [])
+
+    # ----------------------------------------------- project-wide capacity
+    def test_four_baseline_vms_cannot_authorize_a_fifth(self):
+        w = World()
+        for i in range(4):
+            name = f"existing-test-{i}"
+            w.cfg.baseline[name] = w.raw.add_foreign("instances", name)
+        with self.assertRaises(Refused):
+            w.ctl.admit(1, 1, U1)
+        self.assertEqual(w.record()["state"], FREE)
+
+    def test_ceiling_counts_all_zones_and_stopped_vms(self):
+        w = World()
+        for name, zone in (("a", spec.ZONE), ("b", "europe-west1-b"),
+                           ("c", "asia-east1-a")):
+            w.cfg.baseline[name] = w.raw.add_foreign("instances", name,
+                                                     zone=zone)
+        w.raw.instances["a"]["status"] = "TERMINATED"
+        with self.assertRaises(Refused) as ctx:
+            w.ctl.admit(1, 1, U1)
+        self.assertIn("ceiling", str(ctx.exception))
+
+    def test_two_baseline_vms_leave_room_for_one_lease(self):
+        w = World()
+        for name, zone in (("a", spec.ZONE), ("b", "europe-west1-b")):
+            w.cfg.baseline[name] = w.raw.add_foreign("instances", name,
+                                                     zone=zone)
+        w.ctl.admit(1, 1, U1)
+        self.assertEqual(w.record()["state"], RESERVED)
+
+    def test_unknown_resource_in_another_zone_blocks_admission(self):
+        for kind in ("instances", "disks"):
+            w = World()
+            w.raw.add_foreign(kind, "stray", zone="europe-west1-b")
+            with self.assertRaises(Refused):
+                w.ctl.admit(1, 1, U1)
+
+    def test_baseline_in_another_zone_is_tolerated_and_never_deleted(self):
+        w = World()
+        w.cfg.baseline["far"] = w.raw.add_foreign("instances", "far",
+                                                  zone="europe-west1-b")
+        w.started()
+        w.ctl.reconcile(U1)
+        self.assertIn("far", w.raw.remote["europe-west1-b"]["instances"])
+        self.assertNotIn("far", {c[2] for c in w.deletes()})
+
+    def test_census_follows_every_page(self):
+        w = World()
+        w.raw.page_size = 1
+        w.raw.add_foreign("instances", "p1", zone="z-1")
+        w.raw.add_foreign("instances", "p2", zone="z-2")
+        w.cfg.baseline.update(p1=w.raw.remote["z-1"]["instances"]["p1"]["id"])
+        # p2 is unknown and lives on a later page.
+        with self.assertRaises(Refused):
+            w.ctl.admit(1, 1, U1)
+
+    def test_census_pending_operation_blocks_across_pages(self):
+        w = World()
+        w.raw.page_size = 1
+        for i in range(3):
+            w.raw.add_foreign("disks", f"d{i}", zone=f"z-{i}")
+            w.cfg.baseline[f"d{i}"] = w.raw.remote[f"z-{i}"]["disks"][
+                f"d{i}"]["id"]
+        w.raw._op("insert", "x", status="RUNNING")
+        with self.assertRaises(Refused):
+            w.ctl.admit(1, 1, U1)
+
+    def test_census_fails_closed_on_list_errors_and_unreachable_scopes(self):
+        w = World()
+        w.raw.unreachables = ["zones/us-east1-b"]
+        with self.assertRaises(Refused):
+            w.ctl.admit(1, 1, U1)
+        for key in (("instances", "aggregatedList"), ("disks", "aggregatedList"),
+                    ("globalOperations", "aggregatedList")):
+            w = World()
+            w.raw.list_error.add(key)
+            with self.assertRaises(Refused):
+                w.ctl.admit(1, 1, U1)
+            self.assertEqual(w.record()["state"], FREE)
+
+    def test_runaway_paging_fails_closed(self):
+        w = World(max_pages=2)
+        w.raw.page_size = 1
+        for i in range(3):
+            w.raw.add_foreign("disks", f"d{i}", zone=f"z-{i}")
+        with self.assertRaises(Refused):
+            w.ctl.admit(1, 1, U1)
+
+    def test_cleanup_reads_all_operation_pages_before_release(self):
+        w = World()
+        w.started()
+        w.raw.page_size = 1
+        w.raw._op("insert", "someone-else", status="RUNNING")  # last page
+        self.assertEqual(w.ctl.reconcile(U1).status, "blocked")
+        self.assertNotEqual(w.record()["state"], FREE)
+
+    def test_cleanup_blocks_when_operation_listing_fails(self):
+        w = World()
+        w.started()
+        w.raw.list_error.add(("zoneOperations", "list"))
+        self.assertEqual(w.ctl.reconcile(U1).status, "blocked")
+        self.assertEqual(w.deletes(), [])
+        self.assertNotEqual(w.record()["state"], FREE)
 
     def test_preexisting_and_published_resources_never_deleted(self):
         w = World()
@@ -461,6 +702,15 @@ class T(unittest.TestCase):
             w.cloud.call("instances", "get", name="x", zone="europe-west1-b")
         self.assertEqual(w.raw.calls, [])
 
+    def test_policy_scope_is_pinned_to_the_approved_project_and_zone(self):
+        raw = FakeCloud(FakeClock())
+        for project, zone in (("other-project", spec.ZONE),
+                              (spec.PROJECT, "europe-west1-b"),
+                              ("other-project", "europe-west1-b")):
+            with self.assertRaises(ForbiddenOperation):
+                PolicyCloud(raw, project, zone)
+        PolicyCloud(raw, spec.PROJECT, spec.ZONE)
+
     def test_full_scenarios_only_use_allowlisted_calls(self):
         w = World()
         w.started()
@@ -483,6 +733,10 @@ class T(unittest.TestCase):
                          "DELETE")
         self.assertNotIn("maxRunDuration", body["scheduling"])
         self.assertEqual([d["autoDelete"] for d in body["disks"]], [True, True])
+        self.assertEqual([d["boot"] for d in body["disks"]], [True, False])
+        # The source copy is read-only; there is no writable alternative.
+        self.assertEqual([d["mode"] for d in body["disks"]],
+                         ["READ_WRITE", "READ_ONLY"])
         sizes = [d["initializeParams"]["diskSizeGb"] for d in body["disks"]]
         self.assertEqual(sizes, ["10", "300"])
         self.assertTrue(all(d["initializeParams"]["diskType"].endswith(
@@ -519,6 +773,11 @@ class T(unittest.TestCase):
                 diskType="zones/z/diskTypes/pd-ssd"),
             "wrong size": lambda b: b["disks"][1]["initializeParams"].update(
                 diskSizeGb="500"),
+            "writable source copy": lambda b: b["disks"][1].update(
+                mode="READ_WRITE"),
+            "source copy without mode": lambda b: b["disks"][1].pop("mode"),
+            "source copy as boot": lambda b: b["disks"][1].update(boot=True),
+            "read-only boot": lambda b: b["disks"][0].update(mode="READ_ONLY"),
             "third disk": lambda b: b["disks"].append(
                 copy.deepcopy(b["disks"][0])),
         }

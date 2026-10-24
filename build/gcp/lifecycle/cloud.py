@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Protocol
 
+from . import spec
+
 
 class ApiError(Exception):
     def __init__(self, status: int, message: str = "") -> None:
@@ -35,18 +37,26 @@ ALLOWED: frozenset = frozenset({
     ("instances", "list"), ("instances", "delete"),
     ("disks", "get"), ("disks", "list"), ("disks", "delete"),
     ("zoneOperations", "get"), ("zoneOperations", "list"),
+    # Read-only project-wide views used only by the admission census.
+    ("instances", "aggregatedList"), ("disks", "aggregatedList"),
+    ("globalOperations", "aggregatedList"),
 })
 
 
 class RawTransport(Protocol):
     def call(self, resource: str, verb: str, *, project: str, zone: str,
              name: Optional[str] = None, body: Optional[dict] = None,
-             request_id: Optional[str] = None) -> dict:
+             request_id: Optional[str] = None,
+             page_token: Optional[str] = None) -> dict:
         ...
 
 
 class PolicyCloud:
     def __init__(self, raw: RawTransport, project: str, zone: str) -> None:
+        # The policy boundary is the reviewed constant, not the caller's input.
+        if (project, zone) != (spec.PROJECT, spec.ZONE):
+            raise ForbiddenOperation(
+                "PolicyCloud scope must be the approved project and zone")
         self._raw = raw
         self.project = project
         self.zone = zone

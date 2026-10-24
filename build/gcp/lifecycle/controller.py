@@ -26,6 +26,7 @@ from . import spec
 from .cloud import ApiError, NotFound, PolicyCloud, Uncertain
 from .store import PreconditionFailed, SlotStore
 
+KINDS = (("instance", "instances"), ("boot", "disks"), ("data", "disks"))
 FREE, RESERVED, ACTIVE, CLEANUP_FAILED = (
     "FREE", "RESERVED", "ACTIVE", "CLEANUP_FAILED")
 NOT_RUNNING = frozenset({"STOPPING", "STOPPED", "TERMINATED", "SUSPENDING",
@@ -59,6 +60,9 @@ class Config:
     # Protected preexisting resources: name -> immutable id. Anything else
     # found at admission is unknown ownership and blocks the lease.
     baseline: dict = field(default_factory=dict)
+    # Project-wide VM ceiling (all zones, protected + temporary, any state).
+    max_vm_slots: int = 3
+    max_pages: int = 100
     max_submit_attempts: int = 1  # same-UUID retry semantics are unverified
     min_submit_minutes: int = 10
     poll_attempts: int = 30
@@ -104,8 +108,14 @@ class Controller:
             self.cfg.sleep(self.cfg.poll_seconds)
         return None
 
-    def _verify(self, kind: str, res: dict, rec: dict) -> Optional[str]:
-        """Return None if res provably belongs to this lease, else a reason."""
+    def _verify(self, kind: str, res: dict, rec: dict,
+                proof: bool) -> Optional[str]:
+        """Return None if res provably belongs to this lease, else a reason.
+
+        A resource whose immutable id is not yet recorded is accepted only
+        with ``proof``: a completed insert operation carrying this lease's
+        clientOperationId. Matching labels alone are never enough.
+        """
         if res.get("name") != rec["names"][kind] or \
                 not spec.is_owned_name(res.get("name", "")):
             return "name"
@@ -117,31 +127,137 @@ class Controller:
         if known:
             if res.get("id") != known:
                 return "id"
-        elif _parse(res.get("creationTimestamp", "1970-01-01T00:00:00Z")) < \
-                _parse(rec["reserved_at"]):
-            return "predates-lease"
+        else:
+            if not proof:
+                return "unproven-ownership"
+            if _parse(res.get("creationTimestamp", "1970-01-01T00:00:00Z")) < \
+                    _parse(rec["reserved_at"]):
+                return "predates-lease"
         return None
 
-    def _adopt(self, rec: dict, gen: int, kind: str, res: dict):
-        if rec["ids"].get(kind) is None:
+    def _inventory(self, inst: dict, rec: dict) -> Optional[str]:
+        """The VM must carry exactly the two intended disks, nothing else.
+
+        Deleting a VM also deletes its autoDelete disks, so this runs before
+        the VM delete and any unexpected or mismatched child blocks it.
+        """
+        attached = inst.get("disks")
+        if not isinstance(attached, list) or len(attached) != 2:
+            return "attachments"
+        names = rec["names"]
+        want = {names["boot"]: True, names["data"]: False}
+        seen = set()
+        for att in attached:
+            src = att.get("source", "")
+            name = src.rsplit("/", 1)[-1]
+            if name not in want or name in seen:
+                return "attachment-unexpected"
+            seen.add(name)
+            if "/zones/" in src and \
+                    src.split("/zones/", 1)[1].split("/", 1)[0] != rec["zone"]:
+                return "attachment-zone"
+            if "/projects/" in src and \
+                    src.split("/projects/", 1)[1].split("/", 1)[0] != \
+                    rec["project"]:
+                return "attachment-project"
+            if bool(att.get("boot")) != want[name]:
+                return "attachment-boot-flag"
+            expected = "READ_WRITE" if want[name] else "READ_ONLY"
+            if att.get("mode", "READ_WRITE") != expected:
+                return "attachment-mode"
+        return None
+
+    def _inspect(self, rec: dict, proof: bool):
+        """Fetch and verify the lease's three resources without changing any.
+
+        Returns (reason, found). reason is None only when every resource that
+        exists is provably this lease's and an existing VM has exactly the two
+        intended disks attached (each of which must then exist and verify).
+        """
+        found = {}
+        for kind, resource in KINDS:
+            res = self._get(resource, rec["names"][kind])
+            if res is not None:
+                found[kind] = res
+        for kind, res in found.items():
+            reason = self._verify(kind, res, rec, proof)
+            if reason:
+                return f"{kind}:{reason}", found
+        if "instance" in found:
+            reason = self._inventory(found["instance"], rec)
+            if reason:
+                return f"instance:{reason}", found
+            for kind in ("boot", "data"):
+                if kind not in found:
+                    return f"{kind}:attached-but-missing", found
+        return None, found
+
+    def _adopt(self, rec: dict, gen: int, found: dict):
+        """Record immutable ids of already-verified resources (one CAS)."""
+        new = {k: res["id"] for k, res in found.items()
+               if rec["ids"].get(k) is None}
+        if new:
             prev = dict(rec)
-            rec["ids"] = dict(rec["ids"], **{kind: res["id"]})
+            rec["ids"] = dict(rec["ids"], **new)
             gen = self._cas(prev, rec, gen)
         return rec, gen
 
     # -------------------------------------------------------------- admission
+    def _pages(self, resource: str, verb: str):
+        """Yield every page; any failure or runaway paging blocks the caller."""
+        token = None
+        for _ in range(self.cfg.max_pages):
+            try:
+                page = self.cloud.call(resource, verb, page_token=token)
+            except (ApiError, Uncertain) as exc:
+                raise Refused(f"cannot list {resource}.{verb}: {exc}") from exc
+            yield page
+            token = page.get("nextPageToken")
+            if not token:
+                return
+        raise Refused(f"{resource}.{verb} exceeded {self.cfg.max_pages} pages")
+
+    def _list_all(self, resource: str) -> list:
+        return [i for p in self._pages(resource, "list")
+                for i in p.get("items", [])]
+
+    def _aggregate(self, resource: str, key: str) -> list:
+        """All items of a project-wide list across every zone."""
+        out = []
+        for page in self._pages(resource, "aggregatedList"):
+            if page.get("unreachables"):
+                raise Refused(f"{resource}: unreachable scopes "
+                              f"{page['unreachables']}")
+            for scope, data in (page.get("items") or {}).items():
+                warning = data.get("warning")
+                if warning and warning.get("code") != "NO_RESULTS_ON_PAGE":
+                    raise Refused(f"{resource} {scope}: {warning.get('code')}")
+                out.extend(data.get(key, []))
+        return out
+
     def _census(self) -> None:
-        """Fail closed on any resource or operation we cannot attribute."""
+        """Fail closed on any resource or operation we cannot attribute.
+
+        Covers every zone of the project. Protected baseline resources are
+        allowed to exist but still count toward the VM ceiling, as do stopped
+        VMs and half-cleaned leases; unknown ownership blocks admission.
+        """
         base = self.cfg.baseline
-        for resource in ("instances", "disks"):
-            for item in self.cloud.call(resource, "list").get("items", []):
+        vms = self._aggregate("instances", "instances")
+        for resource, items in (
+                ("instances", vms),
+                ("disks", self._aggregate("disks", "disks"))):
+            for item in items:
                 if base.get(item["name"]) != item.get("id"):
                     raise Refused(
                         f"unknown {resource} {item['name']}: ownership not "
                         "established, admission blocked")
-        for op in self.cloud.call("zoneOperations", "list").get("items", []):
+        for op in self._aggregate("globalOperations", "operations"):
             if op.get("status") != "DONE":
-                raise Refused(f"pending operation {op.get('name')} in zone")
+                raise Refused(f"pending operation {op.get('name')} in project")
+        if len(vms) + 1 > self.cfg.max_vm_slots:
+            raise Refused(f"{len(vms)} VMs exist; ceiling is "
+                          f"{self.cfg.max_vm_slots} including this lease")
 
     def admit(self, run_id: int, attempt: int, request_id: str) -> dict:
         """Persist the full intent (UUID, body hash, names, deadline) first."""
@@ -236,16 +352,20 @@ class Controller:
                 return Outcome("pending-operation", rec["operation"])
             if done.get("error"):
                 return Outcome("create-failed", str(done["error"]))
+            # Ownership proof: the completed insert for this exact request.
+            if done.get("operationType") != "insert" or \
+                    done.get("clientOperationId") != request_id or \
+                    done.get("targetLink", "").rsplit("/", 1)[-1] != \
+                    rec["names"]["instance"]:
+                return Outcome("operation-mismatch", rec["operation"])
             try:
-                for kind, resource in (("instance", "instances"),
-                                       ("boot", "disks"), ("data", "disks")):
-                    res = self._get(resource, rec["names"][kind])
-                    if res is None:
+                reason, found = self._inspect(rec, proof=True)
+                if reason:
+                    return Outcome("identity-mismatch", reason)
+                for kind, _resource in KINDS:
+                    if kind not in found:
                         return Outcome("missing", kind)
-                    reason = self._verify(kind, res, rec)
-                    if reason:
-                        return Outcome("identity-mismatch", f"{kind}:{reason}")
-                    rec, gen = self._adopt(rec, gen, kind, res)
+                rec, gen = self._adopt(rec, gen, found)
                 return Outcome("created", "ids recorded")
             except _Conflict:
                 continue
@@ -289,9 +409,11 @@ class Controller:
             self._cas(prev, rec, gen)
         return Outcome("cleanup-failed", reason)
 
-    def _delete_owned(self, rec, gen, kind, resource, ev):
+    def _delete_owned(self, rec, gen, kind, resource, found, proof, ev):
         """Delete one resource by exact name after identity verification.
 
+        Only resources that passed the all-or-nothing preflight (``found``)
+        may be deleted; anything that appears later blocks instead.
         Returns (rec, gen, None) when it is confirmed absent, or
         (rec, gen, Outcome) when the slot must stay occupied.
         """
@@ -300,11 +422,13 @@ class Controller:
         if res is None:
             ev.append(f"{kind} {name}: absent (404)")
             return rec, gen, None
-        reason = self._verify(kind, res, rec)
+        reason = None if kind in found else "appeared-during-cleanup"
+        reason = reason or self._verify(kind, res, rec, proof)
+        if kind == "instance" and not reason:  # recheck right before delete
+            reason = self._inventory(res, rec)
         if reason:  # no delete call is made for an unverified resource
             return rec, gen, self._fail(
                 rec, gen, f"identity-mismatch:{kind}:{reason}", ev)
-        rec, gen = self._adopt(rec, gen, kind, res)
         try:
             op = self.cloud.call(resource, "delete", name=name)
         except (ApiError, Uncertain) as exc:
@@ -325,7 +449,11 @@ class Controller:
             return Outcome("not-due")
         owned = set(rec["names"].values())
         related, foreign_pending = [], []
-        for op in self.cloud.call("zoneOperations", "list").get("items", []):
+        try:
+            all_ops = self._list_all("zoneOperations")
+        except Refused as exc:
+            return Outcome("blocked", str(exc))
+        for op in all_ops:
             target = op.get("targetLink", "").rsplit("/", 1)[-1]
             if op.get("clientOperationId") == rec["request_id"] or \
                     target in owned:
@@ -334,15 +462,27 @@ class Controller:
                 foreign_pending.append(op)
         if any(op.get("status") != "DONE" for op in related):
             return Outcome("pending-operation", "owned operation still running")
-        for kind, resource in (("instance", "instances"), ("boot", "disks"),
-                               ("data", "disks")):
-            rec, gen, blocked = self._delete_owned(rec, gen, kind, resource, ev)
+        # Only an insert tied to THIS request id resolves the create; an
+        # operation that merely targets a reused name stays blocking evidence.
+        own_inserts = [op for op in related
+                       if op.get("operationType") == "insert"
+                       and op.get("clientOperationId") == rec["request_id"]]
+        proof = any(not op.get("error") for op in own_inserts)
+        # Preflight: verify the VM's whole attachment inventory and every
+        # child identity BEFORE any delete, because deleting the VM also
+        # deletes its autoDelete disks.
+        reason, found = self._inspect(rec, proof)
+        if reason:
+            return self._fail(rec, gen, f"identity-mismatch:{reason}", ev)
+        rec, gen = self._adopt(rec, gen, found)
+        for kind, resource in KINDS:
+            rec, gen, blocked = self._delete_owned(
+                rec, gen, kind, resource, found, proof, ev)
             if blocked:
                 return blocked
-        inserts = [op for op in related if op.get("operationType") == "insert"]
         create_resolved = (
             rec["submit_attempts"] == 0 or rec["ids"]["instance"] is not None
-            or bool(inserts) or cfg.now() >= _parse(rec["deadline"]))
+            or bool(own_inserts) or cfg.now() >= _parse(rec["deadline"]))
         if not create_resolved:
             # 404 / empty operation list is not proof a create failed: it may
             # still land. The past-deadline terminationTime rejects late ones.

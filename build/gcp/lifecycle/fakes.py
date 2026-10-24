@@ -43,6 +43,10 @@ class FakeCloud:
         self.leak_disks = False            # VM delete leaves autoDelete disks
         self.op_stuck: set = set()         # op names that never reach DONE
         self.delete_op_error: set = set()  # names whose delete op ends in error
+        self.remote: dict = {}             # other zone -> {kind: {name: res}}
+        self.page_size: Optional[int] = None  # paginate list responses
+        self.unreachables: list = []       # aggregatedList scopes that failed
+        self.list_error: set = set()       # (resource, verb) that raise 500
 
     # ------------------------------------------------------------ test setup
     def _id(self) -> str:
@@ -52,14 +56,20 @@ class FakeCloud:
     def _stamp(self) -> str:
         return spec.rfc3339(self.clock.now())
 
-    def add_foreign(self, kind: str, name: str, labels: Optional[dict] = None) -> str:
-        res = self._make(name, labels or {})
-        (self.instances if kind == "instances" else self.disks)[name] = res
+    def add_foreign(self, kind: str, name: str, labels: Optional[dict] = None,
+                    zone: Optional[str] = None) -> str:
+        res = self._make(name, labels or {}, zone or spec.ZONE)
+        if zone and zone != spec.ZONE:
+            store = self.remote.setdefault(
+                zone, {"instances": {}, "disks": {}})[kind]
+        else:
+            store = self.instances if kind == "instances" else self.disks
+        store[name] = res
         return res["id"]
 
-    def _make(self, name: str, labels: dict) -> dict:
+    def _make(self, name: str, labels: dict, zone: str = spec.ZONE) -> dict:
         return {"name": name, "id": self._id(), "labels": dict(labels),
-                "zone": f"https://compute/zones/{spec.ZONE}",
+                "zone": f"https://compute/zones/{zone}",
                 "creationTimestamp": self._stamp(), "status": "RUNNING"}
 
     def _op(self, kind: str, target: str, status: str = "DONE",
@@ -80,8 +90,11 @@ class FakeCloud:
             p = d["initializeParams"]
             disk = self._make(p["diskName"], p["labels"])
             self.disks[disk["name"]] = disk
-            inst["disks"].append({"source": disk["name"],
-                                  "autoDelete": d["autoDelete"]})
+            inst["disks"].append({
+                "source": f"https://compute/zones/{spec.ZONE}/disks/"
+                          f"{disk['name']}",
+                "autoDelete": d["autoDelete"], "boot": d["boot"],
+                "mode": d["mode"], "deviceName": d["deviceName"]})
         self.instances[inst["name"]] = inst
 
     def finish_pending(self, success: bool = True) -> None:
@@ -97,19 +110,68 @@ class FakeCloud:
     # --------------------------------------------------------------- dispatch
     def call(self, resource: str, verb: str, *, project: str, zone: str,
              name: Optional[str] = None, body: Optional[dict] = None,
-             request_id: Optional[str] = None) -> dict:
+             request_id: Optional[str] = None,
+             page_token: Optional[str] = None) -> dict:
         assert project == spec.PROJECT and zone == spec.ZONE
         self.calls.append((resource, verb, name or (body or {}).get("name")))
+        if (resource, verb) in self.list_error:
+            raise ApiError(500, "list failed")
+        if verb in ("list", "aggregatedList"):
+            return getattr(self, f"_{resource}_{verb}")(page_token)
         return getattr(self, f"_{resource}_{verb}")(name, body, request_id)
 
-    def _instances_list(self, *_):
-        return {"items": list(self.instances.values())}
+    def _paginate(self, seq: list, token: Optional[str]):
+        if not self.page_size:
+            return seq, None
+        start = int(token or 0)
+        end = start + self.page_size
+        return seq[start:end], (str(end) if end < len(seq) else None)
 
-    def _disks_list(self, *_):
-        return {"items": list(self.disks.values())}
+    def _list(self, values, token):
+        page, nxt = self._paginate(list(values), token)
+        out = {"items": page}
+        if nxt:
+            out["nextPageToken"] = nxt
+        return out
 
-    def _zoneOperations_list(self, *_):
-        return {"items": list(self.ops.values())}
+    def _aggregate(self, key: str, local: list, remote_kind: Optional[str],
+                   token: Optional[str]) -> dict:
+        scopes = {f"zones/{spec.ZONE}": local}
+        for zone, kinds in self.remote.items():
+            scopes[f"zones/{zone}"] = (
+                list(kinds[remote_kind].values()) if remote_kind else [])
+        names, nxt = self._paginate(list(scopes), token)
+        items = {}
+        for scope in names:
+            items[scope] = ({key: scopes[scope]} if scopes[scope] else
+                            {"warning": {"code": "NO_RESULTS_ON_PAGE"}})
+        out = {"items": items}
+        if self.unreachables:
+            out["unreachables"] = list(self.unreachables)
+        if nxt:
+            out["nextPageToken"] = nxt
+        return out
+
+    def _instances_list(self, token):
+        return self._list(self.instances.values(), token)
+
+    def _disks_list(self, token):
+        return self._list(self.disks.values(), token)
+
+    def _zoneOperations_list(self, token):
+        return self._list(self.ops.values(), token)
+
+    def _instances_aggregatedList(self, token):
+        return self._aggregate("instances", list(self.instances.values()),
+                               "instances", token)
+
+    def _disks_aggregatedList(self, token):
+        return self._aggregate("disks", list(self.disks.values()), "disks",
+                               token)
+
+    def _globalOperations_aggregatedList(self, token):
+        return self._aggregate("operations", list(self.ops.values()), None,
+                               token)
 
     def _zoneOperations_get(self, name, *_):
         if name not in self.ops:
@@ -155,7 +217,7 @@ class FakeCloud:
         if not self.leak_disks:
             for d in inst.get("disks", []):
                 if d["autoDelete"]:
-                    self.disks.pop(d["source"], None)
+                    self.disks.pop(d["source"].rsplit("/", 1)[-1], None)
         return dict(op)
 
     def _disks_delete(self, name, *_):
