@@ -198,6 +198,10 @@ class Controller:
             expected = "READ_WRITE" if want[name] else "READ_ONLY"
             if att.get("mode", "READ_WRITE") != expected:
                 return "attachment-mode"
+            # Only the read-write boot disk may auto-delete. The READ_ONLY
+            # copy must survive VM deletion for explicit verified disk cleanup.
+            if att.get("autoDelete") is not want[name]:
+                return "attachment-autodelete"
         return None
 
     def _inspect(self, rec: dict, proof: Optional[str]):

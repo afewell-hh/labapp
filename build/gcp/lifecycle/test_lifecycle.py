@@ -333,15 +333,100 @@ class T(unittest.TestCase):
         self.assertEqual(w.ctl.reconcile(U1).status, "released")
         self.assertEqual(w.raw.disks, {})
 
+    def test_normal_vm_delete_retains_readonly_copy_until_explicit_cleanup(self):
+        w = World()
+        rec = w.started()
+        names, ids = rec["names"], rec["ids"]
+        original_delete = w.raw._disks_delete
+        observed = []
+
+        def delete_data(name, *args):
+            # No leak injection: VM delete auto-deleted boot, but not data.
+            self.assertEqual(name, names["data"])
+            self.assertNotIn(names["instance"], w.raw.instances)
+            self.assertNotIn(names["boot"], w.raw.disks)
+            self.assertEqual(w.raw.disks[name]["id"], ids["data"])
+            self.assertEqual(w.record()["state"], ACTIVE)
+            observed.append(name)
+            return original_delete(name, *args)
+
+        def before_free(key, record, **kwargs):
+            if record["state"] == FREE:
+                self.assertEqual(observed, [names["data"]])
+                self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
+                evidence = record["last_release"]["evidence"]
+                self.assertTrue(any(f"data {names['data']} id {ids['data']}: "
+                                    "deleted, 404 confirmed" == e for e in evidence))
+            return original_write(key, record, **kwargs)
+
+        original_write = w.store.write
+        w.store.write = before_free
+        w.raw._disks_delete = delete_data
+        self.assertEqual(w.ctl.reconcile(U1).status, "released")
+        self.assertEqual(w.deletes(), [("instances", "delete", names["instance"]),
+                                       ("disks", "delete", names["data"])])
+        self.assertEqual(w.record()["state"], FREE)
+
+    def test_cloud_vm_expiry_leaves_readonly_copy_for_janitor(self):
+        w = World()
+        rec = w.started()
+        names = rec["names"]
+        w.clock.advance(61)
+        # Model Compute's deadline DELETE using its normal attachment flags.
+        w.cloud.call("instances", "delete", name=names["instance"])
+        self.assertEqual(set(w.raw.disks), {names["data"]})
+        self.assertEqual(w.record()["state"], ACTIVE)
+        self.assertEqual(w.ctl.reconcile().status, "released")
+        self.assertIn(("disks", "delete", names["data"]), w.deletes())
+        self.assertEqual(w.raw.disks, {})
+
     def test_one_disk_that_will_not_delete_keeps_capacity(self):
         w = World()
         w.started()
-        w.raw.leak_disks = True
         w.raw.delete_noop.add(spec.names(1, 1)["data"])  # DONE but present
         self.assertEqual(w.ctl.reconcile(U1).status, "cleanup-failed")
         self.assertEqual(w.record()["state"], CLEANUP_FAILED)
+        self.assertEqual(w.raw.instances, {})
+        self.assertEqual(set(w.raw.disks), {spec.names(1, 1)["data"]})
         with self.assertRaises(Refused):
             w.ctl.admit(2, 1, U2)
+
+    def test_readonly_copy_delete_failure_keeps_capacity_until_janitor(self):
+        w = World()
+        rec = w.started()
+        name = rec["names"]["data"]
+        w.raw.delete_fail.add(name)
+        self.assertEqual(w.ctl.reconcile(U1).status, "cleanup-failed")
+        self.assertEqual(w.raw.instances, {})
+        self.assertEqual(set(w.raw.disks), {name})
+        self.assertEqual(w.record()["state"], CLEANUP_FAILED)
+        with self.assertRaises(Refused):
+            w.ctl.admit(2, 1, U2)
+        w.raw.delete_fail.clear()
+        self.assertEqual(w.ctl.reconcile().status, "released")
+        self.assertEqual(w.raw.disks, {})
+
+    def test_readonly_copy_pending_delete_operation_prevents_release(self):
+        w = World()
+        rec = w.started()
+        name = rec["names"]["data"]
+        original = w.raw._disks_delete
+
+        def pending(name, *args):
+            op = original(name, *args)
+            w.raw.ops[op["name"]]["status"] = "RUNNING"
+            return op
+
+        w.raw._disks_delete = pending
+        self.assertEqual(w.ctl.reconcile(U1).status, "pending-operation")
+        self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
+        self.assertNotEqual(w.record()["state"], FREE)
+        self.assertEqual(w.ctl.reconcile(U1).status, "pending-operation")
+        with self.assertRaises(Refused):
+            w.ctl.admit(2, 1, U2)
+        for op in w.raw.ops.values():
+            op["status"] = "DONE"
+        self.assertEqual(w.ctl.reconcile(U1).status, "released")
 
     def test_failed_cleanup_retained_then_janitor_recovers(self):
         w = World()
@@ -479,7 +564,7 @@ class T(unittest.TestCase):
         self.assertEqual(w.deletes(), [])
 
     def _assert_nothing_deleted(self, w):
-        """Zero delete calls and every resource still present (autoDelete on)."""
+        """Zero delete calls and every resource still present."""
         self.assertEqual(w.deletes(), [])
         names = spec.names(1, 1)
         self.assertIn(names["instance"], w.raw.instances)
@@ -490,8 +575,7 @@ class T(unittest.TestCase):
             w.ctl.admit(2, 1, U2)
 
     def test_disk_identity_mismatch_blocks_vm_delete_with_autodelete(self):
-        # Normal fake: deleting the VM WOULD remove its autoDelete disks, so
-        # the mismatch must be caught before the VM delete is issued.
+        # VM delete would remove boot; every child must still verify before it.
         for kind, mutate in (
                 ("data-label", lambda w, n: w.raw.disks[n["data"]][
                     "labels"].update({spec.LABEL_LEASE: U2})),
@@ -534,6 +618,12 @@ class T(unittest.TestCase):
                  "attachment-unexpected"),
                 ("writable data", lambda att, w: att[1].update(
                     mode="READ_WRITE"), "attachment-mode"),
+                ("data auto-delete", lambda att, w: att[1].update(
+                    autoDelete=True), "attachment-autodelete"),
+                ("boot retained", lambda att, w: att[0].update(
+                    autoDelete=False), "attachment-autodelete"),
+                ("data missing auto-delete", lambda att, w: att[1].pop(
+                    "autoDelete"), "attachment-autodelete"),
                 ("boot flag", lambda att, w: att[1].update(boot=True),
                  "attachment-boot-flag"),
                 ("other zone", lambda att, w: att[1].update(
@@ -857,7 +947,7 @@ class T(unittest.TestCase):
         self.assertEqual(body["scheduling"]["instanceTerminationAction"],
                          "DELETE")
         self.assertNotIn("maxRunDuration", body["scheduling"])
-        self.assertEqual([d["autoDelete"] for d in body["disks"]], [True, True])
+        self.assertEqual([d["autoDelete"] for d in body["disks"]], [True, False])
         self.assertEqual([d["boot"] for d in body["disks"]], [True, False])
         # The source copy is read-only; there is no writable alternative.
         self.assertEqual([d["mode"] for d in body["disks"]],
@@ -885,6 +975,9 @@ class T(unittest.TestCase):
                 serviceAccounts=[{"email": "x", "scopes": []}]),
             "gpu": lambda b: b.update(guestAccelerators=[{}]),
             "autoDelete off": lambda b: b["disks"][0].update(autoDelete=False),
+            "read-only autoDelete on": lambda b: b["disks"][1].update(autoDelete=True),
+            "read-only autoDelete missing": lambda b: b["disks"][1].pop("autoDelete"),
+            "read-only autoDelete nonboolean": lambda b: b["disks"][1].update(autoDelete=0),
             "duration": lambda b: b["scheduling"].update(
                 maxRunDuration={"seconds": "3300"}),
             "no termination time": lambda b: b["scheduling"].pop(

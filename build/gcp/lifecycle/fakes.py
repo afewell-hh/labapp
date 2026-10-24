@@ -217,7 +217,9 @@ class FakeCloud:
         del self.instances[name]
         if not self.leak_disks:
             for d in inst.get("disks", []):
-                if d["autoDelete"]:
+                # A normal VM delete removes boot, retains the READ_ONLY copy.
+                # leak_disks additionally models a failed boot auto-delete.
+                if d.get("autoDelete") is True:
                     self.disks.pop(d["source"].rsplit("/", 1)[-1], None)
         return dict(op)
 

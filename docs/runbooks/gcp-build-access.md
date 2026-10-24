@@ -156,6 +156,16 @@ immutable IDs, success/failure/cancellation cleanup, and independent expiry
 cleanup. Never delete source/published/preexisting or unowned resources in this
 shared project. Accepted release images need a separate retention decision.
 
+The lifecycle inspector's source-copy disk stays `READ_ONLY` and must use
+`autoDelete: false`: Compute forbids auto-delete for read-only attachments.
+Its boot disk uses `READ_WRITE` with `autoDelete: true`. VM termination with
+`DELETE` therefore requests boot-disk deletion but leaves the 300GB source copy.
+Normal cleanup or the independent janitor must explicitly delete that owned
+copy using the recorded scope/name/immutable ID, wait for the disk operation
+and confirm 404. A missing VM alone never releases capacity. The VM's absolute
+deadline does not bound data-disk retention; independent scheduled cleanup is
+best-effort, and failed cleanup remains capacity-blocking until resolved.
+
 Check CPU/storage quotas before allocation; the historical 500 GB disk quota
 may prevent three appliance VMs. Do not raise quotas or machine sizes
 implicitly. No GPUs are needed. These are policy requirements, **not yet an
@@ -282,6 +292,10 @@ python3 -m unittest discover -s build/gcp -p 'test_bootstrap_lifecycle_access.py
 
 Official sources consulted 2026-10-24:
 
+- [Disk auto-delete settings](https://docs.cloud.google.com/compute/docs/disks/modify-persistent-disk#autodelete):
+  read-only attachments cannot auto-delete; retained disks incur cost until
+  explicitly deleted. This constraint is stated in the disk guide, beyond the
+  `instances.insert` boolean field schema.
 - [Cloud Storage basic-role convenience values](https://docs.cloud.google.com/storage/docs/access-control/iam-roles):
   a new uniform-access bucket gives project owners/editors both legacy bucket
   owner and object owner roles, and viewers both legacy bucket reader and object
