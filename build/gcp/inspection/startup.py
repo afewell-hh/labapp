@@ -25,6 +25,10 @@ VALUES = {
     ('Service', 'Group'): frozenset(('root', 'ubuntu')),
     ('Service', 'WorkingDirectory'): frozenset(('/home/ubuntu/hhfab', '/opt/hedgehog/vlab', '/home/ubuntu')),
     ('Service', 'KillMode'): frozenset(('control-group', 'mixed', 'process', 'none')),
+    # Exact public literals approved in #201; no environment-list parsing.
+    ('Service', 'Environment'): frozenset(('"TERM=xterm-256color"',)),
+    ('Service', 'StandardOutput'): frozenset(('journal',)),
+    ('Service', 'StandardError'): frozenset(('journal',)),
     ('Unit', 'ConditionPathExists'): frozenset(('/sys/class/net/hhbr',)),
     ('Unit', 'DefaultDependencies'): BOOLEANS,
 }

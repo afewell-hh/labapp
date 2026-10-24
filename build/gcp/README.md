@@ -111,9 +111,15 @@ catalogs. Literal second values are integers from 0 through3600. Startup
 commands must match complete public literal commands in `startup.COMMANDS`,
 including the historical #130 inline netfilter command. No arbitrary command
 arguments, environment values, descriptions, documentation URLs or unknown
-directive/section names enter the output. Unknown directives/values/syntax,
-duplicate assignments and resets produce fixed gap codes. Repeated/reset
-directives are omitted rather than assigning invented precedence. Backslashes
+directive/section names enter the output. The sole environment exception is
+the complete quoted
+`Environment="TERM=xterm-256color"` assignment in `[Service]`, approved in
+[#201](https://github.com/afewell-hh/labapp/issues/201). `StandardOutput` and
+`StandardError` accept only `journal`. Other environment assignments,
+`EnvironmentFile`, specifiers and output targets remain withheld.
+Unknown directives/values/syntax, duplicate assignments and resets produce
+fixed gap codes. Repeated/reset directives are omitted rather than assigning
+invented precedence. Backslashes
 refuse the entire unit's settings because continuation/escape semantics are
 unsupported; this is deliberately not a systemd parser.
 CRLF is normalized to LF; lone CR and Unicode whitespace/separators refuse

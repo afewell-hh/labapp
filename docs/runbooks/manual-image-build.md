@@ -62,6 +62,20 @@ recognized literal settings, not complete units to install. All five contain
 | `kubeconfig-merge.service` | `After=network-online.target hhfab-vlab-resume.service`; `Wants=network-online.target`; `Type=oneshot`; `Restart=no` | Unsupported value withheld; no command recovered in the accepted subset. |
 | `vlab-netfilter.service` | `DefaultDependencies=no`; `Type=oneshot` | Repeated assignment and unsupported value withheld; no command or install target recovered in the accepted subset. |
 
+Supplemental observed literals approved in
+[#201](https://github.com/afewell-hh/labapp/issues/201) add three facts for the
+same immutable source, based on the lead's private complete-line comparison
+and independent approval of the public literal associations:
+
+- `hhfab-vlab-resume.service`: `[Service] Environment="TERM=xterm-256color"`.
+- `argocd-port-fix.service`: `[Service] StandardOutput=journal`.
+- `argocd-port-fix.service`: `[Service] StandardError=journal`.
+
+These supplements were not in the startup candidate identified by the hash
+above; the table describes that earlier candidate's recovery limits. A newly
+derived candidate still requires independent approval before publication.
+These three facts do not establish complete or effective units.
+
 All three referenced helpers have presence/hash receipts, but their
 implementations and behavior remain unknown: `/usr/local/bin/fix-argocd-port.sh`,
 `/usr/local/bin/hhbr-ip-setup.sh` and `/usr/local/bin/hhfab-vlab-resume.sh`.
