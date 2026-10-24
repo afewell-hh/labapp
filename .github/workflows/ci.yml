@@ -21,6 +21,7 @@ jobs:
       - name: Run required synthetic filesystem tests
         run: |
           test -f build/gcp/inspection/test_collector.py
+          test -f build/gcp/inspection/test_mounted_collect.py
           python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
 
   lint:
