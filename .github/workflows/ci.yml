@@ -120,5 +120,7 @@ jobs:
         run: |
           test -f build/provision/test_ensure_bridge_ipv4.py
           python3 -m unittest discover -s build/provision -p test_ensure_bridge_ipv4.py -v
+          test -f build/provision/test_bridge_ipv4_harness.py
+          python3 -m unittest discover -s build/provision -p test_bridge_ipv4_harness.py -v
       - name: Test unchanged helper with NET_ADMIN in an isolated namespace
         run: timeout --kill-after=60s 8m bash build/provision/test-bridge-ipv4.sh

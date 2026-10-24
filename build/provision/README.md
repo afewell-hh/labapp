@@ -59,6 +59,7 @@ python3 /absolute/path/to/ensure-bridge-ipv4.py \
   --bridge testbr0 --cidr 192.0.2.2/24 --wait-seconds 10 --poll-ms 100
 # Offline: synthetic inputs and child-process tests, no host networking access.
 python3 -m unittest discover -s build/provision -p test_ensure_bridge_ipv4.py -v
+python3 -m unittest discover -s build/provision -p test_bridge_ipv4_harness.py -v
 # Docker and package-download network access needed for preparation only.
 bash build/provision/test-bridge-ipv4.sh
 ```
@@ -118,9 +119,16 @@ network access. It then executes the unchanged helper with `--network=none`,
 credentials or host networking are supplied. Preparation uses 512 MiB/1 CPU/128
 PIDs and a 210-second internal cap (240 seconds externally); runtime uses
 256 MiB/1 CPU/64 PIDs and 30 seconds internally (45 externally). The runner
-records image IDs, OS/kernel/tool versions and capabilities and removes only
-returned owned container/image IDs, verifying their absence on exit. Host-side
-create/commit/remove commands also have deadlines. CI runs this and the required
+records image IDs, OS/kernel/tool versions and capabilities. A fresh UUID marks
+exact container names, a unique prepared-image tag and an ownership label.
+Cleanup rediscovers only the conjunction of exact name/tag and that label,
+validates returned IDs, removes those IDs and verifies absence. This also recovers
+objects when create/commit succeeded at the daemon but the client response was
+lost; no received ID is required for recovery. An unreachable daemon makes
+cleanup fail, rather than implying absence. Cleanup calls each have a five-second
+cap and one-second kill grace; create/commit commands also have deadlines.
+Synthetic fake-Docker tests exercise lost prep/runtime create responses, lost
+commit response, a foreign-label name collision and cleanup daemon failure. CI runs this and the required
 offline suite alongside all existing checks. A denied NET_ADMIN/bridge operation
 fails the check; it does not trigger privileged or host-network fallback.
 
