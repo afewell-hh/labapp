@@ -99,8 +99,10 @@ def preflight(cpuinfo="/proc/cpuinfo", sys_module="/sys/module", dev_kvm="/dev/k
     for tool in ("qemu-system-x86_64", "qemu-img"):
         if shutil.which(tool) is None:
             bad.append("%s not on PATH" % tool)
-    if not any(shutil.which(t) for t in ("xorriso", "mkisofs", "genisoimage")):
-        bad.append("no CD builder (xorriso, mkisofs or genisoimage) on PATH")
+    # Exactly the tools packer-plugin-sdk v0.6.11 step_create_cdrom.go searches on Linux
+    # (it also tries hdiutil and oscdimg); genisoimage alone is never found by the plugin.
+    if not any(shutil.which(t) for t in ("xorriso", "mkisofs")):
+        bad.append("no CD builder the pinned plugin searches (xorriso or mkisofs) on PATH")
     return bad
 
 
