@@ -90,13 +90,65 @@ collector skipped symlinked `/lib` paths; skipped paths remain unknown, not
 absent. Missing fixed paths do not prove no equivalent component exists
 elsewhere. These subsets must not be deployed as production-ready unit files.
 
-This baseline does not recover hhfab's binary version, fabric/wiring inputs,
-chart versions, network/shell settings or runtime/student compatibility.
-Remaining recovery is tracked in [#198](https://github.com/afewell-hh/labapp/issues/198)
-and [#151](https://github.com/afewell-hh/labapp/issues/151). Reproducing the image
-still requires reviewed configuration recovery and clean build, boot/reboot
-and student acceptance. The historical commands below are a separate manual
-workflow, not evidence that they reproduce this immutable source.
+### Persisted CLI identity and VLAB topology
+
+The [approved host candidate and separate lead provenance attestation](https://github.com/afewell-hh/labapp/issues/208#issuecomment-6391555177)
+extend this baseline for the same source image
+`teched-473722/hedgehog-vaidc-v20260114`, immutable ID
+`7638370619126112785`. The capture used accepted main revision
+[`57b920b67dfa2ff769d76f54e3761e41ddbdd962`](https://github.com/afewell-hh/labapp/commit/57b920b67dfa2ff769d76f54e3761e41ddbdd962).
+The lead bound the private source to the derived candidate; the independent
+reviewer approved the exact derived candidate and provenance without inspecting
+raw source. These are observed persisted facts, not new-build or upgrade pins.
+
+- The captured `hhfab` binary is byte-identical to the official
+  `hhfab-v0.43.1-linux-amd64` release member. No guest application was executed.
+  The receipt also records observed byte lengths and SHA-256 digests for
+  `helm`, `k3d` and `kubectl`; their versions remain unknown.
+- The complete captured wiring matches the parsed documents of the existing
+  root [`wiringd.yaml`](../../wiringd.yaml), SHA-256
+  `c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a`:
+  7 switches (2 spines and 5 server-leaves), 10 servers, 21 connections,
+  3 switch groups, one VLAN namespace spanning 1000–2999 and one IPv4
+  namespace containing `10.0.0.0/16`. The public fixture is unchanged.
+  Parsed-document equality does not establish full graph semantics or
+  effective/hydrated Fabric validity.
+- The persisted VLAB configuration contains 1 control, 7 switch and 10 server
+  VM entries. Its selected size settings are below. Gateway and external
+  size settings do not establish that VMs of those types are configured or
+  running.
+
+| VLAB size type | CPU (cores) | RAM (MB) | Disk (GB) |
+| --- | --- | --- | --- |
+| `control` | 6 | 6144 | 100 |
+| `switch` | 4 | 5120 | 50 |
+| `server` | 2 | 768 | 10 |
+| `gateway` | 8 | 6144 | 50 |
+| `external` | 4 | 5120 | 50 |
+
+Field units follow the versioned upstream
+[`VMSize` definition in Fabricator v0.43.1](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabconfig.go#L163-L167)
+(accessed 2026-10-25): cores, MB and GB. These labels retain upstream's
+terminology; they do not measure runtime allocation or host capacity.
+
+The fabric file was rejected during YAML parsing, so no Fabric settings were
+recovered from it; secret-bearing text was neither repaired nor published.
+The captured generic modules and sysctl files yielded no selected settings;
+the selected bridge-specific modules and sysctl files were missing. These
+bounded observations do not prove that equivalent settings are absent elsewhere.
+All shell recipes remain unknown, including captured system bashrc/profile
+and user bashrc; MOTD, user aliases and user profile were missing at the selected
+paths. All original helper implementations remain unknown.
+
+Chart/app versions, GitOps/seed inputs, network/shell behavior and runtime/student
+compatibility remain gaps; see [#151](https://github.com/afewell-hh/labapp/issues/151).
+These recovery limits describe historical evidence, not defaults for a future
+image or a diagnosis of current production. Persisted inputs do not establish
+effective/hydrated configuration, enabled/running services, a complete automated
+build or student acceptance. Reproducing the image still requires reviewed
+configuration recovery and clean build, boot/reboot and student acceptance.
+The historical commands below are a separate manual workflow, not evidence
+that they reproduce this immutable source.
 
 ## Step 1: Launch VM with cloud-config
 
