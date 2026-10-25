@@ -109,7 +109,10 @@ Provisioning logic is written once and run unchanged in development tests, and
 later in Packer. Each module must state, in its header and tests:
 
 - **Interpreter**: shell modules use `#!/usr/bin/env bash` with `set -euo pipefail`,
-  invoked as `bash path`, not relying on the executable bit. The standalone
+  invoked as `bash path`, not relying on the executable bit. The pinned hhfab
+  installer uses Ubuntu 24.04 Python 3.12 stdlib (host tests also support Python
+  3.10+), invoked as `python3 path/install-hhfab.py`; keep its sibling
+  `hhfab_release.py` available. It never executes the installed binary. The standalone
   bridge runtime artifact uses Ubuntu 24.04 Python 3.12 stdlib, invoked as
   `python3 path`; it is not a provisioning framework or image integration.
 - **User/privilege**: who runs it (root vs `ubuntu`), and what needs `sudo`.

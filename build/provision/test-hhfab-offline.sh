@@ -3,6 +3,16 @@
 # Requires Docker, curl, Python3 stdlib, timeout; no environment overrides/cwd dependency.
 # No cloud identity, host socket/credentials, privileged mode or host networking.
 set -euo pipefail
+mode=${1:-offline}
+[[ "$#" -le 1 && ( "$mode" == offline || "$mode" == install ) ]]
+prepare_command=prepare
+lane_program=hhfab_test.py
+work_tmpfs=/work:rw,nosuid,nodev,noexec,size=64m,uid=1000,gid=1000,mode=700
+if [[ "$mode" == install ]]; then
+  prepare_command=prepare-install
+  lane_program=test_install_hhfab.py
+  work_tmpfs=/work:rw,exec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=700
+fi
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 base=ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 IFS= read -r suffix < /proc/sys/kernel/random/uuid
@@ -65,7 +75,7 @@ trap 'exit 143' TERM
 for dependency in docker timeout python3 curl; do command -v "$dependency" >/dev/null; done
 timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Version}}'
 # Official archives verified/extracted on host, never executed on host.
-timeout --kill-after=3s 270s python3 "$here/hhfab_test.py" prepare "$workdir" "$here/../.."
+timeout --kill-after=3s 270s python3 "$here/hhfab_test.py" "$prepare_command" "$workdir" "$here/../.."
 prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$run_label" \
   --memory=512m --cpus=1 --pids-limit=128 --security-opt=no-new-privileges \
   "$base" timeout --kill-after=3s 210s bash -ceu '
@@ -90,11 +100,11 @@ lane_failed=0
 for version in 0.43.1 0.50.4; do
   runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --label "$run_label" \
     --network=none --cap-drop=ALL --security-opt=no-new-privileges --read-only --user=1000:1000 \
-    --tmpfs /work:rw,nosuid,nodev,noexec,size=64m,uid=1000,gid=1000,mode=700 \
+    --tmpfs "$work_tmpfs" \
     --tmpfs /var/log:rw,nosuid,nodev,noexec,size=8m,uid=1000,gid=1000,mode=700 \
     --memory=1g --cpus=2 --pids-limit=128 --env LABAPP_HHFAB_TEST=1 \
     --env PYTHONDONTWRITEBYTECODE=1 "$image_id" \
-    timeout --kill-after=3s 120s python3 /suite/hhfab_test.py lane "$version")"
+    timeout --kill-after=3s 120s python3 "/suite/$lane_program" lane "$version")"
   [[ "$runtime_id" =~ ^[a-f0-9]{64}$ ]]
   if ! python3 "$here/hhfab_test.py" attach "$runtime_id" "$workdir/report"; then
     echo "hhfab test: lane $version failed" >&2

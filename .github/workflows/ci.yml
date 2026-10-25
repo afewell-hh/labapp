@@ -147,3 +147,14 @@ jobs:
           python3 -m unittest discover -s build/provision -p test_hhfab_offline.py -v
       - name: Run actual official CLI in isolated Ubuntu containers
         run: timeout --kill-after=30s 10m bash build/provision/test-hhfab-offline.sh
+
+  hhfab-install:
+    name: Pinned hhfab installer in two disposable Ubuntu containers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer integrity and preservation regressions
+        run: python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
+      - name: Run unchanged installer and installed CLI smoke checks
+        run: timeout --kill-after=30s 10m bash build/provision/test-install-hhfab.sh
