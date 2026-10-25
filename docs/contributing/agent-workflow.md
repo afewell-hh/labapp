@@ -230,6 +230,48 @@ here: see #145 (parent), #139 and #140.
 - Multi-round automatic review/fix loops and monitoring outside an active
   session are not assumed; see "Lead follow-up" below.
 
+### Offline validation in GitHub workers
+
+The Claude Code Action v1 workflow adds scoped commands through
+[`claude_args: --allowedTools`](https://github.com/anthropics/claude-code-action/blob/v1/docs/configuration.md).
+It allows `python3 -m unittest discover ...`, `python3 -m py_compile ...`,
+`bash -n ...`, `shellcheck ...` and `git diff --check ...`, alongside the
+existing source-research and issue/PR commands. Run checks directly from the
+repository root; a Python heredoc, `python3 -c`, general shell execution,
+package installation or a different command spelling is not added by these
+rules. Missing dependencies still require a CI/lead handoff.
+
+For example, the portable preparation checks are:
+
+```bash
+python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v
+python3 -m py_compile build/packer-qemu/host_verify.py
+bash -n build/packer-qemu/guest/guest-build.sh
+shellcheck build/packer-qemu/guest/guest-build.sh
+git diff --check
+```
+
+**These commands are not a security sandbox.** Unittest imports and executes
+repository code, which can start subprocesses, use the network and access the
+worker's runner/GitHub authority. Only run scoped, inspected offline tests;
+the task must still authorize any container, builder, VM or cloud execution.
+[Claude permissions](https://code.claude.com/docs/en/permissions) distinguish
+command approval from OS-level sandboxing. Do not use test code to bypass a
+tool denial or the platform's workflow-write restriction.
+
+The workflow's read-scoped `GITHUB_TOKEN` is distinct from the action's
+[GitHub App token](https://github.com/anthropics/claude-code-action/blob/v1/src/github/token.ts),
+whose default permissions include contents, PR and issue writes. Its existing
+`id-token: write` supports the action's App-token exchange; it is not GCP
+authorization. Keep both settings unchanged and keep cloud credentials,
+private state and trusted lifecycle identities out of worker jobs. GCP access
+continues to require the fixed-main workflow/event identities in the
+[access runbook](../runbooks/gcp-build-access.md).
+
+After a workflow permission change, the lead must verify a harmless, scoped
+worker run and its actual results. A parsed allowlist is not execution evidence;
+until verified, retain the CI/lead fallback and report denials exactly.
+
 ## Lead follow-up
 
 - While an authorized session is active and jobs or reviews are pending, the
