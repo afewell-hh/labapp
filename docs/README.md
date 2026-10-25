@@ -10,6 +10,7 @@
 | [`runbooks/manual-image-build.md`](runbooks/manual-image-build.md) | Maintainers | Current manual image build and troubleshooting |
 | [`../build/gcp/README.md`](../build/gcp/README.md) | Developers, lead | Access bootstrap, fixed lifecycle runner and offline collector |
 | [`../build/provision/README.md`](../build/provision/README.md) | Developers | Provisioning modules and their tests |
+| [`../build/packer-qemu/README.md`](../build/packer-qemu/README.md) | Developers, lead | Stock Packer/QEMU portability experiment: inputs, private observer, watchdog, runner preflight |
 | [`../AGENTS.md`](../AGENTS.md), [`../CLAUDE.md`](../CLAUDE.md) | Agents | Short entrypoints |
 
 Plans, status and evidence are kept in GitHub issues and PRs, not here.
