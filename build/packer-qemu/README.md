@@ -169,6 +169,102 @@ need proof. Direct delegated [cgroup v2](https://docs.kernel.org/admin-guide/cgr
 would require correct attach-before-exec, permissions and ownership handling;
 a hand-written process supervisor is not a substitute for those guarantees.
 
+## Bounded container probe (`container_runner.py`)
+
+One fixed non-VM `probe` mode; no Packer/QEMU/VM path, no arbitrary command
+option. Docker is reached only through a `Backend`: fixed `/usr/bin/docker`,
+explicit `--host unix://…` and an empty `--config` dir (no caller context or
+credential helpers), minimal environment, and a bounded byte collector (64 KiB
+cap, deadline, process-group kill; overflow or invalid UTF-8 is an error, never
+truncated). The CLI prints its plan unless `--execute` is given. Runtime evidence, tested
+Docker versions and remaining acceptance gates are recorded in #255; offline
+fake-process tests alone cannot establish containment.
+
+* Inputs: only the Ubuntu digest already pinned in `build/provision`
+  (`PINNED_IMAGE`; there is no image option), never pulled and never deleted
+  (`--pull=never`; only the probe container is removed). `image inspect` must
+  show that digest in `RepoDigests` and no `Config.Volumes` or `ONBUILD`; the
+  image ID is what gets created, with `--no-healthcheck`. Workspace root and a
+  separate host-only ledger dir must be owned, symlink-free and not
+  group/other-writable; root callers are refused.
+* Create argv (fixed): `/bin/bash` entrypoint running the entry script, then
+  `exec timeout` (same PID 1, no `--init`), `--restart=no`, `--network=none`,
+  `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, caller UID:GID,
+  256m/1 CPU/64 PIDs, `--log-driver=none`, one bind of the fresh output workspace.
+  No device, socket, home, credentials, privileged or host namespaces.
+* Clock and deadline: Linux `CLOCK_BOOTTIME` on the host and builtin Bash
+  `read` of `/proc/uptime` at ACTUAL container start, both including suspend.
+  The host rejects nonzero time-namespace offsets; the startup wrapper requires
+  the same kernel boot ID and zero monotonic/boottime namespace offsets before
+  running work. Only an explicit local Unix Docker endpoint is supported; remote
+  contexts and forwarded endpoints are unsupported. The host passes the admission
+  work deadline floored to whole seconds. The wrapper floors uptime and computes
+  `timer = deadline - now - 1 (rounding) - 5 (kill-after)`; under 5 s it exits
+  125. It then execs GNU timeout as the same PID 1. Budget: `probe` is 30 s work
+  + 20 s cleanup; each Docker call is capped by remaining budget. Cancellation
+  and deadline are checked through final publication. Host expiry is failure.
+  This probe targets an awake local Linux host. GNU timeout's running timer
+  behavior across host suspend/failure is unproven here; this is not a universal
+  absolute watchdog or a VM runtime guarantee. No sleep controls are installed.
+* Ledger (host-only, outside the container-writable workspace): use one shared
+  ledger directory as the admission authority for the local endpoint. A
+  nonblocking `flock` covers scan, reservation, run, cleanup and publication;
+  a competing invocation returns HOLD without contacting Docker. Directory
+  scans accept at most 128 entries, each record at most 4 KiB; symlinks, corrupt
+  or incomplete records and unexpected entries fail closed. One fsynced,
+  atomically renamed JSON record per request (name, label, image, full ID,
+  workspace, deadlines, state) written BEFORE each mutation (`reserved`,
+  `create_intent`, `start_intent`, `stop_rm_intent`). Any record not `released`
+  (including corrupt ones) blocks a new request with `hold`/exit 7 and no Docker
+  call: unresolved requests are never retried as fresh work. A ledger write
+  failure before create prevents the mutation; after it, the result is `hold`.
+  Host death leaves the record plus the container's own timer.
+* Cleanup: queries exact name+label (rejects any extra ID or an unexplained
+  vanished container), inspects the full ID and requires the exact name and
+  label before `stop`/`rm`, then requires successful empty name+label and
+  full-ID queries. A lost/failed stop or rm response is uncertain and stays
+  `hold` even if later queries find nothing; a failed query is not absence.
+  Lost create/start responses also stay `hold`. `released` is written only for
+  verified container removal AND owned workspace removal with confirmed absence.
+  A workspace removal failure is HOLD and blocks reuse. `hold` retains the
+  host ledger; workspace retention is best effort if removal already occurred.
+* Signals: SIGTERM/SIGINT mark cancellation and unwind to cleanup (a signal
+  during cleanup only sets the flag); a cancelled run is never accepted.
+  Finalization exceptions become `hold`, never a crash or acceptance.
+* Acceptance (probe only): exit 124/137, not OOM-killed, cleanup verified, and
+  startup evidence: `/out/witness` is exactly one small regular file written by the
+  fixed probe (`start <boot seconds> <timer>`, `probe <setsid child pid>`,
+  `term_ignored`). The detached child installs its own TERM-ignore handler and
+  writes its own PID after `setsid`; the parent waits for that line. The timer
+  must be consistent with the deadline, and the container
+  ran about as long as that timer (an immediate 137 is rejected). Anything else
+  in the workspace is untrusted and rejects. Exit codes: accepted 0, failed 1,
+  usage 2, hold 7.
+
+Pinned-source findings (read 2026-10-25, documented not tested): coreutils
+[`timeout.c` v9.4](https://raw.githubusercontent.com/coreutils/coreutils/v9.4/src/timeout.c)
+(Ubuntu 24.04's series) installs handlers for TERM/INT/QUIT/HUP/ALRM, so PID 1
+can receive them; on the first signal it sends to the child then, unless
+`--foreground`, to its own group (ignoring that signal itself first), and arms
+`--kill-after` only then. `setpgid(0,0)` is unchecked, so failing as a session
+leader is harmless. It exits 124 on timeout, or 137 if the child was KILLed.
+[pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+(man-pages 6.19): PID 1 exit SIGKILLs the namespace; PID 1 only receives
+signals it has handlers for, except SIGKILL/SIGSTOP from an ancestor.
+[`docker stop`](https://docs.docker.com/reference/cli/docker/container/stop/):
+TERM, then KILL after the grace period. [Live restore](https://docs.docker.com/engine/daemon/live-restore/):
+containers keep running without the daemon, so the internal timer must stand alone.
+
+Before extending to any VM mode, require real-Docker proof that descendants (including the
+`setsid` child) die with PID 1 and that the exit codes above hold, observing
+child existence and namespace cleanup directly (the witness records a pid; it
+does not prove cleanup); `bash`/`timeout`/`setsid` presence in the pinned image;
+exact 124-vs-137 behavior with a TERM-ignoring probe; UID mapping of the bind (rootless/userns);
+`/dev/kvm` passthrough; input verification and evidence binding (core/plugin/
+base/module hashes, nonce, acceleration, normal shutdown); input mounts.
+Assess those gates against the current issue evidence; the fixed non-VM probe
+does not enable VM execution or establish another host configuration's support.
+
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
 python3 -I /abs/build/packer-qemu/supervise.py --preflight-only
