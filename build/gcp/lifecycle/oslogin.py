@@ -50,13 +50,20 @@ class SelfLogin:
         self.token_provider = token_provider
         self.http = transport if transport is not None else HttpTransport()
 
-    def _request(self, method, suffix, payload=None):
+    def _request(self, method, suffix, payload=None, *, import_clock=None, work_deadline=None):
         url = 'https://oslogin.googleapis.com/v1/' + quote(self.user, safe='/') + suffix
         try:
             headers = bearer_headers(self.token_provider)
             headers['Accept-Encoding'] = 'identity'
             if payload is not None:
                 headers['Content-Type'] = 'application/json; charset=utf-8'
+            # Token acquisition can block. Import deadlines are checked after
+            # credentials are ready and immediately before transport submission.
+            if method == 'POST':
+                current = import_clock()
+                if (current >= work_deadline or
+                        int(current.timestamp()*1_000_000) >= int(payload['expirationTimeUsec'])):
+                    raise ValueError('expired import')
             r = self.http.request(method, url, headers=headers,
                                   body=canonical(payload) if payload is not None else None,
                                   timeout=20, max_bytes=PROFILE_LIMIT)
@@ -94,9 +101,10 @@ class SelfLogin:
     def profile(self):
         return self._profile(self._request('GET', '/loginProfile?' + urlencode({'projectId': spec.PROJECT})))
 
-    def _import_once(self, key, expiry):
+    def _import_once(self, key, expiry, *, now, work_deadline):
         result = self._request('POST', ':importSshPublicKey?' + urlencode({'projectId': spec.PROJECT}),
-                               {'key': key, 'expirationTimeUsec': expiry})
+                               {'key': key, 'expirationTimeUsec': expiry},
+                               import_clock=now, work_deadline=work_deadline)
         if not isinstance(result, dict) or set(result) - {'loginProfile', 'details'}:
             raise AccessError('invalid import response')
         profile = self._profile(result.get('loginProfile'))
@@ -215,16 +223,18 @@ class OwnKeyImport:
             raise AccessError('one-shot import capability unavailable')
         intent, gen = self._permit.take()
         self.context.current(self.records.slot())
+        actual, current_gen = read_intent(self.records, self.context)
+        if actual != intent or current_gen != gen:
+            raise AccessError('durable intent changed')
         now = self.now()
         if (now >= timestamp(self.context.binding['work_deadline']) or
                 int(now.timestamp()*1_000_000) >= int(intent['expiration_usec'])):
             raise AccessError('access intent expiration/work deadline reached')
-        actual, current_gen = read_intent(self.records, self.context)
-        if actual != intent or current_gen != gen:
-            raise AccessError('durable intent changed')
         # No retries, including after HTTP errors, malformed response or receipt
         # persistence failure. Re-observing a key cannot synthesize this receipt.
-        profile, response_sha = self.login._import_once(intent['public_key'], intent['expiration_usec'])
+        profile, response_sha = self.login._import_once(
+            intent['public_key'], intent['expiration_usec'], now=self.now,
+            work_deadline=timestamp(self.context.binding['work_deadline']))
         entry = _match(profile, intent['public_key'])
         if entry is None or entry.get('expirationTimeUsec') != intent['expiration_usec']:
             raise AccessError('import response does not prove exact intended key/TTL')

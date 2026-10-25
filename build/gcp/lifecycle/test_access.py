@@ -386,6 +386,33 @@ class OwnKeyTests(unittest.TestCase):
         self.assertFalse(f.posts())
         self.assertEqual(f.w.ctl.reconcile(U1).status, 'blocked')
 
+    def test_slow_intent_read_crossing_ttl_or_work_deadline_never_submits(self):
+        for offset in (0, 25):
+            f = Fixture(); f.w.clock.advance(offset)
+            s = f.session(); s.prepare(key())
+            f.w.clock.advance((20 if offset == 0 else 5) - 0.01)
+            read = f.records.read
+            def slow_read(context, kind):
+                result = read(context, kind)
+                if kind == 'intent':
+                    f.w.clock.t += timedelta(seconds=2)
+                return result
+            f.records.read = slow_read
+            with self.assertRaises(AccessError): s.import_once()
+            with self.assertRaises(AccessError): s.import_once()
+            self.assertFalse(f.posts())
+
+    def test_token_acquisition_crossing_expiration_never_submits(self):
+        f = Fixture(); s = f.session(); s.prepare(key())
+        f.w.clock.advance(19.99)
+        def delayed_token():
+            f.w.clock.t += timedelta(seconds=2)
+            return 'fake-token'
+        f.login.token_provider = delayed_token
+        with self.assertRaises(AccessError): s.import_once()
+        with self.assertRaises(AccessError): s.import_once()
+        self.assertFalse(f.posts())
+
     def test_finite_ttl_and_work_deadline_no_refresh(self):
         f = Fixture(); f.w.clock.advance(25)
         s = f.session(); intent, _ = s.prepare(key())
