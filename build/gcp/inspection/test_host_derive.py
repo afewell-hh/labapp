@@ -3,6 +3,10 @@ import copy
 import hashlib
 import json
 import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -155,6 +159,54 @@ class ReportValidationTests(unittest.TestCase):
             source.symlink_to(output)
             with self.assertRaises(OSError):
                 d.write_candidate(source, parent / 'other')
+
+    def test_direct_deriver_sigterm_removes_owned_partial_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            source, output, ready = parent / 'report', parent / 'candidate', parent / 'ready'
+            source.write_text(json.dumps(empty_report()))
+            source.chmod(0o600)
+            code = """import os,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from inspection import host_derive as d
+source,out,ready=sys.argv[2:]
+real=os.fdopen
+class Slow:
+    def __init__(self,fd): self.file=real(fd,'wb')
+    def __enter__(self): return self
+    def __exit__(self,*args): self.file.close()
+    def write(self,data):
+        self.file.write(data[:1]);self.file.flush()
+        Path(ready).write_text('ready')
+        time.sleep(10)
+def fdopen(fd,mode,*args,**kw):
+    return Slow(fd) if mode=='wb' else real(fd,mode,*args,**kw)
+d.os.fdopen=fdopen
+sys.argv=['derive','--private-report',source,'--private-output',out]
+d.main()
+"""
+            process = subprocess.Popen([sys.executable, '-c', code,
+                str(Path(d.__file__).resolve().parents[1]), str(source), str(output), str(ready)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(ready.exists())
+                self.assertEqual(output.stat().st_size, 1)
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 1)
+                self.assertEqual(stdout, b'')
+                self.assertEqual(stderr, b'Host derivation refused; no source content is printed.\n')
+                self.assertFalse(output.exists())
+                self.assertTrue(source.exists())
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=3)
 
 
 class TypedYamlTests(unittest.TestCase):

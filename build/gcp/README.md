@@ -204,7 +204,9 @@ python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
 `host_derive.py` validates every nested record, status/reason, byte count/hash,
 selection count/completeness and aggregate budget before projection. Trusted
 PyYAML is an explicit CI dependency, never installed on the inspector by this
-code. YAML event preflight rejects tags, anchors/aliases, nonstring/duplicate/
+code. Both new command entrypoints turn SIGTERM into bounded owned cleanup;
+a cancelled derivation removes its exclusive partial candidate and prints only
+the fixed refusal. YAML event preflight rejects tags, anchors/aliases, nonstring/duplicate/
 merge keys, ambiguous scalar forms, unsupported scalar types and resource
 excesses; only SafeLoader nodes are composed, without object constructors.
 CRLF is normalized for parsing; lone CR/control characters refuse. Limits are
@@ -384,7 +386,9 @@ state remain separate gates, including an unformatted BIOS boot partition
 The harness unmounts and verifies no exact-target mount, revalidates ownership
 before detach, waits for udev, requires the owned loop mapping absent and the
 backing-file hash unchanged, then deletes only explicit generated files and
-empty directories. Uncertain cleanup preserves evidence and fails; the lead
+empty directories. The complete fixture manifest is declared before writes, so
+preparation errors/cancellation also remove exact owned partial entries without
+recursion. Uncertain cleanup preserves evidence and fails; the lead
 must resolve it before source inspection or slot reuse. It never recursively
 deletes through a mountpoint. Output is fixed status/count/hash evidence only.
 Offline tests cover mapping-identity refusal, not actual kernel mounts or all

@@ -56,8 +56,8 @@ def verify_loop(raw, backing, identity, loop=None):
         raise Refused("synthetic_loop_mismatch") from None
 
 
-def populate_fixture(fixture, profile):
-    """Compile-time public fixtures; return exact owned entries for cleanup."""
+def fixture_manifest(fixture, profile):
+    """Predeclare exact public fixture ownership BEFORE any mutation."""
     if profile not in ('default', 'host-baseline-v1'):
         raise Refused('unsupported_profile')
     files = {'/etc/os-release': b'ID=labapp_synthetic\n'}
@@ -74,10 +74,17 @@ def populate_fixture(fixture, profile):
         while parent != fixture:
             directories.add(parent)
             parent = parent.parent
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target.write_bytes(body)
-    return [fixture / path.lstrip('/') for path in files], sorted(
+    return {fixture / path.lstrip('/'): body for path, body in files.items()}, sorted(
         directories, key=lambda path: len(path.parts), reverse=True)
+
+
+def populate_fixture(fixture, profile):
+    files, directories = fixture_manifest(fixture, profile)
+    for directory in reversed(directories):
+        directory.mkdir(mode=0o700, exist_ok=True)
+    for target, body in files.items():
+        target.write_bytes(body)
+    return list(files), directories
 
 
 def run(profile='default'):
@@ -98,9 +105,10 @@ def run(profile='default'):
     cleanup_ok = True
     fixture_files, fixture_dirs = [], []
     try:
+        fixture_files, fixture_dirs = fixture_manifest(fixture, profile)
         validate_namespace(command, work)
         fixture.mkdir(mode=0o700)
-        fixture_files, fixture_dirs = populate_fixture(fixture, profile)
+        populate_fixture(fixture, profile)
         with backing.open("xb") as stream:
             stream.truncate(SIZE)
         info = backing.lstat()
@@ -188,7 +196,7 @@ def run(profile='default'):
                 cleanup_ok = False
         if cleanup_ok:
             # Explicit owned entries only. Never recurse through a guest mount.
-            for path in [output, backing] + fixture_files:
+            for path in [output, backing] + list(fixture_files):
                 path.unlink(missing_ok=True)
             for path in [target] + fixture_dirs + [fixture]:
                 if path.exists():

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 
 import yaml
@@ -521,13 +522,25 @@ def write_candidate(source, output):
     candidate = derive(report)
     encoded = (json.dumps(candidate, sort_keys=True, ensure_ascii=True) + '\n').encode('ascii')
     require(len(encoded) <= REPORT_LIMIT)
-    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # Delay cancellation only across creation/ownership assignment; deliver it
+    # inside the cleanup scope, including before fdopen enters its context.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     try:
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(encoded)
-    except BaseException:
-        output.unlink()
-        raise
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(encoded)
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+            try:
+                os.close(fd)
+            except OSError:
+                pass  # fdopen may already have closed its owned descriptor.
+            output.unlink()
+            raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     return {'candidate_sha256': hashlib.sha256(encoded).hexdigest(), 'private_review_required': True}
 
 
@@ -536,9 +549,12 @@ def main():
     parser.add_argument('--private-report', required=True)
     parser.add_argument('--private-output', required=True)
     args = parser.parse_args()
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         print(json.dumps(write_candidate(args.private_report, args.private_output), sort_keys=True))
-    except (Refused, OSError, ValueError, UnicodeError, RecursionError):
+    except (Refused, OSError, ValueError, UnicodeError, RecursionError, KeyboardInterrupt):
         parser.exit(1, 'Host derivation refused; no source content is printed.\n')
 
 
