@@ -92,6 +92,8 @@ runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --labe
 [[ "$runtime_id" =~ ^[a-f0-9]{64}$ && "$(owned_container "$runtime")" == "$runtime_id" ]]
 timeout --kill-after=3s 30s docker cp "$here/." "$runtime_id:/suite/"
 timeout --kill-after=1s 10s docker start "$runtime_id" >/dev/null
+# Prove conflicting ambient policy is active before unchanged state capture.
+timeout --kill-after=3s 30s docker exec "$runtime_id" python3 /suite/qemu_offline_container.py --prepare-policy
 # Exact actual target state is captured using the same unchanged module CLI.
 timeout --kill-after=3s 30s docker exec "$runtime_id" python3 /suite/install-qemu.py \
   --capture-state /target-state.json --base-id "$base"
