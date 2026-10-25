@@ -548,3 +548,24 @@ IAM is enabled; the active component dispatch remains unchanged. Future live
 builds require separate review of capture/retention, access/IAM, fixed runner
 budgets, staging/sealing and boot/reboot gates. The 45-minute first-fixture
 30-work/15-cleanup split is a proposed runner budget, not implemented here.
+
+
+### Candidate capture remains a library-only gate
+
+The [explicit capture/quarantine contract](../../build/gcp/README.md#explicit-candidate-capture-and-quarantine-library-contract)
+uses the existing serial CAS ledger, with a distinct image request UUID and
+exact immutable source/output identity. Ordinary component/inspector cleanup
+and the active no-input workflows do not select capture. No builder image IAM,
+new dispatch, sealing sequence or image release is enabled here. Retained-build
+VM names remain in the historical lifecycle namespace; the candidate namespace
+also needs explicit alignment with the separately reviewed builder IAM design
+before any grants or live invocation.
+
+Live retention additionally requires an independent trusted quarantine-expiry
+runner, monitoring for overdue/blocked records and failed/missing runs, and lead
+escalation. These integrations are unimplemented. The <=24-hour stored retention
+bound is policy, not proof of exact-time deletion; best-effort cron and a VM's
+termination deadline cannot establish retained disk/image absence. Only exact
+identity checks, terminal operations and verified absence allow a deletion
+receipt. See the library contract for release/retention fencing and the remaining
+API/IAM assumptions.

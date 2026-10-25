@@ -30,6 +30,9 @@ class FakeClock:
 class FakeCloud:
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
+        self.images: dict = {}
+        self.image_ops: dict = {}
+        self.capture_mode = "ok"
         self.instances: dict = {}
         self.disks: dict = {}
         self.ops: dict = {}
@@ -116,7 +119,7 @@ class FakeCloud:
     def call(self, resource: str, verb: str, *, project: str, zone: str,
              name: Optional[str] = None, body: Optional[dict] = None,
              request_id: Optional[str] = None,
-             page_token: Optional[str] = None) -> dict:
+             page_token: Optional[str] = None, capture: Optional[dict] = None) -> dict:
         assert project == spec.PROJECT and zone == spec.ZONE
         self.calls.append((resource, verb, name or (body or {}).get("name")))
         if (resource, verb) in self.list_error:
@@ -175,7 +178,7 @@ class FakeCloud:
                                token)
 
     def _globalOperations_aggregatedList(self, token):
-        return self._aggregate("operations", list(self.ops.values()), None,
+        return self._aggregate("operations", list(self.ops.values()) + list(self.image_ops.values()), None,
                                token)
 
     def _zoneOperations_get(self, name, *_):
@@ -187,7 +190,10 @@ class FakeCloud:
         return op
 
     def _images_get(self, name, *_):
-        assert name == spec.COMPONENT_IMAGE.rsplit("/", 1)[-1]
+        if name != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1]:
+            if name not in self.images:
+                raise NotFound(name)
+            return dict(self.images[name])
         return {"name": name, "id": spec.COMPONENT_IMAGE_ID, "status": "READY",
                 "architecture": "X86_64", "diskSizeGb": "10"}
 
@@ -241,3 +247,50 @@ class FakeCloud:
         if name not in self.delete_noop:
             del self.disks[name]
         return dict(op)
+
+
+    def _images_list(self, token):
+        return self._list(self.images.values(), token)
+
+    def _globalOperations_get(self, name, *_):
+        if name not in self.image_ops:
+            raise NotFound(name)
+        op = dict(self.image_ops[name])
+        if name in self.op_stuck:
+            op["status"] = "RUNNING"
+        return op
+
+    def _image_op(self, verb, name, request_id, target_id):
+        op = self._op(verb, name, client_id=request_id)
+        del self.ops[op["name"]]
+        op.update(targetLink=f"https://compute.googleapis.com/compute/v1/projects/{spec.PROJECT}/global/images/{name}",
+                  targetId=target_id)
+        self.image_ops[op["name"]] = op
+        return dict(op)
+
+    def _images_insert(self, _name, body, request_id):
+        if self.capture_mode == "timeout_nothing":
+            raise Uncertain("lost capture response")
+        if body["name"] in self.images:
+            raise ApiError(409, "image exists")
+        disk = self.disks[body["sourceDisk"].rsplit("/", 1)[-1]]
+        image = dict(body, id=self._id(), sourceDiskId=disk["id"], status="READY")
+        self.images[image["name"]] = image
+        op = self._image_op("insert", image["name"], request_id, image["id"])
+        if self.capture_mode == "pending":
+            self.image_ops[op["name"]]["status"] = "RUNNING"
+        if self.capture_mode == "lost":
+            raise Uncertain("capture response lost after creation")
+        return op
+
+    def _images_delete(self, name, _body, request_id):
+        if name in self.delete_fail:
+            raise ApiError(500, "image delete failed")
+        if name not in self.images:
+            raise NotFound(name)
+        op = self._image_op("delete", name, request_id, self.images[name]["id"])
+        if name in self.delete_op_error:
+            self.image_ops[op["name"]]["error"] = {"errors": [1]}
+        if name not in self.delete_noop:
+            del self.images[name]
+        return op

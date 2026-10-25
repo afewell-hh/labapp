@@ -617,8 +617,9 @@ on normal cleanup, failure, cancellation and expiry. Cloud VM deletion leaves
 that disk billable: independently scheduled cleanup must still verify the disk's
 immutable ID, terminal operations and absence before `FREE`, including when the
 VM has already disappeared. Unknown inserts, foreign replacements, unexpected
-children and pending operations continue to hold capacity. This profile adds
-no image capture/retention method, CLI mode, dispatch, identity or IAM grant.
+children and pending operations continue to hold capacity. Image capture is an explicit library opt-in described below; ordinary cleanup
+still disposes of the retained boot. This profile adds no CLI mode, dispatch,
+identity or IAM grant.
 The active component workflow is unchanged. A live build needs separately
 reviewed capture/retention, IAM, fixed runner/staging/sealing and boot/reboot gates.
 
@@ -634,6 +635,84 @@ defines deletion behavior for attached disks;
 [absolute VM termination](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime)
 documents initial `terminationTime` plus `DELETE`. These are documented API
 semantics, not a live build test.
+
+### Explicit candidate capture and quarantine library contract
+
+The retained base-build controller exposes `prepare_capture(lease_uuid,
+capture_uuid, retain_until=None)` and `capture(lease_uuid)` as separate opt-in
+library actions. They require the current confirmed build, a distinct nonzero
+UUID, and more than fifteen minutes remaining before its original absolute
+lease deadline. No CLI or workflow invokes them. Guest staging/sealing, runner
+integration, scoped IAM and separately authorized live capture/boot/reboot
+remain required gates; these methods establish no sealing result.
+
+Preparation persists the exact unique `labapp-candidate-<capture UUID>` name,
+labels, request/body hash, immutable boot disk ID, original deadline and a
+preflight snapshot of all existing image names/IDs before mutation. Those IDs
+are protected, including the eleven saved images in the accepted project
+baseline; offline tests use synthetic IDs. UUID tombstones persist through
+FREE and later admissions, so deleted output names cannot be reused. History
+is bounded at 512 intents and then fails closed pending a reviewed migration.
+Existing VM/boot names are unchanged. The candidate and retained-build
+namespaces still require alignment with the separately reviewed IAM proposal;
+these library changes do not establish compatibility with future grants.
+
+Capture verifies the terminal request-correlated VM insertion and exact child
+inventory, deletes the builder while retaining its sole boot, confirms the
+delete operation and VM absence, and rechecks the immutable unattached boot and
+remaining budget before recording submission and calling `images.insert` once.
+The source must be unattached and no `forceCreate` is sent.
+The source ID is checked again after a returned insertion response.
+`sourceDiskId` is output-only, so immutable provenance is also checked on the
+resulting image. The image must match its request-correlated terminal global
+operation target ID, recorded source disk ID/path and exact labels. Names,
+labels, elapsed time, API errors or 404 alone never resolve a lost insertion.
+Uncertainty keeps the boot and slot occupied. CAS fences cancellation before
+cleanup: cleanup resolves an already submitted capture but never starts one.
+
+Normal/failure/cancel/expiry reconciliation checks capture/global operations
+before disposing of the exact candidate and retained boot. It persists image
+delete intent/UUID before submission, verifies terminal request/target-ID proof
+and exact absence, then disposes of the boot. Pending operations, foreign
+incarnations, extra children and ambiguous writes/deletes hold capacity. Compute
+has no immutable-ID precondition on image delete; isolated owned namespaces,
+restricted writers and independently reviewed IAM remain live safety gates.
+There is no family, promotion, publication, IAM mutation or force replacement.
+
+An explicit `retain_until` can preserve a READY candidate for at most 24 hours
+from preparation. After VM/boot absence and terminal operations, the same CAS
+that releases the VM slot durably transfers its exact image/operation/source
+identity and deletion deadline to a separate `quarantine` inventory in the
+existing ledger object. This inventory survives FREE/reserve/release, rejects
+duplicates/malformed entries and does not hide foreign resources from admission.
+Expired quarantine blocks admission. Independent `reconcile_quarantine()` works
+while a newer VM lease occupies the slot and deletes only the exact expired
+image; it never disposes of that VM or its disks. Without retention, cleanup
+deletes the candidate before release.
+
+No independent capture-expiry runner, schedule, monitoring or escalation is
+installed by this library change. Before live retention is enabled, a separate
+trusted cleanup runner must invoke quarantine reconciliation independently of
+creator completion, monitor overdue/blocked records and failed/missing runs,
+and alert the lead for exact-identity investigation. A best-effort cron cadence
+is not a deletion deadline guarantee; only terminal operations plus verified
+absence establish deletion. The VM's cloud deadline deletes neither retained
+boot nor candidate image.
+
+Required lifecycle CI discovers `test_capture.py` with controller ordering,
+lost responses, cancellation/CAS races, HTTP paths/bodies, wire-level GCS
+round trips, protected image collisions and independent quarantine expiry.
+These offline tests do not prove live API/IAM, scheduling, sealing or image boot.
+
+Sources checked 2026-10-25 (Compute REST v1, documentation 2026-09-01):
+[images.insert](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/insert)
+(request UUID, forceCreate parameter and output-only sourceDiskId),
+[globalOperations.aggregatedList](https://docs.cloud.google.com/compute/docs/reference/rest/v1/globalOperations/aggregatedList)
+(project-wide operations including global scope),
+[globalOperations.get](https://docs.cloud.google.com/compute/docs/reference/rest/v1/globalOperations/get)
+(terminal operation, clientOperationId and targetId), and
+[images.delete](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/delete)
+(name and request UUID; no immutable-ID precondition).
 
 ### Run the tests
 

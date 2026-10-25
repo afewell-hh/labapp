@@ -2,8 +2,8 @@
 
 The controller never talks to a cloud client directly. Every call goes through
 ``PolicyCloud``, which rejects any resource/verb outside the reviewed set and
-any project/zone outside the fixed scope. Only one fixed public Ubuntu image
-read is supported. Image mutations, snapshots, addresses,
+any project/zone outside the fixed scope. The fixed public Ubuntu image read
+remains separate from identity-bound candidate capture/get/delete and its census. Snapshots, addresses,
 firewalls, IAM, and instance stop/start/setScheduling/setMetadata are absent
 by construction.
 """
@@ -34,7 +34,9 @@ class ForbiddenOperation(Exception):
 
 
 ALLOWED: frozenset = frozenset({
-    ("images", "get"),  # fixed public Ubuntu pin only; no image mutations
+    ("images", "get"), ("images", "list"),
+    ("images", "insert"), ("images", "delete"),
+    ("globalOperations", "get"),
     ("instances", "insert"), ("instances", "get"),
     ("instances", "list"), ("instances", "delete"),
     ("disks", "get"), ("disks", "list"), ("disks", "delete"),
@@ -49,7 +51,8 @@ class RawTransport(Protocol):
     def call(self, resource: str, verb: str, *, project: str, zone: str,
              name: Optional[str] = None, body: Optional[dict] = None,
              request_id: Optional[str] = None,
-             page_token: Optional[str] = None) -> dict:
+             page_token: Optional[str] = None,
+             capture: Optional[dict] = None) -> dict:
         ...
 
 
@@ -69,9 +72,40 @@ class PolicyCloud:
         if kw.get("project", self.project) != self.project or \
                 kw.get("zone", self.zone) != self.zone:
             raise ForbiddenOperation("project/zone outside the fixed scope")
-        if resource == "images" and (verb != "get" or
-                kw.get("name") != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] or
-                set(kw) != {"name"}):
-            raise ForbiddenOperation("only the fixed public Ubuntu image read is permitted")
+        if resource == "images" and not (verb == "get" and
+                kw.get("name") == spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] and
+                set(kw) == {"name"}):
+            validate_image_call(verb, kw)
+        if resource == "globalOperations" and verb == "get":
+            try:
+                spec.validate_capture(kw.get("capture"))
+            except ValueError as exc:
+                raise ForbiddenOperation(str(exc)) from exc
         kw["project"], kw["zone"] = self.project, self.zone
         return self._raw.call(resource, verb, **kw)
+
+
+def validate_image_call(verb, kw):
+    try:
+        c = kw.get("capture")
+        spec.validate_capture(c)
+        if set(kw) - {"name", "body", "request_id", "page_token", "capture", "project", "zone"}:
+            raise ValueError("unexpected image parameters")
+        if verb != "list" and kw.get("page_token") is not None:
+            raise ValueError("unexpected image page token")
+        if kw.get("name") != (None if verb in ("insert", "list") else c["name"]):
+            raise ValueError("image name outside capture")
+        if verb == "insert":
+            if (kw.get("body") != spec.capture_body(c) or
+                    kw.get("request_id") != c["request_id"] or not c["submitted"]):
+                raise ValueError("image insert outside intent")
+        elif verb == "delete" and (c.get("image_id") is None or not c["delete_submitted"] or
+                kw.get("request_id") != c["delete_request_id"]):
+            raise ValueError("image deletion requires immutable identity")
+        elif verb not in ("get", "delete", "list"):
+            raise ValueError("unsupported image operation")
+        if verb != "insert" and (kw.get("body") is not None or
+                (verb in ("get", "list") and kw.get("request_id") is not None)):
+            raise ValueError("unexpected image parameters")
+    except ValueError as exc:
+        raise ForbiddenOperation(str(exc)) from exc

@@ -105,6 +105,20 @@ class Controller:
             for name in IMMUTABLE:
                 if prev.get(name) != rec.get(name):
                     raise AssertionError(f"immutable field {name} changed")
+        old_capture, new_capture = prev.get("capture"), rec.get("capture")
+        if old_capture is not None and rec.get("state") != FREE:
+            if new_capture is None:
+                raise AssertionError("capture intent removed")
+            mutable = {"submitted", "operation", "image_id", "insert_receipt",
+                       "delete_submitted", "delete_operation", "delete_receipt"}
+            if ({k: v for k, v in old_capture.items() if k not in mutable} !=
+                    {k: v for k, v in new_capture.items() if k not in mutable}):
+                raise AssertionError("immutable capture intent changed")
+            for key in ("submitted", "delete_submitted"):
+                if old_capture[key] and not new_capture[key]:
+                    raise AssertionError("capture intent cannot regress")
+            if old_capture.get("image_id") not in (None, new_capture.get("image_id")):
+                raise AssertionError("capture image ID changed")
         try:
             return self.store.write(self.cfg.key, rec, if_generation_match=gen)
         except PreconditionFailed as exc:
@@ -304,12 +318,12 @@ class Controller:
         return rec, gen
 
     # -------------------------------------------------------------- admission
-    def _pages(self, resource: str, verb: str):
+    def _pages(self, resource: str, verb: str, **kw):
         """Yield every page; any failure or runaway paging blocks the caller."""
         token = None
         for _ in range(self.cfg.max_pages):
             try:
-                page = self.cloud.call(resource, verb, page_token=token)
+                page = self.cloud.call(resource, verb, page_token=token, **kw)
             except (ApiError, Uncertain) as exc:
                 raise Refused(f"cannot list {resource}.{verb}: {exc}") from exc
             yield page
@@ -318,8 +332,8 @@ class Controller:
                 return
         raise Refused(f"{resource}.{verb} exceeded {self.cfg.max_pages} pages")
 
-    def _list_all(self, resource: str) -> list:
-        return [i for p in self._pages(resource, "list")
+    def _list_all(self, resource: str, **kw) -> list:
+        return [i for p in self._pages(resource, "list", **kw)
                 for i in p.get("items", [])]
 
     def _aggregate(self, resource: str, key: str) -> list:
@@ -344,6 +358,22 @@ class Controller:
         VMs and half-cleaned leases; unknown ownership blocks admission.
         """
         base = self.cfg.baseline
+        current, _ = self.store.read(self.cfg.key)
+        quarantines = self._quarantines(current or {})
+        if quarantines:
+            images = self._list_all("images", capture=quarantines[0])
+            allowed = {}
+            for c in quarantines:
+                allowed.update(c["preexisting_images"])
+                allowed[c["name"]] = c["image_id"]
+                if self.cfg.now() >= _parse(c["retain_until"]):
+                    raise Refused("overdue quarantine blocks admission")
+            for image in images:
+                if allowed.get(image["name"]) != image.get("id"):
+                    raise Refused("foreign or replaced image blocks admission")
+                for c in quarantines:
+                    if image["name"] == c["name"]:
+                        self._verify_image(c, image, c["image_id"])
         vms = self._aggregate("instances", "instances")
         for resource, items in (
                 ("instances", vms),
@@ -374,6 +404,7 @@ class Controller:
             rec, gen = self.store.read(cfg.key)
         if rec["state"] != FREE:
             raise Refused(f"slot is {rec['state']}")
+        self._quarantines(rec)
         self._census()
         if cfg.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
             self._check_component_image()
@@ -383,6 +414,8 @@ class Controller:
                                run_id=run_id, attempt=attempt, deadline=deadline, profile=cfg.profile)
         lease = {
             "schema": 1, "slot": cfg.key, "state": RESERVED,
+            "quarantine": rec.get("quarantine", []),
+            "used_capture_ids": rec.get("used_capture_ids", []),
             "epoch": rec["epoch"] + 1, "project": cfg.project, "zone": cfg.zone,
             "run_id": run_id, "attempt": attempt, "request_id": request_id,
             "body_hash": spec.body_hash(body), "boot_image": cfg.boot_image,
@@ -517,7 +550,7 @@ class Controller:
             try:
                 self._lease_kinds(rec)
                 return self._reconcile_once(rec, gen, force)
-            except Refused as exc:
+            except (Refused, ApiError, Uncertain) as exc:
                 return Outcome("blocked", str(exc))
             except _Conflict:
                 continue
@@ -576,6 +609,14 @@ class Controller:
         cfg, ev = self.cfg, []
         if not self._is_due(rec, force):
             return Outcome("not-due")
+        self._quarantines(rec)
+        if rec.get("capture"):
+            self._capture_intent(rec)
+            # Fence concurrent explicit capture before observing/deleting any
+            # resources. A stale capture submitter must lose its next CAS.
+            prev = dict(rec)
+            rec.update(state=CLEANUP_FAILED, reason="capture-cleanup")
+            gen = self._cas(prev, rec, gen)
         owned = set(rec["names"].values())
         related, foreign_pending = [], []
         try:
@@ -606,6 +647,20 @@ class Controller:
         if reason:
             return self._fail(rec, gen, f"identity-mismatch:{reason}", ev)
         rec, gen = self._adopt(rec, gen, found)
+        quarantine = list(rec.get("quarantine", []))
+        if rec.get("capture"):
+            c, image = self._capture_status(self._capture_intent(rec))
+            prev = dict(rec)
+            rec["capture"] = c
+            gen = self._cas(prev, rec, gen)
+            if image is not None and c["retain_until"] and cfg.now() < _parse(c["retain_until"]):
+                if image.get("status") != "READY" or not c.get("insert_receipt"):
+                    return Outcome("blocked", "candidate not ready for quarantine")
+                if any(x["name"] == c["name"] or x["image_id"] == c["image_id"] for x in quarantine):
+                    return Outcome("blocked", "duplicate candidate quarantine")
+                quarantine.append(c)
+            else:
+                rec, gen, c = self._dispose_image(rec, gen, c, image)
         for kind, resource in self._lease_kinds(rec):
             rec, gen, blocked = self._delete_owned(
                 rec, gen, kind, resource, found, proof, ev)
@@ -626,7 +681,8 @@ class Controller:
         if foreign_pending:
             return Outcome("blocked", "unexpected pending operation in zone")
         free = {"schema": 1, "slot": rec["slot"], "state": FREE,
-                "epoch": rec["epoch"],
+                "epoch": rec["epoch"], "quarantine": quarantine,
+                "used_capture_ids": rec.get("used_capture_ids", []),
                 "last_release": {
                     "run_id": rec["run_id"], "attempt": rec["attempt"],
                     "request_id": rec["request_id"], "ids": rec["ids"],
@@ -634,3 +690,323 @@ class Controller:
                     "evidence": (rec["evidence"] + ev)[-50:]}}
         self._cas(rec, free, gen)
         return Outcome("released", "; ".join(ev))
+
+    # ---------------------------------------------------------- image capture
+    def _capture_intent(self, rec):
+        c = rec.get("capture")
+        try:
+            spec.validate_capture(c)
+            if (rec.get("profile") != spec.UBUNTU_BASE_BUILD or
+                    c["lease_id"] != rec["request_id"] or c["run_id"] != rec["run_id"] or
+                    c["attempt"] != rec["attempt"] or c["deadline"] != rec["deadline"] or
+                    c["source_disk_id"] != rec["ids"]["boot"]):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError):
+            raise Refused("capture does not match owned build record") from None
+        return c
+
+    def _quarantines(self, rec):
+        entries = rec.get("quarantine", [])
+        try:
+            import uuid
+            used = rec.get("used_capture_ids", [])
+            if (not isinstance(used, list) or len(used) > 512 or len(set(used)) != len(used) or
+                    any(str(uuid.UUID(value)) != value or uuid.UUID(value).int == 0 for value in used)):
+                raise ValueError()
+            if not isinstance(entries, list) or len(entries) > 32:
+                raise ValueError()
+            for c in entries:
+                spec.validate_capture(c)
+                if c["request_id"] not in used:
+                    raise ValueError()
+                if not c["submitted"] or not c.get("image_id") or not c.get("insert_receipt") or not c["retain_until"]:
+                    raise ValueError()
+            if (len({c["name"] for c in entries}) != len(entries) or
+                    len({c["image_id"] for c in entries}) != len(entries) or
+                    len({c["request_id"] for c in entries}) != len(entries)):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError):
+            raise Refused("invalid or duplicate quarantine inventory") from None
+        return entries
+
+    def _image(self, c):
+        try:
+            return self.cloud.call("images", "get", name=c["name"], capture=c)
+        except NotFound:
+            return None
+
+    def _verify_image(self, c, image, target_id):
+        if (image.get("name") != c["name"] or image.get("id") != target_id or
+                target_id in c["preexisting_images"].values() or
+                image.get("labels") != spec.capture_body(c)["labels"] or
+                image.get("sourceDiskId") != c["source_disk_id"] or
+                not spec.resource_link(c["source_disk"], image.get("sourceDisk")) or
+                image.get("family") or image.get("sourceImage") or image.get("sourceSnapshot")):
+            raise Refused("candidate immutable identity/provenance mismatch")
+
+    def _capture_operations(self, c):
+        # aggregatedList is operations.aggregatedList and includes global,
+        # regional and zonal operations. Never mistake zoneOperations.list
+        # for an enumeration of global images.insert operations.
+        ops = self._aggregate("globalOperations", "operations")
+        related = []
+        path = f"projects/{spec.PROJECT}/global/images/{c['name']}"
+        for op in ops:
+            own = (op.get("clientOperationId") in
+                   (c["request_id"], c["delete_request_id"]) or
+                   op.get("targetLink", "").rsplit("/", 1)[-1] == c["name"])
+            if own:
+                current = self.cloud.call("globalOperations", "get", name=op["name"], capture=c)
+                if not spec.resource_link(path, current.get("targetLink")):
+                    raise Refused("capture operation target mismatch")
+                related.append(current)
+            elif op.get("status") != "DONE":
+                raise Refused("unexpected pending project operation")
+        for field in ("operation", "delete_operation"):
+            name = c.get(field)
+            receipt = c.get("insert_receipt" if field == "operation" else "delete_receipt")
+            if (name and not (receipt and receipt.get("name") == name) and
+                    not any(op.get("name") == name for op in related)):
+                # Direct GET closes list visibility lag; 404 is uncertainty.
+                op = self.cloud.call("globalOperations", "get", name=name, capture=c)
+                if not spec.resource_link(path, op.get("targetLink")):
+                    raise Refused("capture operation target mismatch")
+                related.append(op)
+        if any(op.get("status") != "DONE" for op in related):
+            raise Refused("capture operation pending")
+        return related
+
+    def _capture_status(self, c):
+        """Resolve only terminal request-correlated insertion + exact source ID."""
+        ops = self._capture_operations(c)
+        inserts = [op for op in ops if op.get("operationType") == "insert" and
+                   op.get("clientOperationId") == c["request_id"]]
+        if c.get("insert_receipt"):
+            inserts.append(c["insert_receipt"])
+        if c["submitted"] and not inserts:
+            raise Refused("capture insert outcome unproven")
+        successes = [op for op in inserts if not op.get("error")]
+        if successes and len(successes) != len(inserts):
+            raise Refused("conflicting capture operation outcomes")
+        ids = {op.get("targetId") for op in successes}
+        if successes and (len(ids) != 1 or not all(isinstance(i, str) and i.isdecimal() and int(i) > 0 for i in ids)):
+            raise Refused("capture target ID missing or conflicting")
+        new = dict(c)
+        if successes:
+            target_id = next(iter(ids))
+            if c.get("image_id") not in (None, target_id):
+                raise Refused("capture image incarnation changed")
+            if target_id in c["preexisting_images"].values():
+                raise Refused("capture target is a protected preflight image ID")
+            new.update(image_id=target_id, insert_receipt=successes[0])
+        image = self._image(new)
+        if image is not None:
+            if not successes:
+                raise Refused("candidate exists without request-correlated creation proof")
+            self._verify_image(new, image, new["image_id"])
+        if c["delete_submitted"]:
+            deletes = [op for op in ops if op.get("operationType") == "delete" and
+                       op.get("clientOperationId") == c["delete_request_id"]]
+            if c.get("delete_receipt"):
+                deletes.append(c["delete_receipt"])
+            if (not deletes or any(op.get("error") or op.get("targetId") != new["image_id"]
+                                   for op in deletes)):
+                raise Refused("candidate deletion outcome unproven or failed")
+            new["delete_receipt"] = deletes[0]
+            if image is not None:
+                raise Refused("candidate remains after terminal deletion")
+        return new, image
+
+    def prepare_capture(self, request_id, capture_id, *, retain_until=None):
+        """Explicit opt-in. No guest sealing or image publication is implied."""
+        import uuid
+        rec, gen = self.store.read(self.cfg.key)
+        if rec is None or rec.get("state") != ACTIVE or rec["request_id"] != request_id:
+            raise Refused("capture requires current ACTIVE build")
+        self._lease_kinds(rec)
+        self._quarantines(rec)
+        if (rec.get("profile") != spec.UBUNTU_BASE_BUILD or rec.get("capture") or
+                capture_id in rec.get("used_capture_ids", []) or
+                len(rec.get("used_capture_ids", [])) >= 512):
+            raise Refused("capture requires unused name and retained build without previous intent")
+        if self.cfg.now() + timedelta(minutes=spec.CAPTURE_RESERVE_MINUTES) >= _parse(rec["deadline"]):
+            raise Refused("insufficient capture/cleanup budget")
+        if not all(rec["ids"].values()):
+            raise Refused("capture requires confirmed immutable build IDs")
+        ops = self._list_all("zoneOperations")
+        if any(op.get("status") != "DONE" for op in ops):
+            raise Refused("build operations pending")
+        proof, error = self._insert_target_id(rec, [op for op in ops if
+            op.get("operationType") == "insert" and op.get("clientOperationId") == request_id])
+        if error or proof != rec["ids"]["instance"]:
+            raise Refused("build insertion proof unavailable")
+        reason, found = self._inspect(rec, proof)
+        if reason or "boot" not in found:
+            raise Refused("source boot identity unresolved")
+        c = dict(request_id=capture_id, lease_id=request_id, run_id=rec["run_id"],
+                 attempt=rec["attempt"], name="labapp-candidate-" + capture_id,
+                 source_disk=f"projects/{spec.PROJECT}/zones/{spec.ZONE}/disks/{rec['names']['boot']}",
+                 source_disk_id=rec["ids"]["boot"], deadline=rec["deadline"],
+                 prepared_at=spec.rfc3339(self.cfg.now()),
+                 retain_until=spec.rfc3339(retain_until) if retain_until is not None else None,
+                 preexisting_images={}, submitted=False, operation=None,
+                 image_id=None, insert_receipt=None, delete_submitted=False,
+                 delete_request_id=str(uuid.uuid5(uuid.UUID(capture_id), "delete")),
+                 delete_operation=None, delete_receipt=None)
+        c["body_hash"] = spec.body_hash(spec.capture_body(c))
+        try:
+            spec.validate_capture(c)
+            images = self._list_all("images", capture=c)
+            c["preexisting_images"] = {im["name"]: im["id"] for im in images}
+            spec.validate_capture(c)
+            # Read exact output before committing intent; existing names/IDs
+            # are never adopted even if they carry plausible labels.
+            if self._image(c) is not None:
+                raise Refused("candidate output already exists")
+            self._capture_operations(c)
+        except ValueError as exc:
+            raise Refused(str(exc)) from exc
+        prev = dict(rec)
+        rec["capture"] = c
+        rec["used_capture_ids"] = rec.get("used_capture_ids", []) + [capture_id]
+        try:
+            self._cas(prev, rec, gen)
+        except _Conflict as exc:
+            raise Refused("capture preparation lost ownership") from exc
+        return Outcome("capture-prepared", c["name"])
+
+    def capture(self, request_id):
+        """Delete builder retaining boot, fence submission, then insert once.
+
+        Cancellation CAS-fences ACTIVE before cleanup. A paused actor cannot
+        resume insertion after cancellation or after another submission.
+        """
+        rec, gen = self.store.read(self.cfg.key)
+        if rec is None or rec.get("state") != ACTIVE or rec["request_id"] != request_id:
+            raise Refused("capture requires current ACTIVE build")
+        self._lease_kinds(rec)
+        c = self._capture_intent(rec)
+        if c["submitted"]:
+            raise Refused("capture already submitted; reconcile instead")
+        if self.cfg.now() + timedelta(minutes=spec.CAPTURE_RESERVE_MINUTES) >= _parse(c["deadline"]):
+            raise Refused("insufficient capture/cleanup budget")
+        ops = self._list_all("zoneOperations")
+        if any(op.get("status") != "DONE" for op in ops):
+            return Outcome("pending-operation")
+        proof, error = self._insert_target_id(rec, [op for op in ops if
+            op.get("operationType") == "insert" and op.get("clientOperationId") == request_id])
+        if error or proof != rec["ids"]["instance"]:
+            raise Refused("build insertion proof unavailable")
+        reason, found = self._inspect(rec, proof)
+        if reason or "boot" not in found:
+            raise Refused("source boot identity unresolved")
+        self._capture_operations(c)
+        if self._image(c) is not None:
+            raise Refused("candidate output collision")
+        rec, gen, blocked = self._delete_owned(rec, gen, "instance", "instances", found, proof, [])
+        if blocked:
+            return blocked
+        # Both the absolute budget and exact retained disk are rechecked AFTER
+        # deletion. No forceCreate is accepted; the source must be unattached.
+        if self._get("instances", rec["names"]["instance"]) is not None:
+            raise Refused("builder is still present")
+        disk = self._get("disks", rec["names"]["boot"])
+        if disk is None or self._verify("boot", disk, rec, proof) or disk.get("users"):
+            raise Refused("source boot changed or attached")
+        if self.cfg.now() + timedelta(minutes=spec.CAPTURE_RESERVE_MINUTES) >= _parse(c["deadline"]):
+            raise Refused("insufficient capture/cleanup budget")
+        prev = dict(rec)
+        c = dict(c, submitted=True)
+        rec["capture"] = c
+        try:
+            gen = self._cas(prev, rec, gen)  # only winner may POST
+        except _Conflict as exc:
+            raise Refused("capture submission lost ownership") from exc
+        try:
+            op = self.cloud.call("images", "insert", body=spec.capture_body(c),
+                                 request_id=c["request_id"], capture=c)
+        except (ApiError, Uncertain) as exc:
+            return Outcome("uncertain", str(exc))
+        prev = dict(rec)
+        rec["capture"] = dict(c, operation=op["name"])
+        try:
+            self._cas(prev, rec, gen)
+        except _Conflict:
+            return Outcome("uncertain", "capture operation not persisted; reconcile")
+        disk = self._get("disks", rec["names"]["boot"])
+        if disk is None or self._verify("boot", disk, rec, proof) or disk.get("users"):
+            return Outcome("blocked", "source boot changed after capture")
+        return Outcome("capture-submitted", op["name"])
+
+    def _dispose_image(self, rec, gen, c, image, *, quarantine_index=None):
+        """Persist delete intent before sending; unknown deletes hold identity."""
+        if image is None:
+            return rec, gen, c
+        if image.get("status") != "READY":
+            raise Refused("candidate image not READY")
+        if c["delete_submitted"]:
+            raise Refused("candidate delete already submitted but unresolved")
+        c = dict(c, delete_submitted=True)
+        prev = dict(rec)
+        if quarantine_index is None:
+            rec["capture"] = c
+        else:
+            rec["quarantine"] = list(rec["quarantine"])
+            rec["quarantine"][quarantine_index] = c
+        gen = self._cas(prev, rec, gen)
+        # Recheck exact incarnation immediately before delete (API has no
+        # numeric-ID conditional delete; isolated owned namespace is a live gate).
+        latest = self._image(c)
+        if latest is None:
+            raise Refused("candidate disappeared before delete submission")
+        self._verify_image(c, latest, c["image_id"])
+        op = self.cloud.call("images", "delete", name=c["name"],
+                             request_id=c["delete_request_id"], capture=c)
+        prev = dict(rec)
+        c = dict(c, delete_operation=op["name"])
+        if quarantine_index is None:
+            rec["capture"] = c
+        else:
+            rec["quarantine"] = list(rec["quarantine"])
+            rec["quarantine"][quarantine_index] = c
+        gen = self._cas(prev, rec, gen)
+        c, image = self._capture_status(c)
+        if image is not None:
+            raise Refused("candidate deletion not confirmed")
+        prev = dict(rec)
+        if quarantine_index is None:
+            rec["capture"] = c
+        else:
+            rec["quarantine"] = list(rec["quarantine"])
+            rec["quarantine"][quarantine_index] = c
+        gen = self._cas(prev, rec, gen)  # retain terminal proof across op expiry
+        return rec, gen, c
+
+    def reconcile_quarantine(self):
+        """Independent expiry entry point, including while a VM owns the slot.
+
+        No scheduler/monitor is installed here. A future trusted runner must
+        call independently, monitor overdue/failures and escalate uncertainty.
+        """
+        for _ in range(self.cfg.cas_retries):
+            rec, gen = self.store.read(self.cfg.key)
+            if rec is None:
+                return Outcome("free")
+            try:
+                entries = self._quarantines(rec)
+                for index, c in enumerate(entries):
+                    if self.cfg.now() < _parse(c["retain_until"]):
+                        continue
+                    current, image = self._capture_status(c)
+                    rec, gen, current = self._dispose_image(rec, gen, current, image,
+                                                            quarantine_index=index)
+                    prev = dict(rec)
+                    rec["quarantine"] = [x for x in rec["quarantine"] if x["request_id"] != c["request_id"]]
+                    self._cas(prev, rec, gen)
+                    return Outcome("quarantine-deleted", c["name"])
+                return Outcome("not-due")
+            except _Conflict:
+                continue
+            except (Refused, ApiError, Uncertain) as exc:
+                return Outcome("blocked", str(exc))
+        return Outcome("blocked", "persistent quarantine conflicts")
