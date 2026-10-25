@@ -235,3 +235,79 @@ Primary sources, accessed 2026-10-25: official versioned
 [initial template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml),
 [hydration](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/hydrate.go),
 and [0.50.4 CLI](https://github.com/githedgehog/fabricator/blob/v0.50.4/cmd/hhfab/main.go).
+
+## Pinned hhfab installer
+
+`install-hhfab.py` installs only official Linux-amd64 0.43.1 or 0.50.4 using the
+archive and member pins in the preceding table. The caller must choose a version;
+0.50.4 remains a compatibility candidate, not an accepted next-image upgrade.
+The installer is not yet called by cloud-init or Packer.
+
+```bash
+# Ubuntu 24.04: Python 3.12 stdlib and curl; root for /usr/local/bin.
+# Keep hhfab_release.py alongside install-hhfab.py. No login environment needed.
+python3 /absolute/path/build/provision/install-hhfab.py --version 0.50.4
+# Offline delivery uses exactly the same installer and full integrity checks.
+# Destination directory must already exist and be writable by the caller.
+python3 /absolute/path/build/provision/install-hhfab.py --version 0.43.1 \
+  --install-dir /absolute/owned/bin --archive /absolute/release.tar.gz
+# Host synthetic failures plus actual unchanged installer in two fresh containers.
+python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
+timeout --kill-after=30s 10m bash build/provision/test-install-hhfab.sh
+```
+
+Python 3.10+ stdlib supports host tests; representative installation uses Ubuntu
+24.04's pinned distribution Python 3.12 described above. Invocation is explicit
+`python3`, noninteractive, without sudo or environment overrides. All options are
+shown above; `--version` is required, `--install-dir` defaults to `/usr/local/bin`,
+and omitted `--archive` downloads the exact official versioned release via curl
+on PATH. The module resolves its sibling import independently of cwd; relative
+archive paths use the caller's cwd. The install directory must be absolute,
+caller-owned and not group/world writable; every component must be a real
+(non-symlink) directory. Existing targets and local archives must be single-link
+regular files. Symlink, directory, special-file and hardlink targets are refused.
+Callers must trust the interpreter, PATH tools, module directory, destination
+ancestors and archive input, and exclude concurrent mutations of those paths.
+Observed target changes are checked before replacement; this is not an atomic
+transaction against a hostile concurrent filesystem writer.
+
+No existing or downloaded binary is executed by installation. Correct 0755
+binaries return unchanged; a matching nonexecutable binary is repaired through
+verified replacement. Downloads enforce HTTPS redirects only, exact archive-size
+ceiling, 120 seconds, and minimum 1KiB/s over 20 seconds, without retries. The
+child has a 125-second external deadline and two-second kill/reap grace. The
+installer invocation has a 180-second alarm covering download, hashing,
+extraction and publication (plus child reaping/cleanup; normal OS scheduling is
+assumed). Exact archive size/hash is checked before parsing; only the sole regular
+member `hhfab-linux-amd64/hhfab` is accepted, with its exact size/hash. Extraction
+streams at most that pinned member size, never tar-extracts names or links.
+Staging is private on the destination filesystem; only verified 0755 bytes are
+atomically renamed to `hhfab`. Failure before publication preserves the existing
+binary and removes staging. Publication is atomic visibility, not a power-loss
+durability guarantee. No directory creation or package installation is implicit.
+
+The installer test uses the existing bounded Docker ownership/cleanup runner in
+an explicit separate mode. Public archives are downloaded and verified during
+host preparation, then baked with the unchanged installer and shared verification
+module. Each version installs, reruns, repairs mode and executes the installed
+`hhfab --version` in a separate fresh network-none uid1000 container. Runtime
+`/work` is a 512MiB executable tmpfs for staging/installing the larger binary;
+other capability, resource, network, ownership and cleanup restrictions remain
+those of the offline configuration harness. No host mounts, socket, credentials
+or host binary execution occur. The optional local-archive path enables offline
+production delivery too; it does not bypass a pin. Synthetic regressions exercise
+integrity/member failures, download nonzero/timeout with real child processes,
+unsupported platform/version, unsafe paths, prior-state preservation, exact
+idempotence and mode repair. Shared harness tests continue covering lost daemon
+responses and cleanup failures. CI keeps the existing six jobs and adds a separate
+installer job. These tests do not prove systemd, nested KVM, VLAB startup, image
+boot/reboot, or student acceptance.
+
+Primary sources accessed 2026-10-25: official
+[0.43.1 release](https://github.com/githedgehog/fabricator/releases/tag/v0.43.1),
+[0.50.4 release](https://github.com/githedgehog/fabricator/releases/tag/v0.50.4),
+[release API](https://api.github.com/repos/githedgehog/fabricator/releases/tags/v0.50.4),
+and [upstream installer](https://i.hhdev.io/hhfab). The upstream installer defaults
+to `latest` and `/usr/local/bin`; this module deliberately requires explicit
+version selection. The docs overview was unavailable through the research browser;
+no installation claim relies on that page.
