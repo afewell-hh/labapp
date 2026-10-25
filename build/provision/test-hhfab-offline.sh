@@ -63,7 +63,7 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 for dependency in docker timeout python3 curl; do command -v "$dependency" >/dev/null; done
-docker version --format 'Docker server {{.Server.Version}}'
+timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Version}}'
 # Official archives verified/extracted on host, never executed on host.
 python3 "$here/hhfab_test.py" prepare "$workdir" "$here/../.."
 prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$run_label" \
@@ -78,14 +78,14 @@ prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$ru
   ')"
 [[ "$prep_id" =~ ^[a-f0-9]{64}$ ]]
 timeout --kill-after=5s 240s docker start -a "$prep_id"
-[[ "$(timeout 5s docker inspect --format '{{.State.ExitCode}}' "$prep_id")" == 0 ]]
+[[ "$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$prep_id")" == 0 ]]
 timeout --kill-after=3s 30s docker cp "$workdir/." "$prep_id:/suite/"
 # Only public binary and fixture files; guest can read them without host mount.
 # mktemp source directory permissions do not propagate through copy's /. contents.
 image_id="$(timeout --kill-after=3s 30s docker commit --change "LABEL $run_label" "$prep_id" "$image_tag")"
 [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
-timeout 5s docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
-timeout 5s docker image inspect "$image_id" --format 'Prepared {{.Id}}'
+timeout --kill-after=1s 5s docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
+timeout --kill-after=1s 5s docker image inspect "$image_id" --format 'Prepared {{.Id}}'
 lane_failed=0
 for version in 0.43.1 0.50.4; do
   runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --label "$run_label" \
@@ -100,7 +100,7 @@ for version in 0.43.1 0.50.4; do
     echo "hhfab test: lane $version failed" >&2
     lane_failed=1
   fi
-  if [[ "$(timeout 5s docker inspect --format '{{.State.ExitCode}}' "$runtime_id")" != 0 ]]; then
+  if [[ "$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$runtime_id")" != 0 ]]; then
     lane_failed=1
   fi
   object="$(owned_container "$runtime")"
@@ -109,4 +109,4 @@ for version in 0.43.1 0.50.4; do
   remaining="$(owned_container "$runtime")"
   [[ -z "$remaining" ]]
 done
-exit "$lane_failed"
+[[ "$lane_failed" == 0 ]]

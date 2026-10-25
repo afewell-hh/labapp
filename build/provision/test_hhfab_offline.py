@@ -94,6 +94,8 @@ class OwnershipTests(ownership.CleanupTests):
             root = Path(directory)
             fake = root / "docker"
             source = ownership.FAKE_DOCKER.replace("elif a[0] == 'start':", "elif a[0] == 'cp':\n    pass\nelif a[0] == 'start':")
+            source = source.replace("elif a[0] == 'inspect':\n    print('0')",
+                                    "elif a[0] == 'inspect':\n    print('1' if mode == 'lane_failed' and 'runtime' in s['containers'][a[-1]]['name'] else '0')")
             # Inject explicit deletion refusal, retained object must cause failure.
             source = source.replace("obj = s['containers'].pop(a[-1])", "\n    if mode == 'remove_denied':\n        save(); sys.exit(1)\n    obj = s['containers'].pop(a[-1])")
             fake.write_text(source)
@@ -124,6 +126,13 @@ class OwnershipTests(ownership.CleanupTests):
         self.assertTrue(any(not obj["name"].endswith("-foreign") for obj in state["containers"].values()))
         first_query = next(i for i, args in enumerate(state["calls"]) if args[:2] == ["container", "ls"])
         self.assertFalse(any(a[0] == "rm" or a[:2] == ["image", "rm"] for a in state["calls"][first_query:]))
+
+    def test_failed_lane_is_aggregate_failure_and_second_lane_runs(self):
+        result, state = self.run_harness("lane_failed")
+        self.assertEqual(result.returncode, 1)
+        runtimes = [args for args in state["calls"] if args[0] == "create" and any("runtime" in arg for arg in args)]
+        self.assertEqual(len(runtimes), 2)
+        self.assert_owned_removed(state)
 
     def test_remove_denied_is_failure(self):
         result, state = self.run_harness("remove_denied")
