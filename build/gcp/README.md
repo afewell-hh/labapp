@@ -1039,8 +1039,9 @@ the exact accepted bytes/hash in the ledger, enforce the pre-import barrier,
 and verify first-SSH boot UUID and `evidence.json` SHA before guest work.
 Guest attributes are guest-writable interval evidence, not attestation.
 
-Required offline CI command (owned synthetic files, injected metadata/process
-transports; subprocess failure tests run only tiny Python fixtures):
+Required offline command (owned synthetic files, injected metadata/process
+transports; subprocess failure tests run only tiny Python fixtures). CI also
+rejects zero discovered tests before running this same suite:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/prelogin -t build/gcp -v

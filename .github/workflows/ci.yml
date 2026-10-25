@@ -132,7 +132,15 @@ jobs:
       - name: Run required fixed pre-login hook tests
         run: |
           test -f build/gcp/prelogin/test_prelogin.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/prelogin -t build/gcp -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          import unittest
+          suite = unittest.TestLoader().discover('build/gcp/prelogin', top_level_dir='build/gcp')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required pre-login suite discovered no tests')
+          print(f'Required pre-login tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
 
   bridge-ipv4:
     name: Bridge IPv4 offline and disposable namespace tests
