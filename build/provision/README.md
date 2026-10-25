@@ -420,6 +420,9 @@ provides an independent invocation ceiling; the CLI also arms a235second alarm. 
 state: fail and discard that disposable guest; there is no atomic rollback or
 automatic repair. A correct rerun reauthenticates the snapshot and verifies exact
 versions, mandatory tool/firmware verification against dpkg md5sums, dependency consistency and dpkg audit again.
+The pinned socat package provides the exact `socat -> socat1` link; its regular
+`socat1` payload and that fixed link target are both verified. Minimal-image
+documentation exclusions do not bypass verification of the required tools.
 
 `qemu_witness.py` accepts no arguments or accelerator/binary/disk/firmware
 options. It requires the exact QEMU/SeaBIOS package identities and artifact

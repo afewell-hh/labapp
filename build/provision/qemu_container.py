@@ -55,7 +55,11 @@ def install():
     print(json.dumps({'actual_signature_refusal': True, 'actual_unavailable_pin_refusal': True,
                       'preinstall_failure_packages_unchanged': True}))
     for _ in range(2):
-        module['install']()
+        code, output = bounded(['/usr/bin/python3', '/suite/install-qemu.py'], 240,
+                               env={'PATH': '/usr/bin:/bin', 'LANG': 'C'})
+        if code:
+            raise Refusal('unchanged installer CLI failed')
+        print(json.dumps(json.loads(output)), flush=True)
     assert {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()} == apt_before
     # Real held-state preflight refuses before an APT transaction.
     assert bounded(['/usr/bin/apt-mark', 'hold', 'socat'], 10)[0] == 0

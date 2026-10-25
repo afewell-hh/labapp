@@ -42,15 +42,19 @@ def verify_tools():
     # Ubuntu images. Verify the mandatory payloads against installed package
     # md5sums instead; origin authenticity is APT's signed SHA256 index chain.
     for package, relative in [('qemu-system-x86', 'usr/bin/qemu-system-x86_64'),
-                              ('qemu-utils', 'usr/bin/qemu-img'), ('socat', 'usr/bin/socat'),
+                              ('qemu-utils', 'usr/bin/qemu-img'), ('socat', 'usr/bin/socat1'),
                               ('seabios', 'usr/share/seabios/bios-256k.bin')]:
-        metadata = Path('/var/lib/dpkg/info') / (package + '.md5sums')
-        expected = dict(line.split(None, 1)[::-1] for line in metadata.read_text().splitlines())
+        metadata = call(['/usr/bin/dpkg-query', '--control-show', package, 'md5sums']).decode()
+        expected = dict(line.split(None, 1)[::-1] for line in metadata.splitlines())
         artifact = Path('/') / relative
         if artifact.is_symlink() or not artifact.is_file() or relative not in expected:
-            raise Refusal('installed pinned artifact missing')
+            raise Refusal('installed pinned artifact missing: ' + package)
         if hashlib.md5(artifact.read_bytes()).hexdigest() != expected[relative]:
-            raise Refusal('installed pinned artifact drift')
+            raise Refusal('installed pinned artifact drift: ' + package)
+
+    socat = Path('/usr/bin/socat')
+    if not socat.is_symlink() or os.readlink(socat) != 'socat1':
+        raise Refusal('socat package symlink drift')
 
 
 def preflight():
