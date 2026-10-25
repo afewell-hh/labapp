@@ -4,6 +4,7 @@ Run as root in a fresh private mount namespace on the authorized clean inspector
 Creates only its own tiny /run backing file and loop. Production layout validation
 must refuse TYPE=loop; this is not a positive whole-wrapper/source-layout proof.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -55,7 +56,38 @@ def verify_loop(raw, backing, identity, loop=None):
         raise Refused("synthetic_loop_mismatch") from None
 
 
-def run():
+def fixture_manifest(fixture, profile):
+    """Predeclare exact public fixture ownership BEFORE any mutation."""
+    if profile not in ('default', 'host-baseline-v1'):
+        raise Refused('unsupported_profile')
+    files = {'/etc/os-release': b'ID=labapp_synthetic\n'}
+    if profile == 'host-baseline-v1':
+        from .host_baseline import MANIFEST
+        files.update({path: b'' for _, path, _ in MANIFEST})
+        files['/home/ubuntu/hhfab/include/synthetic.yaml'] = (
+            b'apiVersion: wiring.githedgehog.com/v1beta1\nkind: SwitchGroup\n'
+            b'metadata: {name: synthetic}\nspec: {}\n')
+    directories = set()
+    for path, body in files.items():
+        target = fixture / path.lstrip('/')
+        parent = target.parent
+        while parent != fixture:
+            directories.add(parent)
+            parent = parent.parent
+    return {fixture / path.lstrip('/'): body for path, body in files.items()}, sorted(
+        directories, key=lambda path: len(path.parts), reverse=True)
+
+
+def populate_fixture(fixture, profile):
+    files, directories = fixture_manifest(fixture, profile)
+    for directory in reversed(directories):
+        directory.mkdir(mode=0o700, exist_ok=True)
+    for target, body in files.items():
+        target.write_bytes(body)
+    return list(files), directories
+
+
+def run(profile='default'):
     if os.geteuid() != 0:
         raise Refused("root_required")
     for tool in (LOSETUP, "/usr/sbin/mkfs.ext4", "/usr/sbin/blockdev",
@@ -65,18 +97,18 @@ def run():
             raise Refused("synthetic_tool_missing")
     work = Path(tempfile.mkdtemp(prefix="labapp-synthetic-", dir="/run"))
     fixture = work / "fixture"
-    etc = fixture / "etc"
     backing = work / "owned.ext4"
     target = work / "mounted"
     output = work / "inventory.json"
     attached = attempted = False
     loop = None
     cleanup_ok = True
+    fixture_files, fixture_dirs = [], []
     try:
+        fixture_files, fixture_dirs = fixture_manifest(fixture, profile)
         validate_namespace(command, work)
         fixture.mkdir(mode=0o700)
-        etc.mkdir(mode=0o700)
-        (etc / "os-release").write_text('ID=labapp_synthetic\n', encoding="ascii")
+        populate_fixture(fixture, profile)
         with backing.open("xb") as stream:
             stream.truncate(SIZE)
         info = backing.lstat()
@@ -122,11 +154,20 @@ def run():
         validate_mount(command(["/usr/bin/findmnt", "--json", "--mountpoint", str(target),
                                 "--output", "TARGET,SOURCE,FSTYPE,OPTIONS,MAJ:MIN,PROPAGATION"]),
                        target, loop, number)
-        summary = write_private(target, output)
-        records = json.loads(output.read_text(encoding="ascii"))["records"]
-        captured = [item for item in records if item["path"] == "/etc/os-release"]
-        if (len(captured) != 1 or captured[0].get("private_content") != 'ID=labapp_synthetic\n' or
-                stat.S_IMODE(output.lstat().st_mode) != 0o600):
+        if profile == 'default':
+            summary = write_private(target, output)
+            records = json.loads(output.read_text(encoding="ascii"))["records"]
+            captured = [item for item in records if item["path"] == "/etc/os-release"]
+            if len(captured) != 1 or captured[0].get("private_content") != 'ID=labapp_synthetic\n':
+                raise Refused("synthetic_collector_mismatch")
+        else:
+            from .host_baseline import write_private as host_write_private
+            summary = host_write_private(target, output)
+            report = json.loads(output.read_text(encoding="ascii"))
+            if (report['profile'] != profile or not report['collection_complete'] or
+                    len(report['fixed_records']) != 16 or report['include']['selected_count'] != 1):
+                raise Refused("synthetic_collector_mismatch")
+        if stat.S_IMODE(output.lstat().st_mode) != 0o600:
             raise Refused("synthetic_collector_mismatch")
     finally:
         if attempted:
@@ -155,9 +196,9 @@ def run():
                 cleanup_ok = False
         if cleanup_ok:
             # Explicit owned entries only. Never recurse through a guest mount.
-            for path in (output, etc / "os-release", backing):
+            for path in [output, backing] + list(fixture_files):
                 path.unlink(missing_ok=True)
-            for path in (target, etc, fixture):
+            for path in [target] + fixture_dirs + [fixture]:
                 if path.exists():
                     path.rmdir()
             work.rmdir()
@@ -169,11 +210,14 @@ def run():
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("default", "host-baseline-v1"), default="default")
+    args = parser.parse_args()
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        print(json.dumps(run(), sort_keys=True))
+        print(json.dumps(run(args.profile), sort_keys=True))
     except (Refused, OSError, ValueError, KeyError, KeyboardInterrupt, subprocess.SubprocessError):
         raise SystemExit("Synthetic kernel proof refused; owned cleanup may be required.") from None
 

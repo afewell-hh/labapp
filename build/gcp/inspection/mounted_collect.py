@@ -200,13 +200,20 @@ def validate_mount(raw, mountpoint, partition, number):
 
 def collect_mounted(disk, partition, disk_number, partition_number, private_dir,
                     run=command, collector=write_private, boot_partition=None,
-                    boot_partition_number=None, stat_probe=debugfs_stat):
+                    boot_partition_number=None, stat_probe=debugfs_stat, profile="default"):
     """Caller is root; run/collector injection is for offline tests only.
 
     An unmount failure refuses success and preserves the private mountpoint for
     lead cleanup. Never recursively delete a guest mount or inspect its files
     during cleanup. The explicit private directory must initially be empty.
     """
+    if profile not in ("default", "host-baseline-v1"):
+        raise Refused("unsupported_profile")
+    if profile == "host-baseline-v1":
+        if collector is not write_private:
+            raise Refused("conflicting_collector_profile")
+        from .host_baseline import write_private as host_write_private
+        collector = host_write_private
     if (boot_partition is None) != (boot_partition_number is None):
         raise Refused("paired_boot_identity_required")
     if boot_partition is not None and (boot_partition in (disk, partition) or
@@ -272,6 +279,7 @@ def main():
     parser.add_argument("--disk-number", required=True)
     parser.add_argument("--partition-number", required=True)
     parser.add_argument("--private-dir", required=True)
+    parser.add_argument("--profile", choices=("default", "host-baseline-v1"), default="default")
     parser.add_argument("--boot-partition")
     parser.add_argument("--boot-partition-number")
     args = parser.parse_args()
@@ -284,7 +292,8 @@ def main():
         summary = collect_mounted(args.disk, args.partition, args.disk_number,
                                   args.partition_number, args.private_dir,
                                   boot_partition=args.boot_partition,
-                                  boot_partition_number=args.boot_partition_number)
+                                  boot_partition_number=args.boot_partition_number,
+                                  profile=args.profile)
     except (Refused, Gap, OSError, ValueError, KeyboardInterrupt):
         parser.exit(1, "Mount collection refused; private cleanup may be required.\n")
     print(json.dumps(summary, sort_keys=True))

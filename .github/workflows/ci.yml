@@ -18,8 +18,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Install trusted lead-side YAML dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
       - name: Run required synthetic filesystem tests
         run: |
+          test -f build/gcp/inspection/test_host_baseline.py
+          test -f build/gcp/inspection/test_host_derive.py
           test -f build/gcp/inspection/test_collector.py
           test -f build/gcp/inspection/test_mounted_collect.py
           python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
