@@ -977,3 +977,88 @@ Supplier source describes the intended layout, not exact published-image
 attestation; actual pinned-image identities and mount behavior require the
 bounded lead proof. Guest-attribute sources and trust limits are in the access
 runbook. The dirty-journal refusal fixture remains separate from this pin change.
+
+
+## Standalone pre-login evidence
+
+`prelogin/hook.py` is a self-contained Python 3.10+ stdlib root hook; it takes
+no command-line or environment configuration. It is **not installed or enabled**
+by any profile, controller or workflow. Its fixed production mode is
+`inventory-only`; the reviewed installed-manifest registry is empty. Synthetic
+tests inject a baseline mode and manifest solely to exercise readiness checks.
+No Ubuntu/Noble guest layout is declared supported.
+
+Self-source hashing recognizes only the default runner path
+`/tmp/metadata-scriptsSUFFIX/startup-script`: root-owned sticky `01777` `/tmp`,
+a no-follow root-owned `0700` runner directory, and a stable root-owned regular
+single-link source file with no group/other write permission. The bounded
+suffix is not selected by metadata. This dedicated self-source read permits
+neither arbitrary paths nor writable ancestors for snapshot/inventory reads;
+custom runner directories remain unsupported. Tests also exercise the actual
+source-reading branch without injecting hook bytes.
+
+The hook reads only the fixed local metadata keys and selected local paths,
+uses fixed bounded `dpkg-query`, `systemctl` and `cloud-init status --wait
+--format=json` commands, and exports selected package tuples and typed path
+facts/hashes. It never exports file bodies, parses caches, executes clean hooks,
+changes packages or deletes files. It refuses direct startup/cloud-final ordering
+cycles, unknown unit output and an activating cloud-final before waiting; these
+conservative checks do not establish compatibility with an installed unit graph.
+The entire run has a 210-second monotonic cap within the metadata deadline,
+with at most 180 seconds waiting and 20 seconds for subsequent collection and
+publication. Unknown layouts remain diagnostic evidence, never baseline approval.
+
+It creates an exclusive root `0700` reservation at
+`/var/lib/labapp-prelogin-LEASE/baseline.json` and a root `0700` directory at
+`/run/labapp-prelogin-LEASE`, containing exclusive `0600` reservation and
+`evidence.json` files. Existing, partial or reboot-persistent reservations refuse
+reruns; they never rebaseline. The final evidence file is at most 64 KiB, with
+its SHA and kernel boot UUID in the receipt. A future reviewed sealer must
+verify and remove exactly these lease-owned files/directories before capture;
+no blanket cleanup is implemented. Kernel-boot/controller checks remain required.
+
+Inventory publication uses exactly four canonical ASCII JSON parts, each at
+most 4096 bytes, with an ordered length/SHA descriptor in a 4096-byte summary.
+The parts total at most 16 KiB. Lease/epoch/run/attempt, nonce, numeric VM ID,
+kernel boot UUID and profile/hook digests repeat in every part. Unsupported
+path types and inventory limits produce `incomplete`/`limit` diagnostic status,
+never ready. Transport failures suppress the summary; partial/lost parts cannot
+be accepted. PUTs are spaced at least one second apart, without retries.
+Each HTTP operation has one absolute deadline of at most five seconds and no
+later than the overall deadline. The standalone Linux main-thread hook uses
+`SIGALRM` across connection, headers and body, closes responses/connections on
+failure, and restores the prior handler with no remaining timer. It refuses an
+already active interval timer and never starts a background request.
+
+`prelogin/receipt.py` separately parses one exact guest-attribute item and the
+complete strict typed receipt/parts. Inventory cannot satisfy `ready=True`.
+This parser performs no authenticated read, access import or controller CAS.
+Future integration must check the occupied lease, immutable VM/disk/source
+identity, metadata and deadline before and after authenticated reads, preserve
+the exact accepted bytes/hash in the ledger, enforce the pre-import barrier,
+and verify first-SSH boot UUID and `evidence.json` SHA before guest work.
+Guest attributes are guest-writable interval evidence, not attestation.
+
+Required offline command (owned synthetic files, injected metadata/process
+transports; subprocess failure tests run only tiny Python fixtures). CI also
+rejects zero discovered tests before running this same suite:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/prelogin -t build/gcp -v
+```
+
+The fixed source is bounded to 32 KiB (lead-scoped revision from the original
+16 KiB proposal to keep the deadline and filesystem safeguards readable);
+output bounds are unchanged.
+Current [Compute metadata limits](https://docs.cloud.google.com/compute/docs/metadata/setting-custom-metadata)
+allow 256 KB per value and 512 KB total, including inline startup scripts.
+[Guest attributes](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes)
+allow 256 KiB values, ten queries/minute and a three/second burst; other guest
+writers can still cause loss, which the parser rejects. Sources checked
+2026-10-25. [cloud-init CLI](https://docs.cloud-init.io/en/latest/reference/cli.html)
+26.2 and [upstream startup unit](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google-startup-scripts.service)
+and the runner's [temporary script handling](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google_metadata_script_runner/main.go)
+plus [default run-directory configuration](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google_guest_agent/cfg/cfg.go)
+are behavior references, not installed Noble payload proof. Offline tests do
+not prove live metadata, systemd ordering, IAM, installed manifests, guest
+access fencing, sealing, capture or boot/reboot behavior.
