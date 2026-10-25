@@ -84,7 +84,7 @@ class Preflight:
     def __init__(self, http=None, token_provider=gcloud_token, profile=spec.INSPECTOR):
         spec.kinds(profile)
         self.profile = profile
-        self.images = COMPONENT_IMAGES if profile == spec.UBUNTU_COMPONENT else IMAGES
+        self.images = COMPONENT_IMAGES if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else IMAGES
         self.http = http if http is not None else HttpTransport()
         self.token_provider = token_provider
 
@@ -123,7 +123,7 @@ class Preflight:
         # E2 shares the regional CPUS pool with N1 (not E2_CPUS).
         self._quota(region, ({"CPUS": 2, "N2_CPUS": 2, "INSTANCES": 1,
                               "DISKS_TOTAL_GB": spec.COMPONENT_DISK_GB}
-                             if self.profile == spec.UBUNTU_COMPONENT else
+                             if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else
                              {"CPUS": 2, "DISKS_TOTAL_GB": 310}))
         for actual, (path, image_id, minimum) in zip(images, self.images):
             if (actual.get("id") != image_id or
@@ -131,7 +131,7 @@ class Preflight:
                     actual.get("status") != "READY" or
                     str(actual.get("diskSizeGb")) != str(minimum)):
                 raise Refused("pinned image identity/status/minimum mismatch")
-            if self.profile == spec.UBUNTU_COMPONENT and actual.get("architecture") != "X86_64":
+            if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and actual.get("architecture") != "X86_64":
                 raise Refused("component image architecture mismatch")
 
     @staticmethod
@@ -154,7 +154,7 @@ class Preflight:
 def verify_disk_provenance(controller, record):
     """Check actual cloned image IDs; names alone cannot pin incarnations."""
     profile = record.get("profile", spec.INSPECTOR)
-    images = COMPONENT_IMAGES if profile == spec.UBUNTU_COMPONENT else IMAGES
+    images = COMPONENT_IMAGES if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else IMAGES
     kinds = [kind for kind, _ in spec.kinds(profile)[1:]]
     if set(record["ids"]) != {"instance", *kinds} or set(record["names"]) != {"instance", *kinds}:
         raise Refused("created disk inventory mismatch")
@@ -162,7 +162,7 @@ def verify_disk_provenance(controller, record):
         disk = controller.cloud.call("disks", "get", name=record["names"][kind])
         if (not record["ids"].get(kind) or disk.get("id") != record["ids"][kind] or
                 disk.get("sourceImageId") != image_id or
-                (profile == spec.UBUNTU_COMPONENT and
+                (profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and
                  disk.get("sourceImage") not in (path,
                      "https://www.googleapis.com/compute/v1/" + path,
                      "https://compute.googleapis.com/compute/v1/" + path))):

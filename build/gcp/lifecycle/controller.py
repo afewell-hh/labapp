@@ -75,16 +75,14 @@ class Config:
     def __post_init__(self) -> None:
         spec.kinds(self.profile)
         if self.lease_minutes is None:
-            self.lease_minutes = (spec.COMPONENT_LEASE_MINUTES if self.profile == spec.UBUNTU_COMPONENT
-                                  else spec.LEASE_MINUTES)
+            self.lease_minutes = spec.lease_limit(self.profile)
         self.validate_lease()
 
     def validate_lease(self) -> None:
         spec.kinds(self.profile)
-        maximum = (spec.COMPONENT_LEASE_MINUTES if self.profile == spec.UBUNTU_COMPONENT
-                   else spec.LEASE_MINUTES)
-        if self.profile == spec.UBUNTU_COMPONENT and self.boot_image != spec.COMPONENT_IMAGE:
-            raise ValueError("component boot image must match the reviewed pin")
+        maximum = spec.lease_limit(self.profile)
+        if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and self.boot_image != spec.COMPONENT_IMAGE:
+            raise ValueError("Ubuntu boot image must match the reviewed pin")
         if (type(self.lease_minutes) is not int or
                 not 1 <= self.lease_minutes <= maximum):
             raise ValueError(f"lease_minutes must be an integer from 1 to {maximum}")
@@ -133,12 +131,12 @@ class Controller:
             if "profile" in rec or "children" in rec:
                 if rec.get("profile") != profile or rec.get("children") != expected_children:
                     raise ValueError("mixed child intent")
-            if profile == spec.UBUNTU_COMPONENT and rec.get("boot_image_id") != spec.COMPONENT_IMAGE_ID:
-                raise ValueError("component immutable image pin mismatch")
+            if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and rec.get("boot_image_id") != spec.COMPONENT_IMAGE_ID:
+                raise ValueError("Ubuntu immutable image pin mismatch")
             if spec.body_hash(body) != rec["body_hash"]:
                 raise ValueError("persisted body hash mismatch")
             minutes = (_parse(rec["deadline"]) - _parse(rec["reserved_at"])).total_seconds() / 60
-            maximum = spec.COMPONENT_LEASE_MINUTES if profile == spec.UBUNTU_COMPONENT else spec.LEASE_MINUTES
+            maximum = spec.lease_limit(profile)
             if not 0 < minutes <= maximum:
                 raise ValueError("persisted deadline outside profile")
             return kinds
@@ -197,7 +195,7 @@ class Controller:
             return "zone"
         if kind == "instance" and proof is not None and res.get("id") != proof:
             return "operation-target-id"
-        if kind == "boot" and rec.get("profile") == spec.UBUNTU_COMPONENT:
+        if kind == "boot" and rec.get("profile") in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
             source = res.get("sourceImage", "")
             if (source not in (spec.COMPONENT_IMAGE, "https://www.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE,
                                "https://compute.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE) or
@@ -264,9 +262,9 @@ class Controller:
             expected = "READ_WRITE" if want[name] else "READ_ONLY"
             if att.get("mode", "READ_WRITE") != expected:
                 return "attachment-mode"
-            # Only the read-write boot disk may auto-delete. The READ_ONLY
-            # copy must survive VM deletion for explicit verified disk cleanup.
-            if att.get("autoDelete") is not want[name]:
+            # Base-build boot and inspector source copy survive VM deletion.
+            auto_delete = want[name] and rec.get("profile") != spec.UBUNTU_BASE_BUILD
+            if att.get("autoDelete") is not auto_delete:
                 return "attachment-autodelete"
         return None
 
@@ -377,7 +375,7 @@ class Controller:
         if rec["state"] != FREE:
             raise Refused(f"slot is {rec['state']}")
         self._census()
-        if cfg.profile == spec.UBUNTU_COMPONENT:
+        if cfg.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
             self._check_component_image()
         now = cfg.now()
         deadline = now + timedelta(minutes=cfg.lease_minutes)
@@ -397,7 +395,7 @@ class Controller:
             "operation": None, "ids": {kind: None for kind, _ in spec.kinds(cfg.profile)},
             "reason": None, "evidence": [],
         }
-        if cfg.profile == spec.UBUNTU_COMPONENT:
+        if cfg.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
             lease["boot_image_id"] = spec.COMPONENT_IMAGE_ID
         try:
             self._cas(rec, lease, gen)
@@ -414,7 +412,7 @@ class Controller:
                 rec["request_id"] != request_id:
             raise Refused("no RESERVED lease with this request id to submit")
         self._lease_kinds(rec)
-        if rec.get("profile") == spec.UBUNTU_COMPONENT:
+        if rec.get("profile") in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
             self._check_component_image()
         deadline = _parse(rec["deadline"])
         if cfg.now() + timedelta(minutes=cfg.min_submit_minutes) > deadline:
