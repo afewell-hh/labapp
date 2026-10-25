@@ -15,11 +15,14 @@ Codex does not document an import mechanism, so this file uses plain links;
 - **Current build:** partly automated (cloud-init, `cloud-config.yaml`) and
   partly manual. The documented process is
   [docs/runbooks/manual-image-build.md](docs/runbooks/manual-image-build.md).
-- **Current priority:** an efficient, reproducible, automated Packer image
-  build using a lead / Claude worker / Codex reviewer workflow. Same-code
-  provisioning modules and container checks live in `build/provision/`; a
-  complete Packer image pipeline remains to be implemented. GCP Marketplace publication is not the primary
-  objective (decisions in #136 and #137).
+- **Current priority:** efficient, reproducible, automated VM builds for
+  multiple platforms, with GCP as the current production delivery. The lead
+  selects tools based on source-backed research and measured fit, using a
+  lead / Claude worker / Codex reviewer workflow. Same-code provisioning
+  modules and container checks live in `build/provision/`; a complete image
+  pipeline remains to be implemented. Additional platform priorities and CPU
+  scope are open; compatibility requires validation. GCP Marketplace publication
+  is not the primary objective (decisions in #136 and #137).
 - **Longer-term:** an installer for fresh Ubuntu 24.04 VMs; an EMC GitOps and
   observability stack (ArgoCD, Gitea, Prometheus, Grafana).
 - **Status and plans:** GitHub only. Parent issue #145 and its children hold
