@@ -160,3 +160,14 @@ jobs:
         run: python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
       - name: Run unchanged installer and installed CLI smoke checks
         run: timeout --kill-after=30s 10m bash build/provision/test-install-hhfab.sh
+
+  qemu-prerequisites:
+    name: Signed snapshot QEMU installation and isolated TCG fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required failure and bounded execution regressions
+        run: python3 -m unittest discover -s build/provision -p test_qemu.py -v
+      - name: Two fresh unchanged installations and nonroot offline fixture
+        run: timeout --kill-after=30s 20m bash build/provision/test-qemu.sh

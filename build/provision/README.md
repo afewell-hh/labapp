@@ -381,3 +381,87 @@ python3 -m unittest discover -s build/provision -p test_component_prerequisites.
 The fake-systemd/KVM tests verify failure, interruption, ownership and descriptor
 cleanup; real local subprocess tests exercise time/output caps. These tests do
 not execute host systemd/KVM or establish live guest evidence.
+
+## Snapshot-pinned QEMU prerequisites and execution witness
+
+`install-qemu.py` is a standalone root/noninteractive Ubuntu 24.04 amd64 Python
+3.12 module (host unit tests support Python 3.10+); keep `hhfab_release.py` beside
+it. It requires APT/dpkg, the Ubuntu archive keyring and installed HTTPS CA
+certificates. It accepts no arguments/environment overrides and works from any
+cwd. Run only in a disposable guest, with an outer deadline:
+
+```bash
+sudo timeout --kill-after=3s 240s python3 build/provision/install-qemu.py
+python3 build/provision/qemu_witness.py
+```
+
+The installer uses official signed snapshot `20261024T000000Z`, Noble
+main/universe plus updates/security, and explicit versions:
+`qemu-system-x86`/`qemu-utils=1:8.2.2+ds-0ubuntu1.18`,
+`socat=1.8.0.0-4ubuntu0.1`, `seabios=1.16.3-2`. These are component experiment
+pins, not an upgraded production-image decision. Update snapshot and pins
+together after review. Standard APT signed Release → package index → archive
+verification remains mandatory; no current-mirror fallback or authentication
+bypass. Temporary source/list/cache/preferences paths preserve `/etc/apt`.
+Existing base dependencies can differ: the receipt records the full installed
+package versions and downloaded archive hashes, not a universal dependency
+closure or a permanently archived mirror. Ubuntu intends snapshot retention
+of at least two years. No libvirt/GUI/kernel/user/group/bridge changes occur.
+
+Preflight rejects wrong OS/architecture/nonroot, dpkg audit findings, any held
+packages, and installed top-level pin drift. Installation refuses removals,
+downgrade authorization and hold override. Network requests have 15-second
+inactivity timeouts, zero retries and a 10-second dpkg-lock wait; APT work shares
+a 210-second elapsed budget, each child bounded to at most 180 seconds. Smaller
+pre/postflight queries each have a 10-second limit. The outer 240-second limit
+provides an independent invocation ceiling; the CLI also arms a235second alarm. APT failure can leave partial dpkg
+state: fail and discard that disposable guest; there is no atomic rollback or
+automatic repair. A correct rerun reauthenticates the snapshot and verifies exact
+versions, dpkg artifact verification, dependency consistency and dpkg audit again.
+
+`qemu_witness.py` accepts no arguments or accelerator/binary/disk/firmware
+options. It requires the exact QEMU/SeaBIOS package identities and artifact
+hashes in its source. Caller UID/GID/groups and actual `/dev/kvm` device facts
+are recorded; no permission repair is attempted. The production CLI uses only
+`-accel kvm -cpu host`, never TCG fallback. Its original annotated BIOS fixture
+emits a fresh random nonce through port0xe9 and exits33 through port0xf4. It
+owns a private 1MiB raw disk under `/tmp`, uses snapshot mode and checks the
+backing hash afterwards. No default devices, guest networking, external disk,
+monitor or serial console is enabled. The real process-group helper caps
+combined output at4KiB, execution at15seconds, then kills/reaps in2seconds;
+private files are removed on success/failure/interruption. The CLI adds a40second
+overall alarm and converts SIGTERM to a cleanup-capable interruption. The report records
+nonce equality, hashes, elapsed time and cleanup. Root success would not prove
+student access, Linux boot, full VLAB, networking, reboot or image readiness.
+
+```bash
+python3 -m unittest discover -s build/provision -p test_qemu.py -v
+timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
+```
+
+The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
+containers, then runs the unchanged QEMU module twice in each and checks actual
+signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. Base manifest digest is
+`68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`;
+Python pins are `3.12.3-0ubuntu2.1`/`3.12.3-1ubuntu0.17`, CA certificates
+`20240203`. Bootstrap transitive inputs come from current official mirrors and
+are recorded in the full package receipt; this is not a fully locked base.
+Preparation has network access,1GiB/2CPU/128PID limits and a510second internal
+bound/540second attach bound. Runtime uses a committed immutable image ID,
+UID/GID1000, network none, all capabilities dropped, no-new-privileges, read-only
+root,64MiB owned tmpfs,768MiB/1CPU/128PID limits and45second/60second bounds.
+There are no host mounts, devices, socket or credential sharing. The test-only
+internal TCG lane uses `-accel tcg,thread=single -cpu qemu64` with the same fixture
+and checks exact nonce/exit/unchanged disk. Separately the unchanged production
+CLI and actual KVM-only QEMU must refuse the absent KVM device. **TCG success is
+fixture/command proof, not KVM execution proof.** Exact nonce names/tags plus
+ownership label recover ambiguous create/commit responses; cleanup removes
+immutable IDs and verifies absence, and daemon query failure is never absence.
+Every Docker operation has an external deadline. No cloud resource is used.
+
+Sources (accessed2026-10-25): [Ubuntu snapshot service](https://snapshot.ubuntu.com/),
+[Noble apt-get](https://manpages.ubuntu.com/manpages/noble/man8/apt-get.8.html),
+[apt-secure](https://manpages.ubuntu.com/manpages/noble/man8/apt-secure.8.html),
+[QEMU8.2.2 boot-sector pattern](https://github.com/qemu/qemu/blob/v8.2.2/tests/qtest/boot-sector.c),
+[debug exit](https://github.com/qemu/qemu/blob/v8.2.2/hw/misc/debugexit.c),
+[debug console](https://github.com/qemu/qemu/blob/v8.2.2/hw/char/debugcon.c).
