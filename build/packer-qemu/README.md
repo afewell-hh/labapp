@@ -169,6 +169,60 @@ need proof. Direct delegated [cgroup v2](https://docs.kernel.org/admin-guide/cgr
 would require correct attach-before-exec, permissions and ownership handling;
 a hand-written process supervisor is not a substitute for those guarantees.
 
+## Bounded container probe (`container_runner.py`, #255 initial stage, UNRUN)
+
+One fixed non-VM `probe` mode; no Packer/QEMU/VM path, no arbitrary command
+option. Docker is reached only through a `Backend` (absolute `/usr/bin/docker`,
+minimal environment, per-call bound). The CLI prints its validated plan unless
+`--execute` is given; nothing here has been run against a real Docker daemon.
+
+* Inputs: a pre-acquired `name@sha256:<digest>` image (`--pull=never`; the image
+  ID from `image inspect` is what gets created), an owned, symlink-free,
+  non-shared workspace root, non-root caller. Root and tag-only images are refused.
+* Create argv (fixed): `/usr/bin/timeout` as entrypoint (exec form, so PID 1; no
+  shell, no `--init`), `--restart=no`, `--network=none`, `--cap-drop=ALL`,
+  `no-new-privileges`, `--read-only`, caller UID:GID, 256m/1 CPU/64 PIDs,
+  `--log-driver=none`, one bind of the fresh output workspace. No device, socket,
+  home, credentials, privileged or host namespaces.
+* Budget: one admission time; `probe` is 30 s work + 20 s cleanup (sentinel and
+  fixture allocations belong to VM mode, not accepted here). Workspace creation,
+  version/image checks, create, start and polling spend the work window; every
+  Docker call is capped by remaining budget (no call after expiry). The internal
+  timer is `remaining - 10 s (start) - 5 s (kill-after)`, never a full allocation;
+  under 5 s is rejected before create. The host also gives up at the work
+  deadline, but that is a failure, never acceptance.
+* Ownership: fresh UUID name + label reserved in memory before create. Create
+  or start responses that are lost, unparseable or interrupted leave the result
+  `hold` even if cleanup then proves absence. Cleanup queries exact name+label,
+  rejects any extra ID, stops/removes by full ID, then requires successful empty
+  name+label and full-ID queries. A failed query is not absence. `hold` keeps the
+  workspace and means no slot reuse.
+* Acceptance (probe only): container exited with 124 or 137 (internal timer
+  fired; the probe ignores TERM and starts a `setsid` child so escalation and
+  PID 1 exit are exercised), not OOM-killed, cleanup verified, and an empty
+  output workspace (any entry is untrusted output and rejects). Exit codes:
+  accepted 0, failed 1, usage 2, hold 7.
+
+Pinned-source findings (read 2026-10-25, documented not tested): coreutils
+[`timeout.c` v9.4](https://raw.githubusercontent.com/coreutils/coreutils/v9.4/src/timeout.c)
+(Ubuntu 24.04's series) installs handlers for TERM/INT/QUIT/HUP/ALRM, so PID 1
+can receive them; on the first signal it sends to the child then, unless
+`--foreground`, to its own group (ignoring that signal itself first), and arms
+`--kill-after` only then. `setpgid(0,0)` is unchecked, so failing as a session
+leader is harmless. It exits 124 on timeout, or 137 if the child was KILLed.
+[pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+(man-pages 6.19): PID 1 exit SIGKILLs the namespace; PID 1 only receives
+signals it has handlers for, except SIGKILL/SIGSTOP from an ancestor.
+[`docker stop`](https://docs.docker.com/reference/cli/docker/container/stop/):
+TERM, then KILL after the grace period. [Live restore](https://docs.docker.com/engine/daemon/live-restore/):
+containers keep running without the daemon, so the internal timer must stand alone.
+
+Unmet before any VM mode: the real-Docker proof that descendants (including the
+`setsid` child) die with PID 1 and that the exit codes above hold; Ubuntu image
+pin and `timeout`/`setsid` presence; UID mapping of the bind (rootless/userns);
+`/dev/kvm` passthrough; input verification and evidence binding (core/plugin/
+base/module hashes, nonce, acceleration, normal shutdown); input mounts.
+
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
 python3 -I /abs/build/packer-qemu/supervise.py --preflight-only
