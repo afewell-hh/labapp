@@ -409,7 +409,9 @@ closure or a permanently archived mirror. Ubuntu intends snapshot retention
 of at least two years. No libvirt/GUI/kernel/user/group/bridge changes occur.
 
 Preflight rejects wrong OS/architecture/nonroot, dpkg audit findings, any held
-packages, and installed top-level pin drift. Installation refuses removals,
+packages, and installed top-level pin drift. After authenticated index update,
+isolated `apt-get check` rejects unsatisfied base dependencies before simulation
+or installation can repair them. Installation refuses removals,
 downgrade authorization and hold override. Network requests have 15-second
 inactivity timeouts, zero retries and a 10-second dpkg-lock wait; APT work shares
 a 210-second elapsed budget, each child bounded to at most 180 seconds. Smaller

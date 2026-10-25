@@ -83,6 +83,22 @@ except KeyboardInterrupt:
             with self.assertRaises(ProcessLookupError):
                 os.kill(int(pidfile.read_text()), 0)
 
+    def test_dependency_check_failure_blocks_simulation_and_install(self):
+        calls = []
+        def call(args, seconds=10):
+            calls.append(args)
+            if args[-1] == 'update':
+                return b''
+            if args[-1] == 'check':
+                raise Refusal('unsatisfied dependency base')
+            self.fail('mutation/simulation attempted on broken base')
+        before = set(Path('/var/tmp').glob('labapp-qemu-*'))
+        with patch.dict(self.globals, {'preflight': lambda: {}, 'call': call}):
+            with self.assertRaisesRegex(Refusal, 'unsatisfied'):
+                self.module['install']()
+        self.assertEqual([args[-1] for args in calls], ['update', 'check'])
+        self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
+
     def test_authenticated_update_failure_stops_before_install_and_removes_workspace(self):
         calls = []
         def call(args, seconds=10):

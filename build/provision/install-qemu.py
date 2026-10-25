@@ -110,6 +110,9 @@ def install():
                 raise Refusal("installation deadline exceeded")
             return call(args, min(180, remaining))
         run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
+        # dpkg audit can be clean despite configured-but-unsatisfied dependency
+        # relations. Refuse that base before install can implicitly repair it.
+        run([*apt, "check"])
         selected = [name + "=" + version for name, version in PINS.items()]
         # --no-remove and no downgrade/hold override remain active for simulation
         # and actual transaction. Standard signed Release/index/deb verification.
