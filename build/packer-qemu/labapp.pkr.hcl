@@ -46,12 +46,29 @@ source "qemu" "labapp" {
   communicator     = "none"
   shutdown_timeout = "5m"
 
-  # qmp_enable stays false: the builder's monitor is a separate single-client
-  # socket whose events it never reads. These two sockets belong to the
-  # verifier alone. -vnc none: loopback VNC cannot be password-protected without
-  # qmp_enable (UNRUN override check).
+  # Every builder channel that would touch QEMU is explicitly off, so the
+  # verifier is the sole controller: no VNC (disable_vnc skips the pinned
+  # stepTypeBootCommand VNC connection that would otherwise fail before
+  # shell-local), no boot-command typing, no builder QMP (its monitor is a
+  # separate single-client socket whose events go unread), no VNC password
+  # (which forces qmp_enable) and no bridge networking. Any transient port
+  # reservation stays on loopback. UNRUN: each attribute name/effect is taken
+  # from the pinned docs/source and must be confirmed by `packer validate`.
+  disable_vnc      = true
+  vnc_bind_address = "127.0.0.1"
+  vnc_use_password = false
+  boot_command     = []
+  qmp_enable       = false
+  net_bridge       = ""
+
+  # The two sockets belong to the verifier alone. -S starts QEMU paused so the
+  # guest cannot run until the verifier has attached the receipt reader,
+  # validated QMP and KVM, and sent `cont`. -monitor none removes the default
+  # HMP monitor; -vnc none keeps the display listener off (UNRUN override check).
   qemuargs = [
+    ["-S"],
     ["-cpu", "host"],
+    ["-monitor", "none"],
     ["-qmp", "unix:${var.work_dir}/events.sock,server=on,wait=off"],
     ["-serial", "unix:${var.work_dir}/serial.sock,server=on,wait=off"],
     ["-vnc", "none"],

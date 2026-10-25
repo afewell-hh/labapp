@@ -45,8 +45,28 @@ evidence of incompatibility.
   that only `host_verify.py` opens: `-qmp unix:DIR/events.sock,server=on,wait=off`
   and `-serial unix:DIR/serial.sock,server=on,wait=off`. Neither flag is a builder
   default when `qmp_enable = false`. No `-device`/`-drive` override is used (the
-  docs warn that one drops Packer's defaults). `-cpu host` and `-vnc none` are
-  also set; whether they override or conflict with defaults is **UNRUN**.
+  docs warn that one drops Packer's defaults). `-cpu host`, `-vnc none`, `-monitor
+  none` and `-S` are also set; whether they override or conflict with defaults is
+  **UNRUN**.
+* Builder channels are explicitly off: `disable_vnc = true` (without it the pinned
+  `stepTypeBootCommand` still connects to VNC and fails before `shell-local`),
+  `boot_command = []` (no typing), `qmp_enable = false` (no native QMP),
+  `vnc_use_password = false`, no `net_bridge`, and `vnc_bind_address = "127.0.0.1"`
+  for any transient reservation. Attribute names and effects are from the pinned
+  docs/source and **UNRUN** (`packer validate` has not been run).
+* Startup order: `-S` launches QEMU paused. The sole observer (1) attaches the
+  serial receipt reader, (2) reads and validates the QMP greeting and version
+  (QEMU >= 4), (3) sends `qmp_capabilities`, `query-status` (must be `prelaunch`,
+  `running=false`), `query-kvm` (`present` and `enabled` both true), each with a
+  fixed command id and a strict response schema, one in flight, and only then (4)
+  sends `cont`. Events interleaved with responses are tolerated; a `SHUTDOWN`
+  before `cont` is acknowledged fails. Writes are nonblocking and resumed after
+  partial writes. The ordering relies on the guest not running before `cont`; the
+  builder's own boot-wait and provisioner start are **UNRUN** against `-S`.
+* Strict parsing: UTF-8 only; duplicate keys (at any depth), `NaN`/`Infinity`,
+  overflowing numbers, non-object messages, a response carrying both `return` and
+  `error` (or missing/unknown/duplicate/wrong `id`), a `null`/malformed greeting
+  and malformed event envelopes all fail with fixed reason codes.
 * `DIR` is created by `supervise.py` (`mkdtemp`, 0700, safe characters only). The
   verifier refuses an endpoint that is not a socket owned by the same user.
 * Startup race: the provisioner starts after `stepRun`, but sockets may not exist
@@ -56,7 +76,9 @@ evidence of incompatibility.
   guest needs minutes to reach shutdown.
 * Success needs both: a serial line `LABAPP-RECEIPT v1 nonce=<64hex> inputs=<64hex>
   status=ok` equal to this run's values, and QMP `SHUTDOWN` with
-  `data.guest == true` and `reason == "guest-shutdown"`. `status=fail`, a
+  `data.guest == true` and `reason == "guest-shutdown"` (exactly those two keys; a
+  second `SHUTDOWN` fails). Observation continues after the receipt: it alone never
+  succeeds, a normal guest shutdown is still required. `status=fail`, a
   malformed, stale, wrong or duplicate receipt, a host/non-guest shutdown,
   `GUEST_PANICKED`, EOF before shutdown, or shutdown without a drained receipt
   (5 s) fail. QEMU exit, EOF or a vanished socket never succeed on their own.
@@ -78,8 +100,12 @@ NoCloud (`cidata` CD from `cd_files`) stages bytes. Final-stage `runcmd` only
 copies them to `/var/lib/labapp-build/in` and runs
 `systemctl start --no-block labapp-build.service`. The unit is
 `After=cloud-final.service` and `guest-build.sh` first requires
-`cloud-init status --format json` to say `done` with no errors (`After=` alone is
-satisfied by a failed unit). Then it checks the staged bytes against `MANIFEST`,
+`cloud-init status --format json` to exit zero and say `done`, with no non-empty
+`errors`/`recoverable_errors` and no nonzero exit/return code at any nesting level
+(`status: done` alone is insufficient, and `After=` alone is satisfied by a failed
+unit; the exact Noble JSON shape is **UNRUN**). Then it checks the staged
+directory with a bounded `find -print0` enumeration (no `ls | grep`; ShellCheck
+SC2010 is fixed, not suppressed), then checks the staged bytes against `MANIFEST`,
 runs `plan.txt` lines, seals, `sync`s, writes the receipt and calls poweroff, all
 outside `cloud-final`; cloud-init is never cleaned from its own active script.
 `runcmd` reaches `scripts_user` in the final stage (cloud-init 24.1.3 source);

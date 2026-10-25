@@ -5,11 +5,19 @@ Invoke: python3 -I /absolute/path/host_verify.py --qmp SOCK --serial SOCK
 Python 3.10+ stdlib, Linux only, no environment overrides, no cwd dependence,
 no shell, no sudo. Runs as the build user (the same user that runs Packer).
 
+QEMU is launched paused (-S). This sole observer first attaches the serial
+receipt reader, then negotiates validated QMP (greeting and version, command
+ids, strict response schemas), confirms query-status prelaunch with
+running=false and query-kvm present=true enabled=true, and only then sends
+`cont`. Duplicate JSON keys, non-finite numbers, invalid UTF-8 or types,
+wrong/missing/duplicate ids and return/error conflicts all fail.
+
 Success requires BOTH, from the one QEMU instance this run owns:
   1. a guest receipt line on the private serial socket carrying this run's
      nonce and input digest with status=ok, and
   2. a QMP SHUTDOWN event with data.guest == true and reason "guest-shutdown".
-QEMU process exit, EOF or a vanished socket is never accepted on its own.
+The receipt alone is never enough: observation continues until a normal guest
+shutdown. QEMU process exit, EOF or a vanished socket is never accepted alone.
 
 This process must be the ONLY client of both sockets. They are opened by QEMU
 (-qmp ...,server=on,wait=off and -serial unix:...,server=on,wait=off) through
@@ -19,6 +27,7 @@ Neither channel authenticates the guest; the nonce rejects stale receipts only.
 """
 import argparse
 import json
+import math
 import os
 import re
 import selectors
@@ -32,6 +41,7 @@ QMP_TOTAL_MAX = 1 << 20
 SERIAL_LINE_MAX = 4096
 SERIAL_TOTAL_MAX = 4 << 20
 DRAIN_GRACE = 5.0
+MIN_QEMU_MAJOR = 4  # SHUTDOWN.reason needs QEMU 4.0+
 CONNECT_POLL = 0.05
 RECEIPT_PREFIX = b"LABAPP-RECEIPT"
 RECEIPT_RE = re.compile(
@@ -96,32 +106,181 @@ class Lines:
         return out
 
 
+def _no_dupes(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def _no_constant(_name):
+    raise ValueError("nonfinite constant")
+
+
+def _finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("nonfinite number")
+    return value
+
+
+def parse_json(line):
+    """Strict UTF-8 JSON object: no duplicate keys, NaN/Infinity or non-objects."""
+    try:
+        msg = json.loads(line.decode("utf-8"), object_pairs_hook=_no_dupes,
+                         parse_constant=_no_constant, parse_float=_finite_float)
+    except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError
+        raise Failure("qmp-malformed") from None
+    if not isinstance(msg, dict):
+        raise Failure("qmp-malformed")
+    return msg
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def check_greeting(msg):
+    """Exactly {"QMP": {"version": {"qemu": {major,minor,micro}}, "capabilities": [..]}}."""
+    body = msg.get("QMP")
+    if set(msg) != {"QMP"} or not isinstance(body, dict):
+        raise Failure("qmp-no-greeting")
+    version = body.get("version")
+    qemu = version.get("qemu") if isinstance(version, dict) else None
+    if (not isinstance(qemu, dict) or not isinstance(body.get("capabilities"), list)
+            or not all(_is_int(qemu.get(k)) for k in ("major", "minor", "micro"))):
+        raise Failure("qmp-bad-greeting")
+    if qemu["major"] < MIN_QEMU_MAJOR:
+        raise Failure("qmp-version")
+
+
+def _empty(ret):
+    return isinstance(ret, dict) and not ret
+
+
+def _prelaunch(ret):
+    return (isinstance(ret, dict) and {"status", "running"} <= set(ret)
+            and set(ret) <= {"status", "running", "singlestep"}
+            and ret["status"] == "prelaunch" and ret["running"] is False)
+
+
+def _kvm(ret):
+    return (isinstance(ret, dict) and set(ret) == {"enabled", "present"}
+            and ret["present"] is True and ret["enabled"] is True)
+
+
+# (command, id, return-value check, failure reason). The guest only starts at
+# `cont`, after the serial receipt reader is attached and KVM is confirmed.
+STARTUP = (("qmp_capabilities", "hv-1", _empty, "qmp-negotiation"),
+           ("query-status", "hv-2", _prelaunch, "qmp-not-prelaunch"),
+           ("query-kvm", "hv-3", _kvm, "qmp-kvm-unavailable"),
+           ("cont", "hv-4", _empty, "qmp-cont"))
+
+
+class Qmp:
+    """QMP state machine: greeting -> startup commands (one in flight) -> running."""
+
+    def __init__(self):
+        self.state, self.step, self.out = "greeting", 0, bytearray()
+        self.shutdown_ok = False
+
+    def _send_next(self):
+        command, ident = STARTUP[self.step][:2]
+        self.out += json.dumps({"execute": command, "id": ident}).encode() + b"\n"
+
+    def handle(self, msg):
+        if self.state == "greeting":
+            check_greeting(msg)
+            self.state = "startup"
+            self._send_next()
+        elif "event" in msg:
+            self._event(msg)
+        elif set(msg) in ({"return", "id"}, {"error", "id"}):
+            self._response(msg)
+        else:
+            raise Failure("qmp-bad-message")
+
+    def _response(self, msg):
+        if self.state != "startup":
+            raise Failure("qmp-unexpected-response")
+        _, ident, check, reason = STARTUP[self.step]
+        if msg["id"] != ident:  # also rejects replays of an already-answered id
+            raise Failure("qmp-id-mismatch")
+        if "error" in msg or not check(msg["return"]):
+            raise Failure(reason)
+        self.step += 1
+        if self.step == len(STARTUP):
+            self.state = "running"
+        else:
+            self._send_next()
+
+    def _event(self, msg):
+        data = msg.get("data")
+        if (set(msg) - {"event", "data", "timestamp"} or not isinstance(msg["event"], str)
+                or not isinstance(msg.get("timestamp"), dict)
+                or ("data" in msg and not isinstance(data, dict))):
+            raise Failure("qmp-bad-message")
+        if msg["event"] == "GUEST_PANICKED":
+            raise Failure("guest-panicked")
+        if msg["event"] != "SHUTDOWN":
+            return  # interleaved events (RESUME, STOP, ...) are not evidence
+        if self.state != "running":
+            raise Failure("early-shutdown")
+        if self.shutdown_ok:
+            raise Failure("duplicate-shutdown")
+        if (set(data or {}) != {"guest", "reason"} or data["guest"] is not True
+                or data["reason"] != "guest-shutdown"):
+            raise Failure("non-guest-shutdown")
+        self.shutdown_ok = True
+
+
 def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
-    """Drive both connected nonblocking sockets to a verdict; raise Failure."""
+    """Drive both connected nonblocking sockets to a verdict; raise Failure.
+
+    The serial socket is attached and registered before `cont` is ever sent, so
+    the guest cannot run before the receipt reader exists.
+    """
     want = (nonce.encode(), inputs.encode())
     qlines = Lines(QMP_LINE_MAX, QMP_TOTAL_MAX, True)
     slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False)
-    state, receipt_ok, shutdown_ok = "greeting", False, False
+    proto, receipt_ok = Qmp(), False
     qmp_open = serial_open = True
     drain_until = None
+    watching_write = False
     sel = selectors.DefaultSelector()
     sel.register(qmp, selectors.EVENT_READ, "qmp")
     sel.register(serial, selectors.EVENT_READ, "serial")
     try:
         while True:
-            if receipt_ok and shutdown_ok:
+            if receipt_ok and proto.shutdown_ok:
                 return
             now = clock()
             if now >= deadline:
                 raise Failure("timeout")
             if drain_until is not None and (now >= drain_until or not serial_open):
                 raise Failure("shutdown-without-receipt")
-            if not qmp_open and not shutdown_ok:
+            if not qmp_open and not proto.shutdown_ok:
                 raise Failure("qmp-eof-before-shutdown")
-            if not serial_open and not receipt_ok and not shutdown_ok:
+            if not serial_open and not receipt_ok and not proto.shutdown_ok:
                 raise Failure("serial-eof-before-receipt")
+            if qmp_open and bool(proto.out) != watching_write:
+                watching_write = bool(proto.out)
+                sel.modify(qmp, selectors.EVENT_READ
+                           | (selectors.EVENT_WRITE if watching_write else 0), "qmp")
             limit = deadline if drain_until is None else min(deadline, drain_until)
-            for key, _ in sel.select(max(0.0, min(0.2, limit - now))):
+            for key, mask in sel.select(max(0.0, min(0.2, limit - now))):
+                if key.data == "qmp" and mask & selectors.EVENT_WRITE and proto.out:
+                    try:  # nonblocking: a partial write keeps the remainder queued
+                        sent = qmp.send(bytes(proto.out))
+                    except BlockingIOError:
+                        sent = 0
+                    except OSError:
+                        raise Failure("qmp-send") from None
+                    del proto.out[:sent]
+                if not mask & selectors.EVENT_READ:
+                    continue
                 try:
                     data = key.fileobj.recv(65536)
                 except BlockingIOError:
@@ -152,36 +311,9 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
                     qmp_open = False
                     continue
                 for line in qlines.feed(data):
-                    try:
-                        msg = json.loads(line)
-                    except ValueError:
-                        raise Failure("qmp-malformed") from None
-                    if not isinstance(msg, dict):
-                        raise Failure("qmp-malformed")
-                    if state == "greeting":
-                        if "QMP" not in msg:
-                            raise Failure("qmp-no-greeting")
-                        try:
-                            qmp.send(b'{"execute":"qmp_capabilities"}\n')
-                        except OSError:
-                            raise Failure("qmp-send") from None
-                        state = "negotiating"
-                    elif state == "negotiating":
-                        if "event" in msg:
-                            continue
-                        if "return" not in msg:
-                            raise Failure("qmp-negotiation")
-                        state = "events"
-                    elif msg.get("event") == "SHUTDOWN":
-                        data_ = msg.get("data")
-                        if (isinstance(data_, dict) and data_.get("guest") is True
-                                and data_.get("reason") == "guest-shutdown"):
-                            shutdown_ok = True
-                            drain_until = clock() + DRAIN_GRACE
-                        else:
-                            raise Failure("non-guest-shutdown")
-                    elif msg.get("event") == "GUEST_PANICKED":
-                        raise Failure("guest-panicked")
+                    proto.handle(parse_json(line))
+                    if proto.shutdown_ok and drain_until is None:
+                        drain_until = clock() + DRAIN_GRACE
     finally:
         sel.close()
 
@@ -200,8 +332,8 @@ def verify(args, clock=time.monotonic):
     deadline = clock() + args.timeout
     qmp = serial = None
     try:
+        serial = connect(args.serial, deadline, clock)  # receipt reader first
         qmp = connect(args.qmp, deadline, clock)
-        serial = connect(args.serial, deadline, clock)
         observe(qmp, serial, args.nonce, args.inputs, deadline, clock)
         write_result(args.result, args.nonce, args.inputs)
     finally:

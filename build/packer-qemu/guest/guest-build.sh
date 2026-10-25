@@ -29,15 +29,44 @@ emit() { # status
 }
 
 check_cloud_init() {
-  cloud-init status --format json | python3 -c '
+  # `status: done` alone is not enough: any error, recoverable error (also in
+  # the nested per-stage `detail`/`init`/`modules-*` records of the 24.x format)
+  # or nonzero exit status of `cloud-init status` rejects.
+  local out
+  out=$(cloud-init status --format json) || return 1
+  python3 -c '
 import json, sys
+
+def clean(value):
+    """False if any errors/recoverable_errors/nonzero exit anywhere is non-empty."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("errors", "recoverable_errors") and item:
+                return False
+            if key in ("exit_code", "returncode", "status_code") and item not in (0, None):
+                return False
+            if not clean(item):
+                return False
+    elif isinstance(value, list):
+        return all(clean(item) for item in value)
+    return True
+
 s = json.load(sys.stdin)
-sys.exit(0 if s.get("status") == "done" and not s.get("errors") else 1)'
+sys.exit(0 if isinstance(s, dict) and s.get("status") == "done" and clean(s) else 1)
+' <<<"$out"
 }
 
 check_inputs() {
+  local name
+  local -a have=()
   (cd "$IN" && sha256sum --check --strict --quiet MANIFEST)
-  diff <(cd "$IN" && ls -A | grep -vx -e nonce -e MANIFEST | sort) \
+  # Bounded, NUL-safe enumeration: top-level entries only, no ls|grep parsing.
+  while IFS= read -r -d '' name; do
+    name=${name#"$IN"/}
+    [[ $name == nonce || $name == MANIFEST ]] && continue
+    have+=("$name")
+  done < <(find "$IN" -mindepth 1 -maxdepth 1 -print0)
+  diff <(printf '%s\n' "${have[@]}" | sort) \
        <(awk '{print $2}' "$IN/MANIFEST" | sort) >/dev/null
 }
 
