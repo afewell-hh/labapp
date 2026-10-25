@@ -49,6 +49,40 @@ class InstallTests(unittest.TestCase):
             with self.assertRaisesRegex(Refusal, 'Ubuntu'):
                 self.module['preflight']()
 
+    def test_cli_sigterm_kills_reaps_real_child_and_unwinds_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pidfile = root / 'pid'
+            workspace = root / 'owned'
+            child = ("import os,signal,time; from pathlib import Path; "
+                     "Path(" + repr(str(pidfile)) + ").write_text(str(os.getpid())); "
+                     "os.kill(os.getppid(),signal.SIGTERM); time.sleep(10)")
+            program = """
+import runpy,sys,tempfile
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from hhfab_release import bounded
+n=runpy.run_path(sys.argv[2]); main=n['main']; child=sys.argv[3]; parent=Path(sys.argv[4])
+def harmless_workload():
+    parent.mkdir()
+    try:
+        bounded([sys.executable,'-c',child],5)
+    finally:
+        parent.rmdir()
+main.__globals__['install']=harmless_workload
+sys.argv=['install-qemu.py']
+try:
+    main()
+except KeyboardInterrupt:
+    sys.exit(130)
+"""
+            result = subprocess.run([sys.executable, '-c', program, str(INSTALL.parent), str(INSTALL), child, str(workspace)],
+                                    capture_output=True, timeout=7)
+            self.assertEqual(result.returncode, 130, result.stderr)
+            self.assertFalse(workspace.exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pidfile.read_text()), 0)
+
     def test_authenticated_update_failure_stops_before_install_and_removes_workspace(self):
         calls = []
         def call(args, seconds=10):

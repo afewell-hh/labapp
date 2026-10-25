@@ -6,6 +6,7 @@ hhfab_release.py. Any cwd; no shell/login environment. Run on disposable guests:
 APT cannot roll back partial failure. Preserves distro sources/preferences.
 """
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,22 @@ def installed():
             if row.split("\t")[2] == "installed"}
 
 
+def verify_tools():
+    # dpkg --verify also reports documentation deliberately excluded by minimal
+    # Ubuntu images. Verify the mandatory payloads against installed package
+    # md5sums instead; origin authenticity is APT's signed SHA256 index chain.
+    for package, relative in [('qemu-system-x86', 'usr/bin/qemu-system-x86_64'),
+                              ('qemu-utils', 'usr/bin/qemu-img'), ('socat', 'usr/bin/socat'),
+                              ('seabios', 'usr/share/seabios/bios-256k.bin')]:
+        metadata = Path('/var/lib/dpkg/info') / (package + '.md5sums')
+        expected = dict(line.split(None, 1)[::-1] for line in metadata.read_text().splitlines())
+        artifact = Path('/') / relative
+        if artifact.is_symlink() or not artifact.is_file() or relative not in expected:
+            raise Refusal('installed pinned artifact missing')
+        if hashlib.md5(artifact.read_bytes()).hexdigest() != expected[relative]:
+            raise Refusal('installed pinned artifact drift')
+
+
 def preflight():
     if os.geteuid() != 0:
         raise Refusal("root required")
@@ -57,8 +74,7 @@ def preflight():
         if actual is not None and actual != version:
             raise Refusal("installed pinned package drift: " + name)
     if all(before.get(name) == version for name, version in PINS.items()):
-        if call(['/usr/bin/dpkg', '--verify', *PINS]).strip():
-            raise Refusal('installed pinned artifact drift')
+        verify_tools()
     return before
 
 
@@ -107,8 +123,7 @@ def install():
             raise Refusal("installed version mismatch")
         if call(["/usr/bin/dpkg", "--audit"]).strip():
             raise Refusal("post-install dpkg audit failed")
-        if call(['/usr/bin/dpkg', '--verify', *PINS]).strip():
-            raise Refusal('installed pinned artifact verification failed')
+        verify_tools()
         for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
                      "/usr/share/seabios/bios-256k.bin"):
             if not Path(path).is_file():
@@ -118,7 +133,7 @@ def install():
                           "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))
 
 
-if __name__ == "__main__":
+def main():
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
     def expired(_signum, _frame):
@@ -130,6 +145,13 @@ if __name__ == "__main__":
         if len(sys.argv) != 1:
             raise Refusal("no options accepted")
         install()
+    finally:
+        signal.alarm(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
     except KeyboardInterrupt:
         print("qemu install: interrupted", file=sys.stderr)
         sys.exit(130)

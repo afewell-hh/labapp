@@ -417,7 +417,7 @@ pre/postflight queries each have a 10-second limit. The outer 240-second limit
 provides an independent invocation ceiling; the CLI also arms a235second alarm. APT failure can leave partial dpkg
 state: fail and discard that disposable guest; there is no atomic rollback or
 automatic repair. A correct rerun reauthenticates the snapshot and verifies exact
-versions, dpkg artifact verification, dependency consistency and dpkg audit again.
+versions, mandatory tool/firmware verification against dpkg md5sums, dependency consistency and dpkg audit again.
 
 `qemu_witness.py` accepts no arguments or accelerator/binary/disk/firmware
 options. It requires the exact QEMU/SeaBIOS package identities and artifact
