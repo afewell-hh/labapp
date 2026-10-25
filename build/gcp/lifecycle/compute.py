@@ -135,6 +135,11 @@ class ComputeRestTransport:
                 raise ForbiddenOperation("Invalid persisted Compute request ID")
         if page_token is not None and (verb not in ("list", "aggregatedList") or not self._valid_page_token(page_token)):
             raise ForbiddenOperation("Unexpected/invalid Compute page token")
+        if resource == "images":
+            if (verb != "get" or name != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] or
+                    body is not None or request_id is not None or page_token is not None):
+                raise ForbiddenOperation("only the fixed public Ubuntu image read is permitted")
+            return self._request("GET", BASE + "/" + spec.COMPONENT_IMAGE)
         project_url = f"{BASE}/projects/{spec.PROJECT}"
         endpoint = "operations" if resource in ("zoneOperations", "globalOperations") else resource
         zonal_url = f"{project_url}/zones/{spec.ZONE}/{endpoint}"

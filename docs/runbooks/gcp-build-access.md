@@ -144,6 +144,13 @@ Optional local impersonation is a separate access decision: it would require
 an independently authenticated local session. It is not needed for the lead to
 dispatch this workflow and is not granted by the script.
 
+The lifecycle library also has a fixed one-disk Ubuntu component profile (see
+[its contract](../../build/gcp/README.md#fixed-ubuntu-component-library-profile)).
+It is not selectable by the current trusted workflows or access helpers. Its
+30-minute maximum and nested-capable small shape do not authorize a launch,
+change IAM, establish guest egress, or implement full Packer image capture.
+Those are separate reviewed operational scopes.
+
 ## VM lifecycle gates (before any later build workflow)
 
 The owner permits at most **three simultaneous build/test VM slots**, counting

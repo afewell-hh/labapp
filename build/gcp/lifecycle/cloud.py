@@ -2,9 +2,10 @@
 
 The controller never talks to a cloud client directly. Every call goes through
 ``PolicyCloud``, which rejects any resource/verb outside the reviewed set and
-any project/zone outside the fixed scope. Images, snapshots, addresses,
+any project/zone outside the fixed scope. Only one fixed public Ubuntu image
+read is supported. Image mutations, snapshots, addresses,
 firewalls, IAM, and instance stop/start/setScheduling/setMetadata are absent
-by construction. No real transport exists in this change.
+by construction.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ class ForbiddenOperation(Exception):
 
 
 ALLOWED: frozenset = frozenset({
+    ("images", "get"),  # fixed public Ubuntu pin only; no image mutations
     ("instances", "insert"), ("instances", "get"),
     ("instances", "list"), ("instances", "delete"),
     ("disks", "get"), ("disks", "list"), ("disks", "delete"),
@@ -67,5 +69,9 @@ class PolicyCloud:
         if kw.get("project", self.project) != self.project or \
                 kw.get("zone", self.zone) != self.zone:
             raise ForbiddenOperation("project/zone outside the fixed scope")
+        if resource == "images" and (verb != "get" or
+                kw.get("name") != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] or
+                set(kw) != {"name"}):
+            raise ForbiddenOperation("only the fixed public Ubuntu image read is permitted")
         kw["project"], kw["zone"] = self.project, self.zone
         return self._raw.call(resource, verb, **kw)
