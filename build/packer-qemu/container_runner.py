@@ -7,11 +7,13 @@ Docker is reached only through `Backend`; tests substitute a fake. The CLI refus
 to contact Docker unless `--execute` is given (otherwise it prints the plan).
 Python 3.10+ stdlib. See README.md "Bounded container probe" for unmet gates.
 
-Clock basis: one wall-clock epoch (`time.time` on the host, `date +%s` inside the
-container, which shares the host clock). Deadlines are floored to whole seconds
-and the container subtracts one more second, so rounding only shortens the timer.
+Clock basis: Linux CLOCK_BOOTTIME on the host and /proc/uptime at startup,
+including suspend. The fixed Bash wrapper checks the boot ID and zero time
+namespace offsets, floors uptime, reserves rounding and escalation, then execs
+GNU timeout as the same PID 1.
 """
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -45,19 +47,51 @@ CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")      # no comma: --mount is comma-split
 HOST_RE = re.compile(r"^unix:///[A-Za-z0-9_./-]+$")
 STATE_RE = re.compile(r"^(created|running|paused|restarting|removing|exited|dead) (\d{1,3}) (true|false)$")
-WITNESS_RE = re.compile(r"^start (\d{9,12}) (\d{1,4})\nprobe (\d{1,9})\nterm_ignored\n$")
-# Runs as the container's PID 1 (sh), recomputes the timer at ACTUAL startup from
-# the original admission deadline ($1), then execs timeout, which stays PID 1.
-# Under MIN_TIMER (late start) it exits 125 without running the probe.
-ENTRY = ("n=$(/bin/date +%s) || exit 125; t=$(($1-n-1-" + str(KILL_AFTER) + ")); "
-         "[ \"$t\" -ge " + str(MIN_TIMER) + " ] || exit 125; "
-         "echo \"start $n $t\" > /out/witness || exit 125; "
-         "exec /usr/bin/timeout --kill-after=" + str(KILL_AFTER) + "s \"${t}s\" /bin/sh -c \"$2\"")
-# Fixed child tree: a setsid descendant (its pid is witnessed) plus a TERM-ignoring
-# shell loop, so the internal timer must escalate and PID 1 exit must reap the
-# namespace.
-PROBE_SCRIPT = ("/usr/bin/setsid /bin/sleep 3600 & echo \"probe $!\" >> /out/witness; trap '' TERM; "
-                "echo term_ignored >> /out/witness; while :; do /bin/sleep 1; done")
+WITNESS_RE = re.compile(r"^start (\d{1,12}) (\d{1,4})\nprobe ([1-9]\d{0,8})\nterm_ignored\n$")
+ENTRY = ('read -r boot < /proc/sys/kernel/random/boot_id || exit 125; '
+         '[ "$boot" = "$2" ] || exit 125; '
+         'count=0; while read -r kind sec ns extra; do '
+         '[[ "$kind" = monotonic || "$kind" = boottime ]] || exit 125; '
+         '[[ "$sec" = 0 && "$ns" = 0 && -z "$extra" ]] || exit 125; '
+         '((count+=1)); done < /proc/self/timens_offsets; '
+         '[[ "$count" = 2 ]] || exit 125; '
+         'read -r up idle < /proc/uptime || exit 125; '
+         r'[[ "$up" =~ ^[0-9]{1,12}\.[0-9]{2}$ ]] || exit 125; '
+         'n=${up%.*}; t=$(($1-10#$n-1-5)); '
+         '[ "$t" -ge 5 ] || exit 125; '
+         'echo "start $n $t" > /out/witness || exit 125; '
+         'exec /usr/bin/timeout --kill-after=5s "${t}s" /bin/bash -c "$3"')
+# The detached child installs its own handler after setsid, then witnesses its
+# own PID. The parent waits for that line before appending the final marker.
+PROBE_SCRIPT = ("trap '' TERM; /usr/bin/setsid /bin/bash -c "
+                "'trap \"\" TERM; echo \"probe $$\" >> /out/witness; "
+                "while :; do /bin/sleep 1; done' & "
+                'while :; do { read -r first; read -r child; } < /out/witness; '
+                r'[[ "$child" = probe\ * ]] && break; /bin/sleep 0.01; done; '
+                'echo term_ignored >> /out/witness; while :; do /bin/sleep 1; done')
+
+
+def boot_clock():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def read_proc(path, limit=256):
+    with open(path, "rb") as handle:
+        raw = handle.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("oversized proc clock data")
+    return raw.decode("ascii").strip()
+
+
+def host_boot_id():
+    boot = read_proc("/proc/sys/kernel/random/boot_id")
+    if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
+        raise ValueError("invalid boot ID")
+    lines = read_proc("/proc/self/timens_offsets").splitlines()
+    if sorted(line.split() for line in lines) != [["boottime", "0", "0"], ["monotonic", "0", "0"]]:
+        raise ValueError("time namespace offsets unsupported")
+    return boot
+
 
 
 class DockerError(Exception):
@@ -82,11 +116,13 @@ class Backend:
     bounded byte collector with a deadline."""
 
     def __init__(self, docker="/usr/bin/docker", host="unix:///var/run/docker.sock", config="/nonexistent-empty"):
+        if not HOST_RE.fullmatch(host):
+            raise ValueError("local Unix Docker endpoint required")
         self.docker, self.host, self.config = docker, host, config
 
     def call(self, args, seconds):
         argv = [self.docker, "--host", self.host, "--config", self.config, *args]
-        end = time.monotonic() + seconds
+        end = boot_clock() + seconds
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, start_new_session=True,
@@ -96,7 +132,7 @@ class Backend:
         chunks, size, fd = [], 0, proc.stdout.fileno()
         try:
             while True:
-                left = end - time.monotonic()
+                left = end - boot_clock()
                 if left <= 0:
                     raise DockerTimeout()
                 if not select.select([fd], [], [], left)[0]:
@@ -108,16 +144,19 @@ class Backend:
                 if size > OUT_CAP:
                     raise DockerError()          # overflow: reject, do not truncate
                 chunks.append(data)
-            proc.wait(timeout=max(end - time.monotonic(), 0.01))
+            proc.wait(timeout=max(end - boot_clock(), 0.01))
         except subprocess.TimeoutExpired as exc:
             raise DockerTimeout() from exc
         finally:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                proc.wait()
+            # Kill the owned group even if its original parent already exited.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
             proc.stdout.close()
         if proc.returncode != 0:
             raise DockerError()
@@ -182,29 +221,57 @@ def check_private_dir(path, uid, what):
     return info
 
 
+def released_record(record):
+    """Only our complete terminal records permit reuse; malformed state holds."""
+    try:
+        return (record["state"] == "released" and record["image"] == PINNED_IMAGE
+                and re.fullmatch(r"labapp-probe-[a-zA-Z0-9-]+", record["name"])
+                and record["label"] == "labapp.probe.run=" + record["name"][13:]
+                and (record["id"] is None or CONTAINER_ID_RE.fullmatch(record["id"]))
+                and (record["workspace"] is None or PATH_RE.fullmatch(record["workspace"]))
+                and 0 <= record["admitted_at"] < record["work_deadline"] < record["deadline"]
+                and isinstance(record["pid"], int) and record["pid"] > 0
+                and record["outcome"] in ("accepted", "failed") and "reason" in record)
+    except (KeyError, TypeError):
+        return False
+
+
 def unresolved_records(directory):
     """Names of ledger records that are not released (corrupt counts as unresolved)."""
     out = []
-    for entry in sorted(os.listdir(directory)):
-        if entry.startswith("labapp-probe-") and entry.endswith(".json"):
+    with os.scandir(directory) as entries:
+        for count, entry in enumerate(entries):
+            if count >= 128:
+                return ["ledger_entry_limit"]
+            if entry.name == "admission.lock" or entry.name == "docker-config":
+                if entry.is_symlink():
+                    return ["symlinked_ledger_entry"]
+                continue
+            if not re.fullmatch(r"labapp-probe-[a-zA-Z0-9-]+\.json", entry.name):
+                return ["unexpected_ledger_entry"]
             try:
-                with open(os.path.join(directory, entry)) as handle:
-                    released = json.load(handle).get("state") == "released"
-            except (OSError, ValueError, AttributeError):
-                released = False
-            if not released:
-                out.append(entry)
+                fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                        return ["invalid_ledger_record"]
+                    raw = handle.read(4097)
+                record = json.loads(raw)
+                if len(raw) > 4096 or not isinstance(record, dict) or not released_record(record):
+                    out.append(entry.name)
+            except (OSError, ValueError):
+                out.append(entry.name)
     return out
 
 
-def create_args(name, label, image_id, user, workspace, deadline):
+def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot-id>"):
     """Exact, fixed creation argv: no init, no restart, no pull, healthcheck off."""
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
             "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64",
             "--log-driver=none", f"--mount=type=bind,src={workspace},dst=/out",
-            "--entrypoint=/bin/sh", image_id, "-c", ENTRY, "sh", str(deadline), PROBE_SCRIPT]
+            "--entrypoint=/bin/bash", image_id, "-c", ENTRY, "bash", str(deadline), boot_id, PROBE_SCRIPT]
 
 
 def owned_query(name, label):
@@ -221,21 +288,22 @@ def identity_args(ident):
             '{{.Id}} {{.Name}} {{index .Config.Labels "labapp.probe.run"}}', ident]
 
 
-IMAGE_FORMAT = ('{"id":{{json .Id}},"repo":{{json .RepoDigests}},"vol":{{json .Config.Volumes}},'
-                '"onbuild":{{json .Config.OnBuild}}}')
+IMAGE_FORMAT = '{{json .}}'
 
 
 def check_image(raw, image):
-    """Return the image ID after rejecting inherited behavior this probe cannot bound."""
+    """Inspect whole bounded JSON: optional Config keys may be absent."""
     try:
         info = json.loads(raw)
-        ok = (IMAGE_ID_RE.match(info["id"]) and image in info["repo"]
-              and not info["vol"] and not info["onbuild"])
-    except (ValueError, KeyError, TypeError):
+        config = info["Config"]
+        ok = (IMAGE_ID_RE.fullmatch(info["Id"]) and isinstance(info["RepoDigests"], list)
+              and image in info["RepoDigests"]
+              and not config.get("Volumes") and not config.get("OnBuild"))
+    except (ValueError, KeyError, TypeError, AttributeError):
         ok = False
     if not ok:
-        raise DockerError()      # wrong digest, anonymous volumes or ONBUILD: refuse
-    return info["id"]
+        raise DockerError()
+    return info["Id"]
 
 
 def make_workspace(root, ident, uid):
@@ -249,15 +317,19 @@ def make_workspace(root, ident, uid):
 def read_witness(path, deadline, started_after):
     """Parse the fixed probe's startup witness; return the timer seconds or None.
     Untrusted data: exactly one small regular file with an exact format."""
-    if os.listdir(path) != ["witness"]:
-        return None
+    with os.scandir(path) as entries:
+        first = next(entries, None)
+        if first is None or first.name != "witness" or next(entries, None) is not None:
+            return None
     full = os.path.join(path, "witness")
     if not stat.S_ISREG(os.lstat(full).st_mode):
         return None
-    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
         raw = handle.read(257)
-    match = WITNESS_RE.match(raw.decode("ascii", "replace"))
+    match = WITNESS_RE.fullmatch(raw.decode("ascii", "replace"))
     if not match:
         return None
     n, t = int(match.group(1)), int(match.group(2))
@@ -266,7 +338,25 @@ def read_witness(path, deadline, started_after):
     return t
 
 
-def run_probe(image, root, ledger_dir, backend, *, clock=time.time, sleep=time.sleep,
+def run_probe(image, root, ledger_dir, backend, **kwargs):
+    # Nonblocking admission: one host ledger authority must be used for this
+    # endpoint. Hold this lock through scan, reservation, cleanup and publication.
+    check_private_dir(ledger_dir, kwargs.get("uid") or os.getuid(), "ledger dir")
+    kwargs.setdefault("admitted_at", kwargs.get("clock", boot_clock)())
+    try:
+        fd = os.open(os.path.join(ledger_dir, "admission.lock"),
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        with os.fdopen(fd, "r+") as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise OSError("invalid lock")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return _run_probe_locked(image, root, ledger_dir, backend, **kwargs)
+    except OSError:
+        return {"outcome": "hold", "reason": "admission_lock_unavailable", "cleanup": "not_attempted"}
+
+
+def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sleep=time.sleep,
               admitted_at=None, new_uuid=lambda: str(uuid.uuid4()),
               uid=None, gid=None, work=None, cleanup=None, handle_signals=False):
     """Return a result dict; outcome is accepted, failed or hold. Never raises on
@@ -282,14 +372,15 @@ def run_probe(image, root, ledger_dir, backend, *, clock=time.time, sleep=time.s
     check_private_dir(ledger_dir, uid, "ledger dir")
     if os.path.commonpath([root, ledger_dir]) in (root, ledger_dir):
         raise ValueError("ledger dir and workspace root must be separate trees")
-    if unresolved_records(ledger_dir):
+    prior = unresolved_records(ledger_dir)
+    if prior:
         return {"outcome": "hold", "reason": "unresolved_prior_request", "cleanup": "not_attempted",
-                "records": unresolved_records(ledger_dir)}
+                "records": prior}
     ident = new_uuid()
     own = {"name": f"labapp-probe-{ident}", "label": f"labapp.probe.run={ident}", "ident": ident,
            "id": None, "ambiguous": None, "attempted": False, "workspace": None, "ledger": None,
            "cancelled": False, "cleaning": False, "uncertain": False, "started_at": None,
-           "witness": None, "deadline": int(budget.work_deadline)}
+           "witness": None, "boot_id": host_boot_id(), "deadline": int(budget.work_deadline)}
     result = {"outcome": "failed", "reason": None, "name": own["name"], "label": own["label"]}
     if handle_signals:
         def on_signal(signum, frame):
@@ -315,6 +406,11 @@ def run_probe(image, root, ledger_dir, backend, *, clock=time.time, sleep=time.s
         except BaseException as exc:   # finalization must never erase the ledger or accept
             result["outcome"], result["reason"] = "hold", "finalization_error"
             result["error"] = type(exc).__name__
+            if own["ledger"] is not None:
+                try:
+                    own["ledger"].write("hold", outcome="hold", reason="finalization_error")
+                except BaseException:
+                    pass
     finally:
         if handle_signals:
             for s, old in zip((signal.SIGTERM, signal.SIGINT), previous):
@@ -347,7 +443,7 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     _checkpoint(own, budget, clock)
     if budget.work_left() < START_RESERVE + KILL_AFTER + MIN_TIMER:
         raise Expired()
-    argv = create_args(own["name"], own["label"], image_id, f"{uid}:{gid}", own["workspace"], own["deadline"])
+    argv = create_args(own["name"], own["label"], image_id, f"{uid}:{gid}", own["workspace"], own["deadline"], own["boot_id"])
     own["attempted"] = True
     own["ambiguous"] = "ambiguous_create"
     ledger.write("create_intent", image_id=image_id)       # durable BEFORE the daemon mutation
@@ -423,21 +519,33 @@ def _finish(backend, budget, own, result, clock):
         result["outcome"], result["reason"] = "hold", "ledger_or_cleanup_unresolved"
     if not own["attempted"] and not ledger.failed:
         release = True    # no daemon mutation was ever attempted
-    try:
-        ledger.write("released" if release else "hold", outcome=result["outcome"], reason=result["reason"])
-    except OSError:
-        release = False
-        result["outcome"], result["reason"] = "hold", "ledger_write_failed"
+    # Workspace absence is part of cleanup, before durable capacity release.
     if own["workspace"] and release:
         try:
             shutil.rmtree(own["workspace"])
+            if os.path.lexists(own["workspace"]):
+                raise OSError("workspace still exists")
             result["workspace"] = "removed"
         except Exception:
-            result["workspace"] = "retained"
-            result["workspace_path"] = own["workspace"]
-    elif own["workspace"]:
+            release = False
+            result["outcome"], result["reason"] = "hold", "workspace_cleanup_failed"
+    if own["workspace"] and result.get("workspace") != "removed":
         result["workspace"] = "retained"
         result["workspace_path"] = own["workspace"]
+    if own["cancelled"] or clock() >= budget.deadline:
+        if result["outcome"] == "accepted":
+            result["outcome"], result["reason"] = "failed", "cancelled" if own["cancelled"] else "deadline_exceeded"
+    try:
+        published_acceptance = result["outcome"] == "accepted"
+        ledger.write("released" if release else "hold", outcome=result["outcome"], reason=result["reason"])
+        # Publication itself can be slow/interrupted. Revoke acceptance and
+        # durable release if its bound was crossed during that write.
+        if published_acceptance and (own["cancelled"] or clock() >= budget.deadline):
+            result["outcome"], result["reason"] = "hold", "publication_interrupted"
+            ledger.write("hold", outcome="hold", reason=result["reason"])
+    except OSError:
+        result["outcome"], result["reason"] = "hold", "ledger_write_failed"
+        ledger.write("hold", outcome="hold", reason=result["reason"])
     result["ledger"] = ledger.path
 
 
@@ -482,7 +590,6 @@ def parse(argv):
     p = argparse.ArgumentParser(prog="container_runner.py", description=__doc__.splitlines()[0])
     p.add_argument("--workspace-root", required=True, help="existing owned absolute directory")
     p.add_argument("--ledger-dir", required=True, help="host-only owned 0700 directory, not under the workspace root")
-    p.add_argument("--docker", default="/usr/bin/docker")
     p.add_argument("--docker-host", default="unix:///var/run/docker.sock")
     p.add_argument("--execute", action="store_true", help="contact Docker (default: print plan only)")
     return p.parse_args(argv)
@@ -490,21 +597,25 @@ def parse(argv):
 
 def main(argv=None):
     args = parse(sys.argv[1:] if argv is None else argv)
-    if not PATH_RE.match(args.docker) or not HOST_RE.match(args.docker_host) \
+    if not HOST_RE.fullmatch(args.docker_host) \
             or not PATH_RE.match(args.workspace_root) or not PATH_RE.match(args.ledger_dir):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
-                           "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline epoch>")
+                           "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>")
         print(json.dumps({"mode": "probe", "executed": False, "image": PINNED_IMAGE, "create": plan}))
         return 0
     try:
         config = os.path.join(args.ledger_dir, "docker-config")     # empty: no helpers/credentials
         check_private_dir(args.ledger_dir, os.getuid(), "ledger dir")
         os.makedirs(config, mode=0o700, exist_ok=True)
+        check_private_dir(config, os.getuid(), "docker config")
+        with os.scandir(config) as entries:
+            if next(entries, None) is not None:
+                raise ValueError("Docker config must be empty")
         result = run_probe(PINNED_IMAGE, args.workspace_root, args.ledger_dir,
-                           Backend(args.docker, args.docker_host, config), handle_signals=True)
+                           Backend(host=args.docker_host, config=config), handle_signals=True)
     except (ValueError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT["usage"]

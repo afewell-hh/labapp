@@ -1,10 +1,11 @@
 """Offline tests with a synthetic Docker daemon and fake docker executables.
 
 No Docker, container, systemd or VM is used (the entry script is run only under the
-local /bin/sh with stand-in paths). They prove the supervisor's call sequence,
+local /bin/bash with stand-in paths). They prove the supervisor's call sequence,
 bounds, ledger ordering and fail-closed decisions, not Docker or kernel behavior.
 """
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -60,19 +61,19 @@ class FakeDaemon:
         return "\n".join(out)
 
     def image_info(self):
-        info = {"id": IMAGE_ID, "repo": [IMAGE], "vol": None, "onbuild": None}
+        info = {"Id": IMAGE_ID, "RepoDigests": [IMAGE], "Config": {}}
         if self.mode == "image_volume":
-            info["vol"] = {"/data": {}}
+            info["Config"]["Volumes"] = {"/data": {}}
         if self.mode == "image_onbuild":
-            info["onbuild"] = ["RUN x"]
+            info["Config"]["OnBuild"] = ["RUN x"]
         if self.mode == "image_other_digest":
-            info["repo"] = ["ubuntu@sha256:" + "c" * 64]
+            info["RepoDigests"] = ["ubuntu@sha256:" + "c" * 64]
         return json.dumps(info)
 
     def start(self, c):
         self.clock.now += self.start_delay
         args = c["args"]
-        deadline = int(args[args.index("sh") + 1])
+        deadline = int(args[args.index("bash") + 1])
         n = int(self.clock.now)
         timer = deadline - n - 1 - cr.KILL_AFTER
         ws = self.option(args, "--mount=").split("src=")[1].split(",")[0]
@@ -198,7 +199,7 @@ class CreateArgumentTests(RunnerCase):
         args = next(c[0] for c in daemon.calls if c[0][0] == "create")
         for required in ("--pull=never", "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
                          "--security-opt=no-new-privileges", "--read-only", "--pids-limit=64",
-                         "--memory=256m", "--cpus=1", "--entrypoint=/bin/sh"):
+                         "--memory=256m", "--cpus=1", "--entrypoint=/bin/bash"):
             self.assertIn(required, args)
         for forbidden in ("--privileged", "--init", "--pid", "--ipc", "--uts", "--userns",
                           "--device", "--volume", "-v", "--env", "-e", "--cap-add", "--group-add"):
@@ -207,7 +208,7 @@ class CreateArgumentTests(RunnerCase):
         self.assertEqual([a for a in args if a.startswith("--mount")],
                          [f"--mount=type=bind,src={workspace_of(args)},dst=/out"])
         tail = args[args.index(IMAGE_ID) + 1:]
-        self.assertEqual(tail, ["-c", cr.ENTRY, "sh", "1030", cr.PROBE_SCRIPT])   # fixed; deadline = admission + 30
+        self.assertEqual(tail, ["-c", cr.ENTRY, "bash", "1030", cr.host_boot_id(), cr.PROBE_SCRIPT])   # fixed; deadline = admission + 30
         self.assertTrue(any(a.startswith("--user=") and not a.startswith("--user=0") for a in args))
 
     def test_only_the_pinned_digest_and_non_root_are_accepted(self):
@@ -228,19 +229,32 @@ class CreateArgumentTests(RunnerCase):
     def test_entry_script_recomputes_timer_and_execs_same_pid1(self):
         """Run ENTRY under local sh with stand-in paths: no container involved."""
         with tempfile.TemporaryDirectory() as d:
-            for name, body in (("date", "echo 1000"), ("timeout", 'echo "$@" > OUT/argv; echo pid=$$ >> OUT/argv')):
+            boot = "12345678-1234-1234-1234-123456789abc"
+            for name, content in (("boot", boot), ("offsets", "monotonic 0 0\nboottime 0 0\n"),
+                                  ("uptime", "1000.99 10.00")):
                 with open(os.path.join(d, name), "w") as handle:
-                    handle.write("#!/bin/sh\n" + body.replace("OUT", d) + "\n")
-                os.chmod(os.path.join(d, name), 0o755)
-            script = cr.ENTRY.replace("/bin/date", d + "/date").replace("/usr/bin/timeout", d + "/timeout") \
-                .replace("/out/", d + "/")
-            done = subprocess.run(["/bin/sh", "-c", script, "sh", "1030", "PROBE"], capture_output=True)
-            self.assertEqual(done.returncode, 0, done.stderr)
+                    handle.write(content.rstrip("\n") + "\n")
+            timeout = os.path.join(d, "timeout")
+            with open(timeout, "w") as handle:
+                handle.write('#!/bin/bash\nprintf "%s\\n" "$$" "$@" > ' + d + '/argv\n')
+            os.chmod(timeout, 0o755)
+            script = cr.ENTRY.replace("/proc/sys/kernel/random/boot_id", d + "/boot") \
+                .replace("/proc/self/timens_offsets", d + "/offsets").replace("/proc/uptime", d + "/uptime") \
+                .replace("/usr/bin/timeout", timeout).replace("/out/", d + "/")
+            proc = subprocess.Popen(["/bin/bash", "-c", script, "bash", "1030", boot, "PROBE"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, err = proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 0, err)
             with open(os.path.join(d, "argv")) as handle:
-                argv = handle.read().split("\n")[0]
-            self.assertEqual(argv, "--kill-after=5s 24s /bin/sh -c PROBE")        # 1030-1000-1-5
-            late = subprocess.run(["/bin/sh", "-c", script, "sh", "1010", "PROBE"], capture_output=True)
-            self.assertEqual(late.returncode, 125)                                  # under MIN_TIMER: no probe
+                argv = handle.read().splitlines()
+            self.assertEqual(argv, [str(proc.pid), "--kill-after=5s", "24s", "/bin/bash", "-c", "PROBE"])
+            for deadline, bootarg in (("1010", boot), ("1030", "different")):
+                late = subprocess.run(["/bin/bash", "-c", script, "bash", deadline, bootarg], capture_output=True, timeout=3)
+                self.assertEqual(late.returncode, 125)
+            with open(os.path.join(d, "offsets"), "w") as handle:
+                handle.write("monotonic 0 0\nboottime 1 0\n")
+            shifted = subprocess.run(["/bin/bash", "-c", script, "bash", "1030", boot], capture_output=True, timeout=3)
+            self.assertEqual(shifted.returncode, 125)
 
 
 class BudgetTests(RunnerCase):
@@ -525,7 +539,117 @@ class CancellationTests(RunnerCase):
         self.setUp()
         with mock.patch.object(cr.shutil, "rmtree", side_effect=RuntimeError()):
             result, _ = self.run_probe()
-        self.assertEqual((result["outcome"], result["workspace"]), ("accepted", "retained"))
+        self.assertEqual((result["outcome"], result["workspace"]), ("hold", "retained"))
+
+
+class BoundaryRegressionTests(RunnerCase):
+    def test_concurrent_invocation_cannot_pass_admission(self):
+        blocked = []
+        def nested(args):
+            if args[0] == "version":
+                blocked.append(self.run_probe()[0])
+        result, _ = self.run_probe(daemon={"on_call": nested})
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(blocked[0]["reason"], "admission_lock_unavailable")
+        self.assertEqual(len([n for n in os.listdir(self.ledger) if n.endswith(".json")]), 1)
+
+    def test_release_is_after_confirmed_workspace_absence(self):
+        real = cr.Ledger.write
+        def observe(ledger, state, **more):
+            if state == "released":
+                self.assertEqual(os.listdir(self.root), [])
+                self.assertFalse(os.path.lexists(ledger.data["workspace"]))
+            return real(ledger, state, **more)
+        with mock.patch.object(cr.Ledger, "write", observe):
+            self.assertEqual(self.run_probe()[0]["outcome"], "accepted")
+        # A valid complete released record permits the next serial request.
+        self.assertEqual(self.run_probe()[0]["outcome"], "accepted")
+
+    def test_failed_or_ineffective_workspace_removal_blocks_reuse(self):
+        for effect in (OSError(), None):
+            self.setUp()
+            with mock.patch.object(cr.shutil, "rmtree", side_effect=effect):
+                result, _ = self.run_probe()
+            self.assertEqual(result["outcome"], "hold")
+            self.assertEqual(self.record()["state"], "hold")
+            second, daemon = self.run_probe()
+            self.assertEqual(second["outcome"], "hold")
+            self.assertEqual(daemon.calls, [])
+
+    def test_cancellation_during_workspace_cleanup_prevents_acceptance(self):
+        real = cr.shutil.rmtree
+        def remove(path):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return real(path)
+        with mock.patch.object(cr.shutil, "rmtree", remove):
+            result, _ = self.run_probe(handle_signals=True)
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "cancelled"))
+
+    def test_deadline_crossing_during_publication_revokes_release(self):
+        real = cr.Ledger.write
+        def publish(ledger, state, **more):
+            real(ledger, state, **more)
+            if state == "released":
+                self.clock.now += 100
+        with mock.patch.object(cr.Ledger, "write", publish):
+            result, _ = self.run_probe()
+        self.assertEqual((result["outcome"], self.record()["state"]), ("hold", "hold"))
+
+    def test_failed_release_publication_is_replaced_with_hold(self):
+        real = cr.Ledger.write
+        def publish(ledger, state, **more):
+            real(ledger, state, **more)
+            if state == "released":
+                raise OSError("directory fsync failure after rename")
+        with mock.patch.object(cr.Ledger, "write", publish):
+            result, _ = self.run_probe()
+        self.assertEqual((result["outcome"], self.record()["state"]), ("hold", "hold"))
+
+    def test_symlinked_lock_is_hold_without_daemon_contact(self):
+        os.symlink("/dev/null", os.path.join(self.ledger, "admission.lock"))
+        result, daemon = self.run_probe()
+        self.assertEqual(result["outcome"], "hold")
+        self.assertEqual(daemon.calls, [])
+
+    def test_corrupt_oversized_symlink_and_fifo_records_hold(self):
+        for kind in ("corrupt", "oversized", "symlink", "fifo", "incomplete"):
+            self.setUp()
+            path = os.path.join(self.ledger, "labapp-probe-bad.json")
+            if kind == "symlink":
+                os.symlink("/dev/zero", path)
+            elif kind == "fifo":
+                os.mkfifo(path)
+            else:
+                with open(path, "w") as handle:
+                    handle.write({"corrupt": "{", "oversized": "x" * 5000,
+                                  "incomplete": '{"state":"released"}'}.get(kind, ""))
+            result, daemon = self.run_probe()
+            self.assertEqual(result["outcome"], "hold", kind)
+            self.assertEqual(daemon.calls, [], kind)
+
+    def test_ledger_entry_count_is_bounded(self):
+        for n in range(129):
+            with open(os.path.join(self.ledger, f"labapp-probe-{n}.json"), "w") as handle:
+                json.dump({"state": "hold"}, handle)
+        self.assertEqual(cr.unresolved_records(self.ledger), ["ledger_entry_limit"])
+        self.assertEqual(self.run_probe()[0]["outcome"], "hold")
+
+    def test_host_clock_uses_boottime_and_rejects_shifted_namespace(self):
+        with mock.patch.object(cr.time, "clock_gettime", return_value=123.5) as clock:
+            self.assertEqual(cr.boot_clock(), 123.5)
+            clock.assert_called_once_with(time.CLOCK_BOOTTIME)
+        boot = "12345678-1234-1234-1234-123456789abc"
+        with mock.patch.object(cr, "read_proc", side_effect=[boot, "monotonic 0 0\nboottime 1 0"]):
+            with self.assertRaises(ValueError):
+                cr.host_boot_id()
+
+    def test_probe_child_installs_handler_and_witnesses_own_pid(self):
+        self.assertNotIn("$!", cr.PROBE_SCRIPT)
+        self.assertIn('setsid /bin/bash -c', cr.PROBE_SCRIPT)
+        self.assertIn('trap "" TERM; echo "probe $$"', cr.PROBE_SCRIPT)
+        syntax = subprocess.run(["/bin/bash", "-n"], input=cr.PROBE_SCRIPT, text=True,
+                                capture_output=True, timeout=3)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
 
 class RealBackendTests(unittest.TestCase):
@@ -585,6 +709,17 @@ class RealBackendTests(unittest.TestCase):
             with self.assertRaises(cr.DockerTimeout):
                 backend.call(["x"], 0.4)
             time.sleep(0.2)
+            self.assertFalse(os.path.exists(marker))
+
+    def test_exited_parent_pipe_holder_is_killed_on_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "escaped")
+            backend = self.fake(directory, f"(sleep 0.8; touch {marker}) & exit 0")
+            start = time.monotonic()
+            with self.assertRaises(cr.DockerTimeout):
+                backend.call(["x"], 0.15)
+            self.assertLess(time.monotonic() - start, 1)
+            time.sleep(1)
             self.assertFalse(os.path.exists(marker))
 
     def test_invalid_utf8_is_rejected(self):
