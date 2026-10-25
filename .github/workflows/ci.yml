@@ -130,3 +130,20 @@ jobs:
           python3 -m unittest discover -s build/provision -p test_bridge_ipv4_harness.py -v
       - name: Test unchanged helper with NET_ADMIN in an isolated namespace
         run: timeout --kill-after=60s 8m bash build/provision/test-bridge-ipv4.sh
+
+  hhfab-offline:
+    name: Official hhfab offline configuration proof (two versions)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install distribution fixture-parser dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
+      - name: Required integrity, bounds and ownership regression tests
+        run: |
+          test -f build/provision/test_hhfab_offline.py
+          python3 -m unittest discover -s build/provision -p test_hhfab_offline.py -v
+      - name: Run actual official CLI in isolated Ubuntu containers
+        run: timeout --kill-after=30s 10m bash build/provision/test-hhfab-offline.sh
