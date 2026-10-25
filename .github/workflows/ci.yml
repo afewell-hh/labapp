@@ -162,7 +162,7 @@ jobs:
         run: timeout --kill-after=30s 10m bash build/provision/test-install-hhfab.sh
 
   qemu-prerequisites:
-    name: Signed snapshot QEMU installation and isolated TCG fixture
+    name: Signed snapshot QEMU online and offline installation and TCG fixture
     runs-on: ubuntu-24.04
     timeout-minutes: 22
     steps:
@@ -171,3 +171,7 @@ jobs:
         run: python3 -m unittest discover -s build/provision -p test_qemu.py -v
       - name: Two fresh unchanged installations and nonroot offline fixture
         run: timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
+      - name: Offline data, target drift and downloader ownership regressions
+        run: python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
+      - name: Actual captured-state acquisition and disconnected unchanged installation
+        run: timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh

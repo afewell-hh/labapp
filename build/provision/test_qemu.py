@@ -26,9 +26,11 @@ class InstallTests(unittest.TestCase):
             with self.assertRaisesRegex(Refusal, 'root'):
                 self.module['preflight']()
 
-    def preflight_call(self, audit=b'', holds=b'', architecture=b'amd64\n', packages=None):
+    def preflight_call(self, audit=b'', holds=b'', architecture=b'amd64\n', foreign=b'', packages=None):
         def call(args, seconds=10):
             if args[0].endswith('dpkg'):
+                if '--print-foreign-architectures' in args:
+                    return foreign
                 return architecture if '--print-architecture' in args else audit
             if args[0].endswith('apt-mark'):
                 return holds
@@ -38,6 +40,7 @@ class InstallTests(unittest.TestCase):
     def test_wrong_os_arch_audit_hold_drift(self):
         # OS read and key presence are fixture inputs; no fake executable/APT.
         for override, reason in [({'architecture': b'arm64'}, 'amd64'),
+                                 ({'foreign': b'arm64'}, 'foreign'),
                                  ({'audit': b'partial'}, 'broken'), ({'holds': b'socat'}, 'held'),
                                  ({'packages': {'socat': '0'}}, 'drift')]:
             with self.subTest(reason=reason), patch('os.geteuid', return_value=0), \

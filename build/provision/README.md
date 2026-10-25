@@ -386,9 +386,9 @@ not execute host systemd/KVM or establish live guest evidence.
 
 `install-qemu.py` is a standalone root/noninteractive Ubuntu 24.04 amd64 Python
 3.12 module (host unit tests support Python 3.10+); keep `hhfab_release.py` beside
-it. It requires APT/dpkg, the Ubuntu archive keyring and installed HTTPS CA
-certificates. It accepts no arguments/environment overrides and works from any
-cwd. Run only in a disposable guest, with an outer deadline:
+it and `qemu_offline.py`. It requires APT/dpkg and the Ubuntu archive keyring;
+networked mode also requires installed HTTPS CA certificates. Its default accepts
+no arguments/environment overrides and works from any cwd. Run only in a disposable guest, with an outer deadline:
 
 ```bash
 sudo timeout --kill-after=3s 240s python3 build/provision/install-qemu.py
@@ -424,6 +424,82 @@ The pinned socat package provides the exact `socat -> socat1` link; its regular
 `socat1` payload and that fixed link target are both verified. Minimal-image
 documentation exclusions do not bypass verification of the required tools.
 
+The explicit disconnected path uses the **same installer** and fixed selection:
+
+```bash
+# On the actual disposable target, before other package/policy changes:
+sudo python3 build/provision/install-qemu.py --capture-state /tmp/qemu-state.json \
+  --base-id gce-image:IMMUTABLE_IMAGE_ID
+# Trusted lead copies that private data to the trusted acquisition host:
+timeout --kill-after=30s 9m bash build/provision/prepare-qemu-offline.sh \
+  /private/qemu-state.json /private/new-qemu-bundle
+# Lead supplies the printed receipt SHA independently of the transferred bundle.
+# On the same target after authenticated transfer:
+sudo timeout --kill-after=3s 240s python3 build/provision/install-qemu.py \
+  --offline /private/new-qemu-bundle --receipt-sha256 EXPECTED_SHA256 \
+  --base-id gce-image:IMMUTABLE_IMAGE_ID
+```
+
+The immutable base identifier is **caller attested**, not a guest proof of GCE
+identity. The trusted lead must verify the actual lease/instance/disk-image
+binding independently before supplying it. Container tests instead use the fixed
+`ubuntu@sha256:…` base identity. A state export is private package inventory, not
+credentials; retain it only for the owned transfer and remove it afterwards.
+The capture exclusively creates a0600 file. It binds actual status, architecture,
+foreign architectures, selections, holds/audit, archive keyring, OS identity,
+module files and hashes of supported `/etc/apt` policy files and effective APT
+configuration. Auth credential files are never read or transferred.
+It does not export source/config contents or auth/proxy credentials.
+
+Supported policy is deliberately narrow: amd64 only, no foreign architectures,
+holds, audit findings or nonempty preferences (including preferences.d).
+Both modes explicitly replace sources, preferences, cache/solver settings,
+proxies, credential-file paths and hooks with the reviewed fixed module policy.
+Native compressed-index storage (`Acquire::GzipIndexes=true`) keeps the transfer
+within the fixed data bounds; no index parser is introduced. A locally generated
+`APT_CONFIG` redirects main/parts **before** parsing; ambient APT hooks and
+configuration are never loaded by its APT transactions. Original files remain
+unchanged; hashes bind target policy drift, they do not authorize executing it.
+Do not use this module where those fixed overrides violate required site policy.
+
+`prepare-qemu-offline.sh STATE NEW_DIRECTORY` is a **trusted lead tool** run only
+from reviewed code, never an arbitrary worker artifact. It launches one pinned
+Ubuntu downloader with no mounts, devices, credentials, Docker socket or host
+APT. Python/CA bootstrap uses the existing fixed package pins; transitive inputs
+remain current-mirror inputs. Native APT authenticates signed snapshot Release
+→ indexes → downloaded archives against the copied **actual target status**;
+the downloader's own package state never substitutes for that target. The
+resolver does not write any target status database. It exports data-only lists,
+archives and a receipt binding **every** file plus target/base/module/snapshot/pins.
+The independently expected receipt digest and successful authenticated native
+APT acquisition must come through the trusted lead boundary. A self-asserted
+receipt or signed InRelease alone does not authenticate arbitrary adjacent indexes.
+
+Offline mode rejects receipt/inventory mismatch, unexpected config/paths, links,
+special files and oversized data, copies verified data to its own workspace,
+rehashes and checks the exact three InRelease signatures. Incoming directories
+and ancestors must be trusted caller owned, quiescent, and inaccessible to
+untrusted writers; this is not an archive upload API. All file reads are bounded
+and no-follow; no transferred APT configuration executes. Limits are256 files,
+256MiB total,64MiB/file and16MiB receipt/state. Downloader staging is320MiB
+noexec tmpfs; limits are1GiB RAM/2CPU/128PIDs. Fixed native acquisition shares
+210seconds, each child at most180seconds, with230second overall guest alarm.
+The validated data tree is copied to a fixed owned writable export before exit
+(tmpfs disappears when Docker stops). Bootstrap plus acquisition has420second
+guest/450second client bounds; all
+Docker calls have deadlines and the client caps combined output at1MiB.
+Exact nonce name plus label and immutable ID checks govern cleanup; daemon
+query failure is never treated as absence. Failed acquisition output is removed.
+
+Before any new transaction, offline mode rechecks the actual target fingerprint,
+including immediately after simulation. It uses the **real** local dpkg database,
+skips update and forces `--no-download` for checks/simulation/installation, with
+no network repair/fallback. A correct rerun verifies exact pins/artifacts,
+dependency consistency and audit and performs **no install transaction**; it does
+not require the now-stale preinstallation status hash. This exception cannot
+authorize changes on a different state. APT failure still requires discarding the
+disposable target; no rollback is promised.
+
 `qemu_witness.py` accepts no arguments or accelerator/binary/disk/firmware
 options. It requires the exact QEMU/SeaBIOS package identities and artifact
 hashes in its source. Caller UID/GID/groups and actual `/dev/kvm` device facts
@@ -441,7 +517,9 @@ student access, Linux boot, full VLAB, networking, reboot or image readiness.
 
 ```bash
 python3 -m unittest discover -s build/provision -p test_qemu.py -v
+python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
 timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
+timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 ```
 
 The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
@@ -464,7 +542,17 @@ ownership label recover ambiguous create/commit responses; cleanup removes
 immutable IDs and verifies absence, and daemon query failure is never absence.
 Every Docker operation has an external deadline. No cloud resource is used.
 
-Sources (accessed2026-10-25): [Ubuntu snapshot service](https://snapshot.ubuntu.com/),
+The additional proof prepares a Python-only target image, captures its actual
+state after starting with network none, acquires from a separate connected
+container, then invokes the unchanged offline CLI twice. Real missing/corrupt
+list/archive/receipt, unexpected config, symlink, target drift, foreign/base
+identity and invalid-signature inputs must fail before dpkg mutation. The same
+TCG fixture verifies installed payloads without KVM. This container closure does
+not establish a GCE closure, KVM, VLAB, image capture or release acceptance.
+
+Sources (accessed2026-10-25): [Debian native APT on both machines](https://www.debian.org/doc/manuals/apt-offline/ch2.en.html),
+[Noble APT configuration loading order](https://manpages.ubuntu.com/manpages/noble/man5/apt.conf.5.html),
+[Ubuntu snapshot service](https://snapshot.ubuntu.com/),
 [Noble apt-get](https://manpages.ubuntu.com/manpages/noble/man8/apt-get.8.html),
 [apt-secure](https://manpages.ubuntu.com/manpages/noble/man8/apt-secure.8.html),
 [QEMU8.2.2 boot-sector pattern](https://github.com/qemu/qemu/blob/v8.2.2/tests/qtest/boot-sector.c),

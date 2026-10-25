@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Root-only Ubuntu24.04 amd64 Python3.12 module; no options/env overrides.
+"""Root-only Ubuntu24.04 amd64 Python3.12 fixed QEMU module.
 
-Needs apt/dpkg, Ubuntu archive keyring, HTTPS CA certificates and sibling
-hhfab_release.py. Any cwd; no shell/login environment. Run on disposable guests:
+Needs apt/dpkg, Ubuntu archive keyring and sibling hhfab_release.py /
+qemu_offline.py. HTTPS CA certificates are needed only for networked mode. Any cwd; no shell/login environment. Run on disposable guests:
 APT cannot roll back partial failure. Preserves distro sources/preferences.
 """
 import json
@@ -13,6 +13,8 @@ import sys
 import signal
 import tempfile
 import time
+import argparse
+import qemu_offline as offline
 
 from hhfab_release import Refusal, bounded, digest
 
@@ -57,7 +59,7 @@ def verify_tools():
         raise Refusal('socat package symlink drift')
 
 
-def preflight():
+def preflight(network=True):
     if os.geteuid() != 0:
         raise Refusal("root required")
     release = Path("/etc/os-release").read_text().splitlines()
@@ -65,11 +67,14 @@ def preflight():
         raise Refusal("Ubuntu 24.04 required")
     if call(["/usr/bin/dpkg", "--print-architecture"]).strip() != b"amd64":
         raise Refusal("amd64 required")
+    if call(["/usr/bin/dpkg", "--print-foreign-architectures"]).strip():
+        raise Refusal("foreign architectures unsupported")
     if call(["/usr/bin/dpkg", "--audit"]).strip():
         raise Refusal("broken dpkg state")
     if call(["/usr/bin/apt-mark", "showhold"]).strip():
         raise Refusal("held packages require explicit resolution")
-    for path in ("/usr/share/keyrings/ubuntu-archive-keyring.gpg", "/etc/ssl/certs/ca-certificates.crt"):
+    for path in (["/usr/share/keyrings/ubuntu-archive-keyring.gpg"] +
+                 (["/etc/ssl/certs/ca-certificates.crt"] if network else [])):
         if not Path(path).is_file():
             raise Refusal("archive keyring/CA dependency missing")
     before = installed()
@@ -82,62 +87,76 @@ def preflight():
     return before
 
 
-def install():
+def install(bundle=None, receipt_sha=None, base=None):
     started = time.monotonic()
-    before = preflight()
+    before = preflight() if bundle is None else preflight(network=False)
     # Lists/cache/sources/preferences isolated. The real dpkg database stays real;
     # APT acquires its normal dpkg locks. No ambient APT_CONFIG or proxy variables.
     with tempfile.TemporaryDirectory(prefix="labapp-qemu-", dir="/var/tmp") as temporary:
         root = Path(temporary)
         root.chmod(0o755)
-        for name in ("lists/partial", "archives/partial", "parts", "preferences"):
-            (root / name).mkdir(parents=True)
-        sources = root / "sources.list"
-        sources.write_text("".join(
-            "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] "
-            f"https://snapshot.ubuntu.com/ubuntu/{SNAPSHOT}/ {suite} main universe\n"
-            for suite in ("noble", "noble-updates", "noble-security")))
-        options = ["-o", f"Dir::Etc::sourcelist={sources}", "-o", f"Dir::Etc::sourceparts={root / 'parts'}",
-                   "-o", f"Dir::Etc::preferences={root / 'preferences' / 'none'}",
-                   "-o", f"Dir::Etc::preferencesparts={root / 'preferences'}",
-                   "-o", f"Dir::State::lists={root / 'lists'}", "-o", f"Dir::Cache::archives={root / 'archives'}",
-                   "-o", "Acquire::Retries=0", "-o", "Acquire::https::Timeout=15",
-                   "-o", "DPkg::Lock::Timeout=10", "-o", "APT::Get::AllowUnauthenticated=false",
-                   "-o", "Acquire::AllowInsecureRepositories=false", "-o", "Acquire::AllowWeakRepositories=false",
-                   "-o", "Acquire::AllowDowngradeToInsecureRepositories=false",
-                   "-o", "Acquire::Check-Valid-Until=true",
-                   "-o", "APT::Get::allow-Downgrades=false", "-o", "APT::Get::allow-Change-Held-Packages=false"]
-        apt = ["/usr/bin/apt-get", *options]
-        def run(args):
-            remaining = 210 - (time.monotonic() - started)
-            if remaining <= 0:
-                raise Refusal("installation deadline exceeded")
-            return call(args, min(180, remaining))
+        apt, config = offline.setup(root, SNAPSHOT)
+        original_env = dict(ENV)
+        ENV['APT_CONFIG'] = config
+        try:
+            _transaction(root, apt, started, before, bundle, receipt_sha, base)
+        finally:
+            ENV.clear()
+            ENV.update(original_env)
+
+
+def _transaction(root, apt, started, before, bundle, receipt_sha, base):
+    def run(args):
+        remaining = 210 - (time.monotonic() - started)
+        if remaining <= 0:
+            raise Refusal("installation deadline exceeded")
+        return call(args, min(180, remaining))
+    expected_state = None
+    if bundle is None:
         run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
-        # dpkg audit can be clean despite configured-but-unsatisfied dependency
-        # relations. Refuse that base before install can implicitly repair it.
-        run([*apt, "check"])
-        selected = [name + "=" + version for name, version in PINS.items()]
-        # --no-remove and no downgrade/hold override remain active for simulation
-        # and actual transaction. Standard signed Release/index/deb verification.
-        run([*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
+    else:
+        expected_state = offline.receive(Path(bundle), receipt_sha, root, base, SNAPSHOT, PINS, call)
+        apt = [*apt, '--no-download']
+        if not all(before.get(name) == version for name, version in PINS.items()):
+            # capture uses normal target APT config identity, not our temp config.
+            saved_config = ENV.pop('APT_CONFIG')
+            try:
+                if offline.capture(call, base) != expected_state:
+                    raise Refusal('target state drift before transaction')
+            finally:
+                ENV['APT_CONFIG'] = saved_config
+    # dpkg audit can be clean despite configured-but-unsatisfied dependency
+    # relations. Refuse that base before install can implicitly repair it.
+    run([*apt, "check"])
+    selected = [name + "=" + version for name, version in PINS.items()]
+    # --no-remove and no downgrade/hold override remain active for simulation
+    # and actual transaction. Standard signed Release/index/deb verification.
+    run([*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
+    if bundle is None or not all(before.get(name) == version for name, version in PINS.items()):
+        if expected_state is not None:
+            saved_config = ENV.pop('APT_CONFIG')
+            try:
+                if offline.capture(call, base) != expected_state:
+                    raise Refusal('target state drift immediately before transaction')
+            finally:
+                ENV['APT_CONFIG'] = saved_config
         run([*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
-        run([*apt, "check"])
-        archives = [{"name": p.name, "bytes": p.stat().st_size, "sha256": digest(p)}
-                    for p in sorted((root / "archives").glob("*.deb"))]
-        after = installed()
-        if any(after.get(name) != version for name, version in PINS.items()):
-            raise Refusal("installed version mismatch")
-        if call(["/usr/bin/dpkg", "--audit"]).strip():
-            raise Refusal("post-install dpkg audit failed")
-        verify_tools()
-        for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
-                     "/usr/share/seabios/bios-256k.bin"):
-            if not Path(path).is_file():
-                raise Refusal("installed artifact missing")
-        print(json.dumps({"snapshot": SNAPSHOT, "pins": PINS, "resolved_installed": after,
-                          "downloaded_archives": archives, "changed": before != after,
-                          "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))
+    run([*apt, "check"])
+    archives = [{"name": p.name, "bytes": p.stat().st_size, "sha256": digest(p)}
+                for p in sorted((root / "archives").glob("*.deb"))]
+    after = installed()
+    if any(after.get(name) != version for name, version in PINS.items()):
+        raise Refusal("installed version mismatch")
+    if call(["/usr/bin/dpkg", "--audit"]).strip():
+        raise Refusal("post-install dpkg audit failed")
+    verify_tools()
+    for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
+                 "/usr/share/seabios/bios-256k.bin"):
+        if not Path(path).is_file():
+            raise Refusal("installed artifact missing")
+    print(json.dumps({"snapshot": SNAPSHOT, "pins": PINS, "resolved_installed": after,
+                      "downloaded_archives": archives, "changed": before != after,
+                      "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))
 
 
 def main():
@@ -149,9 +168,36 @@ def main():
     signal.signal(signal.SIGALRM, expired)
     signal.alarm(235)
     try:
-        if len(sys.argv) != 1:
-            raise Refusal("no options accepted")
-        install()
+        parser = argparse.ArgumentParser(description=__doc__)
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument('--capture-state', type=Path)
+        mode.add_argument('--offline', type=Path)
+        parser.add_argument('--receipt-sha256')
+        parser.add_argument('--base-id')
+        args = parser.parse_args()
+        if args.capture_state:
+            if args.receipt_sha256 or not args.base_id:
+                raise Refusal('capture requires base-id only')
+            preflight(network=False)
+            state = offline.capture(call, args.base_id)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=args.capture_state.parent, prefix='.qemu-state-', delete=False) as output:
+                    temporary = Path(output.name)
+                    output.write(offline.encoded(state))
+                os.link(temporary, args.capture_state, follow_symlinks=False)
+            finally:
+                if temporary is not None:
+                    temporary.unlink()
+            print(json.dumps({'state_sha256': digest(args.capture_state)}))
+        elif args.offline:
+            if not args.receipt_sha256 or not args.base_id:
+                raise Refusal('offline requires independently expected receipt and base-id')
+            install(args.offline, args.receipt_sha256, args.base_id)
+        else:
+            if args.receipt_sha256 or args.base_id:
+                raise Refusal('unexpected online options')
+            install()
     finally:
         signal.alarm(0)
 
