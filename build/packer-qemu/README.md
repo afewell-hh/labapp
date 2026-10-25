@@ -19,6 +19,7 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
+| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe` and `hcl-check` tasks; pinned bounded staging (see "Bounded container probe") |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing (access date 2026-10-25, documented not verified)
@@ -264,6 +265,47 @@ exact 124-vs-137 behavior with a TERM-ignoring probe; UID mapping of the bind (r
 base/module hashes, nonce, acceleration, normal shutdown); input mounts.
 Assess those gates against the current issue evidence; the fixed non-VM probe
 does not enable VM execution or establish another host configuration's support.
+
+### Fixed `hcl-check` task (pre-VM tool/HCL check; OFFLINE-tested, never run live)
+
+`--mode hcl-check --core-file … --plugin-file … --base-file …` reuses the probe's
+admission, ledger, deadline, cleanup and HOLD logic with different fixed data. It
+is not an arbitrary-command option and starts no VM. Selected in #264 (reviews
+6404228868/6404240697 control). **Live execution needs separate lead scope**; the
+default prints the plan only.
+
+* Budget: 120 s work **including all staging from admission** + 30 s cleanup,
+  immutable. Proposed 1 CPU / 1 GiB / 128 PIDs (explicit bounds, not measured needs).
+* Pins (`stage_tools.PINS`, from #262/#263): Packer 1.16.2 archive
+  `abbfe0cf…2414` (34,038,571 B), qemu plugin 1.1.7 archive `2da85692…94f2`
+  (15,249,228 B) and the Noble 20261017 disk `04e8f246…6c94` (621,284,352 B); full
+  values are in code. Member name/mode/size/CRC come from the #262 listing. **Member
+  SHA256 values are not pinned** (none was measured): they are computed from the
+  size-bounded, CRC-checked extraction and recorded.
+* Staging (host stdlib, no fetched code runs): whole-archive size and SHA256, exact
+  member set, then only `packer` and the plugin are streamed by actual bytes, with
+  CRC, to fresh 0700 paths (`O_EXCL|O_NOFOLLOW`); `LICENSE.txt` is validated but not
+  extracted. The plugin gets a `_SHA256SUM` sidecar of exactly 64 hex bytes; there is
+  no `packer init`/install. The base image is hashed through one descriptor and bound
+  read-only; the repo's `labapp.pkr.hcl`, `host_verify.py` and guest files are
+  copied (never mounted from the tree).
+* Mounts: `/in` (tools, plugins, HCL, verifier, generated `validate.pkrvars.hcl`),
+  `/in/base.img` and `/out/work/cd` read-only; only fresh `/out` is writable. No
+  network, capabilities, devices, host home, socket or credentials. `inputs` hashes a
+  canonical manifest of staged bytes excluding the var-file; the var-file hash is
+  recorded separately.
+* Steps (fixed script, empty `env -i`, `HOME=/out/home`, `TMPDIR=/out/tmp`,
+  `PACKER_PLUGIN_PATH=/in/plugins`, `ulimit -f` caps each output): `packer version`,
+  `validate -syntax-only`, full `validate -var-file=…`. Full validation executes the
+  plugin's `describe`. Syntax-only does not load plugins; neither proves boot, KVM,
+  QEMU/xorriso presence (checked only at build time) or VLAB.
+* Success needs container exit 0, all three steps 0, `Packer v1.16.2`, staged bytes
+  unchanged after the run, no cancellation/expiry and verified cleanup. Any nonzero
+  step is FAILED; an expected negative test is test evidence, never tool success.
+  The probe's 124/137 rule is not reused.
+* Limits: same-user concurrent writers to the source files are out of scope (identity
+  is re-checked, not locked); `ulimit -f` bounds file size, not total `/out` bytes;
+  the exact `packer version` output format and sidecar acceptance are UNRUN.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.

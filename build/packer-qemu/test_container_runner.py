@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import container_runner as cr
+import test_stage_tools as ts
 
 IMAGE = cr.PINNED_IMAGE
 IMAGE_ID = "sha256:" + "b" * 64
@@ -787,6 +788,215 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cr.main(["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y",
                                       "--docker-host", "tcp://evil:1"]), 2)
+
+
+class HclDaemon(FakeDaemon):
+    """Synthetic daemon for hcl-check: the 'container' writes the fixed result files."""
+
+    GOOD_STEPS = "version 0\nsyntax 0\nfull 0\n"
+
+    def __init__(self, clock, steps=GOOD_STEPS, version="Packer v1.16.2\n", exit_code=0, tamper=False, **kw):
+        super().__init__(clock, "ok", exit_code=exit_code, **kw)
+        self.steps, self.version, self.tamper = steps, version, tamper
+
+    def start(self, c):
+        out = next(a for a in c["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+        files = {"steps": self.steps, "version.out": self.version, "version.err": "",
+                 "syntax.out": "", "syntax.err": "", "full.out": "The configuration is valid.\n",
+                 "full.err": ""}
+        for name, text in files.items():
+            if text is not None:
+                with open(os.path.join(out, name), "w") as handle:
+                    handle.write(text)
+        if self.tamper:
+            packer = os.path.join(os.path.dirname(out), "in", "tools", "packer")
+            os.chmod(packer, 0o600)
+            with open(packer, "ab") as handle:
+                handle.write(b"x")
+        c["state"], c["exit_at"], c["code"] = "running", self.clock.now + 1.0, self.exit_code
+
+
+class HclCheckTests(RunnerCase):
+    def setUp(self):
+        super().setUp()
+        src = os.path.join(os.path.dirname(self.root), "src")
+        os.mkdir(src, 0o700)
+        self.sources, pins = ts.make_inputs(src)
+        patcher = mock.patch.object(cr.stage_tools, "PINS", pins)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_hcl(self, daemon=None, sources=None, **kw):
+        daemon = daemon or HclDaemon(self.clock)
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              admitted_at=self.clock(), uid=os.getuid() or 1000, mode="hcl-check",
+                              sources=self.sources if sources is None else sources, **kw)
+        return result, daemon
+
+    def create_call(self, daemon):
+        return next(c[0] for c in daemon.calls if c[0][0] == "create")
+
+    def test_profile_and_fixed_task_arguments(self):
+        self.assertEqual(cr.PROFILES["hcl-check"], (120, 30))
+        self.assertEqual(cr.PROFILES["probe"], (30, 20))
+        result, daemon = self.run_hcl()
+        args = self.create_call(daemon)
+        for expected in ("--pull=never", "--network=none", "--cap-drop=ALL", "--read-only",
+                         "--security-opt=no-new-privileges", "--memory=1g", "--memory-swap=1g",
+                         "--cpus=1", "--pids-limit=128", "--log-driver=none", "--no-healthcheck"):
+            self.assertIn(expected, args)
+        for forbidden in ("--privileged", "--init", "--pid", "--ipc", "--uts", "--userns", "--device", "--volume",
+                          "-v", "--env", "-e", "--cap-add", "--group-add", "--tmpfs", "--add-host"):
+            self.assertFalse(any(a == forbidden or a.startswith(forbidden + "=") for a in args), forbidden)
+        self.assertNotIn("docker.sock", " ".join(args))
+        mounts = [a for a in args if a.startswith("--mount=")]
+        self.assertEqual(len(mounts), 4)
+        writable = [m for m in mounts if not m.endswith(",readonly")]
+        self.assertEqual(len(writable), 1)
+        self.assertTrue(writable[0].endswith("/out,dst=/out"))
+        self.assertTrue(any(m.endswith(",dst=/in,readonly") for m in mounts))
+        self.assertTrue(any(m.endswith(",dst=/in/base.img,readonly") and f"src={self.sources['base']}," in m
+                            for m in mounts))
+        self.assertTrue(any(m.endswith("/cd,dst=/out/work/cd,readonly") for m in mounts))
+        self.assertEqual(args[-1], cr.HCL_SCRIPT)
+
+    def test_fixed_script_runs_only_the_three_reviewed_commands(self):
+        script = cr.HCL_SCRIPT
+        self.assertEqual(script.count("/in/tools/packer "), 3)
+        for word in ("init", "build", "install", "plugins", "get", "fix", "console", "curl", "wget",
+                     "evaluate-datasources", "inspect"):
+            self.assertNotIn(f"packer {word}", script)
+        self.assertIn("validate -syntax-only /in/labapp.pkr.hcl", script)
+        self.assertIn("validate -var-file=/in/validate.pkrvars.hcl /in/labapp.pkr.hcl", script)
+        self.assertIn("env -i HOME=/out/home TMPDIR=/out/tmp", script)
+        self.assertIn("PACKER_PLUGIN_PATH=/in/plugins", script)
+        self.assertIn("CHECKPOINT_DISABLE=1", script)
+        self.assertIn("ulimit -f", script)
+
+    def test_probe_arguments_are_unchanged_by_the_new_mode(self):
+        args = cr.create_args("n", "l", IMAGE_ID, "1:1", "/w", 5, "b")
+        self.assertEqual(args[-1], cr.PROBE_SCRIPT)
+        self.assertIn("--memory=256m", args)
+        self.assertIn("--pids-limit=64", args)
+        self.assertEqual([a for a in args if a.startswith("--mount=")], ["--mount=type=bind,src=/w,dst=/out"])
+
+    def test_accepted_run_records_identities_and_cleans_up(self):
+        result, daemon = self.run_hcl()
+        self.assertEqual((result["outcome"], result["reason"]), ("accepted", None))
+        self.assertEqual(result["cleanup"], "verified")
+        self.assertEqual(result["workspace"], "removed")
+        evidence = result["evidence"]
+        self.assertEqual(evidence["image_id"], IMAGE_ID)
+        for key in ("inputs", "vars_sha256", "hcl_sha256", "base_sha256", "core_member_sha256",
+                    "plugin_member_sha256", "core_archive_sha256", "plugin_archive_sha256"):
+            self.assertRegex(evidence[key], r"^[0-9a-f]{64}$")
+        self.assertEqual(evidence["steps"]["bytes"], len(HclDaemon.GOOD_STEPS))
+        self.assertEqual(len(evidence["commands"]), 3)
+        self.assertEqual(self.record()["state"], "released")
+        self.assertEqual(self.record()["mode"], "hcl-check")
+        self.assertFalse(os.path.lexists(result.get("workspace_path", "/nonexistent")))
+
+    def test_any_nonzero_step_is_failed_never_tool_success(self):
+        for steps in ("version 0\nsyntax 0\nfull 1\n", "version 0\nsyntax 1\nfull 0\n",
+                      "version 1\nsyntax 0\nfull 0\n", "version 0\nsyntax 0\n", None, "version 0\nsyntax 0\nfull 0\nextra 0\n"):
+            with self.subTest(steps=steps):
+                self.setUp()
+                result, daemon = self.run_hcl(HclDaemon(self.clock, steps=steps))
+                self.assertEqual(result["outcome"], "failed")
+                self.assertEqual(result["reason"], "tool_check_failed")
+                self.assertEqual(result["cleanup"], "verified")
+
+    def test_wrong_core_version_is_failed(self):
+        for version in ("Packer v1.15.4\n", "Packer v1.16.2-dev\n", "Packer v1.16.2\nmore\n", None):
+            with self.subTest(version=version):
+                self.setUp()
+                result, _ = self.run_hcl(HclDaemon(self.clock, version=version))
+                self.assertEqual((result["outcome"], result["reason"]), ("failed", "wrong_core_version"))
+
+    def test_nonzero_container_exit_and_timer_codes_are_failed(self):
+        for code in (1, 124, 137):
+            with self.subTest(code=code):
+                self.setUp()
+                result, _ = self.run_hcl(HclDaemon(self.clock, exit_code=code))
+                self.assertEqual((result["outcome"], result["reason"]), ("failed", "unexpected_exit"))
+
+    def test_oversized_output_is_not_trusted(self):
+        class Flood(HclDaemon):
+            def start(self, c):
+                super().start(c)
+                out = next(a for a in c["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                with open(os.path.join(out, "steps"), "w") as handle:
+                    handle.write("x" * (cr.STEP_CAP + 1))
+        result, _ = self.run_hcl(Flood(self.clock))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "tool_check_failed"))
+
+    def test_symlinked_result_file_is_not_followed(self):
+        class Link(HclDaemon):
+            def start(self, c):
+                super().start(c)
+                out = next(a for a in c["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                os.unlink(os.path.join(out, "steps"))
+                os.symlink("/etc/hostname", os.path.join(out, "steps"))
+        result, _ = self.run_hcl(Link(self.clock))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "tool_check_failed"))
+
+    def test_staged_bytes_changed_during_run_are_not_accepted(self):
+        result, _ = self.run_hcl(HclDaemon(self.clock, tamper=True))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "staged_inputs_changed"))
+        self.assertEqual(result["cleanup"], "verified")
+
+    def test_rejected_input_fails_before_any_daemon_call(self):
+        with open(self.sources["core"], "ab") as handle:
+            handle.write(b"x")
+        result, daemon = self.run_hcl()
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "staging_rejected"))
+        self.assertEqual(daemon.calls, [])
+        self.assertEqual(result["workspace"], "removed")
+
+    def test_staging_spends_the_admission_budget(self):
+        real = cr.stage_tools.stage
+
+        def slow(ws, sources, nonce, check, pins):
+            staged = real(ws, sources, nonce, check, pins=pins)
+            self.clock.now += 200
+            check()
+            return staged
+        with mock.patch.object(cr.stage_tools, "stage", slow):
+            result, daemon = self.run_hcl()
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "budget_exhausted"))
+        self.assertEqual(self.mutations(daemon), [])
+
+    def test_sources_are_required_and_exact(self):
+        for sources in (None, {}, {"core": "/a", "plugin": "/b"}, dict(self.sources, extra="/x")):
+            with self.subTest(sources=sources), self.assertRaises(ValueError):
+                cr.run_probe(IMAGE, self.root, self.ledger, HclDaemon(self.clock), clock=self.clock,
+                             uid=os.getuid() or 1000, mode="hcl-check", sources=sources)
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            cr.run_probe(IMAGE, self.root, self.ledger, HclDaemon(self.clock), clock=self.clock,
+                         uid=os.getuid() or 1000, mode="build")
+
+    def test_cli_plan_for_hcl_check_does_not_touch_docker_or_files(self):
+        argv = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "hcl-check",
+                "--core-file", "/nonexistent/c.zip", "--plugin-file", "/nonexistent/p.zip",
+                "--base-file", "/nonexistent/b.img"]
+        with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cr.main(argv), 0)
+        plan = json.loads(out.getvalue())
+        self.assertEqual((plan["mode"], plan["executed"]), ("hcl-check", False))
+        self.assertIn("--memory=1g", plan["create"])
+
+    def test_cli_requires_all_input_files_only_for_hcl_check(self):
+        base = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cr.main(base + ["--mode", "hcl-check"]), 2)
+            self.assertEqual(cr.main(base + ["--mode", "hcl-check", "--core-file", "/a"]), 2)
+            self.assertEqual(cr.main(base + ["--core-file", "/a"]), 2)
+            with self.assertRaises(SystemExit):
+                cr.main(base + ["--mode", "build"])
 
 
 if __name__ == "__main__":
