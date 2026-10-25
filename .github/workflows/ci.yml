@@ -43,10 +43,11 @@ jobs:
           test -f build/packer-qemu/test_container_runner.py
           test -f build/packer-qemu/test_stage_tools.py
           test -f build/packer-qemu/test_sentinel.py
+          test -f build/packer-qemu/test_sentinel_evidence.py
           PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
           import unittest
           loader = unittest.TestLoader()
-          for pattern in ('test_supervise.py', 'test_host_verify.py', 'test_container_runner.py', 'test_stage_tools.py', 'test_sentinel.py'):
+          for pattern in ('test_supervise.py', 'test_host_verify.py', 'test_container_runner.py', 'test_stage_tools.py', 'test_sentinel.py', 'test_sentinel_evidence.py'):
               required = loader.discover('build/packer-qemu', pattern=pattern)
               if required.countTestCases() == 0:
                   raise SystemExit(f'Required suite {pattern} discovered no tests')
