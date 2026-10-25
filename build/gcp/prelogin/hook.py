@@ -6,6 +6,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import time
@@ -138,25 +139,64 @@ class Files:
             os.close(fd)
             raise
 
+    def read_file(self, fd, name, limit):
+        """Read a stable owned regular file relative to an already checked FD."""
+        child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            before = os.fstat(child)
+            require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                    and before.st_uid == self.uid and not before.st_mode & 0o022
+                    and before.st_dev == os.fstat(fd).st_dev)
+            data = os.read(child, limit + 1)
+            after = os.fstat(child)
+            if len(data) > limit:
+                raise Limit('bounded file exceeded')
+            require(before[:7] == after[:7] and before.st_mtime_ns == after.st_mtime_ns
+                    and before.st_ctime_ns == after.st_ctime_ns)
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            require(after[:7] == current[:7] and after.st_mtime_ns == current.st_mtime_ns
+                    and after.st_ctime_ns == current.st_ctime_ns)
+            return data
+        finally:
+            os.close(child)
+
     def read(self, path, limit):
         fd, name = self.parent(path)
         try:
-            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-            try:
-                before = os.fstat(child)
-                require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == self.uid
-                        and before.st_dev == os.fstat(fd).st_dev)
-                data = os.read(child, limit + 1)
-                after = os.fstat(child)
-                if len(data) > limit:
-                    raise Limit('bounded file exceeded')
-                require(before[:7] == after[:7] and before.st_mtime_ns == after.st_mtime_ns
-                        and before.st_ctime_ns == after.st_ctime_ns)
-                return data
-            finally:
-                os.close(child)
+            return self.read_file(fd, name, limit)
         finally:
             os.close(fd)
+
+    def source(self, path):
+        """Only the default runner's root-owned private directory in sticky /tmp.
+
+        This exception is exclusive to self-source hashing. Snapshot/data walks
+        retain their strict non-writable-ancestor policy. No source path comes
+        from metadata or arguments; production passes this module's __file__.
+        """
+        match = re.fullmatch(r'/tmp/(metadata-scripts[A-Za-z0-9_-]{1,64})/startup-script', path)
+        require(match is not None)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root = os.open(self.root, flags)
+        try:
+            info = os.fstat(root)
+            require(info.st_uid == self.uid and not info.st_mode & 0o022)
+            temporary = os.open('tmp', flags, dir_fd=root)
+            try:
+                info = os.fstat(temporary)
+                require(info.st_uid == self.uid and stat.S_IMODE(info.st_mode) == 0o1777)
+                directory = os.open(match[1], flags, dir_fd=temporary)
+                try:
+                    private = os.fstat(directory)
+                    require(private.st_uid == self.uid and stat.S_IMODE(private.st_mode) == 0o700
+                            and private.st_dev == info.st_dev)
+                    return self.read_file(directory, 'startup-script', 32768)
+                finally:
+                    os.close(directory)
+            finally:
+                os.close(temporary)
+        finally:
+            os.close(root)
 
     def fact(self, path, content=True):
         try:
@@ -246,19 +286,45 @@ class Runtime:
         require((method == 'GET') == (body is None))
         self.check()
         if method == 'PUT':
-            time.sleep(max(0, 1 - (time.monotonic() - self.last_put)))
+            pause = max(0, 1 - (time.monotonic() - self.last_put))
+            require(time.monotonic() + pause < self.end)
+            time.sleep(pause)
             self.check()
             self.last_put = time.monotonic()
-        connection = http.client.HTTPConnection('169.254.169.254', timeout=min(5, self.end-time.monotonic()))
+        # Standalone Linux main-thread hook: SIGALRM interrupts connect,
+        # header parsing and buffered body reads under one absolute deadline.
+        # Per-socket timeouts alone restart on trickled input. There is no
+        # background worker to survive a refused request.
+        deadline = min(self.end, time.monotonic() + 5)
+        require(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0))
+        previous = signal.getsignal(signal.SIGALRM)
+        def expired(signum, frame):
+            raise Refused('metadata request deadline exceeded')
+        signal.signal(signal.SIGALRM, expired)
+        connection, response = None, None
         try:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0)
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            connection = http.client.HTTPConnection('169.254.169.254', timeout=remaining)
             connection.request(method, META + key, body, {'Metadata-Flavor': 'Google'})
             response = connection.getresponse()
             data = response.read(4097)
-            require(response.status == 200 and response.getheader('Metadata-Flavor') == 'Google' and len(data) <= 4096)
+            require(response.status == 200 and response.getheader('Metadata-Flavor') == 'Google'
+                    and len(data) <= 4096 and time.monotonic() < deadline)
             self.check()
             return data
         finally:
-            connection.close()
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                try:
+                    if connection is not None:
+                        connection.close()
+                finally:
+                    signal.signal(signal.SIGALRM, previous)
 
     def command(self, argv, timeout, limit=65536):
         self.check()
@@ -350,7 +416,7 @@ def run(files, runtime, *, manifests=None, hook_bytes=None, now=None, mode=None)
     name = runtime.request('GET', 'instance/name').decode('ascii')
     require(name == 'labapp-build-r' + str(obj['run']) + '-a' + str(obj['attempt']))
     boot = files.read('/proc/sys/kernel/random/boot_id', 64).decode('ascii').strip()
-    hook_bytes = files.read(os.path.abspath(__file__), 20480) if hook_bytes is None else hook_bytes
+    hook_bytes = files.source(os.path.abspath(__file__)) if hook_bytes is None else hook_bytes
     binding = {**{k: obj[k] for k in BIND if k in obj}, 'vm_id': vm,
               'boot_id': boot, 'hook_sha256': digest(hook_bytes)}
     identity(binding)

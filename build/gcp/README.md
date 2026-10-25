@@ -988,6 +988,15 @@ by any profile, controller or workflow. Its fixed production mode is
 tests inject a baseline mode and manifest solely to exercise readiness checks.
 No Ubuntu/Noble guest layout is declared supported.
 
+Self-source hashing recognizes only the default runner path
+`/tmp/metadata-scriptsSUFFIX/startup-script`: root-owned sticky `01777` `/tmp`,
+a no-follow root-owned `0700` runner directory, and a stable root-owned regular
+single-link source file with no group/other write permission. The bounded
+suffix is not selected by metadata. This dedicated self-source read permits
+neither arbitrary paths nor writable ancestors for snapshot/inventory reads;
+custom runner directories remain unsupported. Tests also exercise the actual
+source-reading branch without injecting hook bytes.
+
 The hook reads only the fixed local metadata keys and selected local paths,
 uses fixed bounded `dpkg-query`, `systemctl` and `cloud-init status --wait
 --format=json` commands, and exports selected package tuples and typed path
@@ -1015,6 +1024,11 @@ kernel boot UUID and profile/hook digests repeat in every part. Unsupported
 path types and inventory limits produce `incomplete`/`limit` diagnostic status,
 never ready. Transport failures suppress the summary; partial/lost parts cannot
 be accepted. PUTs are spaced at least one second apart, without retries.
+Each HTTP operation has one absolute deadline of at most five seconds and no
+later than the overall deadline. The standalone Linux main-thread hook uses
+`SIGALRM` across connection, headers and body, closes responses/connections on
+failure, and restores the prior handler with no remaining timer. It refuses an
+already active interval timer and never starts a background request.
 
 `prelogin/receipt.py` separately parses one exact guest-attribute item and the
 complete strict typed receipt/parts. Inventory cannot satisfy `ready=True`.
@@ -1032,8 +1046,9 @@ transports; subprocess failure tests run only tiny Python fixtures):
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/prelogin -t build/gcp -v
 ```
 
-The fixed source is bounded to 20 KiB (lead-scoped revision from the original
-16 KiB proposal to preserve readable code); output bounds are unchanged.
+The fixed source is bounded to 32 KiB (lead-scoped revision from the original
+16 KiB proposal to keep the deadline and filesystem safeguards readable);
+output bounds are unchanged.
 Current [Compute metadata limits](https://docs.cloud.google.com/compute/docs/metadata/setting-custom-metadata)
 allow 256 KB per value and 512 KB total, including inline startup scripts.
 [Guest attributes](https://docs.cloud.google.com/compute/docs/metadata/manage-guest-attributes)
@@ -1041,6 +1056,8 @@ allow 256 KiB values, ten queries/minute and a three/second burst; other guest
 writers can still cause loss, which the parser rejects. Sources checked
 2026-10-25. [cloud-init CLI](https://docs.cloud-init.io/en/latest/reference/cli.html)
 26.2 and [upstream startup unit](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google-startup-scripts.service)
+and the runner's [temporary script handling](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google_metadata_script_runner/main.go)
+plus [default run-directory configuration](https://github.com/GoogleCloudPlatform/guest-agent/blob/main/google_guest_agent/cfg/cfg.go)
 are behavior references, not installed Noble payload proof. Offline tests do
 not prove live metadata, systemd ordering, IAM, installed manifests, guest
 access fencing, sealing, capture or boot/reboot behavior.

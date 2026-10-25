@@ -1,5 +1,8 @@
 """Offline same-code tests: only owned temp files and injected guest transports."""
 import os
+import signal
+import socket
+import threading
 from pathlib import Path
 import tempfile
 import time
@@ -84,6 +87,7 @@ class HookTest(unittest.TestCase):
         target = self.root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
+        target.chmod(0o644)
 
     def run_hook(self, **kwargs):
         return h.run(self.files, self.guest, hook_bytes=b'synthetic hook', now=900, **kwargs)
@@ -266,7 +270,7 @@ class HookTest(unittest.TestCase):
         self.assertFalse(self.guest.puts)
 
     def test_source_bound_and_no_real_manifest(self):
-        self.assertLessEqual(Path(h.__file__).stat().st_size, 20*1024)
+        self.assertLessEqual(Path(h.__file__).stat().st_size, 32*1024)
         self.assertEqual(h.SUPPORTED_MANIFESTS, {})
         self.assertEqual(h.MODE, 'inventory-only')
 
@@ -281,6 +285,8 @@ class HookTest(unittest.TestCase):
                 return self.payload
             def getheader(self, key):
                 return self.flavor
+            def close(self):
+                calls.append('response closed')
         class Connection:
             response = Response()
             def __init__(self, host, timeout):
@@ -309,6 +315,158 @@ class HookTest(unittest.TestCase):
             runtime.end = time.monotonic() - 1
             self.assertRaises(h.Refused, runtime.request, 'GET', 'instance/id')
         self.assertEqual(calls.count('closed'), 4)
+
+    def test_actual_default_runner_source_without_hook_bytes_injection(self):
+        source = Path(h.__file__).read_bytes()
+        path = '/tmp/metadata-scripts1234567890/startup-script'
+        self.write(path[1:], source.decode())
+        (self.root/'tmp').chmod(0o1777)
+        (self.root/'tmp/metadata-scripts1234567890').chmod(0o700)
+        (self.root/path[1:]).chmod(0o755)
+        with patch.object(h, '__file__', path):
+            result = h.run(self.files, self.guest, now=900)
+        self.assertEqual(result['hook_sha256'], h.digest(source))
+        self.assertEqual(result['result'], 'inventory-only')
+        self.parse(result)
+        # This special source read never broadens ordinary data path access.
+        self.assertRaises(h.Refused, self.files.read, path, 32768)
+
+    def test_runner_source_paths_and_ownership_fail_closed(self):
+        path = '/tmp/metadata-scripts123/startup-script'
+        for variant in ('unsafe-tmp', 'unsafe-directory', 'directory-link',
+                        'file-link', 'hardlink', 'writable-file', 'wrong-owner', 'wrong-name'):
+            with self.subTest(variant=variant):
+                self.tearDown()
+                self.setUp()
+                self.write(path[1:], 'synthetic source')
+                temporary = self.root/'tmp'
+                directory = temporary/'metadata-scripts123'
+                source = directory/'startup-script'
+                temporary.chmod(0o1777)
+                directory.chmod(0o700)
+                if variant == 'unsafe-tmp':
+                    temporary.chmod(0o777)
+                elif variant == 'unsafe-directory':
+                    directory.chmod(0o755)
+                elif variant == 'directory-link':
+                    directory.rename(temporary/'other')
+                    directory.symlink_to(temporary/'other', target_is_directory=True)
+                elif variant == 'file-link':
+                    source.unlink()
+                    source.symlink_to(self.root/'etc/passwd')
+                elif variant == 'hardlink':
+                    os.link(source, directory/'other')
+                elif variant == 'writable-file':
+                    source.chmod(0o666)
+                elif variant == 'wrong-owner':
+                    self.files.uid = os.getuid()+1
+                with patch.object(h, '__file__', path if variant != 'wrong-name' else '/tmp/other/startup-script'):
+                    with self.assertRaises((h.Refused, OSError)):
+                        h.run(self.files, self.guest, now=900)
+                self.assertFalse(self.guest.puts)
+
+    def test_absolute_http_deadline_interrupts_trickled_headers_and_body(self):
+        for phase in ('connect', 'headers', 'body'):
+            with self.subTest(phase=phase):
+                client, server = socket.socketpair()
+                stopped = threading.Event()
+                sent = []
+                class LocalConnection(h.http.client.HTTPConnection):
+                    def connect(inner):
+                        if phase == 'connect':
+                            time.sleep(.3)
+                        inner.sock = client
+                header = b'HTTP/1.1 200 OK\r\nMetadata-Flavor: Google\r\nContent-Length: 40\r\n\r\n'
+                def serve():
+                    try:
+                        server.recv(8192)
+                        if phase == 'body':
+                            server.sendall(header)
+                            payload = b'x'*40
+                        else:
+                            payload = header
+                        for byte in payload:
+                            if stopped.wait(.02):
+                                break
+                            server.sendall(bytes((byte,)))
+                            sent.append(byte)
+                    except OSError:
+                        pass
+                    finally:
+                        server.close()
+                worker = threading.Thread(target=serve)
+                worker.start()
+                runtime = h.Runtime()
+                runtime.end = time.monotonic()+.06
+                previous = signal.getsignal(signal.SIGALRM)
+                before = time.monotonic()
+                try:
+                    with patch.object(h.http.client, 'HTTPConnection', LocalConnection):
+                        self.assertRaises(h.Refused, runtime.request, 'GET', 'instance/id')
+                    self.assertLess(time.monotonic()-before, .16)
+                    self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                    self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+                    if phase != 'connect':
+                        self.assertEqual(client.fileno(), -1)
+                finally:
+                    stopped.set()
+                    client.close()
+                    worker.join(timeout=1)
+                    self.assertFalse(worker.is_alive())
+                # A request never survives failure in a worker/background task.
+                self.assertEqual(client.fileno(), -1)
+
+    def test_trickled_part_response_never_attempts_summary(self):
+        client, server = socket.socketpair()
+        stopped = threading.Event()
+        attempted = []
+        class LocalConnection(h.http.client.HTTPConnection):
+            def connect(inner):
+                inner.sock = client
+        def serve():
+            try:
+                server.recv(16384)
+                server.sendall(b'HTTP/1.1 200 OK\r\nMetadata-Flavor: Google\r\nContent-Length: 40\r\n\r\n')
+                for _ in range(40):
+                    if stopped.wait(.02):
+                        break
+                    server.sendall(b'x')
+            except OSError:
+                pass
+            finally:
+                server.close()
+        worker = threading.Thread(target=serve)
+        worker.start()
+        original = self.guest.request
+        def request(method, key, body=None):
+            if method == 'PUT':
+                attempted.append(key)
+                self.guest.end = time.monotonic()+.06
+                return h.Runtime.request(self.guest, method, key, body)
+            return original(method, key, body)
+        self.guest.request = request
+        try:
+            with patch.object(h.http.client, 'HTTPConnection', LocalConnection):
+                self.assertRaises(h.Refused, self.run_hook)
+            self.assertEqual(attempted, ['instance/guest-attributes/labapp-prelogin/inventory-0'])
+            self.assertFalse(self.guest.puts)
+            self.assertEqual(client.fileno(), -1)
+        finally:
+            stopped.set()
+            client.close()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+
+    def test_existing_alarm_refuses_before_connection(self):
+        runtime = h.Runtime()
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 1)
+            with patch.object(h.http.client, 'HTTPConnection') as connection:
+                self.assertRaises(h.Refused, runtime.request, 'GET', 'instance/id')
+                connection.assert_not_called()
+                self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
     def test_metadata_deadline_type_and_unknown_fields(self):
         for change in ({'deadline': 899}, {'uid': True}, {'home': '/root'}, {'nonce': 'x'}, {'extra': 'x'}):
