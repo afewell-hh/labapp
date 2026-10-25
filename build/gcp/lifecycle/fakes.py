@@ -85,6 +85,7 @@ class FakeCloud:
 
     def _materialize(self, body: dict) -> str:
         inst = self._make(body["name"], body["labels"])
+        inst["scheduling"] = dict(body["scheduling"])
         inst["disks"] = []
         for d in body["disks"]:
             p = d["initializeParams"]

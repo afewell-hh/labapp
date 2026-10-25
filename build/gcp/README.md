@@ -483,7 +483,7 @@ perform network access only when explicitly called.
 | `spec.py` | Two fixed profiles (component described below). Inspector: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
 | `cloud.py` | `PolicyCloud`: the controller's mutation/inventory call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. One fixed read-only Ubuntu image GET is also allowed; image mutations, arbitrary image reads, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
-| `cli.py` | Trusted-runner entrypoint for the fixed workflows; validates events and performs four fixed read-only project/region/image preflight requests separately from `PolicyCloud`, then invokes creator or cleanup transitions |
+| `cli.py` | Trusted-runner entrypoint for the fixed workflows; validates events and performs fixed read-only project/region/image preflight requests separately from `PolicyCloud`, then invokes creator or cleanup transitions |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
 | `fakes.py`, `test_lifecycle.py` | Fake cloud with failure injection and the invariant tests |
 
@@ -575,12 +575,13 @@ insertion. Missing profile/child-intent fields are accepted only as the original
 two-disk inspector schema; mixed or unknown inventories fail closed. Both
 profiles share the same serial slot and request/operation/immutable-ID rules.
 
-**Library support does not enable this profile in a workflow.** The active CLI,
-creator/cleanup workflows, access helpers and IAM bootstrap remain fixed to the
-accepted inspector. Using the component requires separately reviewed workflow,
-preflight, permissions, transport/dependency plan and a scoped live task. Offline
-tests prove request/state-machine behavior, not capacity, image boot, systemd,
-KVM or VLAB operation.
+The trusted creator now selects this profile through fixed CLI mode `component`;
+its legacy workflow filename is retained because WIF pins that path. The old
+inspector library and CLI mode remain compatible, including old-ledger cleanup,
+but the active creator no longer dispatches an inspector. Workflow support is
+not live proof: guest access, transport/dependency delivery and each live task
+still need their own reviewed scope. Offline tests prove request/state-machine
+behavior, not capacity, image boot, systemd, KVM or VLAB operation.
 
 Sources checked 2026-10-25: Google's [nested restrictions](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview#restrictions)
 exclude E2; [direct enablement](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#enable_nested_virtualization_directly_on_a_new_vm)
@@ -640,51 +641,51 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
 ## Fixed lifecycle runner
 
-The `labapp-lifecycle-inspect.yml` workflow accepts only a dispatch on `main`,
-with no inputs. The inspector uses a fixed **thirty-minute** absolute lease,
-`e2-standard-2`, a 10GB stock Debian13 boot disk and a 300GB read-only source-copy
-`pd-standard` disk. Both images are checked against pinned immutable IDs before
-admission. The fixed boot pin is
-`projects/debian-cloud/global/images/debian-13-trixie-v20261023`, immutable ID
-`1840322579453583118`; the appliance source pin remains unchanged. Initial
-instance metadata contains only OS Login, project SSH-key blocking,
-`enable-guest-attributes=TRUE` and `labapp-stage=none`; the spec validator
-rejects missing, duplicate, changed or extra settings. Guest attributes permit
-trusted-stock host-public-key publication on first boot; owner access follows
-the linked runbook, with no creator/cleanup guest-attribute read capability.
-Project-global CPU and regional shared CPU/standard-disk quotas must have
-headroom; reads are snapshots, not reservations. Inherited project execution
-metadata (startup/shutdown scripts or cloud-init user-data) blocks this pilot.
-E2 uses the regional `CPUS` pool shared with N1; no `E2_CPUS` entry is required. Existing unknown resources
-still block admission through the controller census. There is no guest script,
-package download, SSH, serial output or filesystem extraction in this pilot.
+The creator's display name is **Labapp bounded Ubuntu component**. Its path
+remains `labapp-lifecycle-inspect.yml` because the existing WIF trust pins that
+path; renaming the file would require a separately reviewed trust migration.
+It accepts only a dispatch on `main`, with no inputs, and invokes the fixed
+`component` CLI mode. It selects the Ubuntu profile above: a thirty-minute
+initial absolute `DELETE` deadline, `n2-standard-2`, and one 20GB standard boot
+disk. It never reads or clones the source appliance. No service account,
+external IP, startup payload, package download, SSH or guest execution is added.
+Initial access-only metadata and the existing serial CAS gate remain unchanged.
 
-Debian's supplier AMD64 fstab/GRUB configuration selects root and ESP by
-build-generated PARTUUID, without a separate `/boot` filesystem. This avoids
-the Ubuntu source's `BOOT` label selector; it is a design rationale, not proof
-of this exact image's boot behavior. Before source collection, the lead must
-verify actual stock cmdline/fstab/effective mount units and exact root/ESP
-ancestry, no unexpected/pending automounts, required Python/tools, OS Login and
-host-key publication. Immediately before and after the unchanged wrapper,
-require every source child unmounted plus exact RO/identity and both ext4
-clean-state checks. Unexpected or reappearing mounts refuse collection. Never
-change source labels/UUIDs or relax the wrapper to accommodate an ambient mount.
-The guest-attribute channel assumes a trusted stock guest: any guest process can
-write it, so it is not attestation against malicious guest code. A clean boot
-and actual kernel mount proof remain lead-only gates after review; container
-compatibility does not establish them.
+Preflight reads only the fixed project, region and public Ubuntu pin. It
+requires exact project/region identity, image name/immutable ID, `READY`,
+`X86_64`, and the 10GB image minimum, then checks global CPU and regional
+`CPUS`, `N2_CPUS`, `INSTANCES` and standard-disk headroom. Inherited execution
+metadata (startup/shutdown scripts or cloud-init user-data) blocks creation.
+These reads are snapshots, not reservations or zonal capacity guarantees.
+The fixed shape/zone were reviewed separately; the creator does not add
+`machineTypes.get` or `zones.get` permissions or probe their endpoints. A live
+scope must refresh owner-side shape/zone support checks. Unknown resources
+continue to block admission through the project census. No quota, networking
+or IAM change is made by dispatch.
 
-The fixed window applies to every new inspector dispatch; there is no duration
-input or environment override. It remains below the 60-minute inspection limit
-and never changes an existing lease. Normal cleanup can end it early. Owner
-IAP access, synthetic mount validation and private collection require their
-separately reviewed authorization; the creator does not run guest commands.
+Google documents `compute.instances.create` for enabling nested virtualization
+at creation; the existing creator already has that permission. No image-creation
+permission or legacy special virtualization image/license is needed for this
+request. Public Ubuntu image read/use follows its supplier IAM; actual identity
+sufficiency and kernel behavior require a separately authorized live pilot.
+See [nested creation permissions](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#enable_nested_virtualization_directly_on_a_new_vm)
+and [REST insert field permissions](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert),
+checked 2026-10-25 for Compute REST v1.
+
+The thirty-minute fixed window has no duration input or environment override;
+normal cleanup can end it early and it never changes an existing lease. Owner
+access and module/runtime checks require their separately reviewed scope.
+Historical two-disk inspectors remain supported by the library and cleanup,
+including their read-only source-copy disk. Their Debian root/ESP identity,
+source mount and private collection gates above remain required if a future
+separately reviewed source-inspection task is authorized; this workflow does
+not dispatch that profile.
 
 The runner fetches only the nine required Python module files through GitHub's
 Contents API at the trusted workflow's `github.sha`, before WIF authentication.
 It does not check out archived gitlinks, execute triggering-run code, download
 artifacts or overwrite auth credentials. The CLI is invoked from that temporary
-module directory as `python3 -m lifecycle.cli inspect` or `cleanup`; these entry
+module directory as `python3 -m lifecycle.cli component` or `cleanup`; these entry
 points require trusted GitHub event context and accept no cloud parameters.
 
 Creator confirmation polls the insert operation for up to six elapsed minutes,
@@ -706,21 +707,25 @@ grace, so early provisioning does not exhaust its observation window first.
 
 Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
 cannot delete; cleanup cannot create. After confirming the insert and persisting
-all three resource IDs, creator checks each actual disk's `sourceImageId`
-against the pinned image ID, then prints only IDs/deadline and polls for VM absence
+the profile's resource IDs, creator checks each actual disk's `sourceImageId`
+(and the component source-image path), then promptly prints a sanitized receipt
+containing names, immutable IDs, request UUID, profile and deadline. It polls
+read-only for VM absence, refusing a changed VM ID or absolute deadline,
 until the immutable deadline plus two minutes. That observation does not release
 the ledger or establish disk cleanup. The independent cleanup workflow handles
 completed creator runs, including failure/cancellation, only after validating
-the fixed name/path, original dispatch, repository/owner, main branch, and the
+either the new component or historical inspector name with the same fixed
+path, original dispatch, repository/owner, main branch, and the
 ledger's run ID and attempt. Late completions cannot force another lease's
 cleanup. Manual cleanup dispatch forces the current lease; scheduled cleanup
 only handles due leases, on an offset ten-minute schedule. This interval is
 best-effort and gives no ten-minute completion guarantee. Both use the same CAS reconciliation and verify the VM
-and both disks absent before release. Schedules remain best-effort; initial
+and every intended disk absent before release. Schedules remain best-effort; initial
 Compute `terminationTime` plus `DELETE` is the independent cloud-side bound.
-That bound requests VM deletion and boot-disk auto-deletion; it does not delete
-the `READ_ONLY` source-copy disk. The independent cleanup workflow must delete
-that owned disk explicitly and confirm absence before releasing the ledger.
+That bound requests VM deletion and boot-disk auto-deletion. For a historical
+inspector it does not delete the `READ_ONLY` source-copy disk; cleanup must
+delete that exact owned disk explicitly. Every profile still requires verified
+VM/child absence and terminal operations before releasing the ledger.
 
 The lead can exercise normal cleanup by dispatching manual cleanup after the
 creator logs confirmed IDs; cancellation by cancelling the creator and checking

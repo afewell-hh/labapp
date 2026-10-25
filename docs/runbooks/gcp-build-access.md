@@ -125,10 +125,10 @@ gh run view RUN_ID --repo afewell-hh/labapp --log
 
 Use this named workflow on `main` for the metadata-only scope described above.
 The separately scoped [fixed lifecycle runner](../../build/gcp/README.md#fixed-lifecycle-runner)
-supports lead-dispatched serial inspectors and independent cleanup. Each new
-inspector receives a fixed 30-minute cloud deadline and a 36-minute creator job
-budget, with no duration input. Dispatch does not authorize guest access or
-collection; those require the separately reviewed owner-access scope below.
+supports lead-dispatched serial Ubuntu component VMs and independent cleanup.
+Each new component receives a fixed 30-minute cloud deadline and a 36-minute creator job
+budget, with no duration input. Dispatch does not authorize guest access or execution; those require a
+separately reviewed owner-access scope.
 Neither path permits arbitrary workflows/commands or general worker cloud credentials. Record
 the run URL, commit, selected image's immutable ID and metadata result in #152.
 A successful setup or auth step alone does not prove image access.
@@ -146,7 +146,10 @@ dispatch this workflow and is not granted by the script.
 
 The lifecycle library also has a fixed one-disk Ubuntu component profile (see
 [its contract](../../build/gcp/README.md#fixed-ubuntu-component-library-profile)).
-It is not selectable by the current trusted workflows or access helpers. Its
+The trusted creator now selects it through fixed `component` CLI mode. Its
+legacy filename `labapp-lifecycle-inspect.yml` remains pinned by WIF; its display
+name is `Labapp bounded Ubuntu component`. Historical inspector dispatch is
+retired, while library/CLI compatibility and old-lease cleanup remain. Its
 30-minute maximum and nested-capable small shape do not authorize a launch,
 change IAM, establish guest egress, or implement full Packer image capture.
 Those are separate reviewed operational scopes.
@@ -245,7 +248,7 @@ The cleanup provider also allows `workflow_run` for immediate cleanup after the
 trusted creator finishes, including cancellation, without giving the creator
 Actions-write or delete privileges. The checked-in cleanup workflow triggers on
 `completed` runs of the fixed creator workflow, then validates its expected
-workflow name/path, head repository, `head_branch == main`, and original event
+component or historical inspector name paired with the fixed creator path, head repository, `head_branch == main`, and original event
 `workflow_dispatch` before using lifecycle credentials. It fetches allowlisted
 code at its own trusted-main SHA, reads the durable ledger and requires the
 triggering run ID/attempt to match before forced cleanup. It never executes
@@ -259,7 +262,10 @@ Custom IAM roles separate creation/read from deletion:
 - Creator: instance/disk creation, inline metadata/labels, inventory/operations,
   serial read and quota/subnet metadata. These project grants are **not**
   prefix-limited creation: they do not enforce VM count, shape, runtime, no-SA,
-  no-external-IP or ownership. Metadata/label permissions can affect other VMs
+  no-external-IP or ownership. Nested enablement at creation uses the existing
+  `compute.instances.create` permission (official nested-virtualization docs,
+  checked 2026-10-25); no IAM change is made for the component profile.
+  Metadata/label permissions can affect other VMs
   or disks, so fixed trusted code, preflight and lifecycle review are essential.
 - Cleanup: instance/disk/zone-operation reads and the project-wide operation
   list needed for census, plus a separate delete-only role
@@ -271,7 +277,10 @@ Custom IAM roles separate creation/read from deletion:
 - Creator subnet use: only `default` in `us-central1`, via a separate subnet-level
   custom role. No network, firewall, external-IP, snapshot, image administration,
   service-account attachment/`actAs`, or service-account-key privilege is granted.
-  Public Debian/source images supply image read/use; no image IAM is changed.
+  Public Ubuntu (and historical Debian/source) images supply image read/use; no
+  image IAM is changed. Component preflight uses existing project/region reads
+  and the exact Ubuntu image; owner-side shape/zone support checks remain a
+  live-task gate because the creator has no machine-type/zone read grants.
 
 The private ledger is exactly
 `gs://labapp-lifecycle-ledger-22685701361`, regional `us-central1`, STANDARD,
