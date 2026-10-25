@@ -215,8 +215,10 @@ class OwnKeyImport:
             raise AccessError('one-shot import capability unavailable')
         intent, gen = self._permit.take()
         self.context.current(self.records.slot())
-        if self.now() >= timestamp(self.context.binding['work_deadline']):
-            raise AccessError('access work deadline reached')
+        now = self.now()
+        if (now >= timestamp(self.context.binding['work_deadline']) or
+                int(now.timestamp()*1_000_000) >= int(intent['expiration_usec'])):
+            raise AccessError('access intent expiration/work deadline reached')
         actual, current_gen = read_intent(self.records, self.context)
         if actual != intent or current_gen != gen:
             raise AccessError('durable intent changed')

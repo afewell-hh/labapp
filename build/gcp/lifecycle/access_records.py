@@ -234,12 +234,21 @@ class GcsAccessRecords:
         self.bucket = bucket
 
     def slot(self):
-        return self._gcs.read(SLOT)[0]
+        try:
+            return self._gcs.read(SLOT)[0]
+        except StoreError:
+            raise AccessError('slot read failed; keep access lease occupied') from None
 
     def _url(self, context, kind):
         return f'https://storage.googleapis.com/storage/v1/b/{self.bucket}/o/' + quote(context.path(kind), safe='')
 
     def read(self, context, kind):
+        try:
+            return self._read(context, kind)
+        except StoreError:
+            raise AccessError('access record read failed; keep lease occupied') from None
+
+    def _read(self, context, kind):
         path = context.path(kind)
         seen = False
         for _ in range(3):
@@ -271,6 +280,12 @@ class GcsAccessRecords:
         Lost upload replies are reconciled once by complete canonical equality;
         absent/mismatched/error reads remain uncertain and are never retried.
         """
+        try:
+            return self._create(context, kind, value)
+        except StoreError:
+            raise AccessError('access upload evidence failed; outcome may be uncertain') from None
+
+    def _create(self, context, kind, value):
         validate_record(value, context, kind)
         context.current(self.slot())
         path = context.path(kind)
@@ -294,8 +309,7 @@ class GcsAccessRecords:
                 raise AccessError('access upload read-back mismatch')
             return gen, True
         if response is not None and response.status != 412:
-            # Treat non-success as uncertain too; never replay the upload.
-            uncertain = True
+            raise AccessError('access upload denied or failed; outcome not accepted')
         found, gen = self.read(context, kind)
         if found is None or canonical(found) != payload:
             raise AccessError('access upload outcome unproven')

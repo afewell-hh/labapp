@@ -14,7 +14,6 @@ from .access_records import (AccessError, Context, GcsAccessRecords, KINDS, LIMI
                              canonical, digest, public_key, validate_record)
 from .auth_http import HttpResponse
 from .controller import Controller, FREE, Refused
-from .gcs import StoreError
 from .oslogin import OwnKeyImport, SelfLogin, cleanup_own_key
 from .test_base_build import world
 from .test_lifecycle import U1, U2
@@ -44,6 +43,7 @@ class GCS:
         self.pending = []
         self.get_mode = 'ok'
         self.after_metadata = None
+        self.explicit_upload_error = None
 
     def put(self, name, value):
         self.seq += 1
@@ -61,6 +61,8 @@ class GCS:
         parsed = urlsplit(url)
         query = parse_qs(parsed.query)
         if method == 'POST':
+            if self.explicit_upload_error:
+                return response({}, self.explicit_upload_error)
             assert parsed.path == '/upload/storage/v1/b/' + BUCKET + '/o'
             assert query['ifGenerationMatch'] == ['0']
             name = query['name'][0]
@@ -86,6 +88,10 @@ class GCS:
             return response({}, 404)
         if self.get_mode == 'error':
             return response({}, 403)
+        if self.get_mode == 'network':
+            raise TimeoutError('private HTTP diagnostic')
+        if self.get_mode == 'badmeta' and query.get('alt') != ['media']:
+            return response({'bucket': 'foreign', 'name': name, 'generation': '1', 'size': '1'})
         if query.get('alt') == ['media']:
             assert query['generation'] == [str(gen)]
             if self.get_mode == 'disappear':
@@ -223,7 +229,7 @@ class AccessSchema(unittest.TestCase):
             bad = dict(value, **change)
             with self.assertRaises(AccessError): validate_record(bad, f.context, 'intent')
         f.gcs.get_mode = 'duplicate'
-        with self.assertRaises(StoreError): f.records.read(f.context, 'intent')
+        with self.assertRaises(AccessError): f.records.read(f.context, 'intent')
         f.gcs.get_mode = 'ok'
         bad = copy.deepcopy(value); bad['posix']['username'] = 'x'*LIMIT
         with self.assertRaises(AccessError): validate_record(bad, f.context, 'intent')
@@ -265,6 +271,13 @@ class AccessGCS(unittest.TestCase):
         self.assertEqual(len(f.posts()), 1)
         uploads = [c for c in f.gcs.calls if c[0] == 'POST' and parse_qs(urlsplit(c[1]).query)['name'] == [f.context.path('intent')]]
         self.assertEqual(len(uploads), 1)
+
+    def test_explicit_upload_denial_or_error_blocks_even_existing_equal_content(self):
+        f = Fixture(); value, _ = f.session().prepare(key())
+        for status in (403, 500):
+            f.gcs.explicit_upload_error = status
+            with self.assertRaises(AccessError): f.records.create(f.context, 'intent', value)
+        self.assertFalse(f.posts())
 
     def test_existing_equal_intent_does_not_grant_original_winner(self):
         f = Fixture(); value, gen = f.session().prepare(key())
@@ -364,6 +377,14 @@ class OwnKeyTests(unittest.TestCase):
         f = Fixture(); f.os.add(key()+' old-comment')
         with self.assertRaisesRegex(AccessError, 'preexists'): f.session().prepare(key())
         self.assertFalse(f.posts()); self.assertFalse(f.gcs.objects)
+
+    def test_expired_intent_is_consumed_without_post_even_before_work_deadline(self):
+        f = Fixture(); s = f.session(); s.prepare(key())
+        f.w.clock.advance(21)
+        with self.assertRaisesRegex(AccessError, 'expiration'): s.import_once()
+        with self.assertRaises(AccessError): s.import_once()
+        self.assertFalse(f.posts())
+        self.assertEqual(f.w.ctl.reconcile(U1).status, 'blocked')
 
     def test_finite_ttl_and_work_deadline_no_refresh(self):
         f = Fixture(); f.w.clock.advance(25)
@@ -484,6 +505,16 @@ class AccessController(unittest.TestCase):
             self.assertEqual((f.w.raw.instances, f.w.raw.disks), ({}, {}))
             self.assertEqual(f.w.record()['access']['phase'], 'finalizing')
             with self.assertRaises(Refused): f.w.ctl.admit(2, 1, U2)
+
+    def test_access_http_metadata_and_duplicate_json_errors_return_blocked(self):
+        for mode in ('error', 'network', 'badmeta', 'duplicate'):
+            f = Fixture(); f.imported(); f.clean(); f.gcs.get_mode = mode
+            outcome = f.w.ctl.reconcile(U1)
+            self.assertEqual(outcome.status, 'blocked')
+            self.assertNotEqual(f.w.record()['state'], FREE)
+            self.assertNotIn('private HTTP diagnostic', outcome.detail)
+            self.assertEqual(f.w.record()['access']['phase'], 'finalizing')
+            self.assertEqual(len(f.posts()), 1)
 
     def test_cas_conflict_rechecks_without_reimport_or_duplicate_archive(self):
         f = Fixture(); f.imported(); f.clean()
