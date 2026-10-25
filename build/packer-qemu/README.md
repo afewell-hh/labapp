@@ -169,15 +169,16 @@ need proof. Direct delegated [cgroup v2](https://docs.kernel.org/admin-guide/cgr
 would require correct attach-before-exec, permissions and ownership handling;
 a hand-written process supervisor is not a substitute for those guarantees.
 
-## Bounded container probe (`container_runner.py`, #255 initial stage, UNRUN)
+## Bounded container probe (`container_runner.py`)
 
 One fixed non-VM `probe` mode; no Packer/QEMU/VM path, no arbitrary command
 option. Docker is reached only through a `Backend`: fixed `/usr/bin/docker`,
 explicit `--host unix://…` and an empty `--config` dir (no caller context or
 credential helpers), minimal environment, and a bounded byte collector (64 KiB
 cap, deadline, process-group kill; overflow or invalid UTF-8 is an error, never
-truncated). The CLI prints its plan unless `--execute` is given; nothing here has
-been run against a real Docker daemon (this implementation has offline fake-process tests only).
+truncated). The CLI prints its plan unless `--execute` is given. Runtime evidence, tested
+Docker versions and remaining acceptance gates are recorded in #255; offline
+fake-process tests alone cannot establish containment.
 
 * Inputs: only the Ubuntu digest already pinned in `build/provision`
   (`PINNED_IMAGE`; there is no image option), never pulled and never deleted
@@ -254,13 +255,15 @@ signals it has handlers for, except SIGKILL/SIGSTOP from an ancestor.
 TERM, then KILL after the grace period. [Live restore](https://docs.docker.com/engine/daemon/live-restore/):
 containers keep running without the daemon, so the internal timer must stand alone.
 
-Unmet before any VM mode: the real-Docker proof that descendants (including the
+Before extending to any VM mode, require real-Docker proof that descendants (including the
 `setsid` child) die with PID 1 and that the exit codes above hold, observing
 child existence and namespace cleanup directly (the witness records a pid; it
 does not prove cleanup); `bash`/`timeout`/`setsid` presence in the pinned image;
 exact 124-vs-137 behavior with a TERM-ignoring probe; UID mapping of the bind (rootless/userns);
 `/dev/kvm` passthrough; input verification and evidence binding (core/plugin/
 base/module hashes, nonce, acceleration, normal shutdown); input mounts.
+Assess those gates against the current issue evidence; the fixed non-VM probe
+does not enable VM execution or establish another host configuration's support.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
