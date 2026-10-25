@@ -144,11 +144,16 @@ class Backend:
                 if size > OUT_CAP:
                     raise DockerError()          # overflow: reject, do not truncate
                 chunks.append(data)
-            proc.wait(timeout=max(end - boot_clock(), 0.01))
-        except subprocess.TimeoutExpired as exc:
-            raise DockerTimeout() from exc
+            # Observe exit without reaping: the retained leader pins its PID /
+            # process-group ID until cleanup, preventing a reused group signal.
+            while os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                left = end - boot_clock()
+                if left <= 0:
+                    raise DockerTimeout()
+                time.sleep(min(0.01, left))
         finally:
-            # Kill the owned group even if its original parent already exited.
+            # Signal the owned group BEFORE reaping its leader, including when
+            # that leader has exited but descendants still hold stdout open.
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:

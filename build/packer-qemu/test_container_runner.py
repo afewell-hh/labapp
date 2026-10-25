@@ -711,6 +711,36 @@ class RealBackendTests(unittest.TestCase):
             time.sleep(0.2)
             self.assertFalse(os.path.exists(marker))
 
+    def test_group_cleanup_precedes_leader_reap(self):
+        real_waitid, real_killpg = os.waitid, os.killpg
+        real_wait = subprocess.Popen.wait
+        events = []
+        def observe(kind, pid, options):
+            self.assertEqual(options, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            events.append("observe")
+            return real_waitid(kind, pid, options)
+        def kill_group(pid, sig):
+            # Even after the leader exited, it must still be our waitable child.
+            status = real_waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            self.assertIsNotNone(status)
+            self.assertEqual(status.si_status, 0)
+            events.append("kill_group")
+            return real_killpg(pid, sig)
+        def reap(proc, timeout=None):
+            self.assertIn("kill_group", events)
+            events.append("reap")
+            return real_wait(proc, timeout=timeout)
+        with tempfile.TemporaryDirectory() as directory:
+            # stdout closes while the leader is still alive: EOF is not exit.
+            backend = self.fake(directory, "exec 1>&-; sleep 0.1; exit 0")
+            with mock.patch.object(cr.os, "waitid", observe), \
+                    mock.patch.object(cr.os, "killpg", kill_group), \
+                    mock.patch.object(cr.subprocess.Popen, "wait", reap), \
+                    mock.patch.object(cr.subprocess.Popen, "poll", side_effect=AssertionError("early reap")):
+                self.assertEqual(backend.call(["x"], 3), "")
+        self.assertGreater(events.count("observe"), 1)
+        self.assertLess(events.index("kill_group"), events.index("reap"))
+
     def test_exited_parent_pipe_holder_is_killed_on_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = os.path.join(directory, "escaped")
