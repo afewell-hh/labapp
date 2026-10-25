@@ -228,3 +228,68 @@ def validate_body(body: dict) -> None:
 def body_hash(body: dict) -> str:
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+CAPTURE_RESERVE_MINUTES = 15
+MAX_QUARANTINE_HOURS = 24
+
+
+def resource_link(path: str, value: str) -> bool:
+    return value in (path, "https://www.googleapis.com/compute/v1/" + path,
+                     "https://compute.googleapis.com/compute/v1/" + path)
+
+
+def capture_body(capture: dict) -> dict:
+    return {"name": capture["name"], "sourceDisk": capture["source_disk"],
+            "labels": {LABEL_OWNER: OWNER_VALUE, LABEL_LEASE: capture["lease_id"],
+                       LABEL_RUN: str(capture["run_id"]),
+                       "labapp-capture": capture["request_id"]}}
+
+
+def validate_capture(c: dict) -> None:
+    """Validate fixed persisted capture intent, never an arbitrary image body.
+
+    sourceDiskId is output-only: the controller also checks the immutable disk
+    immediately before submission and verifies the returned image provenance.
+    """
+    try:
+        import uuid
+        for key in ("request_id", "lease_id", "delete_request_id"):
+            if str(uuid.UUID(c[key])) != c[key] or uuid.UUID(c[key]).int == 0:
+                raise ValueError()
+        if len({c["request_id"], c["lease_id"], c["delete_request_id"]}) != 3:
+            raise ValueError()
+        n = names(c["run_id"], c["attempt"], UBUNTU_BASE_BUILD)
+        expected_name = "labapp-candidate-" + c["request_id"]
+        if (c["name"] != expected_name or c["source_disk"] !=
+                f"projects/{PROJECT}/zones/{ZONE}/disks/{n['boot']}" or
+                not re.fullmatch(r"[1-9][0-9]{0,19}", c["source_disk_id"]) or
+                c["body_hash"] != body_hash(capture_body(c)) or
+                c["name"] in c["preexisting_images"] or
+                c.get("image_id") in c["preexisting_images"].values() or
+                type(c["submitted"]) is not bool or type(c["delete_submitted"]) is not bool):
+            raise ValueError()
+        start = datetime.fromisoformat(c["prepared_at"].replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(c["deadline"].replace("Z", "+00:00"))
+        if not 0 < (deadline - start).total_seconds() <= BASE_BUILD_LEASE_MINUTES * 60:
+            raise ValueError()
+        if c["retain_until"] is not None:
+            end = datetime.fromisoformat(c["retain_until"].replace("Z", "+00:00"))
+            if not 0 < (end - start).total_seconds() <= MAX_QUARANTINE_HOURS * 3600:
+                raise ValueError()
+        if not isinstance(c["preexisting_images"], dict) or any(
+                not isinstance(n, str) or not isinstance(i, str)
+                for n, i in c["preexisting_images"].items()):
+            raise ValueError()
+        for field, request, kind in (("insert_receipt", c["request_id"], "insert"),
+                                     ("delete_receipt", c["delete_request_id"], "delete")):
+            op = c.get(field)
+            if op is not None and (op.get("status") != "DONE" or op.get("error") or
+                    op.get("operationType") != kind or op.get("clientOperationId") != request or
+                    op.get("targetId") != c.get("image_id") or
+                    not resource_link(f"projects/{PROJECT}/global/images/{c['name']}", op.get("targetLink"))):
+                raise ValueError()
+        if c.get("image_id") is not None and not re.fullmatch(r"[1-9][0-9]{0,19}", c["image_id"]):
+            raise ValueError()
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise ValueError("invalid fixed capture intent") from None

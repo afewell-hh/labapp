@@ -17,7 +17,7 @@ from typing import Callable, Optional
 from urllib.parse import urlencode
 
 from . import spec
-from .cloud import ALLOWED, ApiError, ForbiddenOperation, NotFound, Uncertain
+from .cloud import ALLOWED, ApiError, ForbiddenOperation, NotFound, Uncertain, validate_image_call
 
 BASE = "https://compute.googleapis.com/compute/v1"
 _NAME = re.compile(r"[a-zA-Z0-9_-]{1,200}\Z")
@@ -120,7 +120,7 @@ class ComputeRestTransport:
     def call(self, resource: str, verb: str, *, project: str, zone: str,
              name: Optional[str] = None, body: Optional[dict] = None,
              request_id: Optional[str] = None,
-             page_token: Optional[str] = None) -> dict:
+             page_token: Optional[str] = None, capture: Optional[dict] = None) -> dict:
         if (resource, verb) not in ALLOWED:
             raise ForbiddenOperation("Compute resource/verb outside allowlist")
         if project != spec.PROJECT or zone != spec.ZONE:
@@ -136,10 +136,34 @@ class ComputeRestTransport:
         if page_token is not None and (verb not in ("list", "aggregatedList") or not self._valid_page_token(page_token)):
             raise ForbiddenOperation("Unexpected/invalid Compute page token")
         if resource == "images":
-            if (verb != "get" or name != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] or
-                    body is not None or request_id is not None or page_token is not None):
-                raise ForbiddenOperation("only the fixed public Ubuntu image read is permitted")
-            return self._request("GET", BASE + "/" + spec.COMPONENT_IMAGE)
+            if (verb == "get" and name == spec.COMPONENT_IMAGE.rsplit("/", 1)[-1]
+                    and body is None and request_id is None and page_token is None and capture is None):
+                return self._request("GET", BASE + "/" + spec.COMPONENT_IMAGE)
+            image_url = f"{BASE}/projects/{spec.PROJECT}/global/images"
+            if verb == "list":
+                validate_image_call(verb, dict(name=name, body=body, request_id=request_id, capture=capture))
+                if any(v is not None for v in (name, body, request_id)):
+                    raise ForbiddenOperation("unexpected image census parameters")
+                return self._list_page(resource, image_url, False, page_token)
+            validate_image_call(verb, dict(name=name, body=body, request_id=request_id, capture=capture))
+            if page_token is not None:
+                raise ForbiddenOperation("unexpected image page token")
+            if verb == "insert":
+                payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+                return self._request("POST", image_url + "?" + urlencode({"requestId": request_id}), payload)
+            return self._request("DELETE" if verb == "delete" else "GET", image_url + "/" + name +
+                                 ("?" + urlencode({"requestId": request_id}) if request_id else ""))
+        if resource == "globalOperations" and verb == "get":
+            try:
+                spec.validate_capture(capture)
+            except ValueError as exc:
+                raise ForbiddenOperation(str(exc)) from exc
+            if (not isinstance(name, str) or not _NAME.fullmatch(name) or
+                    any(v is not None for v in (body, request_id, page_token))):
+                raise ForbiddenOperation("invalid global operation read")
+            return self._request("GET", f"{BASE}/projects/{spec.PROJECT}/global/operations/{name}")
+        if capture is not None:
+            raise ForbiddenOperation("capture outside fixed image surface")
         project_url = f"{BASE}/projects/{spec.PROJECT}"
         endpoint = "operations" if resource in ("zoneOperations", "globalOperations") else resource
         zonal_url = f"{project_url}/zones/{spec.ZONE}/{endpoint}"

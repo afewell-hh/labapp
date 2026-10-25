@@ -115,7 +115,8 @@ jobs:
         run: |
           test -f build/gcp/lifecycle/test_lifecycle.py
           test -f build/gcp/lifecycle/test_base_build.py
-          python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
+          test -f build/gcp/lifecycle/test_capture.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
 
   bridge-ipv4:
     name: Bridge IPv4 offline and disposable namespace tests
