@@ -14,6 +14,7 @@ GNU timeout as the same PID 1.
 """
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -26,13 +27,24 @@ import sys
 import time
 import uuid
 
+import stage_tools
+
 # The only image this probe accepts: the Ubuntu digest already pinned across
 # build/provision (qemu_offline.py BASE, CI K3D_TEST_IMAGE). Never pulled.
 PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac"
 # probe: 30 s work + 20 s cleanup, measured from one admission time, no renewal.
 # The proposed sentinel (15+5 min) and fixture (30+15 min) profiles are VM-mode
 # allocations and are intentionally not accepted here.
-PROFILES = {"probe": (30, 20)}
+# hcl-check: 120 s work INCLUDING all staging from admission + 30 s cleanup, no renewal.
+PROFILES = {"probe": (30, 20), "hcl-check": (120, 30)}
+MODES = tuple(PROFILES)
+# Proposed explicit bounds for the pre-VM tool check, not measured requirements.
+LIMITS = {"probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
+          "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128")}
+STEP_CAP = 2 * 1024 * 1024    # matches `ulimit -f 2048` in HCL_SCRIPT
+EXCERPT = 2048
+STEPS_EXPECTED = "version 0\nsyntax 0\nfull 0\n"
+VERSION_RE = re.compile(r"^Packer v1\.16\.2\n?$")
 CALL_CAP = 10          # per Docker CLI call, further capped by remaining budget
 STOP_GRACE = 3         # docker stop --timeout
 KILL_AFTER = 5         # GNU timeout --kill-after inside the container
@@ -69,6 +81,18 @@ PROBE_SCRIPT = ("trap '' TERM; /usr/bin/setsid /bin/bash -c "
                 'while :; do { read -r first; read -r child; } < /out/witness; '
                 r'[[ "$child" = probe\ * ]] && break; /bin/sleep 0.01; done; '
                 'echo term_ignored >> /out/witness; while :; do /bin/sleep 1; done')
+# Fixed hcl-check script: three recorded steps, no init/build/install/download/
+# datasource command, empty environment, outputs capped per file by ulimit.
+HCL_ENV = ("/usr/bin/env -i HOME=/out/home TMPDIR=/out/tmp PATH=/usr/bin:/bin LC_ALL=C "
+           "CHECKPOINT_DISABLE=1 PACKER_NO_COLOR=1 PACKER_PLUGIN_PATH=/in/plugins "
+           "PACKER_CACHE_DIR=/out/cache")
+HCL_SCRIPT = ("ulimit -f 2048 || exit 125; umask 077; "
+              'step() { n=$1; shift; "$@" > "/out/$n.out" 2> "/out/$n.err" < /dev/null; '
+              'echo "$n $?" >> /out/steps; }; '
+              f"step version {HCL_ENV} /in/tools/packer version; "
+              f"step syntax {HCL_ENV} /in/tools/packer validate -syntax-only /in/labapp.pkr.hcl; "
+              f"step full {HCL_ENV} /in/tools/packer validate "
+              "-var-file=/in/validate.pkrvars.hcl /in/labapp.pkr.hcl; exit 0")
 
 
 def boot_clock():
@@ -269,14 +293,26 @@ def unresolved_records(directory):
     return out
 
 
-def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot-id>"):
+def mounts(mode, workspace):
+    """Fixed mounts. probe: the workspace is the only (writable) mount. hcl-check:
+    staged inputs (including the base snapshot) and CD files read-only, and only
+    the fresh `out` tree writable."""
+    if mode == "probe":
+        return [f"--mount=type=bind,src={workspace},dst=/out"]
+    return [f"--mount=type=bind,src={workspace}/in,dst=/in,readonly",
+            f"--mount=type=bind,src={workspace}/out,dst=/out",
+            f"--mount=type=bind,src={workspace}/cd,dst=/out/work/cd,readonly"]
+
+
+def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot-id>",
+                mode="probe"):
     """Exact, fixed creation argv: no init, no restart, no pull, healthcheck off."""
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
-            "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64",
-            "--log-driver=none", f"--mount=type=bind,src={workspace},dst=/out",
-            "--entrypoint=/bin/bash", image_id, "-c", ENTRY, "bash", str(deadline), boot_id, PROBE_SCRIPT]
+            *LIMITS[mode], "--log-driver=none", *mounts(mode, workspace),
+            "--entrypoint=/bin/bash", image_id, "-c", ENTRY, "bash", str(deadline), boot_id,
+            PROBE_SCRIPT if mode == "probe" else HCL_SCRIPT]
 
 
 def owned_query(name, label):
@@ -363,12 +399,17 @@ def run_probe(image, root, ledger_dir, backend, **kwargs):
 
 def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sleep=time.sleep,
               admitted_at=None, new_uuid=lambda: str(uuid.uuid4()),
-              uid=None, gid=None, work=None, cleanup=None, handle_signals=False):
+              uid=None, gid=None, work=None, cleanup=None, handle_signals=False,
+              mode="probe", sources=None):
     """Return a result dict; outcome is accepted, failed or hold. Never raises on
     daemon trouble. `hold` keeps the ledger record and workspace for the lead."""
     admitted_at = clock() if admitted_at is None else admitted_at
     uid, gid = (os.getuid() if uid is None else uid), (os.getgid() if gid is None else gid)
-    w, c = PROFILES["probe"]
+    if mode not in MODES:
+        raise ValueError("unknown mode")
+    if mode == "hcl-check" and not (isinstance(sources, dict) and set(sources) == {"core", "plugin", "base"}):
+        raise ValueError("hcl-check needs exactly the core, plugin and base input files")
+    w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
     if image != PINNED_IMAGE:
         raise ValueError("image must be the pinned Ubuntu digest of this repo")
@@ -385,7 +426,8 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     own = {"name": f"labapp-probe-{ident}", "label": f"labapp.probe.run={ident}", "ident": ident,
            "id": None, "ambiguous": None, "attempted": False, "workspace": None, "ledger": None,
            "cancelled": False, "cleaning": False, "uncertain": False, "started_at": None,
-           "witness": None, "boot_id": host_boot_id(), "deadline": int(budget.work_deadline)}
+           "witness": None, "boot_id": host_boot_id(), "deadline": int(budget.work_deadline),
+           "mode": mode, "sources": sources, "staged": None, "image_id": None}
     result = {"outcome": "failed", "reason": None, "name": own["name"], "label": own["label"]}
     if handle_signals:
         def on_signal(signum, frame):
@@ -399,7 +441,7 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
             own["ledger"] = Ledger(ledger_dir, ident, {
                 "name": own["name"], "label": own["label"], "image": image, "id": None,
                 "workspace": None, "admitted_at": admitted_at, "work_deadline": budget.work_deadline,
-                "deadline": budget.deadline, "pid": os.getpid()})
+                "deadline": budget.deadline, "pid": os.getpid(), "mode": mode})
             _run(image, root, backend, budget, own, result, sleep, uid, gid, clock)
         except BaseException as exc:   # cancellation/interrupt included: always clean up
             result["outcome"], result["reason"] = "failed", result["reason"] or _reason(exc)
@@ -425,7 +467,8 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
 
 def _reason(exc):
     return {Expired: "budget_exhausted", DockerError: "daemon_error", OSError: "ledger_or_fs_error",
-            DockerTimeout: "daemon_timeout", ValueError: "invalid_input"}.get(type(exc), "error")
+            DockerTimeout: "daemon_timeout", ValueError: "invalid_input",
+            stage_tools.StageError: "staging_rejected"}.get(type(exc), "error")
 
 
 def _checkpoint(own, budget, clock):
@@ -441,6 +484,11 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     # Preparation consumes the same budget as everything else.
     own["workspace"] = make_workspace(root, own["ident"], uid)
     ledger.write("workspace_made", workspace=own["workspace"])
+    if own["mode"] == "hcl-check":
+        # Staging starts after admission and spends the same absolute budget.
+        own["staged"] = stage_tools.stage(own["workspace"], own["sources"], os.urandom(32).hex(),
+                                          lambda: _checkpoint(own, budget, clock), pins=stage_tools.PINS)
+        _checkpoint(own, budget, clock)
     backend.call(["version", "--format", "{{.Server.Version}}"], budget.seconds(CALL_CAP, budget.work_deadline))
     _checkpoint(own, budget, clock)
     image_id = check_image(backend.call(["image", "inspect", "--format", IMAGE_FORMAT, image],
@@ -448,7 +496,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     _checkpoint(own, budget, clock)
     if budget.work_left() < START_RESERVE + KILL_AFTER + MIN_TIMER:
         raise Expired()
-    argv = create_args(own["name"], own["label"], image_id, f"{uid}:{gid}", own["workspace"], own["deadline"], own["boot_id"])
+    own["image_id"] = image_id
+    argv = create_args(own["name"], own["label"], image_id, f"{uid}:{gid}", own["workspace"], own["deadline"],
+                       own["boot_id"], own["mode"])
     own["attempted"] = True
     own["ambiguous"] = "ambiguous_create"
     ledger.write("create_intent", image_id=image_id)       # durable BEFORE the daemon mutation
@@ -483,6 +533,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
             return
         sleep(min(POLL, max(budget.work_left(), 0)))
     own["exit_seen_at"] = clock()
+    if own["mode"] == "hcl-check":
+        _accept_hcl(own, result, budget, clock, oom, code)
+        return
     if oom or code not in EXPECTED_EXIT:
         result["reason"] = "unexpected_exit"
         return
@@ -496,6 +549,81 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         result["reason"] = "exited_before_timer"
         return
     own["witness"] = timer
+    result["outcome"], result["reason"] = "accepted", None
+    result["exit_code"] = code
+
+
+def read_step(out_dir, name, cap=STEP_CAP):
+    """One fixed result file from the container-writable tree: untrusted, so it must be
+    a regular file within the cap. Returns bytes or None when absent/invalid."""
+    path = os.path.join(out_dir, name)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(cap + 1)
+        if len(raw) != info.st_size or stage_tools.identity(os.fstat(fd)) != stage_tools.identity(info):
+            return None
+        return raw
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _accept_hcl(own, result, budget, clock, oom, code):
+    """Success needs exit 0, all three steps 0, the pinned core version, unchanged
+    staged bytes and (checked later in _finish) verified cleanup. Anything else is
+    FAILED: a nonzero validation is never tool success."""
+    out = os.path.join(own["workspace"], "out")
+    staged = own["staged"]
+    evidence = {"image_id": own["image_id"], "inputs": staged["inputs"],
+                "vars_sha256": staged["vars_sha256"], "hcl_sha256": staged["hcl_sha256"],
+                "base_sha256": staged["base_sha256"],
+                "core_archive_sha256": staged["core_archive_sha256"],
+                "core_member_sha256": staged["core_member_sha256"],
+                "plugin_archive_sha256": staged["plugin_archive_sha256"],
+                "plugin_member_sha256": staged["plugin_member_sha256"],
+                "exit_code": code,
+                "commands": ["packer version", "packer validate -syntax-only labapp.pkr.hcl",
+                             "packer validate -var-file=validate.pkrvars.hcl labapp.pkr.hcl"],
+                "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    result["evidence"] = evidence
+    raw = {n: read_step(out, n) for n in ("steps", "version.out", "version.err", "syntax.out",
+                                          "syntax.err", "full.out", "full.err")}
+    for name, data in raw.items():
+        if data is not None:
+            evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                              "excerpt": data[:EXCERPT].decode("ascii", "replace")}
+    invalid = sorted(name for name, data in raw.items() if data is None)
+    if invalid:
+        evidence["invalid_files"] = invalid
+        result["reason"] = "invalid_step_evidence"
+        return
+    if oom or code != 0:
+        result["reason"] = "unexpected_exit"
+        return
+    steps = raw["steps"]
+    if steps.decode("ascii", "replace") != STEPS_EXPECTED:
+        result["reason"] = "tool_check_failed"
+        return
+    version = raw["version.out"]
+    if not VERSION_RE.fullmatch(version.decode("ascii", "replace")):
+        result["reason"] = "wrong_core_version"
+        return
+    try:
+        intact = stage_tools.verify_staged(own["workspace"], staged,
+                                           lambda: _checkpoint(own, budget, clock))
+    except (OSError, stage_tools.StageError):
+        intact = False
+    if not intact:
+        result["reason"] = "staged_inputs_changed"
+        return
     result["outcome"], result["reason"] = "accepted", None
     result["exit_code"] = code
 
@@ -597,6 +725,9 @@ def parse(argv):
     p.add_argument("--ledger-dir", required=True, help="host-only owned 0700 directory, not under the workspace root")
     p.add_argument("--docker-host", default="unix:///var/run/docker.sock")
     p.add_argument("--execute", action="store_true", help="contact Docker (default: print plan only)")
+    p.add_argument("--mode", choices=MODES, default="probe", help="fixed task (default: probe)")
+    for key in ("core", "plugin", "base"):
+        p.add_argument(f"--{key}-file", help=f"hcl-check: pinned {key} input file (absolute path)")
     return p.parse_args(argv)
 
 
@@ -606,10 +737,18 @@ def main(argv=None):
             or not PATH_RE.match(args.workspace_root) or not PATH_RE.match(args.ledger_dir):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
+    files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
+    if args.mode == "probe" and any(files.values()):
+        print("input files are only for --mode hcl-check", file=sys.stderr)
+        return EXIT["usage"]
+    if args.mode == "hcl-check" and not all(f and PATH_RE.match(f) for f in files.values()):
+        print("hcl-check requires safe absolute --core-file, --plugin-file and --base-file", file=sys.stderr)
+        return EXIT["usage"]
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
-                           "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>")
-        print(json.dumps({"mode": "probe", "executed": False, "image": PINNED_IMAGE, "create": plan}))
+                           "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",
+                           mode=args.mode)
+        print(json.dumps({"mode": args.mode, "executed": False, "image": PINNED_IMAGE, "create": plan}))
         return 0
     try:
         config = os.path.join(args.ledger_dir, "docker-config")     # empty: no helpers/credentials
@@ -620,7 +759,8 @@ def main(argv=None):
             if next(entries, None) is not None:
                 raise ValueError("Docker config must be empty")
         result = run_probe(PINNED_IMAGE, args.workspace_root, args.ledger_dir,
-                           Backend(host=args.docker_host, config=config), handle_signals=True)
+                           Backend(host=args.docker_host, config=config), handle_signals=True,
+                           mode=args.mode, sources=files if args.mode == "hcl-check" else None)
     except (ValueError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT["usage"]

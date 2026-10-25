@@ -1,14 +1,16 @@
 # Stock Packer/QEMU portability experiment (`build/packer-qemu/`)
 
-An **unexecuted experiment**, not the selected build system and not an image
-pipeline. It exists to cheaply falsify one candidate: stock Packer core with the
-stock QEMU plugin, `communicator = "none"`, a NoCloud guest that runs the
+The **VM experiment remains disabled and unproven**. Fixed non-VM Docker `probe`
+and `hcl-check` tasks are available under separately scoped lead execution. The
+experiment tests stock Packer core with the stock QEMU plugin,
+`communicator = "none"`, a NoCloud guest that runs the
 unchanged `build/provision/` modules, and a private host-side observer. Plain
 QEMU carries the same receipt, shutdown, watchdog and cleanup obligations; compare
 the glue honestly and stop on a structural mismatch rather than fork the builder
-or grow a framework. Status, plans and evidence live in GitHub (#253, #252, #145).
-This is preparation-only code with execution disabled. Offline tests use
-fake channels and disposable inputs; they establish no Packer, QEMU, cloud-init
+or grow a framework. Status, plans and actual results live in GitHub
+(#252, #253, #255, #264, #145). This is not a selected build system or image
+pipeline. Offline tests use fake channels and disposable inputs; they establish
+no Packer, QEMU, cloud-init
 or hardware compatibility. Runtime evidence and remaining gates belong in the PR.
 
 ## Files
@@ -19,15 +21,24 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
+| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe` and `hcl-check` tasks; pinned bounded staging (see "Bounded container probe") |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
-## Pins, verification, licensing (access date 2026-10-25, documented not verified)
+## Pins, verification, licensing
 
-| Input | Pin | Verify before first use |
+`stage_tools.PINS` contains the full archive/base SHA256 values, sizes and selected
+archive-member metadata. Authenticated provenance is recorded in the
+[#261 signed-metadata receipt](https://github.com/afewell-hh/labapp/issues/261#issuecomment-6402828950),
+[#262 archive receipt](https://github.com/afewell-hh/labapp/issues/262#issuecomment-6403952254)
+and [#263 image receipt](https://github.com/afewell-hh/labapp/issues/263#issuecomment-6404038389).
+Staging checks caller-supplied bytes against these pins; acquisition receipts do
+not establish executable or VM compatibility.
+
+| Input | Pin | Verification contract |
 |---|---|---|
-| Packer core | `1.16.2` (HCL `required_version = "= 1.16.2"`); uses SDK 0.6.13 | HashiCorp `SHA256SUMS` and its signature; license text at the tag (core is not MPL; check the tag's `LICENSE`) |
-| QEMU plugin | `github.com/hashicorp/qemu` `= 1.1.7`; built on SDK 0.6.11 | Install from a pre-fetched, checksummed binary via `PACKER_PLUGIN_PATH`; this code never runs `packer init` (it downloads). Source headers are MPL-2.0 |
-| Base image | Ubuntu 24.04 cloud image, a local file whose SHA256 is passed as `--base-sha256`; Packer checks it | Canonical `SHA256SUMS` signature; exact serial recorded. No image is pinned or downloaded here |
+| Packer core | `1.16.2` (HCL `required_version = "= 1.16.2"`); uses SDK 0.6.13 | Signed checksum provenance in #261; pinned archive and selected member checked during staging. License text at the tag is BSL 1.1 |
+| QEMU plugin | `github.com/hashicorp/qemu` `= 1.1.7`; built on SDK 0.6.11 | Signed checksum provenance in #261; bounded extraction and computed binary sidecar under `PACKER_PLUGIN_PATH`. No `packer init` or install command. Source headers are MPL-2.0 |
+| Base image | Ubuntu 24.04 Noble 20261017 amd64 cloud image; exact size/SHA256 in `stage_tools.PINS` | Canonical signed checksum provenance in #261/#263; staging copies and hashes an owned read-only snapshot. No download path |
 | Modules | `build/provision/*` bytes, unchanged | Their SHA256 are in `MANIFEST`; the receipt binds `sha256(MANIFEST)` |
 
 The core/plugin SDK split (0.6.13 vs 0.6.11) is an integration risk to test, not
@@ -46,14 +57,14 @@ evidence of incompatibility.
   and `-serial unix:DIR/serial.sock,server=on,wait=off`. Neither flag is a builder
   default when `qmp_enable = false`. No `-device`/`-drive` override is used (the
   docs warn that one drops Packer's defaults). `-cpu host`, `-vnc none`, `-monitor
-  none` and `-S` are also set; whether they override or conflict with defaults is
-  **UNRUN**.
+  none` and `-S` are also set; their interaction with generated defaults requires
+  VM runtime validation.
 * Builder channels are explicitly off: `disable_vnc = true` (without it the pinned
   `stepTypeBootCommand` still connects to VNC and fails before `shell-local`),
   `boot_command = []` (no typing), `qmp_enable = false` (no native QMP),
   `vnc_use_password = false`, no `net_bridge`, and `vnc_bind_address = "127.0.0.1"`
-  for any transient reservation. Attribute names and effects are from the pinned
-  docs/source and **UNRUN** (`packer validate` has not been run).
+  for any transient reservation. Attribute names and effects come from the pinned
+  docs/source; actual HCL-check results belong in #264, separately from VM proof.
 * Startup order: `-S` launches QEMU paused. The sole observer (1) attaches the
   serial receipt reader, (2) reads and validates the QMP greeting and version
   (QEMU >= 4), (3) sends `qmp_capabilities`, `query-status` (must be `prelaunch`,
@@ -64,8 +75,8 @@ evidence of incompatibility.
   `cont` and its matching successful acknowledgment is buffered; success still
   requires that acknowledgment. Responses to queued or partially written commands
   are rejected. Writes are nonblocking and resumed after partial writes. The
-  ordering relies on the guest not running before `cont`; the builder's own
-  boot-wait and provisioner start are **UNRUN** against `-S`.
+  ordering relies on the guest not running before `cont`; VM proof must establish
+  the builder's boot-wait and provisioner behavior with `-S`.
 * Strict parsing: UTF-8 only; duplicate keys (at any depth), `NaN`/`Infinity`,
   overflowing numbers, non-object messages, a response carrying both `return` and
   `error` (or missing/unknown/duplicate/wrong `id`), a `null`/malformed greeting
@@ -93,17 +104,17 @@ evidence of incompatibility.
   before publishing the result marker. `reason` in `SHUTDOWN` needs QEMU 4.0+
   (Ubuntu 24.04 ships 8.2). Terminal event definitions follow the
   [QMP reference](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html)
-  (accessed 2026-10-25; actual pinned runtime remains unexecuted).
+  (accessed 2026-10-25); actual runtime evidence belongs in GitHub.
 * Trust: neither channel authenticates the guest. The private 0700 directory and
   the owned QEMU instance define the boundary; the nonce rejects stale receipts,
   not a malicious guest. Native SSH is **not** used and its identity gap is not
   waived (SDK 0.6.11 `InsecureIgnoreHostKey`).
 * `WaitForShutdown` in the plugin treats any QEMU exit as shutdown, so Packer
   success alone proves nothing. The observer writes `verified.json` only after
-  both pieces of evidence (`O_EXCL`), bound to the nonce and digest. Execution is
-  disabled; no supervisor currently accepts that marker or any build artifact.
+  both pieces of evidence (`O_EXCL`), bound to the nonce and digest. VM execution
+  is disabled; no runner accepts that marker or any VM build artifact.
 
-## Guest sequence (UNRUN on a real Noble disk)
+## Guest sequence (requires VM validation)
 
 NoCloud (`cidata` CD from `cd_files`) stages bytes. Final-stage `runcmd` only
 copies them to `/var/lib/labapp-build/in` and runs
@@ -112,8 +123,8 @@ copies them to `/var/lib/labapp-build/in` and runs
 `cloud-init status --format json` to exit zero and say `done`, with no non-empty
 `errors`/`recoverable_errors` and no nonzero exit/return code at any nesting level
 (`status: done` alone is insufficient, and `After=` alone is satisfied by a failed
-unit; the exact Noble JSON shape is **UNRUN**). Then it checks the staged
-directory with a bounded `find -print0` enumeration (no `ls | grep`; ShellCheck
+unit; the selected disk's JSON shape needs runtime validation). Then it checks
+the staged directory with a bounded `find -print0` enumeration (no `ls | grep`; ShellCheck
 SC2010 is fixed, not suppressed), then checks the staged bytes against `MANIFEST`,
 runs `plan.txt` lines, seals, `sync`s, writes the receipt and calls poweroff, all
 outside `cloud-final`; cloud-init is never cleaned from its own active script.
@@ -139,16 +150,16 @@ offline preparation tests only; it has no build-time deadline guarantee. It
 reserves generated and builtin filenames before copying caller inputs, but is
 not a secure stager: lstat/copy can race, parent directories or the plan can be
 symlinks, and whole-file reads have no size bounds. Use only trusted inputs in a
-disposable offline directory. The execution-grade staging requirements tracked
-in #255 remain unmet. The HCL and guest files are experimental inputs, not an
-approved launch command.
+disposable offline directory. `stage_tools.py` supplies bounded staging for the
+fixed non-VM HCL check; this helper does not enable VM execution. The HCL and guest
+files are experimental inputs, not an approved launch command.
 
 A process session cannot contain a descendant that changes sessions, and a
 PID/session scan followed by signaling has reuse races. Cleanup must not erase
 ownership or remove a workspace while an owned child might remain. An exit code
 or receipt cannot override cancellation, expired budgets or unverified cleanup.
 
-Before re-enabling execution, implement and independently validate a supported
+Before enabling VM execution, implement and independently validate a supported
 Linux containment boundary that includes preparation and all descendants before
 execution begins. Use one absolute admission deadline, covering preparation,
 work and cleanup with no renewal, and reject insufficient remaining work budget
@@ -171,8 +182,10 @@ a hand-written process supervisor is not a substitute for those guarantees.
 
 ## Bounded container probe (`container_runner.py`)
 
-One fixed non-VM `probe` mode; no Packer/QEMU/VM path, no arbitrary command
-option. Docker is reached only through a `Backend`: fixed `/usr/bin/docker`,
+The fixed non-VM `probe` mode exercises containment; `hcl-check` runs only the
+three Packer commands described below. Neither mode launches QEMU or a VM, and
+neither accepts arbitrary commands. Execution requires separate lead scope.
+Docker is reached only through a `Backend`: fixed `/usr/bin/docker`,
 explicit `--host unix://…` and an empty `--config` dir (no caller context or
 credential helpers), minimal environment, and a bounded byte collector (64 KiB
 cap, deadline, process-group kill; overflow or invalid UTF-8 is an error, never
@@ -241,7 +254,7 @@ fake-process tests alone cannot establish containment.
   in the workspace is untrusted and rejects. Exit codes: accepted 0, failed 1,
   usage 2, hold 7.
 
-Pinned-source findings (read 2026-10-25, documented not tested): coreutils
+Pinned-source basis (read 2026-10-25): coreutils
 [`timeout.c` v9.4](https://raw.githubusercontent.com/coreutils/coreutils/v9.4/src/timeout.c)
 (Ubuntu 24.04's series) installs handlers for TERM/INT/QUIT/HUP/ALRM, so PID 1
 can receive them; on the first signal it sends to the child then, unless
@@ -265,6 +278,52 @@ base/module hashes, nonce, acceleration, normal shutdown); input mounts.
 Assess those gates against the current issue evidence; the fixed non-VM probe
 does not enable VM execution or establish another host configuration's support.
 
+### Fixed `hcl-check` task (pre-VM tool/HCL check)
+
+`--mode hcl-check --core-file … --plugin-file … --base-file …` reuses the probe's
+admission, ledger, deadline, cleanup and HOLD logic with different fixed data. It
+is not an arbitrary-command option and starts no VM. Selected in #264 (reviews
+6404228868/6404240697 control). **Live execution needs separate lead scope**; the
+default prints the plan only.
+
+* Budget: 120 s work **including all staging from admission** + 30 s cleanup,
+  immutable. 1 CPU / 1 GiB / 128 PIDs (explicit bounds, not measured needs).
+* Pins (`stage_tools.PINS`, from #262/#263): Packer 1.16.2 archive
+  `abbfe0cf…2414` (34,038,571 B), qemu plugin 1.1.7 archive `2da85692…94f2`
+  (15,249,228 B) and the Noble 20261017 disk `04e8f246…6c94` (621,284,352 B); full
+  values are in code. Member name/mode/size/CRC come from the #262 listing. **Member
+  SHA256 values are not archive-listing pins**: they are computed from the
+  size-bounded, CRC-checked extraction and recorded.
+* Staging (host stdlib, no fetched code runs): whole-archive size and SHA256, exact
+  member set, then only `packer` and the plugin are streamed by actual bytes, with
+  CRC, to fresh 0700 paths (`O_EXCL|O_NOFOLLOW`); `LICENSE.txt` is validated but not
+  extracted. The plugin gets a `_SHA256SUM` sidecar of exactly 64 hex bytes; there is
+  no `packer init`/install. The base image is copied and hashed through one stable
+  descriptor into owned `in/base.img` (0400), then rehashed after the run; no external
+  source pathname is bound. Every source parent is opened without following symlinks,
+  and sources inside the workspace (including aliases) are refused. The repo's
+  `labapp.pkr.hcl`, `host_verify.py` and guest files are copied (never mounted from
+  the tree).
+* Mounts: `/in` (tools, plugins, HCL, verifier, base snapshot and generated
+  `validate.pkrvars.hcl`) and `/out/work/cd` read-only; only fresh `/out` is writable. No
+  network, capabilities, devices, host home, socket or credentials. `inputs` hashes a
+  canonical manifest of staged bytes excluding the var-file; the var-file hash is
+  recorded separately.
+* Steps (fixed script, empty `env -i`, `HOME=/out/home`, `TMPDIR=/out/tmp`,
+  `PACKER_PLUGIN_PATH=/in/plugins`, `ulimit -f` caps each output): `packer version`,
+  `validate -syntax-only`, full `validate -var-file=…`. Full validation executes the
+  plugin's `describe`. Syntax-only does not load plugins; neither proves boot, KVM,
+  QEMU/xorriso presence (checked only at build time) or VLAB.
+* Success needs container exit 0, all three steps 0, `Packer v1.16.2`, all seven
+  status/stdout/stderr files present as bounded regular files (no symlinks; empty
+  stdout/stderr is valid), staged bytes unchanged after the run, no cancellation/expiry
+  and verified cleanup. Any nonzero step is FAILED; an expected negative test is test evidence, never tool success.
+  The probe's 124/137 rule is not reused.
+* Limits: malicious same-user concurrent writers are out of scope (source descriptor
+  identity and copied bytes are checked, not locked); `ulimit -f` bounds file size,
+  not total `/out` bytes. Actual version-output, sidecar and HCL-check results
+  belong in #264; they cannot establish VM readiness.
+
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
 python3 -I /abs/build/packer-qemu/supervise.py --preflight-only
@@ -284,15 +343,16 @@ substitute. A named runner and a supported containment/manager preflight are
 still required before any later execution approval. A passing diagnostic is
 neither build admission nor accelerated nested-VLAB proof.
 
-## Open gates (all UNRUN)
+## VM and platform acceptance gates
 
-`packer validate`; authenticated inputs and licenses; a named KVM runner; that
+Assess current HCL-check results in #264 separately from these VM gates: a named
+KVM runner; verified runtime tools and applicable licenses; that
 `cd_files` globs, `-cpu host`/`-vnc none` overrides and the shell-local/`none` path
 work on the pinned pair; observer and watchdog against a real forced failure
 (crash, hang, bad receipt) leaving no processes or files; unchanged modules twice;
 sealed boot/reboot identity, devices, network; accelerated nested execution; full
 pinned VLAB and course exercises; GCP import route and its resources/IAM (no import
 adapter exists; capture uses `sourceDisk`). Required offline suites are wired into
-CI; shell checks cover `guest/guest-build.sh` only statically. Supported process
-containment and an absolute deadline spanning admission through cleanup remain
-unmet execution gates; passing offline tests cannot authorize a build.
+CI; shell checks cover `guest/guest-build.sh` only statically. VM execution requires
+its own supported containment and absolute admission-through-cleanup deadline
+proof; fixed non-VM tasks and passing offline tests cannot authorize a build.

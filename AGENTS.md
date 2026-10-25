@@ -40,7 +40,9 @@ Codex does not document an import mechanism, so this file uses plain links;
 - `cloud-config.yaml`, `gcp_vm_launch_command.txt`: base system setup and historical VM launch recipes
 - `build/gcp/`: access bootstrap, fixed lifecycle runner and offline collector ([README](build/gcp/README.md))
 - `build/provision/`: Packer-ready modules and tests ([README](build/provision/README.md))
-- `build/packer-qemu/`: offline-prepared, unexecuted stock Packer/QEMU portability experiment ([README](build/packer-qemu/README.md))
+- `build/packer-qemu/`: stock Packer/QEMU VM experiment with VM execution disabled;
+  fixed non-VM Docker `probe` and `hcl-check` tasks require separately scoped lead
+  execution ([README](build/packer-qemu/README.md)). Results and remaining gates live in GitHub.
 - `docs/runbooks/`: manual image build and troubleshooting
 - `docs/`: other docs ([index](docs/README.md)); `STUDENT_QUICK_START.md`: student guide
 - `_archive/`, `archive2/`: archived, not part of the current project
