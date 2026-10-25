@@ -148,6 +148,108 @@ canonical symlink refusal and old/new inventory compatibility. These tests
 cannot prove actual image configuration, boot behavior or helper equivalence
 outside the exact recipe match.
 
+### Opt-in fixed host baseline
+
+`inspection/host_baseline.py` is a separate `host-baseline-v1` profile; the
+original collector, candidate and startup schemas stay unchanged. The inspector
+uses Linux/Python stdlib only. Its fixed selection is:
+
+- SHA256/length only for `/usr/local/bin/{hhfab,k3d,kubectl,helm}` (384MiB each).
+- Private UTF-8 text from `/home/ubuntu/hhfab/fab.yaml`,
+  `/home/ubuntu/hhfab/vlab/config.yaml`, `/etc/sysctl.d/99-vlab-bridge.conf`,
+  `/etc/modules-load.d/br_netfilter.conf`, `/etc/sysctl.conf`, `/etc/modules`.
+- Direct, case-sensitive `.yaml` children of `/home/ubuntu/hhfab/include`,
+  including dot-prefixed names. No recursion or symlink following. Enumeration
+  stops at129 entries; over128 entries or32 selected names makes the entire
+  selection incomplete without reading a truncated sample.
+- Hash/length only for `/home/ubuntu/{.profile,.bashrc,.bash_aliases}` and
+  `/etc/{profile,bash.bashrc,motd}` (256KiB each). Unknown shell hashes and
+  bodies never enter the derived candidate; the initial shell recipe catalog
+  is empty.
+
+All text is limited to256KiB/file and1MiB aggregate. All binary/shell reads
+share512MiB. Failed reads spend their bytes; a timed-out reader spends its
+maximum possible remaining allowance. Files are hashed in64KiB blocks with
+pinned-FD size/device/inode/mtime/ctime checks and an independent no-follow
+reopen check. Inspector operators still supply an immutable, read-only source.
+The total source-operation deadline is120s, per binary60s, other inputs and
+enumeration10s. Linux fork-owned children cover root/component opens, reads,
+enumeration and the output-containment check. On timeout/cancellation the parent
+kills only its owned child and allows at most1s to reap it. Failed reaping is a
+cleanup blocker. Deadline expiry produces explicit gaps; it never extends the
+VM lease. These bounds do not promise real-time host scheduling.
+
+The private report has an exact separate discriminator, all16 fixed IDs in
+manifest order, one include summary, at most32 private child records, and a
+collection-complete flag. All summary/success/gap records count toward the
+existing256-record/8MiB ceilings. It retains the exclusive0600 file in an
+owned0700 directory outside the guest. Names/text remain private. Errors and
+stdout summaries contain only fixed diagnostics/counts/digests.
+
+After separate mount/lifecycle authorization, add exactly
+`--profile host-baseline-v1` to the fixed mounted-wrapper command below. The
+default remains the old collector; no arbitrary profile/path manifest is read.
+For synthetic trusted trees only, the same collector can also run directly:
+
+```bash
+python3 -m build.gcp.inspection.host_baseline \
+  --root /mnt/guest --private-output /private/inspection/host-report.json
+# Trusted LEAD host only, with distribution python3-yaml already installed:
+python3 -m build.gcp.inspection.host_derive \
+  --private-report /private/inspection/host-report.json \
+  --private-output /private/inspection/host-candidate.json
+python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
+```
+
+`host_derive.py` validates every nested record, status/reason, byte count/hash,
+selection count/completeness and aggregate budget before projection. Trusted
+PyYAML is an explicit CI dependency, never installed on the inspector by this
+code. YAML event preflight rejects tags, anchors/aliases, nonstring/duplicate/
+merge keys, ambiguous scalar forms, unsupported scalar types and resource
+excesses; only SafeLoader nodes are composed, without object constructors.
+CRLF is normalized for parsing; lone CR/control characters refuse. Limits are
+depth32, scalar4096UTF-8 bytes,64documents/file,256documents and100,000events
+aggregate. Integer/bool/string/null types remain distinct; quoted values never
+satisfy integer/boolean fields. Malformed YAML becomes a fixed projection gap.
+
+The narrow candidate includes only:
+
+- Four binary identities (unknown SHA/length stays private pending exact-hash
+  review); known hhfab release-member comparisons for0.43.1/0.47.4. Provenance
+  is the [public bounded archive-member receipt](https://github.com/afewell-hh/labapp/issues/203#issuecomment-6391084882).
+  Archive SHA is not binary SHA. These versions are comparisons, not target pins.
+- Selected Fabricatorv1beta1 network/ASN/mode fields and ControlNode/FabNode
+  counts; credentials, users, overrides and status stay withheld. Canonical
+  IPv4 types, ranges and DNS/VIP/DHCP membership are checked when their
+  corresponding persisted subnets exist. Missing values remain unknown.
+- Wiring GVK/role counts and narrow VLAN/IPv4 namespace ranges for Fabric
+  APIv0.96.2. Full parsed-object equality uses the unchanged repository
+  `wiringd.yaml`, pinned SHA256
+  `c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a`.
+  Mapping/document order is ignored, sequence order/scalar types/absent values
+  are retained. Catalog equality requires complete selected input; seven
+  switches in that public fixture are comparison data, not observed facts.
+- VLAB type counts and integer cpu/ram/disk sizes, selected per-file sysctl/
+  module booleans, and six shell catalog statuses. Duplicate/malformed/reset/
+  glob/slash selected network assignments withhold affected keys. Other active
+  content yields an incomplete gap; no effective sysctl precedence is inferred.
+
+Candidate lists are sorted and contain no source basenames, arbitrary names,
+NIC/endpoint graph, secret-adjacent strings or unknown shell hashes. All derived
+results retain `effective:false`, `runtime:"unknown"`, separate collection and
+projection coverage, and fixed gaps. Runtime Helm/Argo/Gitea/Grafana state,
+actual traffic/telemetry, source existence/version and image integration remain
+unproved. Neither successful parsing nor exact public matching is privacy
+approval: provenance and independent exact-hash candidate review remain required
+before publication/general use. No workflow launches a capture with this code.
+
+Primary version-scoped references: [Fabricator fields0.43.1](https://github.com/githedgehog/fabricator/blob/v0.43.1/api/fabricator/v1beta1/fabricator_types.go),
+[VLAB fields0.43.1](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabconfig.go),
+[include loader0.43.1](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/hydrate.go),
+[Fabric API0.96.2](https://github.com/githedgehog/fabric/tree/v0.96.2/api).
+The typed profile does not claim the newer Fabric0.120.3 API. Public sources
+were read2026-10-24/25; offline tests use only public/synthetic fixtures.
+
 ### Fixed mount wrapper
 
 `inspection/mounted_collect.py` adds local ext4 mount/collect/unmount only.
@@ -248,13 +350,19 @@ scope and cannot guarantee compatibility with every Ubuntu revision.
 
 ### Synthetic inspector kernel proof
 
-Before source-copy mounting, the lead can run the fixed no-input
+Before source-copy mounting, the lead can run the fixed-profile
 `inspection/synthetic_ext4.py` on the separately authorized clean inspector:
 
 ```bash
 sudo unshare --mount --propagation private -- \
   /usr/bin/python3 -E -s -m build.gcp.inspection.synthetic_ext4
 ```
+
+Add `--profile host-baseline-v1` to exercise the same host collector with
+its fixed harmless fixture; omitting it preserves the original fixture/proof.
+The offline suite tests selection/fixture/cleanup behavior with fake mounts;
+new host-profile kernel execution requires separate lead authorization and is
+not established by those tests.
 
 Use Python3.12+ and already-present trusted `mkfs.ext4`, `losetup`, `blockdev`,
 `udevadm` plus the wrapper tools above, from the exact reviewed code SHA. No

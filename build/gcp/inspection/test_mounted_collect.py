@@ -61,6 +61,36 @@ class MountWrapperTests(unittest.TestCase):
         return wrapper.collect_mounted("/dev/sdb", "/dev/sdb1", "8:16", "8:17",
             self.private, run=run or self.fake_run, collector=collector or self.fake_collect)
 
+    def test_host_profile_fixed_selection_and_cleanup(self):
+        from inspection import host_baseline
+        with patch.object(host_baseline, 'write_private', side_effect=self.fake_collect):
+            result = wrapper.collect_mounted('/dev/sdb', '/dev/sdb1', '8:16', '8:17',
+                self.private, run=self.fake_run, profile='host-baseline-v1')
+        self.assertEqual(result, {'records': 1})
+        self.assertFalse(self.mountpoint.exists())
+        self.assertEqual(Path(self.calls[-1][0]).name, 'umount')
+
+    def test_host_profile_failure_unmounts_and_removes_partial(self):
+        from inspection import host_baseline
+        def fail(root, output):
+            self.fake_collect(root, output)
+            raise host_baseline.Gap('reader_cleanup_required')
+        with patch.object(host_baseline, 'write_private', side_effect=fail):
+            with self.assertRaises(host_baseline.Gap):
+                wrapper.collect_mounted('/dev/sdb', '/dev/sdb1', '8:16', '8:17',
+                    self.private, run=self.fake_run, profile='host-baseline-v1')
+        self.assertEqual(Path(self.calls[-1][0]).name, 'umount')
+        self.assertFalse(self.mountpoint.exists())
+        self.assertFalse((self.private / 'inventory.json').exists())
+
+    def test_profile_unknown_or_collector_conflict_before_commands(self):
+        for profile, collector in [('unreviewed', wrapper.write_private),
+                                   ('host-baseline-v1', self.fake_collect)]:
+            with self.assertRaises(wrapper.Refused):
+                wrapper.collect_mounted('/dev/sdb', '/dev/sdb1', '8:16', '8:17',
+                    self.private, run=self.fake_run, collector=collector, profile=profile)
+        self.assertEqual(self.calls, [])
+
     def test_success_exact_commands_and_private_result(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
