@@ -172,36 +172,61 @@ a hand-written process supervisor is not a substitute for those guarantees.
 ## Bounded container probe (`container_runner.py`, #255 initial stage, UNRUN)
 
 One fixed non-VM `probe` mode; no Packer/QEMU/VM path, no arbitrary command
-option. Docker is reached only through a `Backend` (absolute `/usr/bin/docker`,
-minimal environment, per-call bound). The CLI prints its validated plan unless
-`--execute` is given; nothing here has been run against a real Docker daemon.
+option. Docker is reached only through a `Backend`: absolute `/usr/bin/docker`,
+explicit `--host unix://…` and an empty `--config` dir (no caller context or
+credential helpers), minimal environment, and a bounded byte collector (64 KiB
+cap, deadline, process-group kill; overflow or invalid UTF-8 is an error, never
+truncated). The CLI prints its plan unless `--execute` is given; nothing here has
+been run against a real Docker daemon (revision 1 is source + fake tests only).
 
-* Inputs: a pre-acquired `name@sha256:<digest>` image (`--pull=never`; the image
-  ID from `image inspect` is what gets created), an owned, symlink-free,
-  non-shared workspace root, non-root caller. Root and tag-only images are refused.
-* Create argv (fixed): `/usr/bin/timeout` as entrypoint (exec form, so PID 1; no
-  shell, no `--init`), `--restart=no`, `--network=none`, `--cap-drop=ALL`,
-  `no-new-privileges`, `--read-only`, caller UID:GID, 256m/1 CPU/64 PIDs,
-  `--log-driver=none`, one bind of the fresh output workspace. No device, socket,
-  home, credentials, privileged or host namespaces.
-* Budget: one admission time; `probe` is 30 s work + 20 s cleanup (sentinel and
-  fixture allocations belong to VM mode, not accepted here). Workspace creation,
-  version/image checks, create, start and polling spend the work window; every
-  Docker call is capped by remaining budget (no call after expiry). The internal
-  timer is `remaining - 10 s (start) - 5 s (kill-after)`, never a full allocation;
-  under 5 s is rejected before create. The host also gives up at the work
-  deadline, but that is a failure, never acceptance.
-* Ownership: fresh UUID name + label reserved in memory before create. Create
-  or start responses that are lost, unparseable or interrupted leave the result
-  `hold` even if cleanup then proves absence. Cleanup queries exact name+label,
-  rejects any extra ID, stops/removes by full ID, then requires successful empty
-  name+label and full-ID queries. A failed query is not absence. `hold` keeps the
-  workspace and means no slot reuse.
-* Acceptance (probe only): container exited with 124 or 137 (internal timer
-  fired; the probe ignores TERM and starts a `setsid` child so escalation and
-  PID 1 exit are exercised), not OOM-killed, cleanup verified, and an empty
-  output workspace (any entry is untrusted output and rejects). Exit codes:
-  accepted 0, failed 1, usage 2, hold 7.
+* Inputs: only the Ubuntu digest already pinned in `build/provision`
+  (`PINNED_IMAGE`; there is no image option), never pulled and never deleted
+  (`--pull=never`; only the probe container is removed). `image inspect` must
+  show that digest in `RepoDigests` and no `Config.Volumes` or `ONBUILD`; the
+  image ID is what gets created, with `--no-healthcheck`. Workspace root and a
+  separate host-only ledger dir must be owned, symlink-free and not
+  group/other-writable; root callers are refused.
+* Create argv (fixed): `/bin/sh` entrypoint running the entry script, then
+  `exec timeout` (same PID 1, no `--init`), `--restart=no`, `--network=none`,
+  `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, caller UID:GID,
+  256m/1 CPU/64 PIDs, `--log-driver=none`, one bind of the fresh output workspace.
+  No device, socket, home, credentials, privileged or host namespaces.
+* Clock and deadline: one wall-clock epoch (host `time.time`, container
+  `date +%s`; the container shares the host clock; a clock step breaks the
+  bound and is not detectable here). The host passes the admission work deadline
+  floored to whole seconds. At ACTUAL container start the entry script computes
+  `timer = deadline - now - 1 (rounding) - 5 (kill-after)`; under 5 s it exits
+  125 without running the probe, so a late daemon start cannot extend the work
+  window. Budget: `probe` is 30 s work + 20 s cleanup (sentinel/fixture
+  allocations are VM mode, not accepted); every Docker call is capped by
+  remaining budget; deadline and cancellation are re-checked after slow calls and
+  before acceptance. The host gives up at the work deadline (one final look
+  first), which is a failure, never acceptance.
+* Ledger (host-only, outside the container-writable workspace): one fsynced,
+  atomically renamed JSON record per request (name, label, image, full ID,
+  workspace, deadlines, state) written BEFORE each mutation (`reserved`,
+  `create_intent`, `start_intent`, `stop_rm_intent`). Any record not `released`
+  (including corrupt ones) blocks a new request with `hold`/exit 7 and no Docker
+  call: unresolved requests are never retried as fresh work. A ledger write
+  failure before create prevents the mutation; after it, the result is `hold`.
+  Host death leaves the record plus the container's own timer.
+* Cleanup: queries exact name+label (rejects any extra ID or an unexplained
+  vanished container), inspects the full ID and requires the exact name and
+  label before `stop`/`rm`, then requires successful empty name+label and
+  full-ID queries. A lost/failed stop or rm response is uncertain and stays
+  `hold` even if later queries find nothing; a failed query is not absence.
+  Lost create/start responses also stay `hold`. `released` is written only for
+  verified removal; `hold` keeps ledger record and workspace.
+* Signals: SIGTERM/SIGINT mark cancellation and unwind to cleanup (a signal
+  during cleanup only sets the flag); a cancelled run is never accepted.
+  Finalization exceptions become `hold`, never a crash or acceptance.
+* Acceptance (probe only): exit 124/137, not OOM-killed, cleanup verified, and
+  startup evidence: `/out/witness` is exactly one small regular file written by the
+  fixed probe (`start <epoch> <timer>`, `probe <setsid child pid>`,
+  `term_ignored`) with a timer consistent with the deadline, and the container
+  ran about as long as that timer (an immediate 137 is rejected). Anything else
+  in the workspace is untrusted and rejects. Exit codes: accepted 0, failed 1,
+  usage 2, hold 7.
 
 Pinned-source findings (read 2026-10-25, documented not tested): coreutils
 [`timeout.c` v9.4](https://raw.githubusercontent.com/coreutils/coreutils/v9.4/src/timeout.c)
@@ -218,8 +243,10 @@ TERM, then KILL after the grace period. [Live restore](https://docs.docker.com/e
 containers keep running without the daemon, so the internal timer must stand alone.
 
 Unmet before any VM mode: the real-Docker proof that descendants (including the
-`setsid` child) die with PID 1 and that the exit codes above hold; Ubuntu image
-pin and `timeout`/`setsid` presence; UID mapping of the bind (rootless/userns);
+`setsid` child) die with PID 1 and that the exit codes above hold, observing
+child existence and namespace cleanup directly (the witness records a pid; it
+does not prove cleanup); `date`/`timeout`/`setsid` presence in the pinned image;
+exact 124-vs-137 behavior with a TERM-ignoring probe; UID mapping of the bind (rootless/userns);
 `/dev/kvm` passthrough; input verification and evidence binding (core/plugin/
 base/module hashes, nonce, acceleration, normal shutdown); input mounts.
 

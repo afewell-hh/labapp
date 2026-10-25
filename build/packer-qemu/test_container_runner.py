@@ -1,17 +1,25 @@
-"""Offline tests with a synthetic Docker daemon and a fake docker executable.
+"""Offline tests with a synthetic Docker daemon and fake docker executables.
 
-No Docker, container, systemd or VM is used. They prove the supervisor's call
-sequence, bounds and fail-closed decisions, not Docker or kernel behavior.
+No Docker, container, systemd or VM is used (the entry script is run only under the
+local /bin/sh with stand-in paths). They prove the supervisor's call sequence,
+bounds, ledger ordering and fail-closed decisions, not Docker or kernel behavior.
 """
+import contextlib
 import hashlib
+import io
+import json
 import os
+import signal
 import stat
+import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import container_runner as cr
 
-IMAGE = "ubuntu@sha256:" + "a" * 64
+IMAGE = cr.PINNED_IMAGE
 IMAGE_ID = "sha256:" + "b" * 64
 
 
@@ -27,11 +35,13 @@ class Clock:
 
 
 class FakeDaemon:
-    """Argv-level fake. `mode` injects faults; every call advances the clock."""
+    """Argv-level fake. `mode` injects faults; every call advances the clock.
+    It models the entry script's arithmetic: timer recomputed at actual start."""
 
-    def __init__(self, clock, mode="ok", exit_code=137, call_cost=0.1):
+    def __init__(self, clock, mode="ok", exit_code=137, call_cost=0.1, start_delay=0.0, on_call=None):
         self.clock, self.mode, self.exit_code, self.cost = clock, mode, exit_code, call_cost
-        self.containers, self.calls, self.polls = {}, [], 0
+        self.start_delay, self.on_call = start_delay, on_call
+        self.containers, self.calls = {}, []
 
     def option(self, args, prefix):
         return next(a[len(prefix):] for a in args if a.startswith(prefix))
@@ -49,17 +59,54 @@ class FakeDaemon:
                 out.append(c["id"])
         return "\n".join(out)
 
+    def image_info(self):
+        info = {"id": IMAGE_ID, "repo": [IMAGE], "vol": None, "onbuild": None}
+        if self.mode == "image_volume":
+            info["vol"] = {"/data": {}}
+        if self.mode == "image_onbuild":
+            info["onbuild"] = ["RUN x"]
+        if self.mode == "image_other_digest":
+            info["repo"] = ["ubuntu@sha256:" + "c" * 64]
+        return json.dumps(info)
+
+    def start(self, c):
+        self.clock.now += self.start_delay
+        args = c["args"]
+        deadline = int(args[args.index("sh") + 1])
+        n = int(self.clock.now)
+        timer = deadline - n - 1 - cr.KILL_AFTER
+        ws = self.option(args, "--mount=").split("src=")[1].split(",")[0]
+        c["state"] = "running"
+        if self.mode == "no_witness":                 # immediate 137, no probe/timer witness
+            c["exit_at"] = self.clock.now + 0.9
+        elif timer < cr.MIN_TIMER:                     # late actual start: probe never runs
+            c["exit_at"], c["code"] = self.clock.now, 125
+        else:
+            text = f"start {n} {timer}\nprobe 77\nterm_ignored\n"
+            if self.mode == "bad_witness":
+                text = f"start {n} {timer + 9}\nprobe 77\nterm_ignored\n"
+            with open(os.path.join(ws, "witness"), "w") as handle:
+                handle.write(text)
+            c["exit_at"] = n + timer + cr.KILL_AFTER
+            if self.mode == "early_exit":
+                c["exit_at"] = self.clock.now + 1.0
+        if self.mode == "never_exits":
+            c["exit_at"] = float("inf")
+        c.setdefault("code", self.exit_code)
+
     def call(self, args, seconds):
         self.calls.append((list(args), seconds))
         self.clock.now += self.cost
         assert seconds > 0
+        if self.on_call:
+            self.on_call(args)
         verb = args[0]
         if self.mode == "down" and verb in ("container", "inspect", "stop", "rm"):
             raise cr.DockerError()
         if verb == "version":
             return "29.6.1"
         if verb == "image":
-            return IMAGE_ID
+            return self.image_info()
         if verb == "create":
             name, label = self.option(args, "--name="), self.option(args, "--label=")
             ident = hashlib.sha256(name.encode()).hexdigest()
@@ -71,22 +118,23 @@ class FakeDaemon:
                 return "not-an-id"
             return ident
         if verb == "start":
-            self.containers[args[-1]]["state"] = "running"
+            self.start(self.containers[args[-1]])
             if self.mode == "start_lost":
                 raise cr.DockerTimeout()
             if self.mode == "start_interrupt":
                 raise KeyboardInterrupt()
             return ""
         if verb == "inspect":
-            self.polls += 1
-            if self.mode == "never_exits":
-                return "running 0 false"
+            c = self.containers[args[-1]]
+            if "{{.Name}}" in args[3]:
+                label = c["label"].split("=", 1)[1]
+                return f"{c['id']} /{c['name']}{'x' if self.mode == 'name_mismatch' else ''} {label}"
             if self.mode == "poll_down":
                 raise cr.DockerError()
-            if self.polls < 3:
+            if self.clock.now < c["exit_at"]:
                 return "running 0 false"
-            self.containers[args[-1]]["state"] = "exited"
-            return f"exited {self.exit_code} {'true' if self.mode == 'oom' else 'false'}"
+            c["state"] = "exited"
+            return f"exited {c['code']} {'true' if self.mode == 'oom' else 'false'}"
         if verb == "container":
             if self.mode == "query_down":
                 raise cr.DockerError()
@@ -94,34 +142,53 @@ class FakeDaemon:
                 return self.matches(args) + "\n" + "c" * 64
             if self.mode == "rm_ignored" and self.containers and "id=" in " ".join(args):
                 return next(iter(self.containers))
+            if self.mode == "vanished" and not self.containers_removed_by_us():
+                return ""
             return self.matches(args)
         if verb == "stop":
+            if self.mode == "stop_fail":
+                raise cr.DockerError()
             return ""
         if verb == "rm":
             if self.mode != "rm_ignored":
                 self.containers.pop(args[-1], None)
             if self.mode == "rm_lost":
                 raise cr.DockerTimeout()
-            return ""
+            return args[-1]
         raise AssertionError(args)
+
+    def containers_removed_by_us(self):
+        return any(c[0][0] == "rm" for c in self.calls)
 
 
 class RunnerCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = os.path.realpath(self.tmp.name)
-        os.chmod(self.root, 0o700)
+        base = os.path.realpath(self.tmp.name)
+        self.root, self.ledger = os.path.join(base, "ws"), os.path.join(base, "ledger")
+        for d in (self.root, self.ledger):
+            os.mkdir(d, 0o700)
         self.clock = Clock()
 
     def run_probe(self, mode="ok", delay=0.0, **kw):
         daemon = FakeDaemon(self.clock, mode, **kw.pop("daemon", {}))
-        result = cr.run_probe(IMAGE, self.root, daemon, clock=self.clock, sleep=self.clock.sleep,
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
                               admitted_at=self.clock() - delay, uid=os.getuid() or 1000, **kw)
         return result, daemon
 
     def mutations(self, daemon):
         return [c[0][0] for c in daemon.calls if c[0][0] in ("create", "start", "rm", "stop")]
+
+    def record(self):
+        names = [n for n in os.listdir(self.ledger) if n.endswith(".json")]
+        self.assertEqual(len(names), 1)
+        with open(os.path.join(self.ledger, names[0])) as handle:
+            return json.load(handle)
+
+
+def workspace_of(args):
+    return next(a for a in args if a.startswith("--mount")).split("src=")[1].split(",")[0]
 
 
 class CreateArgumentTests(RunnerCase):
@@ -129,40 +196,51 @@ class CreateArgumentTests(RunnerCase):
         result, daemon = self.run_probe()
         self.assertEqual(result["outcome"], "accepted", result)
         args = next(c[0] for c in daemon.calls if c[0][0] == "create")
-        for required in ("--pull=never", "--restart=no", "--network=none", "--cap-drop=ALL",
+        for required in ("--pull=never", "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
                          "--security-opt=no-new-privileges", "--read-only", "--pids-limit=64",
-                         "--memory=256m", "--cpus=1", "--entrypoint=/usr/bin/timeout"):
+                         "--memory=256m", "--cpus=1", "--entrypoint=/bin/sh"):
             self.assertIn(required, args)
         for forbidden in ("--privileged", "--init", "--pid", "--ipc", "--uts", "--userns",
                           "--device", "--volume", "-v", "--env", "-e", "--cap-add", "--group-add"):
             self.assertFalse(any(a == forbidden or a.startswith(forbidden + "=") for a in args), forbidden)
         self.assertNotIn("docker.sock", " ".join(args))
-        self.assertNotIn("--network=host", args)
         self.assertEqual([a for a in args if a.startswith("--mount")],
-                         [f"--mount=type=bind,src={result_workspace(args)},dst=/out"])
-        self.assertNotIn("rw", args)
-        self.assertEqual(args[args.index(IMAGE_ID) + 1], "--kill-after=5s")   # timeout is PID 1, exec form
-        self.assertTrue(args[args.index(IMAGE_ID) + 2].endswith("s"))
+                         [f"--mount=type=bind,src={workspace_of(args)},dst=/out"])
+        tail = args[args.index(IMAGE_ID) + 1:]
+        self.assertEqual(tail, ["-c", cr.ENTRY, "sh", "1030", cr.PROBE_SCRIPT])   # fixed; deadline = admission + 30
         self.assertTrue(any(a.startswith("--user=") and not a.startswith("--user=0") for a in args))
 
-    def test_timer_is_remaining_allowance_not_full_allocation(self):
-        _, fresh = self.run_probe()
-        _, late = self.run_probe(delay=5.0)
-        timer = lambda d: int(next(c[0] for c in d.calls if c[0][0] == "create")[-4][:-1])
-        self.assertLess(timer(late), timer(fresh))
-        self.assertLessEqual(timer(fresh) + cr.KILL_AFTER + cr.START_RESERVE, 30)
-        self.assertLessEqual(timer(late) + cr.KILL_AFTER + cr.START_RESERVE, 30 - 5)
-
-    def test_image_must_be_pinned_and_root_refused(self):
-        for bad in ("ubuntu:24.04", "ubuntu@sha256:abc", "UBUNTU@sha256:" + "a" * 64):
+    def test_only_the_pinned_digest_and_non_root_are_accepted(self):
+        for bad in ("ubuntu:24.04", "ubuntu@sha256:abc", "ubuntu@sha256:" + "a" * 64, "debian@sha256:" + "a" * 64):
             with self.assertRaises(ValueError):
-                cr.run_probe(bad, self.root, FakeDaemon(self.clock))
+                cr.run_probe(bad, self.root, self.ledger, FakeDaemon(self.clock))
         with self.assertRaises(ValueError):
-            cr.run_probe(IMAGE, self.root, FakeDaemon(self.clock), uid=0)
+            cr.run_probe(IMAGE, self.root, self.ledger, FakeDaemon(self.clock), uid=0)
 
+    def test_image_config_is_inspected_and_unsupported_images_rejected_before_create(self):
+        for mode in ("image_volume", "image_onbuild", "image_other_digest"):
+            self.setUp()
+            result, daemon = self.run_probe(mode)
+            self.assertEqual(result["outcome"], "failed", mode)
+            self.assertEqual(self.mutations(daemon), [], mode)
+            self.assertNotIn("pull", [c[0][0] for c in daemon.calls])
 
-def result_workspace(args):
-    return next(a for a in args if a.startswith("--mount")).split("src=")[1].split(",")[0]
+    def test_entry_script_recomputes_timer_and_execs_same_pid1(self):
+        """Run ENTRY under local sh with stand-in paths: no container involved."""
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in (("date", "echo 1000"), ("timeout", 'echo "$@" > OUT/argv; echo pid=$$ >> OUT/argv')):
+                with open(os.path.join(d, name), "w") as handle:
+                    handle.write("#!/bin/sh\n" + body.replace("OUT", d) + "\n")
+                os.chmod(os.path.join(d, name), 0o755)
+            script = cr.ENTRY.replace("/bin/date", d + "/date").replace("/usr/bin/timeout", d + "/timeout") \
+                .replace("/out/", d + "/")
+            done = subprocess.run(["/bin/sh", "-c", script, "sh", "1030", "PROBE"], capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            with open(os.path.join(d, "argv")) as handle:
+                argv = handle.read().split("\n")[0]
+            self.assertEqual(argv, "--kill-after=5s 24s /bin/sh -c PROBE")        # 1030-1000-1-5
+            late = subprocess.run(["/bin/sh", "-c", script, "sh", "1010", "PROBE"], capture_output=True)
+            self.assertEqual(late.returncode, 125)                                  # under MIN_TIMER: no probe
 
 
 class BudgetTests(RunnerCase):
@@ -177,13 +255,35 @@ class BudgetTests(RunnerCase):
         self.assertEqual(daemon.calls, [])
         self.assertEqual(result["outcome"], "failed")
 
+    def test_late_actual_start_runs_no_probe_and_is_not_accepted(self):
+        result, daemon = self.run_probe(daemon={"start_delay": 20.0})
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["reason"], "unexpected_exit")       # exit 125, no witness
+        self.assertEqual(daemon.containers, {})
+
+    def test_timer_shrinks_with_actual_start_and_ends_inside_the_deadline(self):
+        seen = []
+
+        def grab(args):
+            if args[0] == "inspect" and "{{.State.Status}}" in args[3]:
+                ws = [os.path.join(self.root, n) for n in os.listdir(self.root)][0]
+                with open(os.path.join(ws, "witness")) as handle:
+                    seen.append(handle.readline().split())
+        self.run_probe(daemon={"on_call": grab})
+        self.setUp()
+        self.run_probe(daemon={"on_call": grab, "start_delay": 8.0})
+        first, second = seen[0], seen[-1]
+        self.assertEqual((first[0], int(first[2])), ("start", 24))      # 1030 - 1000 - 1 - 5
+        self.assertEqual((second[0], int(second[2])), ("start", 16))    # started 8 s later: 1030 - 1008 - 6
+        self.assertLessEqual(int(second[1]) + int(second[2]) + cr.KILL_AFTER, 1030 - 1)
+
     def test_every_call_is_bounded_by_remaining_budget(self):
         _, daemon = self.run_probe(daemon={"call_cost": 4.0})
         for args, seconds in daemon.calls:
             self.assertLessEqual(seconds, cr.CALL_CAP)
 
     def test_slow_daemon_cannot_extend_beyond_total_deadline(self):
-        result, daemon = self.run_probe("never_exits", daemon={"call_cost": 3.0})
+        result, _ = self.run_probe("never_exits", daemon={"call_cost": 3.0})
         self.assertLess(self.clock() - 1000.0, 50.0 + 3.0 + cr.CALL_CAP)
         self.assertNotEqual(result["outcome"], "accepted")
 
@@ -192,6 +292,126 @@ class BudgetTests(RunnerCase):
         self.assertEqual((result["outcome"], result["reason"]), ("failed", "host_expiry"))
         self.assertEqual(daemon.containers, {})
         self.assertEqual(result["cleanup"], "verified")
+
+
+class EvidenceTests(RunnerCase):
+    def test_immediate_137_without_witness_is_not_accepted(self):
+        result, _ = self.run_probe("no_witness")
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "no_probe_witness"))
+
+    def test_inconsistent_witness_is_rejected(self):
+        result, _ = self.run_probe("bad_witness")
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "no_probe_witness"))
+
+    def test_exit_long_before_timer_is_rejected(self):
+        result, _ = self.run_probe("early_exit")
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "exited_before_timer"))
+
+    def test_any_extra_output_is_rejected_as_untrusted(self):
+        def plant(args):
+            if args[0] == "start":
+                os.symlink("/etc/passwd", os.path.join(workspace_of(self.created(daemon)), "evil"))
+        daemon = FakeDaemon(self.clock, on_call=plant)
+        daemon.calls = []
+        self.created = lambda d: next(c[0] for c in d.calls if c[0][0] == "create")
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              uid=os.getuid() or 1000)
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "no_probe_witness"))
+        self.assertEqual(result["workspace"], "removed")
+        self.assertTrue(os.path.exists("/etc/passwd"))
+
+    def test_symlinked_witness_is_rejected(self):
+        def swap(args):
+            if args[0] == "inspect" and "{{.State.Status}}" in args[3]:
+                ws = workspace_of(next(c[0] for c in daemon.calls if c[0][0] == "create"))
+                path = os.path.join(ws, "witness")
+                if os.path.isfile(path) and not os.path.islink(path):
+                    os.unlink(path)
+                    os.symlink("/etc/hostname", path)
+        daemon = FakeDaemon(self.clock, on_call=swap)
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              uid=os.getuid() or 1000)
+        self.assertNotEqual(result["outcome"], "accepted")
+
+    def test_accepted_run_removes_workspace_and_releases_ledger(self):
+        result, _ = self.run_probe()
+        self.assertEqual((result["outcome"], result["workspace"], result["exit_code"]), ("accepted", "removed", 137))
+        self.assertEqual(os.listdir(self.root), [])
+        self.assertEqual(self.record()["state"], "released")
+
+    def test_unexpected_exit_code_and_oom_not_accepted(self):
+        self.assertEqual(self.run_probe(daemon={"exit_code": 0})[0]["reason"], "unexpected_exit")
+        self.setUp()
+        self.assertEqual(self.run_probe("oom")[0]["outcome"], "failed")
+
+    def test_workspace_root_must_be_private_and_symlink_free(self):
+        os.chmod(self.root, 0o777)
+        with self.assertRaises(ValueError):
+            cr.make_workspace(self.root, "x", os.getuid())
+        os.chmod(self.root, 0o700)
+        link = self.root + "-link"
+        os.symlink(self.root, link)
+        self.addCleanup(os.unlink, link)
+        with self.assertRaises(ValueError):
+            cr.make_workspace(link, "x", os.getuid())
+
+
+class LedgerTests(RunnerCase):
+    def test_intent_is_durable_before_each_daemon_mutation(self):
+        seen = []
+
+        def spy(args):
+            if args[0] in ("create", "start", "stop", "rm"):
+                seen.append((args[0], self.record()["state"]))
+        self.run_probe(daemon={"on_call": spy})
+        self.assertEqual(seen, [("create", "create_intent"), ("start", "start_intent"),
+                                ("stop", "stop_rm_intent"), ("rm", "stop_rm_intent")])
+
+    def test_ledger_is_outside_workspace_and_records_recovery_information(self):
+        result, _ = self.run_probe("start_lost")
+        record = self.record()
+        self.assertFalse(result["ledger"].startswith(self.root))
+        for key in ("name", "label", "id", "workspace", "image", "deadline", "state", "outcome"):
+            self.assertIn(key, record)
+        self.assertEqual((record["state"], record["id"]), ("hold", result["container_id"]))
+        self.assertRegex(record["id"], r"^[0-9a-f]{64}$")
+
+    def test_ledger_dir_must_be_separate_from_workspace_root(self):
+        with self.assertRaises(ValueError):
+            cr.run_probe(IMAGE, self.root, self.root, FakeDaemon(self.clock), uid=os.getuid() or 1000)
+        os.mkdir(os.path.join(self.root, "inner"), 0o700)
+        with self.assertRaises(ValueError):
+            cr.run_probe(IMAGE, self.root, os.path.join(self.root, "inner"), FakeDaemon(self.clock),
+                         uid=os.getuid() or 1000)
+
+    def test_unresolved_prior_record_blocks_new_work_without_any_call(self):
+        first, _ = self.run_probe("start_lost")
+        self.assertEqual(first["outcome"], "hold")
+        second, daemon = self.run_probe()
+        self.assertEqual((second["outcome"], second["reason"]), ("hold", "unresolved_prior_request"))
+        self.assertEqual(daemon.calls, [])
+        with open(os.path.join(self.ledger, "labapp-probe-corrupt.json"), "w") as handle:
+            handle.write("{")
+        self.assertEqual(len(cr.unresolved_records(self.ledger)), 2)
+
+    def test_ledger_write_failure_before_create_prevents_mutation(self):
+        with mock.patch.object(cr.Ledger, "write", side_effect=OSError()):
+            result, daemon = self.run_probe()
+        self.assertEqual(daemon.calls, [])
+        self.assertNotEqual(result["outcome"], "accepted")
+
+    def test_ledger_failure_after_create_is_hold(self):
+        real = cr.Ledger.write
+
+        def flaky(self_, state, **more):
+            if state == "created":
+                self_.failed = True
+                raise OSError()
+            return real(self_, state, **more)
+        with mock.patch.object(cr.Ledger, "write", flaky):
+            result, daemon = self.run_probe()
+        self.assertEqual(result["outcome"], "hold")
+        self.assertEqual(result["workspace"], "retained")
 
 
 class AmbiguityAndHoldTests(RunnerCase):
@@ -219,77 +439,93 @@ class AmbiguityAndHoldTests(RunnerCase):
 
     def test_daemon_unreachable_is_hold_not_absence(self):
         result, daemon = self.run_probe("query_down")
-        self.assertEqual(result["outcome"], "hold")
-        self.assertEqual(result["cleanup"], "uncertain")
+        self.assertEqual((result["outcome"], result["cleanup"], result["workspace"]), ("hold", "uncertain", "retained"))
         self.assertEqual(len(daemon.containers), 1)
-        self.assertEqual(result["workspace"], "retained")
 
     def test_stale_identity_under_reservation_is_hold_and_nothing_foreign_removed(self):
         result, daemon = self.run_probe("stale")
         self.assertEqual(result["outcome"], "hold")
         self.assertNotIn("c" * 64, [c[0][-1] for c in daemon.calls if c[0][0] == "rm"])
 
+    def test_name_or_label_mismatch_blocks_stop_and_remove(self):
+        result, daemon = self.run_probe("name_mismatch")
+        self.assertEqual(result["outcome"], "hold")
+        self.assertEqual([m for m in self.mutations(daemon) if m in ("stop", "rm")], [])
+
     def test_remove_ignored_by_daemon_is_hold(self):
         result, _ = self.run_probe("rm_ignored")
         self.assertEqual((result["outcome"], result["cleanup"]), ("hold", "uncertain"))
 
-    def test_lost_remove_response_still_verified_by_queries(self):
-        result, daemon = self.run_probe("rm_lost")
-        self.assertEqual((result["outcome"], result["cleanup"]), ("accepted", "verified"))
-        self.assertEqual(daemon.containers, {})
+    def test_lost_remove_or_failed_stop_stays_hold_even_if_queries_find_nothing(self):
+        for mode in ("rm_lost", "stop_fail"):
+            self.setUp()
+            result, daemon = self.run_probe(mode)
+            self.assertEqual((result["outcome"], result["cleanup"]), ("hold", "uncertain"), mode)
+            self.assertEqual(self.record()["state"], "hold")
+
+    def test_container_vanishing_without_our_remove_is_hold(self):
+        result, _ = self.run_probe("vanished")
+        self.assertEqual(result["outcome"], "hold")
 
     def test_daemon_loss_mid_run_never_accepts(self):
-        result, _ = self.run_probe("poll_down")
-        self.assertNotEqual(result["outcome"], "accepted")
+        self.assertNotEqual(self.run_probe("poll_down")[0]["outcome"], "accepted")
 
     def test_cleanup_queries_use_full_id_and_name_plus_label(self):
         result, daemon = self.run_probe()
-        queries = [c[0] for c in daemon.calls if c[0][0] == "container"]
-        self.assertGreaterEqual(len(queries), 3)
         final = daemon.calls[-2:]
         self.assertTrue(any(f"id={result['container_id']}" in c[0] for c in final))
         self.assertTrue(any("label=" + result["label"] in c[0] and f"name=^/{result['name']}$" in c[0]
                             for c in daemon.calls if c[0][0] == "container"))
+        ids = [c[0][-1] for c in daemon.calls if c[0][0] in ("stop", "rm")]
+        self.assertTrue(all(i == result["container_id"] for i in ids))
 
 
-class OutputAndExitTests(RunnerCase):
-    def test_unexpected_exit_code_not_accepted(self):
-        result, _ = self.run_probe(daemon={"exit_code": 0})
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "unexpected_exit"))
+class CancellationTests(RunnerCase):
+    def test_sigterm_during_work_cleans_up_and_never_accepts(self):
+        def term(args):
+            if args[0] == "start":
+                os.kill(os.getpid(), signal.SIGTERM)
+        daemon = FakeDaemon(self.clock, on_call=term)
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              uid=os.getuid() or 1000, handle_signals=True)
+        self.assertEqual(result["outcome"], "hold")
+        self.assertEqual(result["reason"], "ambiguous_start")
+        self.assertEqual(daemon.containers, {})
+        self.assertEqual(self.record()["state"], "hold")
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
-    def test_oom_not_accepted(self):
-        result, _ = self.run_probe("oom")
-        self.assertEqual(result["outcome"], "failed")
+    def test_sigterm_during_cleanup_does_not_abort_cleanup(self):
+        def term(args):
+            if args[0] == "stop":
+                os.kill(os.getpid(), signal.SIGTERM)
+        daemon = FakeDaemon(self.clock, on_call=term)
+        result = cr.run_probe(IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              uid=os.getuid() or 1000, handle_signals=True)
+        self.assertEqual(daemon.containers, {})
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "cancelled"))
 
-    def test_any_output_is_rejected_as_untrusted(self):
-        class Writer(FakeDaemon):
-            def call(inner, args, seconds):
-                if args[0] == "start":
-                    ws = result_workspace(next(c for c in inner.calls if c[0][0] == "create")[0])
-                    os.symlink("/etc/passwd", os.path.join(ws, "evil"))
-                return super().call(args, seconds)
-        daemon = Writer(self.clock)
-        result = cr.run_probe(IMAGE, self.root, daemon, clock=self.clock, sleep=self.clock.sleep,
-                              uid=os.getuid() or 1000)
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "unexpected_output"))
-        self.assertEqual(result["workspace"], "removed")
-        self.assertTrue(os.path.exists("/etc/passwd"))
+    def test_deadline_passing_during_last_slow_call_blocks_acceptance(self):
+        def slow(args):
+            if args[0] == "rm":
+                self.clock.now += 100
+        result, _ = self.run_probe(daemon={"on_call": slow})
+        self.assertNotEqual(result["outcome"], "accepted")
 
-    def test_accepted_run_removes_workspace(self):
-        result, _ = self.run_probe()
-        self.assertEqual((result["outcome"], result["workspace"]), ("accepted", "removed"))
-        self.assertEqual(os.listdir(self.root), [])
+    def test_finalization_exception_becomes_hold_not_crash_or_acceptance(self):
+        real = cr.Ledger.write
 
-    def test_workspace_root_must_be_private_and_symlink_free(self):
-        os.chmod(self.root, 0o777)
-        result, daemon = self.run_probe()
-        self.assertEqual((result["reason"], daemon.calls), ("invalid_input", []))
-        os.chmod(self.root, 0o700)
-        link = self.root + "-link"
-        os.symlink(self.root, link)
-        self.addCleanup(os.unlink, link)
-        with self.assertRaises(ValueError):
-            cr.make_workspace(link, "x", os.getuid())
+        def boom(self_, state, **more):
+            if state == "released":
+                raise RuntimeError()
+            return real(self_, state, **more)
+        with mock.patch.object(cr.Ledger, "write", boom):
+            result, _ = self.run_probe()
+        self.assertEqual((result["outcome"], result["reason"]), ("hold", "finalization_error"))
+        self.assertNotEqual(self.record()["state"], "released")      # ownership record survives
+        self.setUp()
+        with mock.patch.object(cr.shutil, "rmtree", side_effect=RuntimeError()):
+            result, _ = self.run_probe()
+        self.assertEqual((result["outcome"], result["workspace"]), ("accepted", "retained"))
 
 
 class RealBackendTests(unittest.TestCase):
@@ -300,7 +536,7 @@ class RealBackendTests(unittest.TestCase):
         with open(path, "w") as handle:
             handle.write("#!/bin/sh\n" + body + "\n")
         os.chmod(path, 0o755 | stat.S_IXUSR)
-        return cr.Backend(path)
+        return cr.Backend(path, "unix:///tmp/none.sock", directory)
 
     def test_success_failure_and_timeout_mapping(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -312,32 +548,69 @@ class RealBackendTests(unittest.TestCase):
             with self.assertRaises(cr.DockerError):
                 cr.Backend(os.path.join(directory, "missing")).call(["x"], 1)
 
-    def test_environment_is_minimal(self):
+    def test_explicit_endpoint_config_and_minimal_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend = self.fake(directory, "env | sort | tr '\\n' ' '")
+            backend = self.fake(directory, 'echo "$@"; env | sort | tr "\\n" " "')
             os.environ["DOCKER_HOST"] = "tcp://elsewhere:1"
+            os.environ["DOCKER_CONFIG"] = "/home/someone/.docker"
             self.addCleanup(os.environ.pop, "DOCKER_HOST")
-            self.assertNotIn("DOCKER_HOST", backend.call([], 5))
+            self.addCleanup(os.environ.pop, "DOCKER_CONFIG")
+            out = backend.call(["ps"], 5)
+            self.assertIn(f"--host unix:///tmp/none.sock --config {directory} ps", out)
+            self.assertNotIn("tcp://elsewhere", out)
+            self.assertNotIn("/home/someone", out)
+
+    def test_output_flood_is_rejected_quickly_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = self.fake(directory, "yes aaaaaaaaaaaaaaaa")      # endless stdout
+            start = time.monotonic()
+            with self.assertRaises(cr.DockerError):
+                backend.call(["x"], 10)
+            self.assertLess(time.monotonic() - start, 5)
+            backend = self.fake(directory, "head -c 70000 /dev/zero | tr '\\0' a")   # just over the cap
+            with self.assertRaises(cr.DockerError):
+                backend.call(["x"], 10)
+            backend = self.fake(directory, "head -c 60000 /dev/zero | tr '\\0' a")   # under the cap
+            self.assertEqual(len(backend.call(["x"], 10)), 60000)
+
+    def test_slow_trickle_and_stuck_children_hit_the_deadline_and_are_killed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = self.fake(directory, "while :; do echo a; sleep 0.1; done")
+            start = time.monotonic()
+            with self.assertRaises(cr.DockerTimeout):
+                backend.call(["x"], 0.5)
+            self.assertLess(time.monotonic() - start, 3)
+            marker = os.path.join(directory, "child")
+            backend = self.fake(directory, f"(sleep 30; touch {marker}) & echo started; wait")
+            with self.assertRaises(cr.DockerTimeout):
+                backend.call(["x"], 0.4)
+            time.sleep(0.2)
+            self.assertFalse(os.path.exists(marker))
+
+    def test_invalid_utf8_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(cr.DockerError):
+                self.fake(directory, "printf '\\377\\376'").call(["x"], 5)
 
 
 class CliTests(unittest.TestCase):
     def test_default_prints_plan_without_contacting_docker(self):
-        import contextlib
-        import io
-        import json
-        from unittest import mock
         with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
                 mock.patch("subprocess.run", side_effect=AssertionError), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            code = cr.main(["--image", IMAGE, "--workspace-root", "/tmp/x"])
+            code = cr.main(["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y"])
         self.assertEqual(code, 0)
-        self.assertFalse(json.loads(out.getvalue())["executed"])
+        plan = json.loads(out.getvalue())
+        self.assertFalse(plan["executed"])
+        self.assertEqual(plan["image"], cr.PINNED_IMAGE)
 
-    def test_unpinned_image_is_usage_error(self):
-        import contextlib
-        import io
+    def test_there_is_no_image_option_and_bad_endpoint_is_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cr.main(["--image", "ubuntu:latest", "--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y"])
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cr.main(["--image", "ubuntu:latest", "--workspace-root", "/tmp/x"]), 2)
+            self.assertEqual(cr.main(["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y",
+                                      "--docker-host", "tcp://evil:1"]), 2)
 
 
 if __name__ == "__main__":
