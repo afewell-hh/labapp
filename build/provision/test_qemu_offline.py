@@ -62,14 +62,16 @@ class BoundaryTests(unittest.TestCase):
             with patch.object(protocol, 'MAX_FILES', 2), self.assertRaisesRegex(Refusal, 'count'):
                 protocol.inventory(root)
 
-    def test_preferences_parts_refused_and_auth_files_never_read(self):
-        preference = Path('/etc/apt/preferences.d/site')
-        with patch.object(Path, 'rglob', return_value=[preference]), \
-             patch.object(Path, 'is_dir', return_value=False), \
-             patch.object(protocol, 'regular', return_value=b'Package: *\nPin: release noble\n'):
-            with self.assertRaisesRegex(Refusal, 'preferences unsupported'):
-                protocol.policy_files()
-        with patch.object(Path, 'rglob', return_value=[Path('/etc/apt/auth.conf')]), \
+    def test_preferences_hashed_without_import_and_auth_files_never_read(self):
+        for name in ('preferences', 'preferences.d/site'):
+            with self.subTest(name=name), \
+                 patch.object(Path, 'rglob', return_value=[Path('/etc/apt') / name]), \
+                 patch.object(Path, 'is_dir', return_value=False), \
+                 patch.object(protocol, 'regular', return_value=b'Package: *\nPin: release noble\n'):
+                self.assertEqual(protocol.policy_files(), {name:
+                                 hashlib.sha256(b'Package: *\nPin: release noble\n').hexdigest()})
+        with patch.object(Path, 'rglob', return_value=[Path('/etc/apt/auth.conf'),
+                                                      Path('/etc/apt/auth.conf.d/site')]), \
              patch.object(protocol, 'regular', side_effect=AssertionError('credential read')):
             self.assertEqual(protocol.policy_files(), {})
 

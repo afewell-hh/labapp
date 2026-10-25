@@ -452,7 +452,10 @@ configuration. Auth credential files are never read or transferred.
 It does not export source/config contents or auth/proxy credentials.
 
 Supported policy is deliberately narrow: amd64 only, no foreign architectures,
-holds, audit findings or nonempty preferences (including preferences.d).
+holds or audit findings. Nonempty `/etc/apt/preferences` and `preferences.d`
+files are preserved and hashed as target identity; their pin rules are deliberately
+ignored for this module, as are ambient sources and hooks. No target preference
+parser, provider whitelist or caller policy override is supported.
 Both modes explicitly replace sources, preferences, cache/solver settings,
 proxies, credential-file paths and hooks with the reviewed fixed module policy.
 Native compressed-index storage (`Acquire::GzipIndexes=true`) keeps the transfer
@@ -546,12 +549,16 @@ The additional proof prepares a Python-only target image, captures its actual
 state after starting with network none, acquires from a separate connected
 container, then invokes the unchanged offline CLI twice. Real missing/corrupt
 list/archive/receipt, unexpected config, symlink, target drift, foreign/base
-identity and invalid-signature inputs must fail before dpkg mutation. The same
-TCG fixture verifies installed payloads without KVM. This container closure does
+identity and invalid-signature inputs must fail before dpkg mutation. A real
+ambient negative pin is first shown to block an available dependency candidate;
+then the unchanged isolated installer succeeds while preserving pin/hook bytes,
+never running the harmless pre-invoke marker, and rejecting captured-pin drift.
+The same TCG fixture verifies installed payloads without KVM. This container closure does
 not establish a GCE closure, KVM, VLAB, image capture or release acceptance.
 
 Sources (accessed2026-10-25): [Debian native APT on both machines](https://www.debian.org/doc/manuals/apt-offline/ch2.en.html),
 [Noble APT configuration loading order](https://manpages.ubuntu.com/manpages/noble/man5/apt.conf.5.html),
+[APT2.8.3 preference selection](https://manpages.ubuntu.com/manpages/noble/man5/apt_preferences.5.html),
 [Ubuntu snapshot service](https://snapshot.ubuntu.com/),
 [Noble apt-get](https://manpages.ubuntu.com/manpages/noble/man8/apt-get.8.html),
 [apt-secure](https://manpages.ubuntu.com/manpages/noble/man8/apt-secure.8.html),

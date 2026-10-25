@@ -86,8 +86,6 @@ def policy_files():
         if len(result) >= 128:
             raise Refusal('APT policy inventory limit')
         result[str(path.relative_to('/etc/apt'))] = hashlib.sha256(data).hexdigest()
-        if ('preferences.d' in path.parts or path.name == 'preferences') and data.strip():
-            raise Refusal('nonempty APT preferences unsupported')
     return result
 
 

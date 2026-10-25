@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 
 import qemu_offline as protocol
@@ -11,6 +12,33 @@ import qemu_witness
 
 BASE = protocol.BASE
 BUNDLE = Path('/bundle')
+PREFERENCE = Path('/etc/apt/preferences.d/labapp-test-conflict')
+HOOK = Path('/etc/apt/apt.conf.d/labapp-test-hook')
+MARKER = Path('/tmp/labapp-test-ambient-hook-ran')
+POLICY = {PREFERENCE: b'Package: qemu-system-common\nPin: version *\nPin-Priority: -1\n',
+          HOOK: b'DPkg::Pre-Invoke {"touch /tmp/labapp-test-ambient-hook-ran";};\n'}
+
+
+def prepare_policy():
+    # A positive control on the same real lists makes candidate-none meaningful.
+    def candidate():
+        code, output = bounded(['/usr/bin/apt-cache', 'policy', 'qemu-system-common'], 10)
+        assert code == 0
+        return output.decode().split('Candidate: ', 1)[1].splitlines()[0]
+    assert candidate() != '(none)', 'missing ambient package index positive control'
+    for path, data in POLICY.items():
+        assert not path.exists()
+        path.write_bytes(data)
+    assert candidate() == '(none)', 'ambient negative pin is not active'
+    assert not MARKER.exists()
+    print(json.dumps({'ambient_dependency_candidate_positive_control': True,
+                      'ambient_conflicting_pin_active': True}), flush=True)
+
+
+def unchanged_policy():
+    assert not MARKER.exists(), 'ambient APT hook executed'
+    for path, data in POLICY.items():
+        assert path.read_bytes() == data, 'ambient policy bytes changed'
 
 
 def invoke(expected, success=False, reason=None):
@@ -38,7 +66,16 @@ def main():
         protocol.setup(root, module['SNAPSHOT'])
         state = protocol.receive(BUNDLE, expected, root, BASE, module['SNAPSHOT'], module['PINS'], module['call'])
         assert state == protocol.capture(module['call'], BASE)
+    unchanged_policy()
+    for path, data in POLICY.items():
+        assert state['policy'][str(path.relative_to('/etc/apt'))] == hashlib.sha256(data).hexdigest()
     print(json.dumps({'baseline_receipt_inventory_signatures_target_state_valid': True}), flush=True)
+    # A harmless change to the captured conflicting pin must refuse before APT.
+    PREFERENCE.write_bytes(POLICY[PREFERENCE] + b'# changed after capture\n')
+    invoke(expected, reason='target state drift before transaction')
+    assert digest(Path('/var/lib/dpkg/status')) == before
+    assert not MARKER.exists()
+    PREFERENCE.write_bytes(POLICY[PREFERENCE])
     # Each failure must occur before any real dpkg change; no network exists.
     invoke('0' * 64, reason='trusted expected receipt mismatch')
     for kind in ('archives', 'lists'):
@@ -89,7 +126,10 @@ def main():
     second = invoke(expected, True)
     assert not second['changed']
     assert digest(Path('/var/lib/dpkg/status')) != before
+    unchanged_policy()
     print(json.dumps({'actual_offline_install': True, 'actual_offline_rerun': True,
+                      'ambient_pin_isolated_hook_not_run_policy_bytes_unchanged': True,
+                      'preference_hash_bound_and_drift_refused': True,
                       'pretransaction_refusals_status_unchanged': True,
                       'missing_corrupt_list_archive_receipt': True,
                       'unsafe_config_link_stale_foreign_base_signature_refusals': True,
@@ -100,4 +140,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:] == ['--prepare-policy']:
+        prepare_policy()
+    else:
+        assert not sys.argv[1:]
+        main()
