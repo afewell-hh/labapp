@@ -105,8 +105,20 @@ cannot prove. Full VM builds are not required for every change.
 
 ## Same-code execution contract
 
-Provisioning logic is written once and run unchanged in development tests, and
-later in Packer. Each module must state, in its header and tests:
+Provisioning logic is written once and run unchanged in development tests and
+approved image builders. The goal includes reproducible VM builds for multiple
+platforms, with GCP as the current production delivery. The lead selects tools
+based on source-backed research and measured fit; Packer is an option.
+
+Shared guest provisioning and verification are separate from provider-specific
+builders, lifecycle, access and guest adaptations (boot, drivers, networking,
+guest agents and sealing). Each target needs artifact, boot/reboot and functional
+VLAB/nested-virtualization validation; format conversion alone proves none of
+these. Additional platform priorities and CPU scope remain open. Validate x86
+and ARM runtime scope separately before claiming compatibility; existing GCP
+work and component checks do not establish another target's support.
+
+Each module must state, in its header and tests:
 
 - **Interpreter**: shell modules use `#!/usr/bin/env bash` with `set -euo pipefail`,
   invoked as `bash path`, not relying on the executable bit. The pinned hhfab
