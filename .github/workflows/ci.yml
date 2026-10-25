@@ -154,6 +154,8 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
+      - name: Guest prerequisite offline failure and ownership tests
+        run: python3 -m unittest discover -s build/provision -p test_component_prerequisites.py -v
       - name: Installer integrity and preservation regressions
         run: python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
       - name: Run unchanged installer and installed CLI smoke checks
