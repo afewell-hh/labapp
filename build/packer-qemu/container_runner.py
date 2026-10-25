@@ -34,7 +34,7 @@ PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d
 # allocations and are intentionally not accepted here.
 PROFILES = {"probe": (30, 20)}
 CALL_CAP = 10          # per Docker CLI call, further capped by remaining budget
-STOP_GRACE = 3         # docker stop --time
+STOP_GRACE = 3         # docker stop --timeout
 KILL_AFTER = 5         # GNU timeout --kill-after inside the container
 START_RESERVE = 10     # minimum work left before create is attempted
 MIN_TIMER = 5          # in-container timer below this: the probe does not run
@@ -576,7 +576,7 @@ def _cleanup(backend, budget, own):
             if backend.call(identity_args(ident), budget.seconds(CALL_CAP)) != expect:
                 return False      # exact full ID + name + label must match before mutating
             ledger.write("stop_rm_intent", id=ident)
-            for args in (["stop", f"--time={STOP_GRACE}", ident], ["rm", "-f", ident]):
+            for args in (["stop", f"--timeout={STOP_GRACE}", ident], ["rm", "-f", ident]):
                 try:
                     if backend.call(args, budget.seconds(CALL_CAP)) not in ("", ident):
                         own["uncertain"] = True   # response names something else

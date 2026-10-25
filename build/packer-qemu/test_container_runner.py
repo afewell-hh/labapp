@@ -147,6 +147,10 @@ class FakeDaemon:
                 return ""
             return self.matches(args)
         if verb == "stop":
+            if self.mode == "deprecated_stop_warning":
+                if any(a.startswith("--time=") for a in args):
+                    return "Flag --time has been deprecated, use --timeout instead\n" + args[-1]
+                return args[-1]
             if self.mode == "stop_fail":
                 raise cr.DockerError()
             return ""
@@ -483,6 +487,13 @@ class AmbiguityAndHoldTests(RunnerCase):
 
     def test_daemon_loss_mid_run_never_accepts(self):
         self.assertNotEqual(self.run_probe("poll_down")[0]["outcome"], "accepted")
+
+    def test_current_stop_timeout_flag_avoids_deprecation_stdout(self):
+        result, daemon = self.run_probe("deprecated_stop_warning")
+        self.assertEqual((result["outcome"], result["cleanup"]), ("accepted", "verified"))
+        stop = next(c[0] for c in daemon.calls if c[0][0] == "stop")
+        self.assertEqual(stop, ["stop", f"--timeout={cr.STOP_GRACE}", result["container_id"]])
+        self.assertEqual(self.record()["state"], "released")
 
     def test_cleanup_queries_use_full_id_and_name_plus_label(self):
         result, daemon = self.run_probe()
