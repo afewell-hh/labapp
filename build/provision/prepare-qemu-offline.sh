@@ -81,10 +81,14 @@ PY2
 mkdir -- "$output"
 output_owned=1
 timeout --kill-after=3s 30s docker cp "$id:/export-bundle/." "$output"
-python3 - "$output/receipt.json" <<'PY'
+python3 - "$output/receipt.json" "$here" <<'PY'
 import hashlib,json,sys
 from pathlib import Path
-p=Path(sys.argv[1]); r=json.loads(p.read_bytes())
+sys.path.insert(0,sys.argv[2])
+import qemu_offline as protocol
+p=Path(sys.argv[1]); r=protocol.load(p)
+assert {v.name for v in p.parent.iterdir()} == {'receipt.json','lists','archives'}
+assert protocol.inventory(p.parent) == r['files']
 print(json.dumps({'receipt_sha256': hashlib.sha256(p.read_bytes()).hexdigest(),
                   'files': len(r['files']), 'bytes':sum(v['bytes'] for v in r['files'].values())}))
 PY

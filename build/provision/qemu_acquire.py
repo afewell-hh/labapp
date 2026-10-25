@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import runpy
 import signal
-import shutil
 import sys
 import time
 
@@ -55,7 +54,16 @@ def acquire():
     (root / 'receipt.json').write_bytes(protocol.encoded(receipt))
     # tmpfs disappears when Docker stops the container. Export only this already
     # validated bounded data tree to the owned writable layer before exit.
-    shutil.copytree(root, '/export-bundle', symlinks=False)
+    exported = Path('/export-bundle')
+    exported.mkdir()
+    for directory in ('lists', 'archives'):
+        (exported / directory).mkdir()
+    for relative in files:
+        with (exported / relative).open('xb') as output:
+            output.write(protocol.regular(root / relative))
+    (exported / 'receipt.json').write_bytes(protocol.encoded(receipt))
+    if protocol.inventory(exported) != files:
+        raise Refusal('export inventory mismatch')
     print(json.dumps({'receipt_sha256': digest(root / 'receipt.json'), 'files': len(files),
                       'bytes': sum(row['bytes'] for row in files.values()),
                       'state_sha256': hashlib.sha256(protocol.encoded(state)).hexdigest(),
