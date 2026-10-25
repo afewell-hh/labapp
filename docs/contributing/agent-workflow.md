@@ -234,27 +234,33 @@ here: see #145 (parent), #139 and #140.
 
 The Claude Code Action v1 workflow adds scoped commands through
 [`claude_args: --allowedTools`](https://github.com/anthropics/claude-code-action/blob/v1/docs/configuration.md).
-It allows `python3 -m unittest discover ...`, `python3 -m py_compile ...`,
-`bash -n ...`, `shellcheck ...` and `git diff --check ...`, alongside the
-existing source-research and issue/PR commands. Run checks directly from the
-repository root; a Python heredoc, `python3 -c`, general shell execution,
-package installation or a different command spelling is not added by these
-rules. Missing dependencies still require a CI/lead handoff.
+It allows only `bash -n ...`, `shellcheck ...` and `git diff --check ...`
+as added validation commands, alongside the existing source-research and
+issue/PR commands. Run these static checks directly from the repository root.
+Direct Python execution, including unittest discovery and `py_compile`, is
+not allowed in this credential-bearing worker. Neither general shell
+execution nor package installation is added. Missing dependencies and
+executable tests require a CI/lead handoff.
 
-For example, the portable preparation checks are:
+For example, the worker can run these portable preparation static checks:
 
 ```bash
-python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v
-python3 -m py_compile build/packer-qemu/host_verify.py
 bash -n build/packer-qemu/guest/guest-build.sh
 shellcheck build/packer-qemu/guest/guest-build.sh
 git diff --check
 ```
 
-**These commands are not a security sandbox.** Unittest imports and executes
-repository code, which can start subprocesses, use the network and access the
-worker's runner/GitHub authority. Only run scoped, inspected offline tests;
-the task must still authorize any container, builder, VM or cloud execution.
+**Command permissions are not a security sandbox.** Unittest imports and
+executes repository code with access to the worker's runner/GitHub authority
+and potentially its Claude authentication. Even `python3 -m py_compile` can
+execute a repository-shadowed module: Python's
+[`-m` lookup includes the current directory](https://docs.python.org/3/using/cmdline.html#cmdoption-m).
+Do not run either command here or route test execution through another tool.
+Supply exact Python test/compile commands to CI or the lead for verification
+in a separately assessed environment. Existing CI is a fallback, not a claim
+of credential-free or network-isolated execution. Record what actually ran
+and its environment; worker static checks do not replace executable tests.
+The task must still authorize any container, builder, VM or cloud execution.
 [Claude permissions](https://code.claude.com/docs/en/permissions) distinguish
 command approval from OS-level sandboxing. Do not use test code to bypass a
 tool denial or the platform's workflow-write restriction.
