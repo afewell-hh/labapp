@@ -1,0 +1,28 @@
+#cloud-config
+# NoCloud user-data for the Packer/QEMU experiment (README: "Guest sequence").
+# Final-stage runcmd only stages the verified-later bytes and ENQUEUES the build
+# service without blocking. The service is ordered After=cloud-final.service and
+# itself checks that cloud-init finished without errors (After= alone is also
+# satisfied by a failed unit). Provisioning, verification, sealing, the receipt
+# and poweroff all run outside cloud-final, never from its active script.
+write_files:
+  - path: /etc/systemd/system/labapp-build.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Labapp one-shot image build
+      After=cloud-final.service
+      ConditionPathExists=/var/lib/labapp-build/in/MANIFEST
+
+      [Service]
+      Type=oneshot
+      User=root
+      WorkingDirectory=/
+      StandardInput=null
+      StandardOutput=journal
+      StandardError=journal
+      TimeoutStartSec=1500
+      ExecStart=/bin/bash /var/lib/labapp-build/in/guest-build.sh
+runcmd:
+  - [sh, -ec, "mkdir -p -m 0755 /var/lib/labapp-build/in /run/labapp-cd && mount -o ro,nosuid,nodev /dev/disk/by-label/cidata /run/labapp-cd && cp -a /run/labapp-cd/. /var/lib/labapp-build/in/ && umount /run/labapp-cd && chmod 0600 /var/lib/labapp-build/in/nonce && systemctl daemon-reload && systemctl start --no-block labapp-build.service"]
