@@ -65,7 +65,7 @@ trap 'exit 143' TERM
 for dependency in docker timeout python3 curl; do command -v "$dependency" >/dev/null; done
 timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Version}}'
 # Official archives verified/extracted on host, never executed on host.
-python3 "$here/hhfab_test.py" prepare "$workdir" "$here/../.."
+timeout --kill-after=3s 270s python3 "$here/hhfab_test.py" prepare "$workdir" "$here/../.."
 prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$run_label" \
   --memory=512m --cpus=1 --pids-limit=128 --security-opt=no-new-privileges \
   "$base" timeout --kill-after=3s 210s bash -ceu '

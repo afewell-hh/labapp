@@ -199,7 +199,9 @@ sharing. Clean child environments omit ambient HHFAB_* variables. All inputs
 and verified binaries are baked into a unique owned image. Preparation alone has
 network, with 512MiB/one CPU/128 PIDs and a 210-second internal/240-second external
 apt cap. Downloads get 120 seconds each, 1KiB/s minimum for 20 seconds and exact
-size ceilings; extraction is bounded by exact pinned archive/member sizes.
+size ceilings; extraction is bounded by exact pinned archive/member sizes. The
+complete host download/hash/extract/copy phase gets 270 seconds plus a three-second
+kill grace, including both downloads; exceeding it fails and triggers cleanup.
 Each CLI command gets at most 30 seconds inside a 120-second lane, with two-second
 child-group kill/reap grace. Docker attachment gets 135 seconds and a 1 MiB combined lane-report
 ceiling. Each Docker mutation/query/cleanup has its own bounded deadline. The
