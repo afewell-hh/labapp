@@ -129,6 +129,11 @@ jobs:
           raise SystemExit(0 if result.wasSuccessful() else 1)
           PY
 
+      - name: Run required fixed pre-login hook tests
+        run: |
+          test -f build/gcp/prelogin/test_prelogin.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/prelogin -t build/gcp -v
+
   bridge-ipv4:
     name: Bridge IPv4 offline and disposable namespace tests
     runs-on: ubuntu-24.04
