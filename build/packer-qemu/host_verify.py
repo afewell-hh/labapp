@@ -185,10 +185,24 @@ class Qmp:
     def __init__(self):
         self.state, self.step, self.out = "greeting", 0, bytearray()
         self.shutdown_ok = False
+        self.inflight = None
+        self.cont_sent = False
 
     def _send_next(self):
         command, ident = STARTUP[self.step][:2]
         self.out += json.dumps({"execute": command, "id": ident}).encode() + b"\n"
+
+    def sent(self, count):
+        """Record bytes actually accepted by the socket, separately from queuing."""
+        if count < 0 or count > len(self.out):
+            raise Failure("qmp-send")
+        if count == 0:
+            return
+        del self.out[:count]
+        if not self.out:
+            self.inflight = STARTUP[self.step][1]
+            if STARTUP[self.step][0] == "cont":
+                self.cont_sent = True
 
     def handle(self, msg):
         if self.state == "greeting":
@@ -203,13 +217,14 @@ class Qmp:
             raise Failure("qmp-bad-message")
 
     def _response(self, msg):
-        if self.state != "startup":
+        if self.state != "startup" or self.inflight is None:
             raise Failure("qmp-unexpected-response")
         _, ident, check, reason = STARTUP[self.step]
         if msg["id"] != ident:  # also rejects replays of an already-answered id
             raise Failure("qmp-id-mismatch")
         if "error" in msg or not check(msg["return"]):
             raise Failure(reason)
+        self.inflight = None
         self.step += 1
         if self.step == len(STARTUP):
             self.state = "running"
@@ -222,11 +237,13 @@ class Qmp:
                 or not isinstance(msg.get("timestamp"), dict)
                 or ("data" in msg and not isinstance(data, dict))):
             raise Failure("qmp-bad-message")
-        if msg["event"] == "GUEST_PANICKED":
+        if msg["event"] in ("GUEST_PANICKED", "GUEST_CRASHLOADED"):
             raise Failure("guest-panicked")
+        if msg["event"] == "RESET":
+            raise Failure("guest-reset")
         if msg["event"] != "SHUTDOWN":
             return  # interleaved events (RESUME, STOP, ...) are not evidence
-        if self.state != "running":
+        if not self.cont_sent:
             raise Failure("early-shutdown")
         if self.shutdown_ok:
             raise Failure("duplicate-shutdown")
@@ -254,14 +271,14 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
     sel.register(serial, selectors.EVENT_READ, "serial")
     try:
         while True:
-            if receipt_ok and proto.shutdown_ok:
-                return
             now = clock()
             if now >= deadline:
                 raise Failure("timeout")
+            if receipt_ok and proto.shutdown_ok and proto.state == "running":
+                return
             if drain_until is not None and (now >= drain_until or not serial_open):
                 raise Failure("shutdown-without-receipt")
-            if not qmp_open and not proto.shutdown_ok:
+            if not qmp_open and (not proto.shutdown_ok or proto.state != "running"):
                 raise Failure("qmp-eof-before-shutdown")
             if not serial_open and not receipt_ok and not proto.shutdown_ok:
                 raise Failure("serial-eof-before-receipt")
@@ -278,7 +295,7 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
                         sent = 0
                     except OSError:
                         raise Failure("qmp-send") from None
-                    del proto.out[:sent]
+                    proto.sent(sent)
                 if not mask & selectors.EVENT_READ:
                     continue
                 try:
@@ -335,6 +352,8 @@ def verify(args, clock=time.monotonic):
         serial = connect(args.serial, deadline, clock)  # receipt reader first
         qmp = connect(args.qmp, deadline, clock)
         observe(qmp, serial, args.nonce, args.inputs, deadline, clock)
+        if clock() >= deadline:
+            raise Failure("timeout")
         write_result(args.result, args.nonce, args.inputs)
     finally:
         for sock in (qmp, serial):

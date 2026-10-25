@@ -60,9 +60,12 @@ evidence of incompatibility.
   `running=false`), `query-kvm` (`present` and `enabled` both true), each with a
   fixed command id and a strict response schema, one in flight, and only then (4)
   sends `cont`. Events interleaved with responses are tolerated; a `SHUTDOWN`
-  before `cont` is acknowledged fails. Writes are nonblocking and resumed after
-  partial writes. The ordering relies on the guest not running before `cont`; the
-  builder's own boot-wait and provisioner start are **UNRUN** against `-S`.
+  before `cont` is fully sent fails. A normal shutdown between the fully sent
+  `cont` and its matching successful acknowledgment is buffered; success still
+  requires that acknowledgment. Responses to queued or partially written commands
+  are rejected. Writes are nonblocking and resumed after partial writes. The
+  ordering relies on the guest not running before `cont`; the builder's own
+  boot-wait and provisioner start are **UNRUN** against `-S`.
 * Strict parsing: UTF-8 only; duplicate keys (at any depth), `NaN`/`Infinity`,
   overflowing numbers, non-object messages, a response carrying both `return` and
   `error` (or missing/unknown/duplicate/wrong `id`), a `null`/malformed greeting
@@ -81,11 +84,16 @@ evidence of incompatibility.
   second `SHUTDOWN` fails). Observation continues after the receipt: it alone never
   succeeds, a normal guest shutdown is still required. `status=fail`, a
   malformed, stale, wrong or duplicate receipt, a host/non-guest shutdown,
-  `GUEST_PANICKED`, EOF before shutdown, or shutdown without a drained receipt
+  `RESET`, `GUEST_PANICKED`/`GUEST_CRASHLOADED`, EOF before shutdown or the
+  successful `cont` acknowledgment, or shutdown without a drained receipt
   (5 s) fail. QEMU exit, EOF or a vanished socket never succeed on their own.
 * Bounds: QMP lines 64 KiB / 1 MiB total (violations fail); serial lines 4 KiB
   (longer lines are discarded) / 4 MiB total; one monotonic deadline. Peer bytes
-  are never echoed. `reason` in `SHUTDOWN` needs QEMU 4.0+ (Ubuntu 24.04 ships 8.2).
+  are never echoed. Deadline expiry wins over observed success and is rechecked
+  before publishing the result marker. `reason` in `SHUTDOWN` needs QEMU 4.0+
+  (Ubuntu 24.04 ships 8.2). Terminal event definitions follow the
+  [QMP reference](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html)
+  (accessed 2026-10-25; actual pinned runtime remains unexecuted).
 * Trust: neither channel authenticates the guest. The private 0700 directory and
   the owned QEMU instance define the boundary; the nonce rejects stale receipts,
   not a malicious guest. Native SSH is **not** used and its identity gap is not

@@ -92,6 +92,6 @@ build {
     inline = [
       "exec python3 -I \"$LABAPP_VERIFIER\" --qmp \"$LABAPP_DIR/events.sock\" --serial \"$LABAPP_DIR/serial.sock\" --result \"$LABAPP_DIR/verified.json\" --timeout \"$LABAPP_SECONDS\" --nonce \"$LABAPP_NONCE\" --inputs \"$LABAPP_INPUTS\"",
     ]
-    timeout = "${var.verify_seconds}s" # secondary; supervise.py is the watchdog
+    timeout = "${var.verify_seconds}s" # secondary; approved external containment/watchdog still required
   }
 }

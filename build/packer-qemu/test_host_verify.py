@@ -339,7 +339,7 @@ class VerifyTests(unittest.TestCase):
             (lambda i: ok(i, {"a": 1}), "qmp-negotiation"),
             (lambda i: ok(i, None), "qmp-negotiation"),
             # duplicate response: the answered id again while the next is pending
-            (lambda i: plain(i) + plain(i), "qmp-id-mismatch"))
+            (lambda i: plain(i) + plain(i), "qmp-unexpected-response"))
         for make, expected in cases:
             with self.subTest(expected=expected, sample=make("hv-1")):
                 self.expect(expected, lambda f, m=make: f.qmp_script(
@@ -374,9 +374,54 @@ class VerifyTests(unittest.TestCase):
             thread.join(11)
         self.assertEqual(fake.commands, ORDER[:3])  # never reached `cont`
 
-    def test_shutdown_before_cont_is_acknowledged_fails(self):
+    def test_shutdown_before_cont_ack_is_buffered_until_matching_ack(self):
+        self.fake.qmp_script([], reply={"cont": lambda i: SHUTDOWN_OK + ok(i, {})})
+        self.fake.serial_script([(0.0, receipt())])
+        host_verify.verify(self.fake.args())
+
+    def test_shutdown_before_cont_is_sent_fails(self):
         self.expect("early-shutdown", lambda f: f.qmp_script(
-            [], reply={"cont": lambda i: SHUTDOWN_OK + ok(i, {})}))
+            [], reply={"query-kvm": lambda i: SHUTDOWN_OK + ok(i, RETURNS["query-kvm"])}))
+
+    def test_shutdown_without_successful_cont_ack_fails(self):
+        for suffix in (b"", ok("wrong-id", {}),
+                       b'{"error":{"class":"GenericError"},"id":"hv-4"}\n'):
+            with self.subTest(suffix=suffix):
+                fake = Fake(self)
+                fake.qmp_script([], reply={"cont": lambda i, tail=suffix: SHUTDOWN_OK + tail})
+                fake.serial_script([(0.0, receipt())])
+                self.reason(fake=fake)
+
+    def test_reset_and_crashloaded_reject_even_before_later_shutdown(self):
+        for name, reason in (("RESET", "guest-reset"), ("GUEST_CRASHLOADED", "guest-panicked")):
+            with self.subTest(name=name):
+                self.expect(reason, lambda f, n=name: f.qmp_script(
+                    [(0.1, event(n, {}) + SHUTDOWN_OK)]), serial=[(0.0, receipt())])
+
+    def test_evidence_observed_after_deadline_cannot_succeed(self):
+        expired = [False]
+        original = host_verify.Qmp._event
+        def capture(proto, msg):
+            original(proto, msg)
+            if proto.shutdown_ok:
+                expired[0] = True
+        self.fake.qmp_script([(0.2, SHUTDOWN_OK)])
+        self.fake.serial_script([(0.0, receipt())])
+        with mock.patch.object(host_verify.Qmp, "_event", capture):
+            with self.assertRaisesRegex(host_verify.Failure, "timeout"):
+                host_verify.verify(self.fake.args(), clock=lambda: 106.0 if expired[0] else 100.0)
+        self.assertFalse(os.path.exists(self.fake.result))
+
+    def test_expiry_after_observation_prevents_result_publication(self):
+        now = [100.0]
+        def observed(*_args):
+            now[0] = 106.0
+        with mock.patch.object(host_verify, "connect", return_value=mock.Mock()), \
+                mock.patch.object(host_verify, "observe", side_effect=observed), \
+                mock.patch.object(host_verify, "write_result") as write:
+            with self.assertRaisesRegex(host_verify.Failure, "timeout"):
+                host_verify.verify(self.fake.args(), clock=lambda: now[0])
+        write.assert_not_called()
 
     def test_panic_during_startup_fails(self):
         self.expect("guest-panicked", lambda f: f.qmp_script(
@@ -448,6 +493,26 @@ class VerifyTests(unittest.TestCase):
 
 def shutdown_event(guest, reason):
     return event("SHUTDOWN", {"guest": guest, "reason": reason})
+
+
+class CommandTrackingTests(unittest.TestCase):
+    def test_response_for_queued_or_partial_command_is_unsolicited(self):
+        for count in (0, 1):
+            with self.subTest(bytes_sent=count):
+                proto = host_verify.Qmp()
+                proto.handle(host_verify.parse_json(GREETING))
+                proto.sent(count)
+                with self.assertRaisesRegex(host_verify.Failure, "qmp-unexpected-response"):
+                    proto.handle({"return": {}, "id": "hv-1"})
+
+    def test_queued_next_command_is_not_inflight_after_previous_reply(self):
+        proto = host_verify.Qmp()
+        proto.handle(host_verify.parse_json(GREETING))
+        proto.sent(len(proto.out))
+        proto.handle({"return": {}, "id": "hv-1"})
+        self.assertTrue(proto.out)
+        with self.assertRaisesRegex(host_verify.Failure, "qmp-unexpected-response"):
+            proto.handle({"return": RETURNS["query-status"], "id": "hv-2"})
 
 
 class Trickle:
