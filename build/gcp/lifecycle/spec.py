@@ -1,4 +1,4 @@
-"""Fixed, bounded inspection-VM specification and create-request builder.
+"""Two fixed, bounded VM specifications and create-request builder.
 
 Everything here is a constant or a pure function so the exact request body can
 be hashed, persisted before submission and diffed in tests. Field names follow
@@ -16,6 +16,13 @@ PROJECT = "teched-473722"
 ZONE = "us-central1-a"
 REGION = "us-central1"
 MACHINE_TYPE = "e2-standard-2"
+INSPECTOR = "inspector-v1"
+UBUNTU_COMPONENT = "ubuntu-component-v1"
+COMPONENT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
+COMPONENT_IMAGE_ID = "4575951068918267275"
+COMPONENT_MACHINE = "n2-standard-2"
+COMPONENT_DISK_GB = 20
+COMPONENT_LEASE_MINUTES = 30
 SOURCE_IMAGE = f"projects/{PROJECT}/global/images/hedgehog-vaidc-v20260114"
 SOURCE_DISK_GB = 300  # verified source-image minimum (#151/#153)
 BOOT_DISK_GB = 10
@@ -36,9 +43,18 @@ def is_owned_name(name: str) -> bool:
     return bool(_NAME_RE.match(name))
 
 
-def names(run_id: int, attempt: int) -> dict:
+def kinds(profile: str = INSPECTOR) -> tuple:
+    if profile == INSPECTOR:
+        return (("instance", "instances"), ("boot", "disks"), ("data", "disks"))
+    if profile == UBUNTU_COMPONENT:
+        return (("instance", "instances"), ("boot", "disks"))
+    raise ValueError("unknown fixed lifecycle profile")
+
+
+def names(run_id: int, attempt: int, profile: str = INSPECTOR) -> dict:
     base = f"{SLOT_PREFIX}-r{run_id}-a{attempt}"
     out = {"instance": base, "boot": f"{base}-boot", "data": f"{base}-src"}
+    out = {key: out[key] for key, _ in kinds(profile)}
     for value in out.values():
         if not is_owned_name(value):
             raise ValueError(f"bad resource name {value!r}")
@@ -50,12 +66,15 @@ def rfc3339(moment: datetime) -> str:
 
 
 def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
-               deadline: datetime) -> dict:
-    """Return the exact instances.insert body for one inspection lease."""
+               deadline: datetime, profile: str = INSPECTOR) -> dict:
+    """Return the exact request for an inspector or Ubuntu component lease."""
     if "/family/" in boot_image or "/global/images/" not in boot_image:
         raise ValueError("boot_image must be a pinned image, not a family")
     if not _UUID_RE.match(request_id):
         raise ValueError("request_id must be a lowercase UUID")
+    kinds(profile)
+    if profile == UBUNTU_COMPONENT and boot_image != COMPONENT_IMAGE:
+        raise ValueError("component boot image must match the reviewed pin")
     n = names(run_id, attempt)
     labels = {LABEL_OWNER: OWNER_VALUE, LABEL_LEASE: request_id,
               LABEL_RUN: str(run_id)}
@@ -114,12 +133,35 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
             {"key": "labapp-stage", "value": "none"},
         ]},
     }
-    validate_body(body)
+    if profile == UBUNTU_COMPONENT:
+        body["machineType"] = f"{zone}/machineTypes/{COMPONENT_MACHINE}"
+        body["disks"] = body["disks"][:1]
+        body["disks"][0]["initializeParams"]["diskSizeGb"] = str(COMPONENT_DISK_GB)
+        body["minCpuPlatform"] = "Intel Cascade Lake"
+        body["advancedMachineFeatures"] = {"enableNestedVirtualization": True}
+        # Stop rather than depending on nested-host migration compatibility.
+        body["scheduling"]["onHostMaintenance"] = "TERMINATE"
     return body
 
 
 def validate_body(body: dict) -> None:
     """Reject any body outside the reviewed envelope (defence in depth)."""
+    if body.get("advancedMachineFeatures") is not None:
+        try:
+            label = body["labels"]
+            match = re.fullmatch(r"labapp-lc-s1-r([0-9]{1,15})-a([0-9]{1,3})", body["name"])
+            if match is None:
+                raise ValueError()
+            expected = build_body(boot_image=COMPONENT_IMAGE,
+                                  request_id=label[LABEL_LEASE],
+                                  run_id=int(match[1]), attempt=int(match[2]),
+                                  deadline=datetime.fromisoformat(body["scheduling"]["terminationTime"].replace("Z", "+00:00")),
+                                  profile=UBUNTU_COMPONENT)
+            if body != expected or body_hash(body) != body_hash(expected):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ValueError("body outside the fixed Ubuntu component profile") from None
+        return
     if not is_owned_name(body.get("name", "")):
         raise ValueError("instance name outside the owned pattern")
     for forbidden in ("guestAccelerators", "reservationAffinity",

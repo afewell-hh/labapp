@@ -89,6 +89,9 @@ class FakeCloud:
         for d in body["disks"]:
             p = d["initializeParams"]
             disk = self._make(p["diskName"], p["labels"])
+            disk["sourceImage"] = p["sourceImage"]
+            if p["sourceImage"] == spec.COMPONENT_IMAGE:
+                disk["sourceImageId"] = spec.COMPONENT_IMAGE_ID
             self.disks[disk["name"]] = disk
             inst["disks"].append({
                 "source": f"https://compute/zones/{spec.ZONE}/disks/"
@@ -181,6 +184,11 @@ class FakeCloud:
         if name in self.op_stuck:
             op["status"] = "RUNNING"
         return op
+
+    def _images_get(self, name, *_):
+        assert name == spec.COMPONENT_IMAGE.rsplit("/", 1)[-1]
+        return {"name": name, "id": spec.COMPONENT_IMAGE_ID, "status": "READY",
+                "architecture": "X86_64", "diskSizeGb": "10"}
 
     def _instances_get(self, name, *_):
         if name not in self.instances:

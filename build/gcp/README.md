@@ -480,9 +480,9 @@ perform network access only when explicitly called.
 
 | File | Role |
 |---|---|
-| `spec.py` | Fixed inspection spec: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
+| `spec.py` | Two fixed profiles (component described below). Inspector: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
-| `cloud.py` | `PolicyCloud`: the controller's mutation/inventory call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. Images, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
+| `cloud.py` | `PolicyCloud`: the controller's mutation/inventory call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. One fixed read-only Ubuntu image GET is also allowed; image mutations, arbitrary image reads, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
 | `cli.py` | Trusted-runner entrypoint for the fixed workflows; validates events and performs four fixed read-only project/region/image preflight requests separately from `PolicyCloud`, then invokes creator or cleanup transitions |
 | `controller.py` | State machine `FREE → RESERVED → ACTIVE → FREE`, plus `CLEANUP_FAILED`, on **one persistent slot object** |
 | `fakes.py`, `test_lifecycle.py` | Fake cloud with failure injection and the invariant tests |
@@ -490,7 +490,8 @@ perform network access only when explicitly called.
 ### Safety contract
 
 - `Config.lease_minutes` defaults to 60 and may shorten the lease to an
-  integer from 1 to 60. `min_submit_minutes` must be shorter than that lease;
+  integer from 1 to 60 for the inspector. The Ubuntu component defaults to 30
+  and accepts only 1 through 30. `min_submit_minutes` must be shorter than that lease;
   the fixed thirty-minute inspector uses a one-minute submission margin. Admission
   rechecks these bounds before writing intent; an existing deadline is never
   extended.
@@ -500,7 +501,8 @@ perform network access only when explicitly called.
   is reusable; a stale actor loses its write instead of overwriting a newer
   lease.
 - `admit` persists the UUID (`requestId`), the exact body hash, the intended
-  names and the immutable deadline **before** any cloud call. Identity fields
+  profile, exact intended child initialization, names and the immutable deadline
+  **before** the insertion call. Read-only census/image preflight happens first. Identity fields
   and the deadline cannot change while a lease is held.
 - `submit` records the attempt before sending, reuses the persisted UUID and
   body, and never mints a new UUID. Default is one attempt
@@ -516,15 +518,16 @@ perform network access only when explicitly called.
 - `reconcile` is the only path to `FREE`. Before any delete it runs an
   all-or-nothing preflight: every existing resource must match name, lease
   label, zone and immutable id, and an existing VM must have **exactly** the
-  two intended disks attached (boot `READ_WRITE`/`autoDelete: true`, source
-  copy `READ_ONLY`/`autoDelete: false`). Any
+  intended disks attached (one boot for the component; boot plus source copy
+  for the inspector). Boot is `READ_WRITE`/`autoDelete: true`; the inspector
+  source copy is `READ_ONLY`/`autoDelete: false`. Any
   unexpected or mismatched child blocks the VM delete too, because VM delete
   also removes `autoDelete` disks. An id not yet recorded is adopted only with
   proof (a completed insert whose `clientOperationId` is this lease's UUID,
   whose `targetId` matches the VM incarnation, and a creation time not before
   the reservation); labels alone never suffice. Then
   it deletes the VM, then each disk, by exact name, waits for the delete
-  operation, and requires a 404 for **all three** before release.
+  operation, and requires a 404 for **every intended resource** before release.
   - Compute forbids auto-delete on a read-only attachment. VM deletion, whether
     explicit or at the absolute deadline, auto-deletes only the boot disk. The
     source copy remains billable until the cleanup identity explicitly deletes
@@ -538,13 +541,53 @@ perform network access only when explicitly called.
     id** and no VM is held (an operation that only targets the same name does
     not count) is held. Elapsed time and the deadline never release it: past
     the deadline it reports `blocked` until a terminal current-request insert
-    operation is seen and VM and both disks are verified absent. If the
+    operation is seen and VM and all intended disks are verified absent. If the
     operation has aged out of the list, the slot stays blocked for manual
     review (conservative; whether Compute rejects a late create after
     `terminationTime` is an unverified assumption, not relied on).
   - `reconcile(request_id)` is the owner's forced cleanup and leaves a newer
     lease alone (`superseded`). `reconcile()` is the janitor: it acts only on
     expired, stopped or previously failed leases.
+
+### Fixed Ubuntu component library profile
+
+`Config(boot_image=spec.COMPONENT_IMAGE, profile=spec.UBUNTU_COMPONENT)`
+selects `ubuntu-component-v1`: pinned Ubuntu 24.04 amd64
+`ubuntu-2404-noble-amd64-v20261024`, immutable image ID
+`4575951068918267275`, `n2-standard-2` (2 vCPU / 8 GiB), one 20 GB
+`pd-standard` writable auto-delete boot disk in `us-central1-a`, nested
+virtualization enabled and minimum CPU `Intel Cascade Lake`. Maintenance
+uses `TERMINATE` with automatic restart disabled, a conservative component-test
+choice rather than a claim that nested VMs cannot migrate. The initial absolute
+`terminationTime` uses `DELETE` and defaults to 30 minutes; it cannot exceed 30.
+There is no appliance source disk, guest service account, external address,
+startup code or image capture. This small shape is for prerequisites, not the
+complete VLAB.
+
+The library checks the fixed public image name, immutable ID, readiness,
+architecture and 10 GB image minimum at admission and again before submission;
+no arbitrary image/project read is accepted. Before adoption or deletion it also
+checks the boot disk's actual `sourceImage` and `sourceImageId`. Image-read
+failure blocks creation; provenance mismatch blocks adoption and cleanup for
+lead review. Cleanup does not require the upstream image still to exist.
+Records persist profile, fixed child intent and component image ID before
+insertion. Missing profile/child-intent fields are accepted only as the original
+two-disk inspector schema; mixed or unknown inventories fail closed. Both
+profiles share the same serial slot and request/operation/immutable-ID rules.
+
+**Library support does not enable this profile in a workflow.** The active CLI,
+creator/cleanup workflows, access helpers and IAM bootstrap remain fixed to the
+accepted inspector. Using the component requires separately reviewed workflow,
+preflight, permissions, transport/dependency plan and a scoped live task. Offline
+tests prove request/state-machine behavior, not capacity, image boot, systemd,
+KVM or VLAB operation.
+
+Sources checked 2026-10-25: Google's [nested restrictions](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview#restrictions)
+exclude E2; [direct enablement](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/enabling#enable_nested_virtualization_directly_on_a_new_vm)
+uses `advancedMachineFeatures.enableNestedVirtualization` without a custom
+VMX image; [N2 shapes](https://docs.cloud.google.com/compute/docs/general-purpose-machines#n2_machine_types)
+document the 2 vCPU / 8 GiB machine. The fixed image/zone/shape were separately
+read-only verified by the lead; quota snapshots do not reserve capacity.
 
 ### Run the tests
 

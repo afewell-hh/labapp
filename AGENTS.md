@@ -16,9 +16,9 @@ Codex does not document an import mechanism, so this file uses plain links;
   partly manual. The documented process is
   [docs/runbooks/manual-image-build.md](docs/runbooks/manual-image-build.md).
 - **Current priority:** an efficient, reproducible, automated Packer image
-  build using a lead / Claude worker / Codex reviewer workflow. No complete
-  Packer automation exists yet; only the pinned k3d module pilot in
-  `build/provision/`. GCP Marketplace publication is not the primary
+  build using a lead / Claude worker / Codex reviewer workflow. Same-code
+  provisioning modules and container checks live in `build/provision/`; a
+  complete Packer image pipeline remains to be implemented. GCP Marketplace publication is not the primary
   objective (decisions in #136 and #137).
 - **Longer-term:** an installer for fresh Ubuntu 24.04 VMs; an EMC GitOps and
   observability stack (ArgoCD, Gitea, Prometheus, Grafana).

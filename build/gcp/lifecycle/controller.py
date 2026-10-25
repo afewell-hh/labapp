@@ -5,8 +5,8 @@ One persistent slot record (generation-matched writes) moves through
     FREE -> RESERVED -> ACTIVE -> FREE
                  \\-> CLEANUP_FAILED -> FREE      (any occupied state)
 
-Only ``reconcile`` can return a slot to FREE, and only after the VM and both
-owned disks are confirmed absent (404 after the delete operation is DONE) and
+Only ``reconcile`` can return a slot to FREE, and only after the VM and all
+intended owned disks are confirmed absent (404 after the delete operation is DONE) and
 no create can still land. Normal cleanup and the janitor call the same method.
 Every state change is a compare-and-swap on the slot's generation, so a stale
 actor loses instead of overwriting a newer lease.
@@ -26,7 +26,6 @@ from . import spec
 from .cloud import ApiError, NotFound, PolicyCloud, Uncertain
 from .store import PreconditionFailed, SlotStore
 
-KINDS = (("instance", "instances"), ("boot", "disks"), ("data", "disks"))
 FREE, RESERVED, ACTIVE, CLEANUP_FAILED = (
     "FREE", "RESERVED", "ACTIVE", "CLEANUP_FAILED")
 NOT_RUNNING = frozenset({"STOPPING", "STOPPED", "TERMINATED", "SUSPENDING",
@@ -34,7 +33,7 @@ NOT_RUNNING = frozenset({"STOPPING", "STOPPED", "TERMINATED", "SUSPENDING",
 # Fields that must never change while a lease is held (absolute deadline etc.).
 IMMUTABLE = ("slot", "epoch", "project", "zone", "run_id", "attempt",
              "request_id", "body_hash", "names", "boot_image", "reserved_at",
-             "deadline", "max_submit_attempts")
+             "deadline", "max_submit_attempts", "profile", "children", "boot_image_id")
 
 
 class Refused(Exception):
@@ -54,6 +53,7 @@ class Outcome:
 @dataclass
 class Config:
     boot_image: str
+    profile: str = spec.INSPECTOR
     project: str = spec.PROJECT
     zone: str = spec.ZONE
     key: str = "slots/slot-1.json"
@@ -64,7 +64,7 @@ class Config:
     max_vm_slots: int = 3
     max_pages: int = 100
     max_submit_attempts: int = 1  # same-UUID retry semantics are unverified
-    lease_minutes: int = spec.LEASE_MINUTES
+    lease_minutes: Optional[int] = None
     min_submit_minutes: int = 10
     poll_attempts: int = 30
     poll_seconds: float = 5.0
@@ -73,12 +73,21 @@ class Config:
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
     def __post_init__(self) -> None:
+        spec.kinds(self.profile)
+        if self.lease_minutes is None:
+            self.lease_minutes = (spec.COMPONENT_LEASE_MINUTES if self.profile == spec.UBUNTU_COMPONENT
+                                  else spec.LEASE_MINUTES)
         self.validate_lease()
 
     def validate_lease(self) -> None:
+        spec.kinds(self.profile)
+        maximum = (spec.COMPONENT_LEASE_MINUTES if self.profile == spec.UBUNTU_COMPONENT
+                   else spec.LEASE_MINUTES)
+        if self.profile == spec.UBUNTU_COMPONENT and self.boot_image != spec.COMPONENT_IMAGE:
+            raise ValueError("component boot image must match the reviewed pin")
         if (type(self.lease_minutes) is not int or
-                not 1 <= self.lease_minutes <= spec.LEASE_MINUTES):
-            raise ValueError("lease_minutes must be an integer from 1 to 60")
+                not 1 <= self.lease_minutes <= maximum):
+            raise ValueError(f"lease_minutes must be an integer from 1 to {maximum}")
         if (type(self.min_submit_minutes) is not int or
                 not 0 <= self.min_submit_minutes < self.lease_minutes):
             raise ValueError("submission margin must be shorter than the lease")
@@ -102,6 +111,49 @@ class Controller:
             return self.store.write(self.cfg.key, rec, if_generation_match=gen)
         except PreconditionFailed as exc:
             raise _Conflict(str(exc)) from exc
+
+    def _lease_kinds(self, rec: dict) -> tuple:
+        """Validate persisted intent before reading or deleting its children.
+
+        Missing profile/children means the original schema-1 inspector record;
+        never normalize it in place (old CAS immutable fields stay unchanged).
+        """
+        try:
+            profile = rec.get("profile", spec.INSPECTOR)
+            kinds = spec.kinds(profile)
+            expected_names = spec.names(rec["run_id"], rec["attempt"], profile)
+            if (rec["project"] != spec.PROJECT or rec["zone"] != spec.ZONE or
+                    rec["names"] != expected_names or set(rec["ids"]) != set(expected_names)):
+                raise ValueError("mixed child inventory")
+            body = spec.build_body(boot_image=rec["boot_image"], request_id=rec["request_id"],
+                                   run_id=rec["run_id"], attempt=rec["attempt"],
+                                   deadline=_parse(rec["deadline"]), profile=profile)
+            expected_children = {k: body["disks"][i]["initializeParams"]
+                                 for i, (k, _) in enumerate(kinds[1:])}
+            if "profile" in rec or "children" in rec:
+                if rec.get("profile") != profile or rec.get("children") != expected_children:
+                    raise ValueError("mixed child intent")
+            if profile == spec.UBUNTU_COMPONENT and rec.get("boot_image_id") != spec.COMPONENT_IMAGE_ID:
+                raise ValueError("component immutable image pin mismatch")
+            if spec.body_hash(body) != rec["body_hash"]:
+                raise ValueError("persisted body hash mismatch")
+            minutes = (_parse(rec["deadline"]) - _parse(rec["reserved_at"])).total_seconds() / 60
+            maximum = spec.COMPONENT_LEASE_MINUTES if profile == spec.UBUNTU_COMPONENT else spec.LEASE_MINUTES
+            if not 0 < minutes <= maximum:
+                raise ValueError("persisted deadline outside profile")
+            return kinds
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise Refused("invalid persisted profile or child inventory") from exc
+
+    def _check_component_image(self):
+        try:
+            image = self.cloud.call("images", "get", name=spec.COMPONENT_IMAGE.rsplit("/", 1)[-1])
+        except (ApiError, Uncertain) as exc:
+            raise Refused("fixed component image verification unavailable") from exc
+        if (image.get("name") != spec.COMPONENT_IMAGE.rsplit("/", 1)[-1] or
+                image.get("id") != spec.COMPONENT_IMAGE_ID or image.get("status") != "READY" or
+                image.get("architecture") != "X86_64" or str(image.get("diskSizeGb")) != "10"):
+            raise Refused("fixed component image identity/status/minimum mismatch")
 
     def _get(self, resource: str, name: str) -> Optional[dict]:
         try:
@@ -145,6 +197,12 @@ class Controller:
             return "zone"
         if kind == "instance" and proof is not None and res.get("id") != proof:
             return "operation-target-id"
+        if kind == "boot" and rec.get("profile") == spec.UBUNTU_COMPONENT:
+            source = res.get("sourceImage", "")
+            if (source not in (spec.COMPONENT_IMAGE, "https://www.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE,
+                               "https://compute.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE) or
+                    res.get("sourceImageId") != spec.COMPONENT_IMAGE_ID):
+                return "source-image"
         known = rec["ids"].get(kind)
         if known:
             if res.get("id") != known:
@@ -176,16 +234,17 @@ class Controller:
         return ids.pop(), None
 
     def _inventory(self, inst: dict, rec: dict) -> Optional[str]:
-        """The VM must carry exactly the two intended disks, nothing else.
+        """The VM must carry exactly its fixed profile's intended disks.
 
         Deleting a VM also deletes its autoDelete disks, so this runs before
         the VM delete and any unexpected or mismatched child blocks it.
         """
         attached = inst.get("disks")
-        if not isinstance(attached, list) or len(attached) != 2:
+        children = self._lease_kinds(rec)[1:]
+        if not isinstance(attached, list) or len(attached) != len(children):
             return "attachments"
         names = rec["names"]
-        want = {names["boot"]: True, names["data"]: False}
+        want = {names[kind]: kind == "boot" for kind, _ in children}
         seen = set()
         for att in attached:
             src = att.get("source", "")
@@ -212,14 +271,14 @@ class Controller:
         return None
 
     def _inspect(self, rec: dict, proof: Optional[str]):
-        """Fetch and verify the lease's three resources without changing any.
+        """Fetch and verify the lease's intended resources without changing any.
 
         Returns (reason, found). reason is None only when every resource that
-        exists is provably this lease's and an existing VM has exactly the two
+        exists is provably this lease's and an existing VM has exactly the
         intended disks attached (each of which must then exist and verify).
         """
         found = {}
-        for kind, resource in KINDS:
+        for kind, resource in self._lease_kinds(rec):
             res = self._get(resource, rec["names"][kind])
             if res is not None:
                 found[kind] = res
@@ -231,7 +290,7 @@ class Controller:
             reason = self._inventory(found["instance"], rec)
             if reason:
                 return f"instance:{reason}", found
-            for kind in ("boot", "data"):
+            for kind, _ in self._lease_kinds(rec)[1:]:
                 if kind not in found:
                     return f"{kind}:attached-but-missing", found
         return None, found
@@ -318,22 +377,28 @@ class Controller:
         if rec["state"] != FREE:
             raise Refused(f"slot is {rec['state']}")
         self._census()
+        if cfg.profile == spec.UBUNTU_COMPONENT:
+            self._check_component_image()
         now = cfg.now()
         deadline = now + timedelta(minutes=cfg.lease_minutes)
         body = spec.build_body(boot_image=cfg.boot_image, request_id=request_id,
-                               run_id=run_id, attempt=attempt, deadline=deadline)
+                               run_id=run_id, attempt=attempt, deadline=deadline, profile=cfg.profile)
         lease = {
             "schema": 1, "slot": cfg.key, "state": RESERVED,
             "epoch": rec["epoch"] + 1, "project": cfg.project, "zone": cfg.zone,
             "run_id": run_id, "attempt": attempt, "request_id": request_id,
             "body_hash": spec.body_hash(body), "boot_image": cfg.boot_image,
-            "names": spec.names(run_id, attempt),
+            "profile": cfg.profile,
+            "names": spec.names(run_id, attempt, cfg.profile),
+            "children": {kind: body["disks"][i]["initializeParams"]
+                         for i, (kind, _) in enumerate(spec.kinds(cfg.profile)[1:])},
             "reserved_at": spec.rfc3339(now), "deadline": spec.rfc3339(deadline),
             "submit_attempts": 0, "max_submit_attempts": cfg.max_submit_attempts,
-            "operation": None, "ids": {"instance": None, "boot": None,
-                                       "data": None},
+            "operation": None, "ids": {kind: None for kind, _ in spec.kinds(cfg.profile)},
             "reason": None, "evidence": [],
         }
+        if cfg.profile == spec.UBUNTU_COMPONENT:
+            lease["boot_image_id"] = spec.COMPONENT_IMAGE_ID
         try:
             self._cas(rec, lease, gen)
         except _Conflict as exc:
@@ -348,6 +413,9 @@ class Controller:
         if rec is None or rec["state"] != RESERVED or \
                 rec["request_id"] != request_id:
             raise Refused("no RESERVED lease with this request id to submit")
+        self._lease_kinds(rec)
+        if rec.get("profile") == spec.UBUNTU_COMPONENT:
+            self._check_component_image()
         deadline = _parse(rec["deadline"])
         if cfg.now() + timedelta(minutes=cfg.min_submit_minutes) > deadline:
             raise Refused("too little lease time left to create")
@@ -355,7 +423,8 @@ class Controller:
             raise Refused("submit attempts exhausted; reconcile instead")
         body = spec.build_body(
             boot_image=rec["boot_image"], request_id=rec["request_id"],
-            run_id=rec["run_id"], attempt=rec["attempt"], deadline=deadline)
+            run_id=rec["run_id"], attempt=rec["attempt"], deadline=deadline,
+            profile=rec.get("profile", spec.INSPECTOR))
         if spec.body_hash(body) != rec["body_hash"]:
             raise Refused("persisted body hash mismatch")
         prev = dict(rec)
@@ -402,6 +471,7 @@ class Controller:
             if rec is None or rec["state"] != ACTIVE or \
                     rec["request_id"] != request_id:
                 raise Refused("no ACTIVE lease with this request id")
+            self._lease_kinds(rec)
             done = self._wait(rec["operation"], deadline=deadline)
             if done is None:
                 return Outcome("pending-operation", rec["operation"])
@@ -420,7 +490,7 @@ class Controller:
                 reason, found = self._inspect(rec, proof)
                 if reason:
                     return Outcome("identity-mismatch", reason)
-                for kind, _resource in KINDS:
+                for kind, _resource in self._lease_kinds(rec):
                     if kind not in found:
                         return Outcome("missing", kind)
                 rec, gen = self._adopt(rec, gen, found)
@@ -447,7 +517,10 @@ class Controller:
             if force and rec["request_id"] != request_id:
                 return Outcome("superseded", "slot holds a different lease")
             try:
+                self._lease_kinds(rec)
                 return self._reconcile_once(rec, gen, force)
+            except Refused as exc:
+                return Outcome("blocked", str(exc))
             except _Conflict:
                 continue
         return Outcome("blocked", "persistent write conflicts")
@@ -535,7 +608,7 @@ class Controller:
         if reason:
             return self._fail(rec, gen, f"identity-mismatch:{reason}", ev)
         rec, gen = self._adopt(rec, gen, found)
-        for kind, resource in KINDS:
+        for kind, resource in self._lease_kinds(rec):
             rec, gen, blocked = self._delete_owned(
                 rec, gen, kind, resource, found, proof, ev)
             if blocked:
