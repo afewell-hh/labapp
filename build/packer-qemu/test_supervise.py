@@ -84,6 +84,20 @@ class InputTests(unittest.TestCase):
             handle.write("root bash @IN@/install-x.sh\n")
         self.assertNotEqual(self.stage(plan=plan)[1], self.stage()[1])
 
+    def test_generated_and_builtin_names_are_rejected_before_any_copy(self):
+        for name in ("plan.txt", "meta-data", "nonce", "MANIFEST",
+                     "user-data", "guest-build.sh"):
+            with self.subTest(name=name):
+                source = os.path.join(self.tmp, name)
+                with open(source, "w") as handle:
+                    handle.write("caller content must not be silently overwritten\n")
+                cd = os.path.join(self.tmp, "reserved-" + name)
+                with mock.patch.object(supervise.shutil, "copyfile",
+                                       side_effect=AssertionError("must reject before copy")):
+                    with self.assertRaises(ValueError):
+                        supervise.stage_inputs(cd, [self.module, source], None, "a" * 64)
+                self.assertFalse(os.path.lexists(cd))
+
     def test_duplicate_symlink_and_bad_names_are_rejected(self):
         link = os.path.join(self.tmp, "link.sh")
         os.symlink(self.module, link)

@@ -17,6 +17,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILES = {"sentinel": (15 * 60, 5 * 60), "fixture": (30 * 60, 15 * 60)}
+BUILTIN_NAMES = ("user-data", "guest-build.sh")
+GENERATED_NAMES = ("plan.txt", "meta-data", "nonce", "MANIFEST")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
 EXIT = {"usage": 2, "disabled": 6}
@@ -35,19 +37,22 @@ def stage_inputs(cd, stage, plan, nonce):
     """Copy staged bytes into cd/, write MANIFEST (sorted sha256 list); return its digest.
 
     MANIFEST covers every staged file except itself and the nonce file, so the
-    input digest identifies exact module/service/user-data bytes only.
+    input digest identifies exact module/service/user-data bytes only. This is a
+    trusted disposable offline helper: lstat/copy can race and parent directories
+    or plan may be symlinks; file reads are unbounded. It is not a secure stager.
     """
-    os.mkdir(cd, 0o700)
-    names = set()
-    sources = list(stage) + [os.path.join(HERE, "guest", n)
-                             for n in ("user-data", "guest-build.sh")]
-    for source in sources:
+    names = set(GENERATED_NAMES + BUILTIN_NAMES)
+    # Validate the entire caller-supplied namespace before copying anything.
+    for source in stage:
         name = os.path.basename(source)
         info = os.lstat(source)
         if not NAME_RE.match(name) or name in names or not stat.S_ISREG(info.st_mode):
-            raise ValueError("staged input must be a uniquely named regular file")
+            raise ValueError("staged input must be a unique non-reserved regular file")
         names.add(name)
-        shutil.copyfile(source, os.path.join(cd, name))
+    sources = list(stage) + [os.path.join(HERE, "guest", n) for n in BUILTIN_NAMES]
+    os.mkdir(cd, 0o700)
+    for source in sources:
+        shutil.copyfile(source, os.path.join(cd, os.path.basename(source)))
     with open(os.path.join(cd, "plan.txt"), "wb") as handle:
         if plan:
             with open(plan, "rb") as src:

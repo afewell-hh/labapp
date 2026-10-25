@@ -1,7 +1,8 @@
 # Stock Packer/QEMU portability experiment (README.md). NOT executed or even
 # `packer validate`d in the preparation PR; every attribute below is taken from
-# the pinned docs/source and remains UNRUN. Run only through supervise.py, which
-# creates work_dir (0700), stages cd/, and supplies every variable via PKR_VAR_*.
+# the pinned docs/source and remains UNRUN. Execution is disabled; supervise.py
+# rejects every build request. These are preparation-only inputs, not a launch
+# command. A future approved runner must supply owned staging and containment.
 packer {
   required_version = "= 1.16.2"
   required_plugins {

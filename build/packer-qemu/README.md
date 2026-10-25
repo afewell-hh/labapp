@@ -67,13 +67,14 @@ evidence of incompatibility.
   overflowing numbers, non-object messages, a response carrying both `return` and
   `error` (or missing/unknown/duplicate/wrong `id`), a `null`/malformed greeting
   and malformed event envelopes all fail with fixed reason codes.
-* `DIR` is created by `supervise.py` (`mkdtemp`, 0700, safe characters only). The
-  verifier refuses an endpoint that is not a socket owned by the same user.
-* Startup race: the provisioner starts after `stepRun`, but sockets may not exist
-  or listen yet; the verifier retries (50 ms) until its deadline and then fails.
-  Serial bytes written before it connects are dropped by QEMU, so a missed receipt
-  fails closed. QMP events before the verifier connects are likewise lost, and the
-  guest needs minutes to reach shutdown.
+* A future approved runner must create `DIR` as a fresh private directory
+  (0700, safe characters only) and retain ownership until cleanup is verified.
+  The disabled supervisor does not create it. The verifier refuses an endpoint
+  that is not a socket owned by the same user.
+* Socket startup: after `stepRun`, endpoints may not exist or listen yet; the
+  verifier retries (50 ms) until its deadline and then fails. The `-S` prelaunch
+  protocol above attaches both channels before resuming the guest; elapsed guest
+  startup time is not a protection against missed events or serial bytes.
 * Success needs both: a serial line `LABAPP-RECEIPT v1 nonce=<64hex> inputs=<64hex>
   status=ok` equal to this run's values, and QMP `SHUTDOWN` with
   `data.guest == true` and `reason == "guest-shutdown"` (exactly those two keys; a
@@ -90,9 +91,9 @@ evidence of incompatibility.
   not a malicious guest. Native SSH is **not** used and its identity gap is not
   waived (SDK 0.6.11 `InsecureIgnoreHostKey`).
 * `WaitForShutdown` in the plugin treats any QEMU exit as shutdown, so Packer
-  success alone proves nothing; `supervise.py` additionally requires
-  `verified.json` (written only after both pieces of evidence, `O_EXCL`) with this
-  run's nonce and digest.
+  success alone proves nothing. The observer writes `verified.json` only after
+  both pieces of evidence (`O_EXCL`), bound to the nonce and digest. Execution is
+  disabled; no supervisor currently accepts that marker or any build artifact.
 
 ## Guest sequence (UNRUN on a real Noble disk)
 
@@ -126,8 +127,13 @@ boot/reboot evidence.
 CLI build requests return exit code 6 before input reads, staging, preflight or
 process creation. There is no session-based fallback, process signaling or
 artifact acceptance path. The retained `stage_inputs()` helper serves disposable
-offline preparation tests only; it has no build-time deadline guarantee. The
-HCL and guest files are experimental inputs, not an approved launch command.
+offline preparation tests only; it has no build-time deadline guarantee. It
+reserves generated and builtin filenames before copying caller inputs, but is
+not a secure stager: lstat/copy can race, parent directories or the plan can be
+symlinks, and whole-file reads have no size bounds. Use only trusted inputs in a
+disposable offline directory. The execution-grade staging requirements tracked
+in #255 remain unmet. The HCL and guest files are experimental inputs, not an
+approved launch command.
 
 A process session cannot contain a descendant that changes sessions, and a
 PID/session scan followed by signaling has reuse races. Cleanup must not erase
