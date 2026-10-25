@@ -714,10 +714,100 @@ Sources checked 2026-10-25 (Compute REST v1, documentation 2026-09-01):
 [images.delete](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/delete)
 (name and request UUID; no immutable-ID precondition).
 
+### Own-key access records (offline library only)
+
+`Controller(..., access_records=records).register_access(...)` lets the trusted
+controller register one A producer run/attempt, canonical SELF identity and
+public-key hash against a confirmed retained base build. It reserves the last
+fifteen minutes for cleanup. It does not enable access or launch a workflow.
+`Context.from_slot` captures that occupied lease; `GcsAccessRecords` exposes only
+an exact slot read and four immutable, <=16KiB versioned records:
+`access/slot-1/<captured lease UUID>/{intent,import,seal,removed}.json`.
+Paths come from the validated slot, never caller-supplied object names.
+Reads pair metadata with generation-pinned media. Uploads use
+`ifGenerationMatch=0`, then exact canonical read-back; lost replies and 412
+require equality verification, without replaying the upload. A has no exposed
+list, overwrite, delete or slot-write operation. No private key is accepted.
+
+`SelfLogin` takes an explicitly supplied token provider for the same minimal A
+identity and an expected canonical SELF name. It only addresses that profile,
+one public-key import and exact server-fingerprint deletion. These inputs are
+trusted runner configuration; matching the returned profile name is not token
+introspection or proof of deployed WIF. A newly dedicated identity might lack a
+POSIX profile/account before its first import. Missing/ambiguous profile or
+nonroot project POSIX identity refuses access; no key/bootstrap repair is
+attempted. Live SELF/account behavior remains an explicit deployment gate.
+
+`OwnKeyImport(..., producer_run_id=..., producer_attempt=..., now=...)` checks
+that captured producer and the canonical public-key baseline, writes intent
+before import, and holds a process-bound single-use capability only when its
+fresh internal nonce wins intent creation. A 412, restart, repeated call,
+copied session, different process or rerun cannot reconstruct the capability.
+The capability is consumed before POST. The key expiration is at most twenty
+minutes and never beyond the work deadline. Only an unambiguous successful
+import response can produce `import.json`; canonical wire bytes and exact TTL
+must match. Server-returned fingerprint/name are kept separately from the
+locally computed public-key hash. No refresh, replacement or retry exists.
+A crash before a durable import receipt sacrifices availability. Profile
+re-observation, TTL, workflow termination or VM404 cannot settle a lost import;
+that lease stays occupied pending a separately reviewed authoritative resolution.
+
+Independent `cleanup_own_key` uses A again, never Compute cleanup's identity.
+It requires durable successful-import evidence, preserves unrelated keys,
+deletes only the exact intended key and requires a complete authenticated SELF
+profile proving absence. After an uncertain DELETE, exact absence may yield
+`absence-verified-after-uncertain-delete`; this does not claim a successful
+HTTP response. This narrow safety inference relies on a completed sole import
+and a never-reused key: a delayed DELETE cannot recreate that key or affect a
+distinct new key. Profile errors/conflicts block. Expired absence is recorded
+separately. An existing removal receipt is reused only after fresh exact-absence
+verification. Cleanup has no import path.
+
+Once all existing VM/disk/operation gates pass, reconciliation CAS-transitions
+through occupied `finalizing` and `archived` access phases. It validates bound
+intent/import/removal evidence and archives exact generations/hashes before
+FREE. A missing seal is recorded only as absent at observation, not permanently
+never-created. Access-enabled capture additionally requires seal/removal records
+and currently refuses even syntactically valid seal hashes: trusted pre-login
+ownership provenance and a supported installed sealing manifest have not been
+implemented/accepted. Legacy capture, component and inspector behavior is
+preserved. There is no sealer, executable SSH integration or live entry point.
+
+Access objects are retained after release. Late old uploads remain confined to
+the old UUID namespace and cannot authorize or occupy the next lease's paths.
+Separate `access_history` accounting survives reuse, prevents key/UUID reuse,
+and stops new access registration after sixteen completed access leases; nothing
+is silently pruned. Eventual exact-generation deletion, late-upload accounting,
+soft-deleted/noncurrent versions and migration at the bound need a separately
+reviewed policy before unattended enablement. No complete deletion/physical
+erasure or old-producer-quiescence claim is made.
+
+Proposed A permissions remain **ungranted**: exact slot `get`, and `get/create`
+under the entire `access/slot-1/` object namespace in the configured existing
+ledger bucket with UBLA. This is broader than four exact object grants: IAM
+would cover arbitrary suffixes and historical/future objects. UUID/four-name,
+epoch/body and producer restrictions are trusted-code constraints. No A
+list/delete/update/slot-write, TokenCreator or impersonation is implied.
+Namespace/profile alignment, initial metadata authorization, inherited-grant
+review, effective IAM, supported guest provenance/sealing and all live pilots
+remain separate gates. Required CI discovers a nonzero `test_access.py` suite
+alongside all existing lifecycle tests; fake HTTP/CAS evidence proves none of
+these cloud or guest behaviors.
+
+Sources checked 2026-10-25, GCS JSON API and OS Login v1:
+[GCS generation preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions),
+[GCS IAM conditions](https://docs.cloud.google.com/storage/docs/access-control/iam),
+[SELF profile](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users/getLoginProfile),
+[key import](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users/importSshPublicKey),
+[public-key fields](https://docs.cloud.google.com/compute/docs/oslogin/rest/Shared.Types/SshPublicKey),
+and [exact key deletion](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users.sshPublicKeys/delete).
+The DELETE recovery rule above is an inference about content-bound deletion,
+not a documented general timeout-settlement guarantee.
+
 ### Run the tests
 
 ```bash
-python3 -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
 ```
 
 ## GCS slot adapter

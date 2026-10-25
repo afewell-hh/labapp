@@ -23,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from . import spec
+from .access_records import AccessError, Context, KINDS, digest, public_key
+from .oslogin import check_receipt
 from .cloud import ApiError, NotFound, PolicyCloud, Uncertain
 from .store import PreconditionFailed, SlotStore
 
@@ -96,8 +98,9 @@ def _parse(ts: str) -> datetime:
 
 
 class Controller:
-    def __init__(self, store: SlotStore, cloud: PolicyCloud, cfg: Config):
+    def __init__(self, store: SlotStore, cloud: PolicyCloud, cfg: Config, *, access_records=None):
         self.store, self.cloud, self.cfg = store, cloud, cfg
+        self.access_records = access_records
 
     # ---------------------------------------------------------------- helpers
     def _cas(self, prev: dict, rec: dict, gen: int) -> int:
@@ -105,6 +108,16 @@ class Controller:
             for name in IMMUTABLE:
                 if prev.get(name) != rec.get(name):
                     raise AssertionError(f"immutable field {name} changed")
+        old_access = prev.get("access")
+        if old_access is not None and rec.get("state") != FREE:
+            new_access = rec.get("access")
+            if new_access is None or old_access["binding"] != new_access["binding"]:
+                raise AssertionError("immutable access binding changed")
+            phases = {"registered": 0, "finalizing": 1, "archived": 2}
+            if phases[new_access["phase"]] < phases[old_access["phase"]]:
+                raise AssertionError("access phase cannot regress")
+            if old_access["archive"] and old_access["archive"] != new_access["archive"]:
+                raise AssertionError("access archive changed")
         old_capture, new_capture = prev.get("capture"), rec.get("capture")
         if old_capture is not None and rec.get("state") != FREE:
             if new_capture is None:
@@ -416,6 +429,7 @@ class Controller:
             "schema": 1, "slot": cfg.key, "state": RESERVED,
             "quarantine": rec.get("quarantine", []),
             "used_capture_ids": rec.get("used_capture_ids", []),
+            "access_history": rec.get("access_history", []),
             "epoch": rec["epoch"] + 1, "project": cfg.project, "zone": cfg.zone,
             "run_id": run_id, "attempt": attempt, "request_id": request_id,
             "body_hash": spec.body_hash(body), "boot_image": cfg.boot_image,
@@ -550,7 +564,7 @@ class Controller:
             try:
                 self._lease_kinds(rec)
                 return self._reconcile_once(rec, gen, force)
-            except (Refused, ApiError, Uncertain) as exc:
+            except (Refused, ApiError, Uncertain, AccessError) as exc:
                 return Outcome("blocked", str(exc))
             except _Conflict:
                 continue
@@ -680,8 +694,14 @@ class Controller:
             return Outcome("settling", "create outcome unproven")
         if foreign_pending:
             return Outcome("blocked", "unexpected pending operation in zone")
+        if "access" in rec:
+            rec, gen = self._archive_access(rec, gen)
+        history = list(rec.get("access_history", []))
+        if "access" in rec:
+            history.append(rec["access"])
         free = {"schema": 1, "slot": rec["slot"], "state": FREE,
                 "epoch": rec["epoch"], "quarantine": quarantine,
+                "access_history": history,
                 "used_capture_ids": rec.get("used_capture_ids", []),
                 "last_release": {
                     "run_id": rec["run_id"], "attempt": rec["attempt"],
@@ -690,6 +710,121 @@ class Controller:
                     "evidence": (rec["evidence"] + ev)[-50:]}}
         self._cas(rec, free, gen)
         return Outcome("released", "; ".join(ev))
+
+    # ---------------------------------------------- immutable access evidence
+    def register_access(self, request_id, *, producer_run_id, producer_attempt,
+                        self_user, public_key_text):
+        """B registers one A producer/key before access; no runner is enabled.
+
+        History is retained and never pruned here. At 16 access leases admission
+        of another access producer stops for the later retention/accounting gate.
+        The key is consumed at registration, even if import never happens.
+        """
+        from .access_records import validate_binding
+        rec, gen = self.store.read(self.cfg.key)
+        if (rec is None or rec.get("state") != ACTIVE or rec["request_id"] != request_id or
+                rec.get("profile") != spec.UBUNTU_BASE_BUILD or "access" in rec or
+                rec.get("capture") or self.access_records is None):
+            raise Refused("access requires confirmed current build and record adapter")
+        self._lease_kinds(rec)
+        reason, found = self._inspect(rec, rec["ids"]["instance"])
+        if reason or set(found) != {"instance", "boot"}:
+            raise Refused("access requires current exact VM/boot ownership")
+        _, sha = public_key(public_key_text)
+        history = rec.get("access_history", [])
+        if not isinstance(history, list) or len(history) >= 16:
+            raise Refused("access retention/accounting limit reached")
+        for item in history:
+            try:
+                validate_binding(item["binding"])
+                if (item["binding"]["key_sha256"] == sha or
+                        item["binding"]["lease"] == request_id):
+                    raise Refused("access lease/key must never be reused")
+            except (KeyError, TypeError, AccessError):
+                raise Refused("invalid retained access accounting") from None
+        work = _parse(rec["deadline"]) - timedelta(minutes=15)
+        if self.cfg.now() >= work:
+            raise Refused("insufficient access work/cleanup budget")
+        binding = dict(lease=request_id, epoch=rec["epoch"], run_id=producer_run_id,
+                       attempt=producer_attempt, vm_id=rec["ids"]["instance"],
+                       boot_id=rec["ids"]["boot"], source_image_id=rec["boot_image_id"],
+                       deadline=rec["deadline"], work_deadline=spec.rfc3339(work),
+                       self_user=self_user, key_sha256=sha)
+        validate_binding(binding)
+        prev = dict(rec)
+        rec["access"] = dict(binding=binding, phase="registered", archive={})
+        context = Context.from_slot(rec)
+        # The UUID namespace is immutable. Existing objects are collisions, even
+        # if someone claims their contents are equal; never recover import here.
+        if any(self.access_records.read(context, k)[0] is not None for k in KINDS):
+            raise Refused("access UUID namespace already occupied")
+        try:
+            self._cas(prev, rec, gen)
+        except _Conflict as exc:
+            raise Refused("access registration lost ownership") from exc
+        return context
+
+    def _access_evidence(self, rec, *, sealed=False):
+        if self.access_records is None:
+            raise AccessError("access evidence adapter missing; keep occupied")
+        context = Context.from_slot(rec)
+        values, refs = {}, {}
+        for kind in KINDS:
+            value, generation = self.access_records.read(context, kind)
+            if value is None:
+                if kind != "seal" or sealed:
+                    raise AccessError("required access receipt missing")
+                refs[kind] = {"path": context.path(kind), "generation": 0, "sha256": None}
+                continue
+            # Adapter validation is repeated here so a fake/alternate adapter
+            # cannot accidentally bypass domain binding checks.
+            from .access_records import validate_record
+            validate_record(value, context, kind)
+            if type(generation) is not int or not 0 < generation <= 2**64 - 1:
+                raise AccessError("invalid access evidence generation")
+            values[kind] = value
+            refs[kind] = {"path": context.path(kind), "generation": generation, "sha256": digest(value)}
+        intent = values["intent"]
+        for kind in ("import", "removed") + (("seal",) if "seal" in values else ()):
+            check_receipt(values[kind], context, kind, intent, refs["intent"]["generation"])
+        imported, removed = values["import"], values["removed"]
+        if (removed["server_name"] != imported["server_name"] or
+                removed["fingerprint"] != imported["fingerprint"]):
+            raise AccessError("removal receipt server-key mismatch")
+        return refs
+
+    def _archive_access(self, rec, gen):
+        Context.from_slot(rec)
+        # An occupied CAS phase archives receipt references, not producer
+        # quiescence. Late writes stay in this lease's retained UUID namespace.
+        if rec["access"]["phase"] == "registered":
+            prev = dict(rec)
+            rec["access"] = dict(rec["access"], phase="finalizing")
+            rec.update(state=CLEANUP_FAILED, reason="access-finalizing")
+            gen = self._cas(prev, rec, gen)
+        refs = self._access_evidence(rec)
+        if rec["access"]["phase"] != "archived":
+            prev = dict(rec)
+            rec["access"] = dict(rec["access"], phase="archived", archive=refs)
+            gen = self._cas(prev, rec, gen)
+        else:
+            # Already archived records are immutable; no replacement is adopted.
+            old = rec["access"]["archive"]
+            if any(old[k]["generation"] and old[k] != refs[k] for k in KINDS):
+                raise AccessError("archived access evidence changed")
+        return rec, gen
+
+    def _access_capture_gate(self, rec):
+        if "access" not in rec:
+            return
+        try:
+            self._access_evidence(rec, sealed=True)
+        except AccessError as exc:
+            raise Refused(str(exc)) from exc
+        # No trusted pre-login provenance or supported installed sealing manifest
+        # implementation has been accepted. Data-only seal hashes cannot invent
+        # that authority. A later reviewed implementation must replace this hold.
+        raise Refused("trusted pre-login ownership/sealing manifest gate unresolved")
 
     # ---------------------------------------------------------- image capture
     def _capture_intent(self, rec):
@@ -825,6 +960,7 @@ class Controller:
             raise Refused("capture requires current ACTIVE build")
         self._lease_kinds(rec)
         self._quarantines(rec)
+        self._access_capture_gate(rec)
         if (rec.get("profile") != spec.UBUNTU_BASE_BUILD or rec.get("capture") or
                 capture_id in rec.get("used_capture_ids", []) or
                 len(rec.get("used_capture_ids", [])) >= 512):
@@ -885,6 +1021,7 @@ class Controller:
         if rec is None or rec.get("state") != ACTIVE or rec["request_id"] != request_id:
             raise Refused("capture requires current ACTIVE build")
         self._lease_kinds(rec)
+        self._access_capture_gate(rec)
         c = self._capture_intent(rec)
         if c["submitted"]:
             raise Refused("capture already submitted; reconcile instead")
@@ -1007,6 +1144,6 @@ class Controller:
                 return Outcome("not-due")
             except _Conflict:
                 continue
-            except (Refused, ApiError, Uncertain) as exc:
+            except (Refused, ApiError, Uncertain, AccessError) as exc:
                 return Outcome("blocked", str(exc))
         return Outcome("blocked", "persistent quarantine conflicts")
