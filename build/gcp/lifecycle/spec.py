@@ -1,4 +1,4 @@
-"""Two fixed, bounded VM specifications and create-request builder.
+"""Fixed, bounded VM specifications and create-request builder.
 
 Everything here is a constant or a pure function so the exact request body can
 be hashed, persisted before submission and diffed in tests. Field names follow
@@ -18,6 +18,9 @@ REGION = "us-central1"
 MACHINE_TYPE = "e2-standard-2"
 INSPECTOR = "inspector-v1"
 UBUNTU_COMPONENT = "ubuntu-component-v1"
+UBUNTU_BASE_BUILD = "ubuntu-base-build-v1"
+BASE_BUILD_LEASE_MINUTES = 120
+BASE_BUILD_FIRST_LEASE_MINUTES = 45  # explicit first fixture; no runner enabled
 COMPONENT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
 COMPONENT_IMAGE_ID = "4575951068918267275"
 COMPONENT_MACHINE = "n2-standard-2"
@@ -46,9 +49,17 @@ def is_owned_name(name: str) -> bool:
 def kinds(profile: str = INSPECTOR) -> tuple:
     if profile == INSPECTOR:
         return (("instance", "instances"), ("boot", "disks"), ("data", "disks"))
-    if profile == UBUNTU_COMPONENT:
+    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD):
         return (("instance", "instances"), ("boot", "disks"))
     raise ValueError("unknown fixed lifecycle profile")
+
+
+def lease_limit(profile: str) -> int:
+    """Absolute minutes from admission; profiles cannot renew a lease."""
+    kinds(profile)
+    if profile == UBUNTU_BASE_BUILD:
+        return BASE_BUILD_LEASE_MINUTES
+    return COMPONENT_LEASE_MINUTES if profile == UBUNTU_COMPONENT else LEASE_MINUTES
 
 
 def names(run_id: int, attempt: int, profile: str = INSPECTOR) -> dict:
@@ -67,14 +78,14 @@ def rfc3339(moment: datetime) -> str:
 
 def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
                deadline: datetime, profile: str = INSPECTOR) -> dict:
-    """Return the exact request for an inspector or Ubuntu component lease."""
+    """Return the exact request for one fixed lifecycle profile."""
     if "/family/" in boot_image or "/global/images/" not in boot_image:
         raise ValueError("boot_image must be a pinned image, not a family")
     if not _UUID_RE.match(request_id):
         raise ValueError("request_id must be a lowercase UUID")
     kinds(profile)
-    if profile == UBUNTU_COMPONENT and boot_image != COMPONENT_IMAGE:
-        raise ValueError("component boot image must match the reviewed pin")
+    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD) and boot_image != COMPONENT_IMAGE:
+        raise ValueError("Ubuntu boot image must match the reviewed pin")
     n = names(run_id, attempt)
     labels = {LABEL_OWNER: OWNER_VALUE, LABEL_LEASE: request_id,
               LABEL_RUN: str(run_id)}
@@ -133,9 +144,10 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
             {"key": "labapp-stage", "value": "none"},
         ]},
     }
-    if profile == UBUNTU_COMPONENT:
+    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD):
         body["machineType"] = f"{zone}/machineTypes/{COMPONENT_MACHINE}"
         body["disks"] = body["disks"][:1]
+        body["disks"][0]["autoDelete"] = profile != UBUNTU_BASE_BUILD
         body["disks"][0]["initializeParams"]["diskSizeGb"] = str(COMPONENT_DISK_GB)
         body["minCpuPlatform"] = "Intel Cascade Lake"
         body["advancedMachineFeatures"] = {"enableNestedVirtualization": True}
@@ -156,11 +168,12 @@ def validate_body(body: dict) -> None:
                                   request_id=label[LABEL_LEASE],
                                   run_id=int(match[1]), attempt=int(match[2]),
                                   deadline=datetime.fromisoformat(body["scheduling"]["terminationTime"].replace("Z", "+00:00")),
-                                  profile=UBUNTU_COMPONENT)
+                                  profile=(UBUNTU_BASE_BUILD if body["disks"][0]["autoDelete"] is False
+                                           else UBUNTU_COMPONENT))
             if body != expected or body_hash(body) != body_hash(expected):
                 raise ValueError()
-        except (KeyError, TypeError, ValueError, AttributeError):
-            raise ValueError("body outside the fixed Ubuntu component profile") from None
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+            raise ValueError("body outside the fixed Ubuntu profile") from None
         return
     if not is_owned_name(body.get("name", "")):
         raise ValueError("instance name outside the owned pattern")

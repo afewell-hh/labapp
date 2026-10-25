@@ -533,3 +533,18 @@ Offline shell/YAML checks cannot establish effective IAM, organization policy,
 API propagation, image availability or successful federation. Those require the
 actual authorized setup and the relevant fixed metadata/lifecycle workflows;
 record results in GitHub.
+
+
+## Library-only retained-boot base-build profile
+
+The [base-build library contract](../../build/gcp/README.md#retained-boot-ubuntu-base-build-library-profile)
+adds a fixed 120-minute maximum and explicit 45-minute first fixture using the
+same small pinned public Ubuntu shape as the component. Its boot disk uses
+`autoDelete: false`, so VM expiry alone does not clean it up. The existing
+identity-bound reconciler must complete exact retained-disk deletion and verify
+absence before releasing capacity. Unknown create outcomes and pending operations
+remain occupied. No build CLI/workflow, capture API, image retention or builder
+IAM is enabled; the active component dispatch remains unchanged. Future live
+builds require separate review of capture/retention, access/IAM, fixed runner
+budgets, staging/sealing and boot/reboot gates. The 45-minute first-fixture
+30-work/15-cleanup split is a proposed runner budget, not implemented here.

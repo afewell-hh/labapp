@@ -435,7 +435,7 @@ status only. Offline mocks cover success, failed probe and failed detach;
 the actual loop/kernel path requires separate lead execution on the existing
 bounded inspector. No additional VM or lease extension is implied.
 
-Primary recipe checked2026-10-24: e2fsprogs
+Primary recipe checked 2026-10-24: e2fsprogs
 [j_short_trans_64bit](https://github.com/tytso/e2fsprogs/blob/8fd79523d051d5ea881237f27eb1c664486e0078/tests/j_short_trans_64bit/script)
 uses jo/jw/jc; its later fsck/replay steps are deliberately excluded.
 [do_journal.c](https://github.com/tytso/e2fsprogs/blob/8fd79523d051d5ea881237f27eb1c664486e0078/debugfs/do_journal.c)
@@ -480,7 +480,7 @@ perform network access only when explicitly called.
 
 | File | Role |
 |---|---|
-| `spec.py` | Two fixed profiles (component described below). Inspector: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
+| `spec.py` | Three fixed profiles (Ubuntu profiles described below). Inspector: `e2-standard-2`, `us-central1-a`, 10 GB boot + 300 GB copy of the selected source image (both `pd-standard`; boot `READ_WRITE`/`autoDelete: true`, copy `READ_ONLY`/`autoDelete: false`), no external IP, no service account, absolute `scheduling.terminationTime` with `DELETE` (60 minutes by default). Builds, validates and hashes the exact `instances.insert` body |
 | `store.py` | `SlotStore` protocol: generation-matched writes (`if_generation_match`, 0 = must not exist), **no delete**. `MemoryStore` models Cloud Storage generation semantics |
 | `cloud.py` | `PolicyCloud`: the controller's mutation/inventory call surface. Allows only `instances.{insert,get,list,delete}`, `disks.{get,list,delete}`, `zoneOperations.{get,list}` in the fixed project/zone, plus read-only `{instances,disks,globalOperations}.aggregatedList` for the census. The constructor rejects any project/zone other than the approved constants. One fixed read-only Ubuntu image GET is also allowed; image mutations, arbitrary image reads, snapshots, addresses, stop/start/setScheduling/setMetadata, IAM and quota calls are rejected before reaching any transport |
 | `cli.py` | Trusted-runner entrypoint for the fixed workflows; validates events and performs fixed read-only project/region/image preflight requests separately from `PolicyCloud`, then invokes creator or cleanup transitions |
@@ -491,7 +491,9 @@ perform network access only when explicitly called.
 
 - `Config.lease_minutes` defaults to 60 and may shorten the lease to an
   integer from 1 to 60 for the inspector. The Ubuntu component defaults to 30
-  and accepts only 1 through 30. `min_submit_minutes` must be shorter than that lease;
+  and accepts only 1 through 30. The library-only Ubuntu base-build defaults
+  to 120 and accepts 1 through 120; its first fixture explicitly selects 45.
+  `min_submit_minutes` must be shorter than that lease;
   the fixed thirty-minute inspector uses a one-minute submission margin. Admission
   rechecks these bounds before writing intent; an existing deadline is never
   extended.
@@ -518,8 +520,9 @@ perform network access only when explicitly called.
 - `reconcile` is the only path to `FREE`. Before any delete it runs an
   all-or-nothing preflight: every existing resource must match name, lease
   label, zone and immutable id, and an existing VM must have **exactly** the
-  intended disks attached (one boot for the component; boot plus source copy
-  for the inspector). Boot is `READ_WRITE`/`autoDelete: true`; the inspector
+  intended disks attached (one boot for either Ubuntu profile; boot plus source
+  copy for the inspector). Boot is `READ_WRITE`, with `autoDelete: true` for
+  inspector/component and `false` for base-build; the inspector
   source copy is `READ_ONLY`/`autoDelete: false`. Any
   unexpected or mismatched child blocks the VM delete too, because VM delete
   also removes `autoDelete` disks. An id not yet recorded is adopted only with
@@ -529,8 +532,8 @@ perform network access only when explicitly called.
   it deletes the VM, then each disk, by exact name, waits for the delete
   operation, and requires a 404 for **every intended resource** before release.
   - Compute forbids auto-delete on a read-only attachment. VM deletion, whether
-    explicit or at the absolute deadline, auto-deletes only the boot disk. The
-    source copy remains billable until the cleanup identity explicitly deletes
+    explicit or at the absolute deadline, auto-deletes the inspector/component
+    boot but retains the base-build boot. The inspector source copy remains billable until the cleanup identity explicitly deletes
     it. Independent janitor cleanup is required; the VM deadline alone cannot
     bound data-disk retention. A failed or pending disk delete keeps capacity
     occupied, even when the VM is absent.
@@ -572,7 +575,7 @@ failure blocks creation; provenance mismatch blocks adoption and cleanup for
 lead review. Cleanup does not require the upstream image still to exist.
 Records persist profile, fixed child intent and component image ID before
 insertion. Missing profile/child-intent fields are accepted only as the original
-two-disk inspector schema; mixed or unknown inventories fail closed. Both
+two-disk inspector schema; mixed or unknown inventories fail closed. All
 profiles share the same serial slot and request/operation/immutable-ID rules.
 
 The trusted creator now selects this profile through fixed CLI mode `component`;
@@ -589,6 +592,48 @@ uses `advancedMachineFeatures.enableNestedVirtualization` without a custom
 VMX image; [N2 shapes](https://docs.cloud.google.com/compute/docs/general-purpose-machines#n2_machine_types)
 document the 2 vCPU / 8 GiB machine. The fixed image/zone/shape were separately
 read-only verified by the lead; quota snapshots do not reserve capacity.
+
+### Retained-boot Ubuntu base-build library profile
+
+`Config(boot_image=spec.COMPONENT_IMAGE, profile=spec.UBUNTU_BASE_BUILD,
+lease_minutes=spec.BASE_BUILD_FIRST_LEASE_MINUTES)` explicitly selects the
+45-minute first fixture of `ubuntu-base-build-v1`. The profile defaults to a
+120-minute cap, measured absolutely from admission with no renewal; it leaves
+inspector 60-minute/component 30-minute limits unchanged. The proposed first-fixture allocation
+of 30 minutes work and 15 minutes cleanup reserve is a future runner budget,
+not enforced guest work/capture scheduling. The existing submission margin is
+still enforced, including refusal after expiry.
+
+This uses the exact component public Ubuntu name/ID, small nested machine,
+CPU minimum, single 20 GB disk, fixed metadata/labels, no external IP and no
+service account/scopes. The sole resource-body difference is boot
+`autoDelete: false`. Fixed preflight reads the public Ubuntu image and quotas
+for two CPUs/N2 CPUs, one instance and 20 GB; it never reads/copies the protected
+appliance image or requires the inspector's 310 GB. Actual boot provenance and
+persisted profile/body hash remain required before adoption or deletion.
+
+The existing reconciler disposes of the VM followed by its exact retained boot
+on normal cleanup, failure, cancellation and expiry. Cloud VM deletion leaves
+that disk billable: independently scheduled cleanup must still verify the disk's
+immutable ID, terminal operations and absence before `FREE`, including when the
+VM has already disappeared. Unknown inserts, foreign replacements, unexpected
+children and pending operations continue to hold capacity. This profile adds
+no image capture/retention method, CLI mode, dispatch, identity or IAM grant.
+The active component workflow is unchanged. A live build needs separately
+reviewed capture/retention, IAM, fixed runner/staging/sealing and boot/reboot gates.
+
+Required lifecycle CI discovers `test_base_build.py` alongside the existing
+suite using the command below. Its fake HTTP/controller tests cover retained
+requests, absolute bounds, disposal after cloud expiry, pending/error/no-op
+operations, collision/provenance/cancellation and old-profile compatibility.
+They prove offline policy behavior, not live API/IAM, boot or capture readiness.
+
+Sources checked 2026-10-25 (Compute REST v1):
+[instances.insert autoDelete](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert)
+defines deletion behavior for attached disks;
+[absolute VM termination](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime)
+documents initial `terminationTime` plus `DELETE`. These are documented API
+semantics, not a live build test.
 
 ### Run the tests
 
@@ -753,7 +798,7 @@ Sources checked 2026-10-24 (Compute REST v1, API version 2026-09-01):
 and Google's [current discovery schema](https://github.com/googleapis/google-api-python-client/blob/main/googleapiclient/discovery_cache/documents/compute.v1.json)
 for regions.get and numeric quota fields (the regions reference page timed out).
 
-Inspector identity sources checked2026-10-24: Google's
+Inspector identity sources checked 2026-10-24: Google's
 [Debian OS details](https://docs.cloud.google.com/compute/docs/images/os-details#debian)
 (10GB/GPT/ESP, guest environment and OS Login), Debian cloud-image
 [AMD64 fstab](https://salsa.debian.org/cloud-team/debian-cloud-images/-/blob/9ea44ee81fd04d1944127f33f07adf15a3608136/config_space/13/files/etc/fstab/AMD64),
