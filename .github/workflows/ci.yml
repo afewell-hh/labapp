@@ -87,7 +87,9 @@ jobs:
         run: |
           yamllint .yamllint.yml .github marketplace cloud-config.yaml wiringd.yaml
       - name: Validate cloud-init config schema
-        run: cloud-init schema --config-file cloud-config.yaml --annotate
+        run: |
+          cloud-init schema --config-file cloud-config.yaml --annotate
+          cloud-init schema --config-file build/packer-qemu/guest/user-data --annotate
       - name: Check embedded cloud-init shell without executing it
         shell: bash
         run: |
