@@ -30,6 +30,28 @@ jobs:
           test -f build/gcp/inspection/test_mounted_collect.py
           python3 -m unittest discover -s build/gcp/inspection -t build/gcp -v
 
+  portable-builder-offline:
+    name: Portable builder offline observer and execution-gate tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run required offline suites without builders or credentials
+        run: |
+          test -f build/packer-qemu/test_supervise.py
+          test -f build/packer-qemu/test_host_verify.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          import unittest
+          loader = unittest.TestLoader()
+          for pattern in ('test_supervise.py', 'test_host_verify.py'):
+              required = loader.discover('build/packer-qemu', pattern=pattern)
+              if required.countTestCases() == 0:
+                  raise SystemExit(f'Required suite {pattern} discovered no tests')
+          suite = loader.discover('build/packer-qemu', pattern='test_*.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+
   lint:
     name: Active shell, YAML, cloud-init and bootstrap checks
     runs-on: ubuntu-24.04

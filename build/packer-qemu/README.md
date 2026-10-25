@@ -7,16 +7,16 @@ unchanged `build/provision/` modules, and a private host-side observer. Plain
 QEMU carries the same receipt, shutdown, watchdog and cleanup obligations; compare
 the glue honestly and stop on a structural mismatch rather than fork the builder
 or grow a framework. Status, plans and evidence live in GitHub (#253, #252, #145).
-Nothing here has been run, including `packer validate`; every unit test below
-uses fake owned processes/sockets and shows no Packer, QEMU, cloud-init or
-hardware compatibility.
+This is preparation-only code with execution disabled. Offline tests use
+fake channels and disposable inputs; they establish no Packer, QEMU, cloud-init
+or hardware compatibility. Runtime evidence and remaining gates belong in the PR.
 
 ## Files
 
 | File | Role |
 |---|---|
 | `labapp.pkr.hcl` | One `qemu` source (`communicator = "none"`) and one `shell-local` provisioner that only runs the verifier |
-| `supervise.py` | Host watchdog: stages inputs, owns the absolute deadline, new-session child, owned-session cleanup, final success rule, preflight |
+| `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
@@ -122,31 +122,57 @@ boot/reboot evidence.
 
 ## Watchdog and cleanup (`supervise.py`)
 
-Profiles are absolute from start, no renewal: `sentinel` 15 min work + 5 min
-cleanup, `fixture` 30 + 15. These are experiment allocations, not measured
-performance. Packer runs as a new-session leader; on deadline, SIGTERM/SIGINT or
-any exit the supervisor sends TERM then KILL only to processes whose session id
-is that child's (never by name), then requires an empty session (zombies excluded)
-before the deadline and removes the private directory on failure. Escapes via
-`setsid()` are not detectable. Failure leaves no accepted output. Exit codes: 0 ok,
-1 failed, 2 usage/preflight, 3 timeout, 4 cancelled, 5 cleanup unverified.
-Packer's shell-local `timeout` is set but not relied upon (enforcement untraced).
+**Build execution is disabled.** `run()` always returns `("disabled", None)`;
+CLI build requests return exit code 6 before input reads, staging, preflight or
+process creation. There is no session-based fallback, process signaling or
+artifact acceptance path. The retained `stage_inputs()` helper serves disposable
+offline preparation tests only; it has no build-time deadline guarantee. The
+HCL and guest files are experimental inputs, not an approved launch command.
+
+A process session cannot contain a descendant that changes sessions, and a
+PID/session scan followed by signaling has reuse races. Cleanup must not erase
+ownership or remove a workspace while an owned child might remain. An exit code
+or receipt cannot override cancellation, expired budgets or unverified cleanup.
+
+Before re-enabling execution, implement and independently validate a supported
+Linux containment boundary that includes preparation and all descendants before
+execution begins. Use one absolute admission deadline, covering preparation,
+work and cleanup with no renewal, and reject insufficient remaining work budget
+before starting a builder. Preserve exact ownership on exceptions or incomplete
+cleanup. Proposed experiment allocations remain `sentinel` 15 min work + 5 min
+cleanup and `fixture` 30 + 15; these are not measured performance or implemented
+runtime guarantees.
+
+Primary sources read 2026-10-25 (current upstream manuals; actual runner versions
+remain unverified): [systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)
+documents transient services managed by systemd; [KillMode](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)
+with `control-group` stops unit descendants; [service timeouts](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+distinguish startup, active runtime and stop deadlines. `RuntimeMaxSec` alone
+starts too late to bound admission/preparation and does not bound oneshot units.
+A user transient service is a candidate, not implemented here: manager access,
+unit identity, cancellation, all budget phases and verified empty cleanup still
+need proof. Direct delegated [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+would require correct attach-before-exec, permissions and ownership handling;
+a hand-written process supervisor is not a substitute for those guarantees.
 
 ```bash
-# Preflight only: reads /proc and /sys, runs nothing.
+# Read-only hardware diagnostics; successful exit does not enable execution.
 python3 -I /abs/build/packer-qemu/supervise.py --preflight-only
 ```
 
+The required offline suites run in the `portable-builder-offline` CI job; they
+exercise preparation, observer parsing and rejection of execution without
+launching Packer, QEMU, systemd units or other build processes.
+
 ## Runner preflight
 
-Linux x86_64; `/dev/kvm` readable and writable by the build user; Packer-required
-host tools (`qemu-system-x86_64`, `qemu-img`, and `xorriso`, `mkisofs` or
-`genisoimage` for the CD). Builder boot only needs KVM, but the later nested VLAB
-proof needs a CPU exposing `vmx`/`svm` with the `kvm_intel`/`kvm_amd` `nested`
-parameter enabled; GCP nested virtualization excludes E2 and Arm and costs 10%+.
-The preflight requires both. TCG is never a substitute for either; with no suitable
-runner the work stays static. The builder boot is separate from the accelerated
-nested proof.
+Hardware diagnostics read Linux x86_64, `/dev/kvm` user access, required tools,
+CPU `vmx`/`svm` and the `kvm_intel`/`kvm_amd` nested parameter. They do not open
+KVM or establish that acceleration works. Builder boot requires usable KVM;
+the later nested VLAB proof also requires nested CPU exposure. TCG is never a
+substitute. A named runner and a supported containment/manager preflight are
+still required before any later execution approval. A passing diagnostic is
+neither build admission nor accelerated nested-VLAB proof.
 
 ## Open gates (all UNRUN)
 
@@ -156,5 +182,7 @@ work on the pinned pair; observer and watchdog against a real forced failure
 (crash, hang, bad receipt) leaving no processes or files; unchanged modules twice;
 sealed boot/reboot identity, devices, network; accelerated nested execution; full
 pinned VLAB and course exercises; GCP import route and its resources/IAM (no import
-adapter exists; capture uses `sourceDisk`). Wire the unit-test command into CI in
-the PR that enables it; shell checks cover `guest/guest-build.sh` only statically.
+adapter exists; capture uses `sourceDisk`). Required offline suites are wired into
+CI; shell checks cover `guest/guest-build.sh` only statically. Supported process
+containment and an absolute deadline spanning admission through cleanup remain
+unmet execution gates; passing offline tests cannot authorize a build.
