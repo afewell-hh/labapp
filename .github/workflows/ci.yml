@@ -116,7 +116,18 @@ jobs:
           test -f build/gcp/lifecycle/test_lifecycle.py
           test -f build/gcp/lifecycle/test_base_build.py
           test -f build/gcp/lifecycle/test_capture.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
+          test -f build/gcp/lifecycle/test_access.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          import unittest
+          access = unittest.TestLoader().discover(
+              'build/gcp/lifecycle', pattern='test_access.py', top_level_dir='build/gcp')
+          if access.countTestCases() == 0:
+              raise SystemExit('Required access suite discovered no tests')
+          print(f'Required access tests: {access.countTestCases()}', flush=True)
+          suite = unittest.TestLoader().discover('build/gcp/lifecycle', top_level_dir='build/gcp')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
 
   bridge-ipv4:
     name: Bridge IPv4 offline and disposable namespace tests

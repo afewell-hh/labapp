@@ -74,7 +74,8 @@ class HttpTransport:
         try:
             target = urlsplit(url)
             if (target.scheme != "https" or target.hostname not in
-                    {"storage.googleapis.com", "compute.googleapis.com"} or
+                    {"storage.googleapis.com", "compute.googleapis.com",
+                     "oslogin.googleapis.com"} or
                     target.netloc != target.hostname or target.fragment or
                     method not in {"GET", "POST", "DELETE"} or
                     not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or
