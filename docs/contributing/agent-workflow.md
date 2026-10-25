@@ -165,7 +165,9 @@ Use the [GCP access runbook](../runbooks/gcp-build-access.md) for the trusted
 keyless runner boundary. For explicitly authorized scope, the lead may dispatch
 `labapp-cloud.yml` for fixed image metadata reads, or the fixed
 `labapp-lifecycle-inspect.yml` and `labapp-lifecycle-cleanup.yml` for serial
-lifecycle pilots, all on `main` with no inputs. The cleanup workflow also handles
+component lifecycle pilots, all on `main` with no inputs. The creator retains
+its legacy filename for WIF but runs fixed Ubuntu `component` mode; historical
+inspector dispatch is retired and existing inspector leases remain cleanable. The cleanup workflow also handles
 validated completed creator runs and scheduled due-lease reconciliation; see
 [runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner).
 No arbitrary commands, refs, PR code or triggering-run artifacts enter these
@@ -183,7 +185,7 @@ full build, no silent extension. Require cloud-side bounds at creation,
 normal/cancelled/failed-job cleanup and independent expiry cleanup, with exact
 ownership and immutable IDs. Check quotas before launch; do not increase them
 implicitly. The fixed serial lifecycle uses its CAS ledger and project census
-for admission, an immutable cloud deadline, and verified VM/both-disk cleanup.
+for admission, an immutable cloud deadline, and verified VM/all-intended-disk cleanup.
 New cloud behavior still requires reviewed/tested lifecycle gates and separately
 reviewed IAM before launch; routine Packer builds and guest recovery are separate
 scope. Overall acceptance and live evidence remain in #153/#161. No production

@@ -181,12 +181,12 @@ class CliTests(unittest.TestCase):
         controller.cfg.now.return_value = datetime(2026, 10, 24, 23, tzinfo=timezone.utc)
         disks = [{'id': value, 'sourceImageId': image[1]}
                  for value, image in zip(('b', 'd'), cli.IMAGES)]
-        controller.cloud.call.side_effect = disks + [{'id': '123'}, cli.NotFound()]
+        controller.cloud.call.side_effect = disks + [{'id': '123', 'scheduling': {'terminationTime': '2026-10-24T23:05:00Z'}}, cli.NotFound()]
         with patch('builtins.print'):
             self.assertIn('vm-absent', cli.wait_for_absence(controller, 'lease')['status'])
         controller.cfg.sleep.assert_called_once_with(5)
         controller.cloud.call.side_effect = lambda resource, verb, name: (
-            disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': '123'})
+            disks[0 if name == 'boot' else 1] if resource == 'disks' else {'id': '123', 'scheduling': {'terminationTime': '2026-10-24T23:05:00Z'}})
         controller.cloud.call.reset_mock()
         with patch('builtins.print'), self.assertRaisesRegex(Refused, 'fixed wait bound'):
             cli.wait_for_absence(controller, 'lease')
@@ -199,7 +199,8 @@ class CliTests(unittest.TestCase):
     def test_actual_disk_provenance_mismatch_preserves_cleanup_record(self):
         for field in ('sourceImageId', 'id'):
             controller = Mock()
-            record = {'ids': {'boot': 'b', 'data': 'd'}, 'names': {'boot': 'boot', 'data': 'data'}}
+            record = {'ids': {'instance': 'i', 'boot': 'b', 'data': 'd'},
+                      'names': {'instance': 'vm', 'boot': 'boot', 'data': 'data'}}
             original = deepcopy(record)
             disk = {'id': 'b', 'sourceImageId': cli.IMAGES[0][1]}
             disk[field] = 'replacement'
@@ -274,6 +275,190 @@ class CliTests(unittest.TestCase):
         http.request.return_value = HttpResponse(403, b'private server diagnostics')
         with self.assertRaisesRegex(Refused, '^fixed preflight read failed$'):
             cli.Preflight(http, lambda: 'fake-token').check()
+
+
+class ComponentCliTests(unittest.TestCase):
+    def records(self):
+        records = preflight_records()[:2]
+        records[1]['quotas'] = [
+            {'metric': metric, 'usage': 0, 'limit': need}
+            for metric, need in [('CPUS', 2), ('N2_CPUS', 2), ('INSTANCES', 1), ('DISKS_TOTAL_GB', 20)]]
+        records.append({'id': spec.COMPONENT_IMAGE_ID,
+                        'name': spec.COMPONENT_IMAGE.rsplit('/', 1)[-1],
+                        'status': 'READY', 'architecture': 'X86_64', 'diskSizeGb': '10'})
+        return records
+
+    def check(self, records):
+        http = Mock()
+        http.request.side_effect = [HttpResponse(200, json.dumps(r).encode()) for r in records]
+        cli.Preflight(http, lambda: 'fake', profile=spec.UBUNTU_COMPONENT).check()
+        return http
+
+    def test_component_preflight_exact_three_reads_no_source(self):
+        http = self.check(self.records())
+        urls = [c.args[1] for c in http.request.call_args_list]
+        self.assertEqual(urls, ['https://compute.googleapis.com/compute/v1/' + p for p in (
+            'projects/' + spec.PROJECT, 'projects/' + spec.PROJECT + '/regions/' + spec.REGION,
+            spec.COMPONENT_IMAGE)])
+        self.assertNotIn('hedgehog', str(urls))
+        self.assertTrue(all(c.args[0] == 'GET' and c.kwargs['timeout'] == 20
+                            and c.kwargs['max_bytes'] == 1048576 for c in http.request.call_args_list))
+
+    def test_component_each_quota_required_finite_unique_and_sufficient(self):
+        for metric in ('CPUS', 'N2_CPUS', 'INSTANCES', 'DISKS_TOTAL_GB'):
+            for failure in ('missing', 'duplicate', 'insufficient', 'nonfinite', 'negative'):
+                records = self.records()
+                quotas = records[1]['quotas']
+                target = next(q for q in quotas if q['metric'] == metric)
+                if failure == 'missing': quotas.remove(target)
+                if failure == 'duplicate': quotas.append(deepcopy(target))
+                if failure == 'insufficient': target['usage'] = 1
+                if failure == 'nonfinite': target['limit'] = float('inf')
+                if failure == 'negative': target['usage'] = -1
+                with self.subTest(metric=metric, failure=failure), self.assertRaises(Refused):
+                    self.check(records)
+
+    def test_component_pin_scope_architecture_and_inherited_code_refusals(self):
+        mutations = [lambda r: r[0].update(name='foreign'),
+                     lambda r: r[1].update(name='foreign'),
+                     lambda r: r[2].update(id='replacement'),
+                     lambda r: r[2].update(name='other'),
+                     lambda r: r[2].update(status='PENDING'),
+                     lambda r: r[2].update(architecture='ARM64'),
+                     lambda r: r[2].pop('architecture'),
+                     lambda r: r[2].update(diskSizeGb='11')]
+        mutations += [lambda r, key=key: r[0].update(commonInstanceMetadata={
+            'items': [{'key': key, 'value': 'never print this'}]})
+            for key in ('startup-script', 'startup-script-url', 'shutdown-script',
+                        'shutdown-script-url', 'user-data', 'user-data-encoding')]
+        for mutate in mutations:
+            records = self.records()
+            mutate(records)
+            with self.assertRaises(Refused): self.check(records)
+
+    def test_component_main_fixed_configuration_and_preflight(self):
+        env, event = event_env()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'event'
+            path.write_text(json.dumps(event))
+            env['GITHUB_EVENT_PATH'] = str(path)
+            with patch.dict(os.environ, env), patch.object(cli, 'Controller') as controller, \
+                    patch.object(cli, 'Preflight') as preflight, \
+                    patch.object(cli, 'execute', return_value={'status': 'fixture'}), patch('builtins.print'):
+                self.assertEqual(cli.main(['component']), 0)
+            cfg = controller.call_args.args[2]
+            self.assertEqual((cfg.profile, cfg.boot_image, cfg.lease_minutes, cfg.poll_attempts),
+                             (spec.UBUNTU_COMPONENT, spec.COMPONENT_IMAGE, 30, 72))
+            preflight.assert_called_once_with(profile=spec.UBUNTU_COMPONENT)
+
+    def test_component_trust_failure_before_any_cloud(self):
+        for kind in ('pull_request', 'workflow_run', 'schedule'):
+            env, event = event_env(kind)
+            controller, preflight = Mock(), Mock()
+            with self.assertRaises(Refused): cli.execute('component', controller, preflight, env, event)
+            self.assertEqual(controller.mock_calls + preflight.mock_calls, [])
+        env, event = event_env()
+        event['inputs'] = {'profile': spec.INSPECTOR}
+        with self.assertRaises(Refused): cli.trusted_event('component', env, event)
+
+    def test_new_and_old_completion_names_all_conclusions_and_no_inputs(self):
+        for name in (cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME):
+            for conclusion in ('success', 'failure', 'cancelled', 'timed_out'):
+                env, event = event_env('workflow_run')
+                event['workflow_run'].update(name=name, conclusion=conclusion)
+                self.assertEqual(cli.trusted_event('cleanup', env, event)['name'], name)
+                event['inputs'] = {'command': 'forbidden'}
+                with self.assertRaises(Refused): cli.trusted_event('cleanup', env, event)
+
+    def test_component_preflight_failure_precedes_admission(self):
+        env, event = event_env()
+        controller, preflight = Mock(), Mock()
+        preflight.check.side_effect = Refused('fixture quota exhausted')
+        with self.assertRaises(Refused): cli.execute('component', controller, preflight, env, event)
+        self.assertEqual(controller.mock_calls, [])
+
+    def test_all_creator_repository_bindings_fail_before_cloud(self):
+        mutations = [lambda env, event: env.update(GITHUB_REF='refs/heads/other'),
+                     lambda env, event: env.update(GITHUB_REPOSITORY='foreign/repo'),
+                     lambda env, event: event['repository'].update(id=1),
+                     lambda env, event: event['repository'].update(full_name='foreign/repo'),
+                     lambda env, event: event['repository']['owner'].update(id=1)]
+        for mutate in mutations:
+            env, event = event_env()
+            mutate(env, event)
+            controller, preflight = Mock(), Mock()
+            with self.assertRaises(Refused): cli.execute('component', controller, preflight, env, event)
+            self.assertEqual(controller.mock_calls + preflight.mock_calls, [])
+
+    def test_component_wait_accepts_equivalent_absolute_time_representation(self):
+        from .test_profiles import world
+        w = world()
+        record = w.started()
+        instance = next(iter(w.raw.instances.values()))
+        instance['scheduling']['terminationTime'] = record['deadline'].replace('Z', '.000+00:00')
+        w.cfg.sleep = lambda _seconds: w.raw.instances.clear()
+        with patch('builtins.print'):
+            self.assertIn('vm-absent', cli.wait_for_absence(w.ctl, record['request_id'])['status'])
+        self.assertEqual(w.record()['deadline'], record['deadline'])
+
+    def test_component_actual_create_receipt_and_old_config_cleanup(self):
+        from .test_profiles import world
+        w = world()
+        env, event = event_env()
+        real = w.raw.call
+        def read_then_absent(resource, verb, **kwargs):
+            result = real(resource, verb, **kwargs)
+            if resource == 'instances' and verb == 'get' and read_then_absent.done:
+                raise cli.NotFound()
+            return result
+        read_then_absent.done = False
+        def mark_receipt(line, **kwargs):
+            receipt = json.loads(line)
+            self.assertEqual(receipt['status'], 'created')
+            self.assertEqual(receipt['profile'], spec.UBUNTU_COMPONENT)
+            self.assertEqual(set(receipt['ids']), {'instance', 'boot'})
+            self.assertEqual(set(receipt['names']), {'instance', 'boot'})
+            self.assertEqual(receipt['deadline'], w.record()['deadline'])
+            self.assertEqual(receipt['request_id'], w.record()['request_id'])
+            self.assertTrue(kwargs['flush'])
+            read_then_absent.done = True
+        w.raw.call = read_then_absent
+        with patch('builtins.print', side_effect=mark_receipt):
+            self.assertIn('vm-absent', cli.execute('component', w.ctl, Mock(), env, event)['status'])
+        self.assertFalse(any(c[1] == 'delete' for c in w.raw.calls))
+        # Cleanup's default inspector configuration still follows persisted component intent.
+        w.raw.call = real
+        old = Controller(w.store, w.cloud, Config(boot_image=cli.BOOT_IMAGE,
+                        now=w.clock.now, sleep=w.clock.sleep))
+        env, event = event_env('workflow_run')
+        self.assertEqual(cli.execute('cleanup', old, Mock(), env, event), {'status': 'released'})
+        self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
+
+    def test_component_wait_rejects_changed_deadline_without_mutation(self):
+        from .test_profiles import world
+        w = world()
+        record = w.started()
+        instance = next(iter(w.raw.instances.values()))
+        instance['scheduling']['terminationTime'] = '2099-01-01T00:00:00Z'
+        with patch('builtins.print'), self.assertRaisesRegex(Refused, 'deadline changed'):
+            cli.wait_for_absence(w.ctl, record['request_id'])
+        self.assertFalse(any(c[1] == 'delete' for c in w.raw.calls))
+        self.assertEqual(w.record()['deadline'], record['deadline'])
+
+    def test_component_disk_inventory_and_source_binding_refused(self):
+        from .test_profiles import world
+        for field, replacement in (('sourceImageId', 'wrong'), ('sourceImage', spec.SOURCE_IMAGE)):
+            w = world()
+            record = w.started()
+            next(iter(w.raw.disks.values()))[field] = replacement
+            with patch('builtins.print'), self.assertRaisesRegex(Refused, 'provenance mismatch'):
+                cli.wait_for_absence(w.ctl, record['request_id'])
+            self.assertFalse(any(c[1] == 'delete' for c in w.raw.calls))
+        w = world()
+        record = w.started()
+        record['ids']['data'] = 'foreign'
+        with self.assertRaisesRegex(Refused, 'inventory mismatch'):
+            cli.verify_disk_provenance(w.ctl, record)
 
 
 class PilotBudgetTests(unittest.TestCase):
@@ -382,7 +567,7 @@ class PilotBudgetTests(unittest.TestCase):
                 return {'id': ('b', 'd')[index], 'sourceImageId': cli.IMAGES[index][1]}
             if (clock.now() - start).total_seconds() >= 1800:
                 raise cli.NotFound()
-            return {'id': 'i'}
+            return {'id': 'i', 'scheduling': {'terminationTime': record['deadline']}}
         controller.cloud.call.side_effect = get
         with patch('builtins.print'):
             self.assertIn('vm-absent', cli.wait_for_absence(controller, 'lease')['status'])
@@ -402,7 +587,7 @@ class PilotBudgetTests(unittest.TestCase):
                 controller.cfg.now.side_effect = clock.now
                 if not stalled:
                     controller.cfg.sleep.side_effect = lambda seconds: clock.advance(seconds / 60)
-                controller.cloud.call.return_value = {'id': 'i'}
+                controller.cloud.call.return_value = {'id': 'i', 'scheduling': {'terminationTime': deadline}}
                 with patch.object(cli, 'verify_disk_provenance'), patch('builtins.print'):
                     with self.assertRaises(Refused):
                         cli.wait_for_absence(controller, 'lease')
@@ -423,10 +608,13 @@ class WorkflowTests(unittest.TestCase):
 
     def test_workflow_boundary(self):
         inspect, cleanup = self.workflows()
+        self.assertEqual(inspect['name'], cli.CREATOR_NAME)
         self.assertEqual(inspect['on'], {'workflow_dispatch': None})
+        self.assertIn('python3 -m lifecycle.cli component', inspect['jobs']['inspect']['steps'][-1]['run'])
+        self.assertNotIn('lifecycle.cli inspect', inspect['jobs']['inspect']['steps'][-1]['run'])
         self.assertEqual(cleanup['on']['schedule'], [{'cron': '7,17,27,37,47,57 * * * *'}])
         self.assertEqual(cleanup['on']['workflow_run'],
-                         {'workflows': [cli.CREATOR_NAME], 'types': ['completed'], 'branches': ['main']})
+                         {'workflows': [cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME], 'types': ['completed'], 'branches': ['main']})
         for workflow, mode, identity in ((inspect, 'inspect', 'creator'), (cleanup, 'cleanup', 'cleanup')):
             self.assertEqual(workflow['permissions'], {'contents': 'read', 'id-token': 'write'})
             job = workflow['jobs'][mode]

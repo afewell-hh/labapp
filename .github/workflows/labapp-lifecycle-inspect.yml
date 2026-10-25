@@ -1,5 +1,5 @@
 ---
-name: Labapp bounded lifecycle inspection
+name: Labapp bounded Ubuntu component
 
 'on':
   workflow_dispatch:
@@ -81,9 +81,9 @@ jobs:
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
         with:
           version: '540.0.0'
-      - name: Run fixed lifecycle inspect
+      - name: Run fixed Ubuntu component lifecycle
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/labapp-trusted-lifecycle"
-          python3 -m lifecycle.cli inspect
+          python3 -m lifecycle.cli component

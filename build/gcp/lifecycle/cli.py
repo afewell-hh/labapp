@@ -26,7 +26,8 @@ from .gcs import GcsSlotStore
 REPOSITORY = "afewell-hh/labapp"
 REPOSITORY_ID = 1089062808
 OWNER_ID = 193945001
-CREATOR_NAME = "Labapp bounded lifecycle inspection"
+CREATOR_NAME = "Labapp bounded Ubuntu component"
+LEGACY_CREATOR_NAME = "Labapp bounded lifecycle inspection"
 CREATOR_PATH = ".github/workflows/labapp-lifecycle-inspect.yml"
 BUCKET = "labapp-lifecycle-ledger-22685701361"
 BOOT_IMAGE = "projects/debian-cloud/global/images/debian-13-trixie-v20261023"
@@ -37,6 +38,7 @@ CONFIRM_POLL_ATTEMPTS = 72
 POLL_SECONDS = 5
 ABSENCE_GRACE_SECONDS = 120
 ABSENCE_POLL_ATTEMPTS = (PILOT_LEASE_MINUTES * 60 + ABSENCE_GRACE_SECONDS) // POLL_SECONDS + 1
+COMPONENT_IMAGES = ((spec.COMPONENT_IMAGE, spec.COMPONENT_IMAGE_ID, 10),)
 IMAGES = ((BOOT_IMAGE, "1840322579453583118", 10),
           (spec.SOURCE_IMAGE, "7638370619126112785", 300))
 
@@ -50,8 +52,10 @@ def trusted_event(mode, env, event):
             repo.get("full_name") != REPOSITORY or
             repo.get("owner", {}).get("id") != OWNER_ID):
         raise Refused("untrusted repository or ref")
+    if event.get("inputs", {}):
+        raise Refused("fixed workflow accepts no inputs")
     kind = env.get("GITHUB_EVENT_NAME")
-    if mode == "inspect":
+    if mode in ("inspect", "component"):
         if kind != "workflow_dispatch" or event.get("inputs", {}):
             raise Refused("creator requires fixed main dispatch without inputs")
         return None
@@ -63,7 +67,7 @@ def trusted_event(mode, env, event):
     head = run.get("head_repository", {})
     if (kind != "workflow_run" or event.get("action") != "completed" or
             run.get("status") != "completed" or
-            run.get("name") != CREATOR_NAME or run.get("path") != CREATOR_PATH or
+            run.get("name") not in (CREATOR_NAME, LEGACY_CREATOR_NAME) or run.get("path") != CREATOR_PATH or
             run.get("event") != "workflow_dispatch" or
             run.get("head_branch") != "main" or
             head.get("id") != REPOSITORY_ID or head.get("full_name") != REPOSITORY or
@@ -76,8 +80,11 @@ def trusted_event(mode, env, event):
 
 
 class Preflight:
-    """Only four fixed read-only API requests; no caller-supplied URL/path."""
-    def __init__(self, http=None, token_provider=gcloud_token):
+    """Fixed project/region/image reads; no caller-supplied URL/path."""
+    def __init__(self, http=None, token_provider=gcloud_token, profile=spec.INSPECTOR):
+        spec.kinds(profile)
+        self.profile = profile
+        self.images = COMPONENT_IMAGES if profile == spec.UBUNTU_COMPONENT else IMAGES
         self.http = http if http is not None else HttpTransport()
         self.token_provider = token_provider
 
@@ -85,7 +92,7 @@ class Preflight:
         base = "https://compute.googleapis.com/compute/v1/"
         paths = [f"projects/{spec.PROJECT}",
                  f"projects/{spec.PROJECT}/regions/{spec.REGION}"]
-        paths.extend(path for path, _, _ in IMAGES)
+        paths.extend(path for path, _, _ in self.images)
         records = []
         for path in paths:
             response = self.http.request("GET", base + path,
@@ -114,13 +121,18 @@ class Preflight:
             raise Refused("inherited project execution metadata blocks pilot")
         self._quota(project, {"CPUS_ALL_REGIONS": 2})
         # E2 shares the regional CPUS pool with N1 (not E2_CPUS).
-        self._quota(region, {"CPUS": 2, "DISKS_TOTAL_GB": 310})
-        for actual, (path, image_id, minimum) in zip(images, IMAGES):
+        self._quota(region, ({"CPUS": 2, "N2_CPUS": 2, "INSTANCES": 1,
+                              "DISKS_TOTAL_GB": spec.COMPONENT_DISK_GB}
+                             if self.profile == spec.UBUNTU_COMPONENT else
+                             {"CPUS": 2, "DISKS_TOTAL_GB": 310}))
+        for actual, (path, image_id, minimum) in zip(images, self.images):
             if (actual.get("id") != image_id or
                     actual.get("name") != path.rsplit("/", 1)[-1] or
                     actual.get("status") != "READY" or
                     str(actual.get("diskSizeGb")) != str(minimum)):
                 raise Refused("pinned image identity/status/minimum mismatch")
+            if self.profile == spec.UBUNTU_COMPONENT and actual.get("architecture") != "X86_64":
+                raise Refused("component image architecture mismatch")
 
     @staticmethod
     def _quota(record, needs):
@@ -141,10 +153,19 @@ class Preflight:
 
 def verify_disk_provenance(controller, record):
     """Check actual cloned image IDs; names alone cannot pin incarnations."""
-    for kind, (_, image_id, _) in zip(("boot", "data"), IMAGES):
+    profile = record.get("profile", spec.INSPECTOR)
+    images = COMPONENT_IMAGES if profile == spec.UBUNTU_COMPONENT else IMAGES
+    kinds = [kind for kind, _ in spec.kinds(profile)[1:]]
+    if set(record["ids"]) != {"instance", *kinds} or set(record["names"]) != {"instance", *kinds}:
+        raise Refused("created disk inventory mismatch")
+    for kind, (path, image_id, _) in zip(kinds, images):
         disk = controller.cloud.call("disks", "get", name=record["names"][kind])
         if (not record["ids"].get(kind) or disk.get("id") != record["ids"][kind] or
-                disk.get("sourceImageId") != image_id):
+                disk.get("sourceImageId") != image_id or
+                (profile == spec.UBUNTU_COMPONENT and
+                 disk.get("sourceImage") not in (path,
+                     "https://www.googleapis.com/compute/v1/" + path,
+                     "https://compute.googleapis.com/compute/v1/" + path))):
             raise Refused("created disk image provenance mismatch; independent cleanup required")
 
 
@@ -158,7 +179,8 @@ def wait_for_absence(controller, request_id):
     # The fixed thirty-minute lease plus two-minute cloud convergence allowance.
     # An iteration bound also stops clock changes extending the wait.
     print(json.dumps({"status": "created", "ids": record["ids"],
-                      "deadline": record["deadline"]}, sort_keys=True), flush=True)
+                      "deadline": record["deadline"], "names": record["names"],
+                      "request_id": request_id, "profile": record.get("profile", spec.INSPECTOR)}, sort_keys=True), flush=True)
     cutoff = datetime.fromisoformat(record["deadline"].replace("Z", "+00:00")) + timedelta(seconds=ABSENCE_GRACE_SECONDS)
     for _ in range(ABSENCE_POLL_ATTEMPTS):
         if controller.cfg.now() >= cutoff:
@@ -169,13 +191,20 @@ def wait_for_absence(controller, request_id):
             return {"status": "vm-absent-awaiting-independent-disk-verification"}
         if instance.get("id") != record["ids"]["instance"]:
             raise Refused("instance identity changed during wait")
+        try:
+            observed = datetime.fromisoformat(instance["scheduling"]["terminationTime"].replace("Z", "+00:00"))
+            expected = datetime.fromisoformat(record["deadline"].replace("Z", "+00:00"))
+            if observed != expected:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise Refused("instance deadline changed during wait") from None
         controller.cfg.sleep(POLL_SECONDS)
     raise Refused("VM absence not confirmed within fixed wait bound")
 
 
 def execute(mode, controller, preflight, env, event):
     run = trusted_event(mode, env, event)
-    if mode == "inspect":
+    if mode in ("inspect", "component"):
         # Verify before reserving capacity or issuing any mutation.
         preflight.check()
         run_id, attempt = int(env["GITHUB_RUN_ID"]), int(env["GITHUB_RUN_ATTEMPT"])
@@ -205,19 +234,21 @@ def execute(mode, controller, preflight, env, event):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("inspect", "cleanup"))
+    parser.add_argument("mode", choices=("inspect", "component", "cleanup"))
     args = parser.parse_args(argv)
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         # Trust validation precedes adapter construction and cloud access.
         trusted_event(args.mode, os.environ, event)
+        profile = spec.UBUNTU_COMPONENT if args.mode == "component" else spec.INSPECTOR
         controller = Controller(GcsSlotStore(BUCKET),
                                 PolicyCloud(ComputeRestTransport(), spec.PROJECT, spec.ZONE),
-                                Config(boot_image=BOOT_IMAGE, lease_minutes=PILOT_LEASE_MINUTES,
+                                Config(boot_image=spec.COMPONENT_IMAGE if profile == spec.UBUNTU_COMPONENT else BOOT_IMAGE,
+                                       profile=profile, lease_minutes=PILOT_LEASE_MINUTES,
                                        min_submit_minutes=1,
-                                       poll_attempts=CONFIRM_POLL_ATTEMPTS if args.mode == "inspect" else 30,
+                                       poll_attempts=CONFIRM_POLL_ATTEMPTS if args.mode in ("inspect", "component") else 30,
                                        poll_seconds=POLL_SECONDS))
-        result = execute(args.mode, controller, Preflight(), os.environ, event)
+        result = execute(args.mode, controller, Preflight(profile=profile), os.environ, event)
         print(json.dumps(result, sort_keys=True))
         return 0
     except Exception:
