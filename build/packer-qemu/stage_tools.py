@@ -25,8 +25,17 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 PLUGIN_DIR = ("plugins", "github.com", "hashicorp", "qemu")
 PLUGIN_FILE = "packer-plugin-qemu_v1.1.7_x5.0_linux_amd64"
 VARS_NAME = "validate.pkrvars.hcl"
+SENTINEL_VARS_NAME = "sentinel.pkrvars.hcl"
+VARS_NAMES = (VARS_NAME, SENTINEL_VARS_NAME)     # generated, excluded from the overall identity
 VERIFY_SECONDS = 30
 GUEST_FILES = ("user-data", "guest-build.sh")
+TASKS = ("hcl-check", "sentinel")
+ARTIFACT_LIMIT = 1 << 32      # bound for hashing the disposable sentinel output
+# Sentinel guest assertions. Staged 0444 so `ubuntu` can read the copy made by user-data
+# (cp -a keeps modes; ISO Rock Ridge modes are UNVERIFIED until the tiny ISO check).
+ASSERT_NAME = "assert-sentinel.sh"
+SENTINEL_PLAN = (f"root /bin/bash @IN@/{ASSERT_NAME} root\n"
+                 f"ubuntu /bin/bash @IN@/{ASSERT_NAME} ubuntu\n").encode()
 
 # members: name -> (unix permission bits, uncompressed size, CRC32) from the #262 listing
 PINS = {
@@ -111,9 +120,9 @@ def read_file(path, limit, check=_noop):
     return b"".join(chunks)
 
 
-def hash_file(path, size=None, check=_noop):
+def hash_file(path, size=None, check=_noop, limit=FILE_LIMIT):
     """Return (sha256 hex, identity) of a regular file read once through one descriptor."""
-    handle, info = open_regular(path, FILE_LIMIT if size is None else size)
+    handle, info = open_regular(path, limit if size is None else size)
     with handle:
         if size is not None and info.st_size != size:
             raise StageError("input size differs from its pin")
@@ -236,23 +245,33 @@ def manifest(ws, base_sha, check=_noop):
     rows = [(base_sha, "in/base.img")]
     for top in ("in", "cd"):
         for rel in walk(os.path.join(ws, top)):
-            if top == "in" and rel in (VARS_NAME, "base.img"):
+            if top == "in" and (rel in VARS_NAMES or rel == "base.img"):
                 continue
             rows.append((hash_file(os.path.join(ws, top, rel), check=check)[0], f"{top}/{rel}"))
     return "".join(f"{h}  {n}\n" for h, n in sorted(rows, key=lambda r: r[1])).encode()
 
 
-def vars_text(nonce, inputs, base_sha):
+def vars_text(nonce, inputs, base_sha, verify_seconds=VERIFY_SECONDS):
     return "".join(f'{k} = {v}\n' for k, v in (
         ("work_dir", '"/out/work"'), ("nonce", f'"{nonce}"'), ("inputs", f'"{inputs}"'),
         ("base_image", '"/in/base.img"'), ("base_sha256", f'"{base_sha}"'),
-        ("verifier", '"/in/host_verify.py"'), ("verify_seconds", str(VERIFY_SECONDS)))).encode()
+        ("verifier", '"/in/host_verify.py"'), ("verify_seconds", str(verify_seconds)))).encode()
 
 
-def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
+def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-check",
+          verify_seconds=None):
     """Create ws/in (read-only inputs), ws/cd (read-only CD files) and ws/out (the only
     writable tree, with its fixed empty subdirectories). `sources` maps core, plugin
-    and base to caller-supplied files that must match the pins. Return the evidence."""
+    and base to caller-supplied files that must match the pins. Return the evidence.
+
+    hcl-check keeps its original contract (empty plan, overall digest as `inputs`, 30 s).
+    sentinel stages the assertion script and plan BEFORE the CD MANIFEST, passes
+    SHA256(cd/MANIFEST) (exactly what guest-build.sh puts in its receipt) as the
+    observer `inputs`, keeps the overall in/+cd/ digest as `inputs` EVIDENCE, and
+    takes `verify_seconds` (an int or a callable evaluated when the var-file is
+    written, so it reflects the original budget actually left)."""
+    if task not in TASKS:
+        raise StageError("unknown staging task")
     if not HEX64_RE.match(nonce):
         raise StageError("nonce must be 64 lowercase hex characters")
     for path in sources.values():
@@ -288,7 +307,11 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
         write_new(os.path.join(cd, name),
                   read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o400)
     write_new(os.path.join(cd, "meta-data"), b"instance-id: labapp-build\n", 0o400)
-    write_new(os.path.join(cd, "plan.txt"), b"", 0o400)
+    if task == "sentinel":
+        for name in (ASSERT_NAME, "sentinel-evidence.py"):
+            write_new(os.path.join(cd, name),
+                      read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o444)
+    write_new(os.path.join(cd, "plan.txt"), SENTINEL_PLAN if task == "sentinel" else b"", 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
     lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
                     if n != "nonce")
@@ -298,9 +321,21 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
     if base_sha != base_pin["sha256"]:
         raise StageError("base image differs from its pin")
     inputs = hashlib.sha256(manifest(ws, base_sha, check)).hexdigest()
-    var_bytes = vars_text(nonce, inputs, base_sha)
-    write_new(os.path.join(inp, VARS_NAME), var_bytes, 0o400)
+    extra = {}
+    if task == "sentinel":
+        # Guest receipt identity, distinct from the overall `inputs` above.
+        guest_receipt = hash_file(os.path.join(cd, "MANIFEST"), check=check)[0]
+        seconds = verify_seconds() if callable(verify_seconds) else verify_seconds
+        if not isinstance(seconds, int) or isinstance(seconds, bool) or not 1 <= seconds <= 86400:
+            raise StageError("sentinel needs a verification time within the remaining budget")
+        var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + b"require_sentinel_evidence = true\n"
+        vars_name = SENTINEL_VARS_NAME
+        extra = {"guest_receipt": guest_receipt, "verify_seconds": seconds}
+    else:
+        var_bytes, vars_name = vars_text(nonce, inputs, base_sha), VARS_NAME
+    write_new(os.path.join(inp, vars_name), var_bytes, 0o400)
     return {"inputs": inputs, "vars_sha256": hashlib.sha256(var_bytes).hexdigest(),
+            "vars_name": vars_name, **extra,
             "nonce": nonce, "base_sha256": base_sha, "base_size": base_pin["size"],
             "core_archive_sha256": pins["core"]["sha256"], "core_member_sha256": member_sha["core"],
             "plugin_archive_sha256": pins["plugin"]["sha256"],
@@ -311,6 +346,6 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
 def verify_staged(ws, staged, check=_noop):
     """After the run: staged bytes, var-file and base file are exactly what was recorded."""
     same = hashlib.sha256(manifest(ws, staged["base_sha256"], check)).hexdigest() == staged["inputs"]
-    same = same and hash_file(os.path.join(ws, "in", VARS_NAME), check=check)[0] == staged["vars_sha256"]
+    same = same and hash_file(os.path.join(ws, "in", staged["vars_name"]), check=check)[0] == staged["vars_sha256"]
     return same and hash_file(os.path.join(ws, "in", "base.img"),
                               staged["base_size"], check)[0] == staged["base_sha256"]

@@ -21,7 +21,8 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
-| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe` and `hcl-check` tasks; pinned bounded staging (see "Bounded container probe") |
+| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe` and `hcl-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode is gated off until a runtime identity is accepted |
+| `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Unbuilt sentinel runtime recipe; guest assertions run by the sentinel plan |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing
@@ -323,6 +324,74 @@ default prints the plan only.
   identity and copied bytes are checked, not locked); `ulimit -f` bounds file size,
   not total `/out` bytes. Actual version-output, sidecar and HCL-check results
   belong in #264; they cannot establish VM readiness.
+
+### Fixed `sentinel` task (offline contracts only; UNRUN, execution refused)
+
+`--mode sentinel` reuses the same admission, single ledger, actual-start timer, bounded
+backend, exact name+label+ID cleanup and HOLD semantics. There is no image, command or
+runtime option. **It refuses before the lock, ledger, workspace, staging or any Docker
+call unless `container_runner.SENTINEL_RUNTIME` holds an accepted `image_id` and
+RootFS `diffids`; the shipped value is `None`** (no digest is invented). `supervise.py`
+stays execution-disabled.
+
+* Runtime: `runtime/Dockerfile` (that directory is the whole build context) derives from
+  the full accepted Ubuntu digest, deletes ambient APT sources, writes one Deb822 source
+  pair for snapshot `20261024T000000Z` (Canonical's documented Noble form; the keyring
+  is the base image's own, no key download or authentication/`Valid-Until` bypass) and
+  installs explicit candidate roots `qemu-system-x86`, `qemu-utils`, `seabios`
+  (equal to `build/provision/install-qemu.py` PINS, which are untouched), `python3`,
+  `python3.12` and `xorriso` with `--no-install-recommends`; the resolved package list
+  and `InRelease` hashes are recorded inside the image. The ISO tool is one the pinned
+  SDK actually searches (`xorriso`, `mkisofs`, `hdiutil`, `oscdimg`); the
+  `supervise.py` diagnostic no longer accepts `genisoimage`. Versions are candidates:
+  snapshot availability, closure (for example `ipxe-qemu` option ROMs), HTTP vs CA needs
+  and `Valid-Until` behavior are **unverified** until the preparation job runs.
+  A build-client or job timeout does not prove daemon-side work stopped.
+* Argv: hcl-check's boundary plus `--device=/dev/kvm` and numeric `--group-add` of its
+  GID (metadata-only `lstat` preflight: character device, nonzero group, group rw; no
+  open/ioctl; missing KVM is `kvm_unavailable`, never TCG). Proposed, unmeasured caps:
+  `--cpus=5`, `--memory=10g`, `--memory-swap=10g`, `--pids-limit=512` around the
+  4 vCPU / 8 GiB guest. Sockets stay at the short owned `/out/work/{events,serial}.sock`.
+* Budget: 900 s work including staging from admission, 300 s cleanup, no renewal.
+  `verify_seconds` = work left when the var-file is written minus `SENTINEL_RESERVE`
+  (120 s, unmeasured: Docker calls, Packer start, ISO, convert, rehash, reads). The
+  plugin's 5 min `shutdown_timeout` is not subtracted: the observer returns only after
+  guest shutdown and a later wait returns at once; it stays a secondary cap.
+* Identities: the overall canonical `in/`+`cd/` digest stays runner evidence
+  (`inputs`) and is rechecked after the run; the observer's `--inputs`/receipt value is
+  `SHA256(cd/MANIFEST)` (`guest_receipt`), via the sentinel-specific
+  `sentinel.pkrvars.hcl`. `hcl-check` staging is unchanged.
+* Guest: plan runs `guest/assert-sentinel.sh` as `root` then `ubuntu` (uid, cwd `/`,
+  sanitized environment); it is staged 0444 before the MANIFEST so both users can read
+  the copy. No downloads or VLAB. Only root pipes `cloud-init status --format json`
+  to staged `guest/sentinel-evidence.py` before the seal cleans it. The helper rejects
+  output over 64 KiB (never accepts truncation), malformed/duplicate JSON, non-done
+  status, nested errors/recoverable errors and nonzero status codes. It emits only
+  `LABAPP-EVIDENCE v1 nonce=HEX64 inputs=HEX64 cloud-init=done errors=0 recoverable=0`;
+  arbitrary status fields and error text are never retained or echoed. The identities
+  are the checked staged nonce and CD MANIFEST digest.
+* Observer: sentinel vars set `require_sentinel_evidence = true` (HCL default false),
+  adding `--require-sentinel-evidence`. The observer requires exactly one matching
+  record alongside the existing receipt, prelaunch/KVM/cont and normal-shutdown gates.
+  Missing, malformed, duplicate, stale, non-done or oversized evidence fails within
+  the original serial byte/line/deadline bounds; ordinary overlong boot noise is still
+  discarded. Successful evidence becomes the closed `cloud_init` object
+  `{"status":"done","errors":0,"recoverable_errors":0}` in `verified.json`.
+  Ordinary observer runs ignore evidence lines and retain their original four-key result.
+* Success needs container exit 0, `build 0`, a `verified.json` with exactly the observer's
+  five keys matching this run's nonce, `guest_receipt`, `guest-shutdown` and the
+  exact normalized `cloud_init` summary (integer zero counts), a bounded regular
+  artifact (hashed, then deleted), unchanged staged bytes and verified cleanup.
+  All result-file parents and leaves are opened through anchored directory descriptors
+  with no symlink following; empty output files remain valid and reads reject size or
+  identity changes. External bytes cannot enter evidence through an aliased parent.
+  Runner evidence retains the validated summary and the result-file size/hash, with no
+  raw result-file excerpt.
+  Packer exit 0 or `verified.json` alone is not enough.
+* Unmet before any VM (HOLD): accepted runtime identity from a reviewed preparation
+  workflow with owned builder cleanup; named KVM runner and UID/GID mapping; ISO
+  Rock Ridge mode check; the unrun HCL attributes above; actual guest evidence emission;
+  measured resource caps and reserve; failure/hang trial, then one success.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.

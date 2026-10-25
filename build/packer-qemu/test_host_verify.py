@@ -568,5 +568,67 @@ class PartialWriteTests(unittest.TestCase):
         self.assertIn(b'"cont"', bytes(wrapped.sent))
 
 
+
+def evidence(nonce=NONCE, inputs=INPUTS):
+    return (f"LABAPP-EVIDENCE v1 nonce={nonce} inputs={inputs} "
+            "cloud-init=done errors=0 recoverable=0\n").encode()
+
+
+class SentinelEvidenceTests(unittest.TestCase):
+    def run_case(self, serial, expected=None, required=True):
+        fake = Fake(self)
+        fake.qmp_script([(0.05, SHUTDOWN_OK)])
+        fake.serial_script([(0.02, serial)])
+        args = fake.args(timeout=1)
+        args.require_sentinel_evidence = required
+        if expected:
+            with self.assertRaisesRegex(host_verify.Failure, expected):
+                host_verify.verify(args)
+            self.assertFalse(os.path.exists(fake.result))
+        else:
+            host_verify.verify(args)
+            with open(fake.result) as handle:
+                return json.load(handle)
+
+    def test_required_valid_summary_is_retained_with_existing_binding(self):
+        result = self.run_case(evidence() + receipt())
+        self.assertEqual(result, {"nonce": NONCE, "inputs": INPUTS, "receipt": "ok",
+                                  "shutdown": "guest-shutdown", "cloud_init": host_verify.CLOUD_INIT})
+
+    def test_optional_absent_evidence_keeps_four_keys(self):
+        self.assertNotIn("cloud_init", self.run_case(receipt(), required=False))
+        self.assertNotIn("cloud_init", self.run_case(b"LABAPP-EVIDENCE arbitrary boot text\n" + receipt(),
+                                                    required=False))
+
+    def test_missing_duplicate_stale_malformed_and_non_done_fail(self):
+        cases = [(b"", "missing-sentinel-evidence"),
+                 (evidence() * 2, "duplicate-sentinel-evidence"),
+                 (evidence(nonce="0" * 64), "stale-or-wrong-sentinel-evidence"),
+                 (evidence(inputs="0" * 64), "stale-or-wrong-sentinel-evidence"),
+                 (evidence().replace(b"done", b"running"), "malformed-sentinel-evidence"),
+                 (evidence().replace(b"errors=0", b"errors=1"), "malformed-sentinel-evidence"),
+                 (evidence().replace(b"v1 ", b"v1 extra=secret "), "malformed-sentinel-evidence")]
+        for line, reason in cases:
+            with self.subTest(reason=reason, line=line):
+                self.run_case(line + receipt(), reason)
+
+    def test_oversize_evidence_is_not_dropped_like_boot_noise(self):
+        self.run_case(evidence().rstrip() + b"x" * host_verify.SERIAL_LINE_MAX + b"\n" + receipt(),
+                      "line-limit")
+        # Including a valid prefix before excess bytes must not accept a truncation.
+        with mock.patch.object(host_verify, "SERIAL_TOTAL_MAX", 16):
+            self.run_case(evidence() + receipt(), "output-limit")
+
+    def test_missing_evidence_still_obeys_original_deadline(self):
+        fake = Fake(self)
+        fake.qmp_script([(0.05, SHUTDOWN_OK)])
+        fake.serial_script([(0.02, receipt()), (0.3, b"")])
+        args = fake.args(timeout=0.15)
+        args.require_sentinel_evidence = True
+        with self.assertRaisesRegex(host_verify.Failure, "timeout"):
+            host_verify.verify(args)
+        self.assertFalse(os.path.exists(fake.result))
+
+
 if __name__ == "__main__":
     unittest.main()

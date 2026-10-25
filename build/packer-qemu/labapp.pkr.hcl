@@ -20,6 +20,10 @@ variable "base_image" { type = string }
 variable "base_sha256" { type = string }
 variable "verifier" { type = string }
 variable "verify_seconds" { type = number }
+variable "require_sentinel_evidence" {
+  type    = bool
+  default = false
+}
 
 source "qemu" "labapp" {
   # Packer verifies the local base image against base_sha256; nothing downloads.
@@ -88,9 +92,10 @@ build {
       "LABAPP_NONCE=${var.nonce}",
       "LABAPP_INPUTS=${var.inputs}",
       "LABAPP_SECONDS=${var.verify_seconds}",
+      "LABAPP_EVIDENCE=${var.require_sentinel_evidence ? "--require-sentinel-evidence" : ""}",
     ]
     inline = [
-      "exec python3 -I \"$LABAPP_VERIFIER\" --qmp \"$LABAPP_DIR/events.sock\" --serial \"$LABAPP_DIR/serial.sock\" --result \"$LABAPP_DIR/verified.json\" --timeout \"$LABAPP_SECONDS\" --nonce \"$LABAPP_NONCE\" --inputs \"$LABAPP_INPUTS\"",
+      "exec python3 -I \"$LABAPP_VERIFIER\" --qmp \"$LABAPP_DIR/events.sock\" --serial \"$LABAPP_DIR/serial.sock\" --result \"$LABAPP_DIR/verified.json\" --timeout \"$LABAPP_SECONDS\" --nonce \"$LABAPP_NONCE\" --inputs \"$LABAPP_INPUTS\" $LABAPP_EVIDENCE",
     ]
     timeout = "${var.verify_seconds}s" # secondary; approved external containment/watchdog still required
   }
