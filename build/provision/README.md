@@ -311,3 +311,73 @@ and [upstream installer](https://i.hhdev.io/hhfab). The upstream installer defau
 to `latest` and `/usr/local/bin`; this module deliberately requires explicit
 version selection. The docs overview was unavailable through the research browser;
 no installation claim relies on that page.
+
+## Offline-delivered guest prerequisite probe
+
+`component_prerequisites.py` is a small **guest** check for an explicitly
+approved disposable Ubuntu 24.04 amd64 component VM. It does not launch or
+access VMs. Trusted lead delivery must place this script, the unchanged
+`install-hhfab.py` and `hhfab_release.py` siblings in a root-owned directory,
+and deliver the official 0.50.4 archive pinned above. No guest download, package
+installation, module loading, user/group changes or network repair occurs.
+Version 0.50.4 is a probe compatibility choice, not acceptance as an image pin.
+
+Invoke as root with `/usr/bin/python3` (Ubuntu 24.04 Python 3.12 stdlib;
+offline host tests also support Python 3.10+) and an explicit existing nonroot
+UID with a nonroot primary group:
+
+```bash
+sudo /usr/bin/python3 /trusted/provision/component_prerequisites.py \
+  --owner-uid 1000 --archive /trusted/hhfab-linux-amd64-v0.50.4.tar.gz
+```
+
+The archive and trusted script directory must be readable/traversable by that
+owner. The probe does not change external file permissions. The caller excludes
+concurrent changes to these inputs, their ancestors and `/run`; the selected
+owner must be dedicated and idle. This is not a hostile multiuser sandbox.
+The current directory is irrelevant and children receive fixed clean environments.
+Required tools are fixed `/usr/bin/python3`, `/usr/bin/systemd-run`,
+`/usr/bin/systemctl`, `/usr/bin/env`; PID1 must actually be systemd. Missing
+prerequisites fail without fallback. Protect the root script/import directory
+from writes by the selected owner.
+
+A root-owned unique `/run/labapp-prereq-*` directory permits traversal only;
+its install child belongs to the selected owner. The existing installer runs
+unchanged as that UID/primary GID with supplementary groups cleared, then reruns.
+The probe verifies the pinned binary hash/size, owner, mode0755 and unchanged
+inode/timestamps; the actual installed `--version` smoke also runs as that
+nonroot identity. It never installs into `/usr/local/bin`.
+
+The systemd check creates only a unique `labapp-prereq-<uuid>.service` after
+refusing a preexisting exact name. Its root oneshot has explicit working
+directory/environment, 10-second startup and 5-second stop deadlines and
+control-group kill semantics. Success requires observed Result=success,
+ExecMainStatus=0, active/exited state and an exact nonce marker. Normal failure,
+lost start reply and interruption attempt stop/reset of only that unit and
+verify it is absent before success. The temporary directory is removed on exit.
+Cleanup uncertainty is failure; SIGKILL or machine loss still requires the
+external VM lifecycle owner. No global unit enumeration or journal export occurs.
+
+The separate bounded KVM child opens `/dev/kvm`, requires API12, creates a VM
+handle and immediately closes both descriptors. **This runs as root.** It proves
+only root device/API/VM-handle availability, not student/nonroot KVM permissions,
+L2 instruction execution, QEMU, VLAB, reboot persistence or production service
+integration. No vCPU or custom hypervisor is created.
+
+Each child has a time/output cap (4KiB); installer calls allow65s each,
+CLI20s, service start20s and KVM10s. A210s work deadline leaves bounded cleanup
+(stop15s, reset10s, absence15s, each process kill/reap allowance2s). Use an
+external300s ceiling with cleanup grace in any future access orchestration;
+that ceiling must not replace the cloud lease. Only fixed sanitized JSON is
+printed; child output, paths, journal, credentials and arbitrary exceptions are
+never exported. A failed check exits1 and gives no overall passing claim.
+
+Run the offline suite (also required by existing hhfab install CI):
+
+```bash
+python3 -m unittest discover -s build/provision -p test_component_prerequisites.py -v
+```
+
+The fake-systemd/KVM tests verify failure, interruption, ownership and descriptor
+cleanup; real local subprocess tests exercise time/output caps. These tests do
+not execute host systemd/KVM or establish live guest evidence.
