@@ -308,8 +308,9 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
                   read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o400)
     write_new(os.path.join(cd, "meta-data"), b"instance-id: labapp-build\n", 0o400)
     if task == "sentinel":
-        write_new(os.path.join(cd, ASSERT_NAME),
-                  read_file(os.path.join(repo_dir, "guest", ASSERT_NAME), TEXT_LIMIT, check), 0o444)
+        for name in (ASSERT_NAME, "sentinel-evidence.py"):
+            write_new(os.path.join(cd, name),
+                      read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o444)
     write_new(os.path.join(cd, "plan.txt"), SENTINEL_PLAN if task == "sentinel" else b"", 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
     lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
@@ -327,7 +328,8 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         seconds = verify_seconds() if callable(verify_seconds) else verify_seconds
         if not isinstance(seconds, int) or isinstance(seconds, bool) or not 1 <= seconds <= 86400:
             raise StageError("sentinel needs a verification time within the remaining budget")
-        var_bytes, vars_name = vars_text(nonce, guest_receipt, base_sha, seconds), SENTINEL_VARS_NAME
+        var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + b"require_sentinel_evidence = true\n"
+        vars_name = SENTINEL_VARS_NAME
         extra = {"guest_receipt": guest_receipt, "verify_seconds": seconds}
     else:
         var_bytes, vars_name = vars_text(nonce, inputs, base_sha), VARS_NAME

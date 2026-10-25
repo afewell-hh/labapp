@@ -59,7 +59,7 @@ SENTINEL_RESERVE = 120
 SENTINEL_MIN_VERIFY = 300
 KVM_DEVICE = "/dev/kvm"
 RESULT_CAP = 4096
-SENTINEL_KEYS = {"nonce", "inputs", "shutdown", "receipt"}
+SENTINEL_KEYS = {"nonce", "inputs", "shutdown", "receipt", "cloud_init"}
 STEP_CAP = 2 * 1024 * 1024    # matches `ulimit -f 2048` in HCL_SCRIPT
 EXCERPT = 2048
 STEPS_EXPECTED = "version 0\nsyntax 0\nfull 0\n"
@@ -653,24 +653,10 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
 def read_step(out_dir, name, cap=STEP_CAP):
     """One fixed result file from the container-writable tree: untrusted, so it must be
     a regular file within the cap. Returns bytes or None when absent/invalid."""
-    path = os.path.join(out_dir, name)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
+        return stage_tools.read_file(os.path.join(out_dir, name), cap)
+    except (OSError, stage_tools.StageError):
         return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
-            return None
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            raw = handle.read(cap + 1)
-        if len(raw) != info.st_size or stage_tools.identity(os.fstat(fd)) != stage_tools.identity(info):
-            return None
-        return raw
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
 
 
 def _accept_hcl(own, result, budget, clock, oom, code):
@@ -733,15 +719,17 @@ def _strict_pairs(pairs):
 
 
 def receipt_matches(raw, staged):
-    """verified.json is untrusted container output: exactly the observer's four keys, bound to
+    """verified.json is untrusted container output: exactly the sentinel observer's five keys, bound to
     THIS run's nonce and to SHA256(cd/MANIFEST) (not the overall input identity)."""
     try:
         body = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return False
     return (isinstance(body, dict) and set(body) == SENTINEL_KEYS
             and body["nonce"] == staged["nonce"] and body["inputs"] == staged["guest_receipt"]
-            and body["shutdown"] == "guest-shutdown" and body["receipt"] == "ok")
+            and body["shutdown"] == "guest-shutdown" and body["receipt"] == "ok"
+            and body["cloud_init"] == {"status": "done", "errors": 0, "recoverable_errors": 0}
+            and all(type(body["cloud_init"][k]) is int for k in ("errors", "recoverable_errors")))
 
 
 def _accept_sentinel(own, result, budget, clock, oom, code):
@@ -766,8 +754,9 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
     raw["verified.json"] = read_step(os.path.join(out, "work"), "verified.json", RESULT_CAP)
     for name, data in raw.items():
         if data is not None:
-            evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                              "excerpt": data[:EXCERPT].decode("ascii", "replace")}
+            evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            if name != "verified.json":
+                evidence[name]["excerpt"] = data[:EXCERPT].decode("ascii", "replace")
     invalid = sorted(name for name, data in raw.items() if data is None)
     if invalid:
         evidence["invalid_files"] = invalid
@@ -782,6 +771,8 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
     if not receipt_matches(raw["verified.json"], staged):
         result["reason"] = "stale_or_malformed_receipt"
         return
+    # Retain only the validated closed summary, never arbitrary peer result text.
+    evidence["cloud_init"] = json.loads(raw["verified.json"])["cloud_init"]
     artifact = os.path.join(out, *ARTIFACT)
     try:
         sha, _ = stage_tools.hash_file(artifact, limit=stage_tools.ARTIFACT_LIMIT,

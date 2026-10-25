@@ -363,17 +363,34 @@ stays execution-disabled.
   `sentinel.pkrvars.hcl`. `hcl-check` staging is unchanged.
 * Guest: plan runs `guest/assert-sentinel.sh` as `root` then `ubuntu` (uid, cwd `/`,
   sanitized environment); it is staged 0444 before the MANIFEST so both users can read
-  the copy. No downloads or VLAB. The root run also prints the bounded
-  `cloud-init status` JSON on the serial port before the seal cleans it;
-  **`host_verify.py` currently ignores non-receipt lines, so capturing that evidence is
-  an unmet gate.**
+  the copy. No downloads or VLAB. Only root pipes `cloud-init status --format json`
+  to staged `guest/sentinel-evidence.py` before the seal cleans it. The helper rejects
+  output over 64 KiB (never accepts truncation), malformed/duplicate JSON, non-done
+  status, nested errors/recoverable errors and nonzero status codes. It emits only
+  `LABAPP-EVIDENCE v1 nonce=HEX64 inputs=HEX64 cloud-init=done errors=0 recoverable=0`;
+  arbitrary status fields and error text are never retained or echoed. The identities
+  are the checked staged nonce and CD MANIFEST digest.
+* Observer: sentinel vars set `require_sentinel_evidence = true` (HCL default false),
+  adding `--require-sentinel-evidence`. The observer requires exactly one matching
+  record alongside the existing receipt, prelaunch/KVM/cont and normal-shutdown gates.
+  Missing, malformed, duplicate, stale, non-done or oversized evidence fails within
+  the original serial byte/line/deadline bounds; ordinary overlong boot noise is still
+  discarded. Successful evidence becomes the closed `cloud_init` object
+  `{"status":"done","errors":0,"recoverable_errors":0}` in `verified.json`.
+  Ordinary observer runs ignore evidence lines and retain their original four-key result.
 * Success needs container exit 0, `build 0`, a `verified.json` with exactly the observer's
-  four keys matching this run's nonce, `guest_receipt` and `guest-shutdown`, a bounded
-  regular artifact (hashed, then deleted), unchanged staged bytes and verified cleanup.
+  five keys matching this run's nonce, `guest_receipt`, `guest-shutdown` and the
+  exact normalized `cloud_init` summary (integer zero counts), a bounded regular
+  artifact (hashed, then deleted), unchanged staged bytes and verified cleanup.
+  All result-file parents and leaves are opened through anchored directory descriptors
+  with no symlink following; empty output files remain valid and reads reject size or
+  identity changes. External bytes cannot enter evidence through an aliased parent.
+  Runner evidence retains the validated summary and the result-file size/hash, with no
+  raw result-file excerpt.
   Packer exit 0 or `verified.json` alone is not enough.
 * Unmet before any VM (HOLD): accepted runtime identity from a reviewed preparation
   workflow with owned builder cleanup; named KVM runner and UID/GID mapping; ISO
-  Rock Ridge mode check; the unrun HCL attributes above; capture of the evidence line;
+  Rock Ridge mode check; the unrun HCL attributes above; actual guest evidence emission;
   measured resource caps and reserve; failure/hang trial, then one success.
 
 ```bash

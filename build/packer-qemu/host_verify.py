@@ -1,7 +1,7 @@
 """Bounded host-side completion observer for the stock Packer/QEMU experiment.
 
 Invoke: python3 -I /absolute/path/host_verify.py --qmp SOCK --serial SOCK
---result FILE --timeout SECONDS --nonce HEX64 --inputs HEX64
+--result FILE --timeout SECONDS --nonce HEX64 --inputs HEX64 [--require-sentinel-evidence]
 Python 3.10+ stdlib, Linux only, no environment overrides, no cwd dependence,
 no shell, no sudo. Runs as the build user (the same user that runs Packer).
 
@@ -16,6 +16,9 @@ Success requires BOTH, from the one QEMU instance this run owns:
   1. a guest receipt line on the private serial socket carrying this run's
      nonce and input digest with status=ok, and
   2. a QMP SHUTDOWN event with data.guest == true and reason "guest-shutdown".
+With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
+cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
+in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
 The receipt alone is never enough: observation continues until a normal guest
 shutdown. QEMU process exit, EOF or a vanished socket is never accepted alone.
 
@@ -46,6 +49,11 @@ CONNECT_POLL = 0.05
 RECEIPT_PREFIX = b"LABAPP-RECEIPT"
 RECEIPT_RE = re.compile(
     rb"^LABAPP-RECEIPT v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) status=(ok|fail)$")
+EVIDENCE_PREFIX = b"LABAPP-EVIDENCE"
+EVIDENCE_RE = re.compile(
+    rb"^LABAPP-EVIDENCE v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
+    rb"cloud-init=done errors=0 recoverable=0$")
+CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -81,8 +89,9 @@ def connect(path, deadline, clock):
 class Lines:
     """Newline framing with per-line and total byte bounds."""
 
-    def __init__(self, line_max, total_max, overflow_fatal):
+    def __init__(self, line_max, total_max, overflow_fatal, protected_prefix=None):
         self.line_max, self.total_max = line_max, total_max
+        self.protected_prefix = protected_prefix
         self.fatal, self.buf, self.skipping, self.total = overflow_fatal, b"", False, 0
 
     def feed(self, data):
@@ -97,7 +106,7 @@ class Lines:
                 continue
             self.buf += piece
             if len(self.buf.rstrip(b"\r\n")) > self.line_max:
-                if self.fatal:
+                if self.fatal or (self.protected_prefix and self.buf.startswith(self.protected_prefix)):
                     raise Failure("line-limit")
                 self.buf, self.skipping = b"", not done  # drop the overlong line
             elif done:
@@ -253,7 +262,8 @@ class Qmp:
         self.shutdown_ok = True
 
 
-def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
+def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
+            require_sentinel_evidence=False):
     """Drive both connected nonblocking sockets to a verdict; raise Failure.
 
     The serial socket is attached and registered before `cont` is ever sent, so
@@ -261,8 +271,10 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
     """
     want = (nonce.encode(), inputs.encode())
     qlines = Lines(QMP_LINE_MAX, QMP_TOTAL_MAX, True)
-    slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False)
+    slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False,
+                   EVIDENCE_PREFIX if require_sentinel_evidence else None)
     proto, receipt_ok = Qmp(), False
+    evidence_ok = False
     qmp_open = serial_open = True
     drain_until = None
     watching_write = False
@@ -275,9 +287,10 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
             if now >= deadline:
                 raise Failure("timeout")
             if receipt_ok and proto.shutdown_ok and proto.state == "running":
-                return
+                if not require_sentinel_evidence or evidence_ok:
+                    return dict(CLOUD_INIT) if evidence_ok else None
             if drain_until is not None and (now >= drain_until or not serial_open):
-                raise Failure("shutdown-without-receipt")
+                raise Failure("missing-sentinel-evidence" if receipt_ok else "shutdown-without-receipt")
             if not qmp_open and (not proto.shutdown_ok or proto.state != "running"):
                 raise Failure("qmp-eof-before-shutdown")
             if not serial_open and not receipt_ok and not proto.shutdown_ok:
@@ -310,6 +323,16 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
                         serial_open = False
                         continue
                     for line in slines.feed(data):
+                        if require_sentinel_evidence and line.startswith(EVIDENCE_PREFIX):
+                            found = EVIDENCE_RE.fullmatch(line)
+                            if not found:
+                                raise Failure("malformed-sentinel-evidence")
+                            if evidence_ok:
+                                raise Failure("duplicate-sentinel-evidence")
+                            if found.groups() != want:
+                                raise Failure("stale-or-wrong-sentinel-evidence")
+                            evidence_ok = True
+                            continue
                         if not line.startswith(RECEIPT_PREFIX):
                             continue
                         found = RECEIPT_RE.match(line)
@@ -335,9 +358,11 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic):
         sel.close()
 
 
-def write_result(path, nonce, inputs):
-    body = json.dumps({"nonce": nonce, "inputs": inputs, "shutdown": "guest-shutdown",
-                       "receipt": "ok"}, sort_keys=True).encode() + b"\n"
+def write_result(path, nonce, inputs, cloud_init=None):
+    result = {"nonce": nonce, "inputs": inputs, "shutdown": "guest-shutdown", "receipt": "ok"}
+    if cloud_init is not None:
+        result["cloud_init"] = cloud_init
+    body = json.dumps(result, sort_keys=True).encode() + b"\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(body)
@@ -351,10 +376,11 @@ def verify(args, clock=time.monotonic):
     try:
         serial = connect(args.serial, deadline, clock)  # receipt reader first
         qmp = connect(args.qmp, deadline, clock)
-        observe(qmp, serial, args.nonce, args.inputs, deadline, clock)
+        cloud_init = observe(qmp, serial, args.nonce, args.inputs, deadline, clock,
+                             getattr(args, "require_sentinel_evidence", False))
         if clock() >= deadline:
             raise Failure("timeout")
-        write_result(args.result, args.nonce, args.inputs)
+        write_result(args.result, args.nonce, args.inputs, cloud_init)
     finally:
         for sock in (qmp, serial):
             if sock is not None:
@@ -369,6 +395,7 @@ def parse(argv):
     parser.add_argument("--timeout", required=True, type=float)
     parser.add_argument("--nonce", required=True)
     parser.add_argument("--inputs", required=True)
+    parser.add_argument("--require-sentinel-evidence", action="store_true")
     args = parser.parse_args(argv)
     if not HEX64.match(args.nonce) or not HEX64.match(args.inputs):
         parser.error("nonce and inputs must be 64 lowercase hex digits")

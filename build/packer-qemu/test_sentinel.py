@@ -9,7 +9,9 @@ import io
 import json
 import os
 import re
+import signal
 import stat
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -23,6 +25,7 @@ import test_stage_tools as ts
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = {"image_id": "sha256:" + "d" * 64, "diffids": ["sha256:" + "e" * 64, "sha256:" + "f" * 64]}
 KVM_GID = 994
+REAL_KVM_PREFLIGHT = cr.kvm_preflight
 
 
 class SentinelDaemon(tc.FakeDaemon):
@@ -51,7 +54,8 @@ class SentinelDaemon(tc.FakeDaemon):
             nonce = handle.read().strip()
         with open(os.path.join(ws, "cd", "MANIFEST"), "rb") as handle:
             guest = hashlib.sha256(handle.read()).hexdigest()
-        good = {"nonce": nonce, "inputs": guest, "shutdown": "guest-shutdown", "receipt": "ok"}
+        good = {"nonce": nonce, "inputs": guest, "shutdown": "guest-shutdown", "receipt": "ok",
+                "cloud_init": {"status": "done", "errors": 0, "recoverable_errors": 0}}
         receipts = {
             "good": json.dumps(good),
             "stale": json.dumps({**good, "inputs": "0" * 64}),
@@ -62,6 +66,11 @@ class SentinelDaemon(tc.FakeDaemon):
             "duplicate": '{"nonce": "%s", "nonce": "%s", "inputs": "%s", "shutdown": "guest-shutdown", '
                          '"receipt": "ok"}' % (nonce, nonce, guest),
             "missing": None,
+            "missing_evidence": json.dumps({k: v for k, v in good.items() if k != "cloud_init"}),
+            "bad_evidence": json.dumps({**good, "cloud_init": {"status": "running", "errors": 0,
+                                                              "recoverable_errors": 0}}),
+            "boolean_evidence": json.dumps({**good, "cloud_init": {"status": "done", "errors": False,
+                                                                  "recoverable_errors": 0}}),
         }
         files = {"steps": self.steps, "build.out": "build ok\n", "build.err": ""}
         for name, text in files.items():
@@ -172,18 +181,20 @@ class FailClosedTests(SentinelCase):
         self.assertNotIn("tcg", json.dumps(cr.SENTINEL_SCRIPT + cr.ENTRY).lower())
 
     def test_kvm_preflight_is_metadata_only_and_requires_a_nonroot_group_device(self):
-        def info(mode, gid):
-            return types.SimpleNamespace(st_mode=mode, st_gid=gid)
-        with mock.patch("os.lstat", return_value=info(stat.S_IFCHR | 0o660, KVM_GID)), \
-                mock.patch("os.open", side_effect=AssertionError), mock.patch("builtins.open", side_effect=AssertionError):
-            self.assertEqual(cr.kvm_preflight(), KVM_GID)
-        for bad in (info(stat.S_IFREG | 0o660, KVM_GID), info(stat.S_IFCHR | 0o660, 0),
-                    info(stat.S_IFCHR | 0o600, KVM_GID), info(stat.S_IFCHR | 0o640, KVM_GID)):
-            with self.subTest(mode=oct(bad.st_mode), gid=bad.st_gid), \
-                    mock.patch("os.lstat", return_value=bad), self.assertRaises(cr.HardwareMissing):
-                cr.kvm_preflight()
-        with mock.patch("os.lstat", side_effect=FileNotFoundError), self.assertRaises(cr.HardwareMissing):
-            cr.kvm_preflight()
+        with mock.patch("os.open", side_effect=AssertionError), \
+                mock.patch("builtins.open", side_effect=AssertionError):
+            def info(mode, gid):
+                return types.SimpleNamespace(st_mode=mode, st_gid=gid)
+            with mock.patch("os.lstat", return_value=info(stat.S_IFCHR | 0o660, KVM_GID)), \
+                    mock.patch("os.access", side_effect=AssertionError):
+                self.assertEqual(REAL_KVM_PREFLIGHT(), KVM_GID)
+            for bad in (info(stat.S_IFREG | 0o660, KVM_GID), info(stat.S_IFCHR | 0o660, 0),
+                        info(stat.S_IFCHR | 0o600, KVM_GID), info(stat.S_IFCHR | 0o640, KVM_GID)):
+                with self.subTest(mode=oct(bad.st_mode), gid=bad.st_gid), \
+                        mock.patch("os.lstat", return_value=bad), self.assertRaises(cr.HardwareMissing):
+                    REAL_KVM_PREFLIGHT()
+            with mock.patch("os.lstat", side_effect=FileNotFoundError), self.assertRaises(cr.HardwareMissing):
+                REAL_KVM_PREFLIGHT()
 
     def test_runtime_image_must_be_exactly_the_accepted_id_and_layers(self):
         for fault in ("wrong_id", "wrong_layers", "onbuild"):
@@ -239,12 +250,42 @@ class ArgvTests(SentinelCase):
 
 
 class AcceptanceTests(SentinelCase):
+    def test_parent_alias_never_enters_failure_evidence(self):
+        host = os.path.join(os.path.dirname(self.root), "hostonly")
+        os.mkdir(host)
+        with open(os.path.join(host, "verified.json"), "w") as handle:
+            handle.write("HOST_ONLY_CANARY")
+        class AliasedDaemon(SentinelDaemon):
+            def start(inner, container):
+                super().start(container)
+                out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                work = os.path.join(out, "work")
+                os.rename(work, work + "-owned")
+                os.symlink(host, work)
+        result, _ = self.run_sentinel(AliasedDaemon(self.clock))
+        self.assertEqual(result["reason"], "invalid_step_evidence")
+        self.assertIn("verified.json", result["evidence"]["invalid_files"])
+        self.assertNotIn("verified.json", result["evidence"])
+        self.assertNotIn("HOST_ONLY_CANARY", json.dumps(result))
+
+    def test_cancellation_after_evidence_prevents_acceptance_and_cleans_owned_container(self):
+        real = cr.shutil.rmtree
+        def remove(path):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return real(path)
+        with mock.patch.object(cr.shutil, "rmtree", remove):
+            result, daemon = self.run_sentinel(handle_signals=True)
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "cancelled"))
+        self.assertEqual(daemon.containers, {})
+
     def test_accepted_run_binds_both_identities_and_deletes_the_artifact(self):
         result, daemon = self.run_sentinel()
         self.assertEqual((result["outcome"], result["reason"]), ("accepted", None))
         self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
         evidence = result["evidence"]
         self.assertEqual(evidence["image_id"], RUNTIME["image_id"])
+        self.assertEqual(evidence["cloud_init"], {"status": "done", "errors": 0, "recoverable_errors": 0})
+        self.assertNotIn("excerpt", evidence["verified.json"])
         self.assertEqual(evidence["runtime_diffids"], RUNTIME["diffids"])
         self.assertNotEqual(evidence["inputs"], evidence["guest_receipt"])
         for key in ("inputs", "guest_receipt", "vars_sha256", "hcl_sha256", "base_sha256", "nonce_sha256"):
@@ -271,7 +312,8 @@ class AcceptanceTests(SentinelCase):
                 self.assertEqual(daemon.calls, [])
 
     def test_stale_or_malformed_receipts_are_failed(self):
-        for receipt in ("stale", "wrong_nonce", "no_shutdown", "extra_key", "malformed", "duplicate"):
+        for receipt in ("stale", "wrong_nonce", "no_shutdown", "extra_key", "malformed", "duplicate",
+                        "missing_evidence", "bad_evidence", "boolean_evidence"):
             with self.subTest(receipt=receipt):
                 self.setUp()
                 result, _ = self.run_sentinel(SentinelDaemon(self.clock, receipt=receipt))
@@ -328,6 +370,7 @@ class StagingTests(ts.StageCase):
         self.assertIn(f'inputs = "{manifest_hash}"', text)
         self.assertNotIn(staged["inputs"], text)
         self.assertIn("verify_seconds = 600\n", text)
+        self.assertIn("require_sentinel_evidence = true\n", text)
         self.assertEqual(staged["vars_name"], st.SENTINEL_VARS_NAME)
         self.assertEqual(staged["vars_sha256"], hashlib.sha256(text.encode()).hexdigest())
         overall = st.manifest(self.ws, staged["base_sha256"])
@@ -340,10 +383,10 @@ class StagingTests(ts.StageCase):
         self.sentinel()
         self.assertEqual(sorted(os.listdir(os.path.join(self.ws, "cd"))),
                          ["MANIFEST", "assert-sentinel.sh", "guest-build.sh", "meta-data", "nonce", "plan.txt",
-                          "user-data"])
+                          "sentinel-evidence.py", "user-data"])
         self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", st.ASSERT_NAME)).st_mode), 0o444)
         manifest = self.read("cd", "MANIFEST").decode()
-        for name in (st.ASSERT_NAME, "plan.txt"):
+        for name in (st.ASSERT_NAME, "sentinel-evidence.py", "plan.txt"):
             self.assertRegex(manifest, r"(?m)^[0-9a-f]{64}  " + re.escape(name) + "$")
         plan = self.read("cd", "plan.txt").decode().splitlines()
         self.assertEqual(plan, ["root /bin/bash @IN@/assert-sentinel.sh root",
@@ -457,6 +500,64 @@ class IsoToolDiagnosticTests(unittest.TestCase):
 
     def test_execution_stays_disabled(self):
         self.assertEqual(supervise.run({}, 900, 300), ("disabled", None))
+
+
+
+class EvidencePathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="sentinel-path-")
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+        self.work = os.path.join(self.out, "work")
+        self.host = os.path.join(self.tmp.name, "hostonly")
+        os.makedirs(self.work)
+        os.mkdir(self.host)
+        with open(os.path.join(self.host, "verified.json"), "wb") as handle:
+            handle.write(b"HOST_ONLY_CANARY")
+
+    def test_parent_and_leaf_symlinks_are_rejected(self):
+        os.rmdir(self.work)
+        os.symlink(self.host, self.work)
+        self.assertIsNone(cr.read_step(self.work, "verified.json"))
+        os.unlink(self.work)
+        os.mkdir(self.work)
+        os.symlink(os.path.join(self.host, "verified.json"), os.path.join(self.work, "verified.json"))
+        self.assertIsNone(cr.read_step(self.work, "verified.json"))
+
+    def test_parent_retarget_uses_the_already_anchored_owned_directory(self):
+        with open(os.path.join(self.work, "verified.json"), "wb") as handle:
+            handle.write(b"owned")
+        real_open = os.open
+        def retarget(path, flags, *args, **kw):
+            fd = real_open(path, flags, *args, **kw)
+            if path == "work":
+                os.rename(self.work, self.work + "-original")
+                os.symlink(self.host, self.work)
+            return fd
+        with mock.patch.object(os, "open", side_effect=retarget):
+            self.assertEqual(cr.read_step(self.work, "verified.json"), b"owned")
+
+    def test_empty_is_valid_and_oversize_fifo_or_changing_files_are_invalid(self):
+        path = os.path.join(self.work, "verified.json")
+        with open(path, "wb"):
+            pass
+        self.assertEqual(cr.read_step(self.work, "verified.json"), b"")
+        with open(path, "wb") as handle:
+            handle.write(b"1234")
+        self.assertIsNone(cr.read_step(self.work, "verified.json", 3))
+        real_fstat = os.fstat
+        def changed(fd):
+            info = real_fstat(fd)
+            if not hasattr(changed, "seen"):
+                changed.seen = True
+                return info
+            return types.SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+                                         st_mtime_ns=info.st_mtime_ns + 1, st_ctime_ns=info.st_ctime_ns)
+        with mock.patch.object(os, "fstat", side_effect=changed):
+            self.assertIsNone(cr.read_step(self.work, "verified.json"))
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertIsNone(cr.read_step(self.work, "verified.json"))
 
 
 if __name__ == "__main__":

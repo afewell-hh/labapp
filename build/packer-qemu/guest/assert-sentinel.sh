@@ -27,9 +27,8 @@ for name in $(compgen -e); do
 done
 
 if [[ $want == root ]]; then
-  # Bounded evidence of the selected disk's cloud-init status; guest-build.sh's seal
-  # runs `cloud-init clean --logs` later. The host observer currently ignores
-  # non-receipt serial lines, so capturing this line is an UNMET gate (README).
-  status=$(cloud-init status --format json | head -c 4096 | tr -d '\n')
-  printf '\nLABAPP-EVIDENCE cloud-init-status %s\n' "$status" >/dev/ttyS0
+  # Read the full bounded status, validate it, and emit only a fixed summary.
+  # pipefail rejects a failed cloud-init command; overlong output is never truncated
+  # into an accepted record. Only root runs this before guest-build.sh seals.
+  cloud-init status --format json | python3 -I "${BASH_SOURCE[0]%/*}/sentinel-evidence.py" >/dev/ttyS0
 fi
