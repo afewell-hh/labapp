@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 import zlib
+from unittest import mock
 
 import stage_tools as st
 
@@ -154,8 +155,46 @@ class StageTests(StageCase):
         other = os.path.join(self.ws, "again")
         os.mkdir(other, 0o700)
         staged = st.stage(other, self.sources, self.nonce, pins=self.pins)
-        os.utime(self.sources["base"], ns=(1, 1))
+        base = os.path.join(other, "in", "base.img")
+        os.chmod(base, 0o600)
+        with open(base, "r+b") as handle:
+            handle.write(b"X")
         self.assertFalse(st.verify_staged(other, staged))
+
+    def test_base_snapshot_is_owned_read_only_and_independent_of_source(self):
+        staged = self.stage()
+        snapshot = os.path.join(self.ws, "in", "base.img")
+        self.assertEqual(self.read("in", "base.img"), BASE_BYTES)
+        self.assertEqual(stat.S_IMODE(os.stat(snapshot).st_mode), 0o400)
+        self.assertEqual(os.stat(snapshot).st_uid, os.getuid())
+        self.assertNotEqual(os.stat(snapshot).st_ino, os.stat(self.sources["base"]).st_ino)
+        with open(self.sources["base"], "wb") as handle:
+            handle.write(b"later external source edit")
+        self.assertEqual(self.read("in", "base.img"), BASE_BYTES)
+        self.assertTrue(st.verify_staged(self.ws, staged))
+
+    def test_private_tmp_parent_is_allowed(self):
+        self.assertTrue(self.inputs.startswith("/tmp/"))
+        self.assertTrue(st.verify_staged(self.ws, self.stage()))
+
+    def test_parent_retarget_after_open_cannot_substitute_snapshot(self):
+        # Rename a real parent after open and replace its pathname with an alias.
+        # The already-open descriptor still copies the original pinned bytes.
+        moved = self.inputs + "-moved"
+        alternate = self.inputs + "-alternate"
+        os.mkdir(alternate, 0o700)
+        with open(os.path.join(alternate, "base"), "wb") as handle:
+            handle.write(b"X" * len(BASE_BYTES))
+        calls = []
+        def retarget():
+            if not calls:
+                os.rename(self.inputs, moved)
+                os.symlink(alternate, self.inputs)
+            calls.append(1)
+        snapshot = os.path.join(self.ws, "base.img")
+        sha = st.copy_hash(self.sources["base"], snapshot, len(BASE_BYTES), retarget)
+        self.assertEqual(sha, self.pins["base"]["sha256"])
+        self.assertEqual(self.read("base.img"), BASE_BYTES)
 
 
 class RejectionTests(StageCase):
@@ -236,9 +275,32 @@ class RejectionTests(StageCase):
         os.symlink(real, self.sources["base"])
         self.rejects()
 
+    def test_symlinked_parent_is_rejected_for_each_source(self):
+        alias = self.inputs + "-alias"
+        os.symlink(self.inputs, alias)
+        for key in self.sources:
+            with self.subTest(key=key), self.assertRaises(st.StageError):
+                st.read_file(os.path.join(alias, key), self.pins[key]["size"])
+
+    def test_source_inside_workspace_or_its_alias_is_rejected(self):
+        inside = os.path.join(self.ws, "base")
+        with open(inside, "wb") as handle:
+            handle.write(BASE_BYTES)
+        alias = self.inputs + "-ws-alias"
+        os.symlink(self.ws, alias)
+        for path in (inside, os.path.join(alias, "base")):
+            with self.subTest(path=path):
+                self.rejects(sources=dict(self.sources, base=path))
+        self.assertEqual(os.listdir(self.ws), ["base"])
+
     def test_fifo_source_is_rejected_without_blocking(self):
         os.unlink(self.sources["base"])
         os.mkfifo(self.sources["base"])
+        self.rejects()
+
+    def test_directory_source_is_rejected(self):
+        os.unlink(self.sources["base"])
+        os.mkdir(self.sources["base"])
         self.rejects()
 
     def test_changed_base_image_is_rejected(self):
@@ -283,6 +345,46 @@ class BudgetHookTests(StageCase):
         with self.assertRaises(Stop):
             self.stage(check=check)
         self.assertGreater(len(calls), 3)
+
+    def test_copy_checks_original_budget_between_chunks(self):
+        dest = os.path.join(self.ws, "snapshot")
+        calls = []
+        def expire():
+            calls.append(1)
+            if len(calls) == 3:
+                raise TimeoutError("original deadline")
+        with mock.patch.object(st, "CHUNK", 32), self.assertRaises(TimeoutError):
+            st.copy_hash(self.sources["base"], dest, len(BASE_BYTES), expire)
+        self.assertEqual(os.stat(dest).st_size, 64)
+        self.assertLess(os.stat(dest).st_size, len(BASE_BYTES))
+
+    def test_source_mutation_during_copy_is_rejected(self):
+        calls = []
+        def mutate():
+            if len(calls) == 1:
+                with open(self.sources["base"], "r+b") as handle:
+                    handle.write(b"X")
+                os.utime(self.sources["base"], ns=(1, 1))
+            calls.append(1)
+        with mock.patch.object(st, "CHUNK", 32), self.assertRaises(st.StageError):
+            st.copy_hash(self.sources["base"], os.path.join(self.ws, "snapshot"), len(BASE_BYTES), mutate)
+
+    def test_snapshot_rehash_checks_budget_between_chunks(self):
+        staged = self.stage()
+        original_hash = st.hash_file
+        calls = []
+        def bounded_hash(path, size=None, check=st._noop):
+            if path.endswith("/base.img"):
+                def expire():
+                    calls.append(1)
+                    if len(calls) == 3:
+                        raise TimeoutError("original deadline")
+                return original_hash(path, size, expire)
+            return original_hash(path, size, check)
+        with mock.patch.object(st, "CHUNK", 32), mock.patch.object(st, "hash_file", bounded_hash):
+            with self.assertRaises(TimeoutError):
+                st.verify_staged(self.ws, staged)
+        self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

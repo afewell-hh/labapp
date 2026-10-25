@@ -850,13 +850,13 @@ class HclCheckTests(RunnerCase):
             self.assertFalse(any(a == forbidden or a.startswith(forbidden + "=") for a in args), forbidden)
         self.assertNotIn("docker.sock", " ".join(args))
         mounts = [a for a in args if a.startswith("--mount=")]
-        self.assertEqual(len(mounts), 4)
+        self.assertEqual(len(mounts), 3)
         writable = [m for m in mounts if not m.endswith(",readonly")]
         self.assertEqual(len(writable), 1)
         self.assertTrue(writable[0].endswith("/out,dst=/out"))
         self.assertTrue(any(m.endswith(",dst=/in,readonly") for m in mounts))
-        self.assertTrue(any(m.endswith(",dst=/in/base.img,readonly") and f"src={self.sources['base']}," in m
-                            for m in mounts))
+        self.assertFalse(any(self.sources[key] in m for key in self.sources for m in mounts))
+        self.assertFalse(any("dst=/in/base.img" in m for m in mounts))
         self.assertTrue(any(m.endswith("/cd,dst=/out/work/cd,readonly") for m in mounts))
         self.assertEqual(args[-1], cr.HCL_SCRIPT)
 
@@ -903,7 +903,7 @@ class HclCheckTests(RunnerCase):
                 self.setUp()
                 result, daemon = self.run_hcl(HclDaemon(self.clock, steps=steps))
                 self.assertEqual(result["outcome"], "failed")
-                self.assertEqual(result["reason"], "tool_check_failed")
+                self.assertEqual(result["reason"], "invalid_step_evidence" if steps is None else "tool_check_failed")
                 self.assertEqual(result["cleanup"], "verified")
 
     def test_wrong_core_version_is_failed(self):
@@ -911,7 +911,8 @@ class HclCheckTests(RunnerCase):
             with self.subTest(version=version):
                 self.setUp()
                 result, _ = self.run_hcl(HclDaemon(self.clock, version=version))
-                self.assertEqual((result["outcome"], result["reason"]), ("failed", "wrong_core_version"))
+                reason = "invalid_step_evidence" if version is None else "wrong_core_version"
+                self.assertEqual((result["outcome"], result["reason"]), ("failed", reason))
 
     def test_nonzero_container_exit_and_timer_codes_are_failed(self):
         for code in (1, 124, 137):
@@ -928,7 +929,7 @@ class HclCheckTests(RunnerCase):
                 with open(os.path.join(out, "steps"), "w") as handle:
                     handle.write("x" * (cr.STEP_CAP + 1))
         result, _ = self.run_hcl(Flood(self.clock))
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "tool_check_failed"))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "invalid_step_evidence"))
 
     def test_symlinked_result_file_is_not_followed(self):
         class Link(HclDaemon):
@@ -938,7 +939,100 @@ class HclCheckTests(RunnerCase):
                 os.unlink(os.path.join(out, "steps"))
                 os.symlink("/etc/hostname", os.path.join(out, "steps"))
         result, _ = self.run_hcl(Link(self.clock))
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "tool_check_failed"))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "invalid_step_evidence"))
+
+    def test_every_step_evidence_file_is_required_bounded_regular_and_no_follow(self):
+        for name in ("steps", "version.out", "version.err", "syntax.out", "syntax.err", "full.out", "full.err"):
+            for fault in ("missing", "directory", "fifo", "oversize", "symlink"):
+                with self.subTest(name=name, fault=fault):
+                    self.setUp()
+                    class BadEvidence(HclDaemon):
+                        def start(inner, c):
+                            super().start(c)
+                            out = next(a for a in c["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                            path = os.path.join(out, name)
+                            os.unlink(path)
+                            if fault == "directory":
+                                os.mkdir(path)
+                            elif fault == "fifo":
+                                os.mkfifo(path)
+                            elif fault == "oversize":
+                                with open(path, "wb") as handle:
+                                    handle.truncate(cr.STEP_CAP + 1)
+                            elif fault == "symlink":
+                                target = os.path.join(out, "synthetic-target")
+                                with open(target, "w") as handle:
+                                    handle.write("synthetic output")
+                                os.symlink(target, path)
+                    result, _ = self.run_hcl(BadEvidence(self.clock))
+                    self.assertEqual((result["outcome"], result["reason"]), ("failed", "invalid_step_evidence"))
+                    self.assertEqual(result["evidence"]["invalid_files"], [name])
+                    self.assertEqual(result["cleanup"], "verified")
+
+    def test_source_edit_before_create_does_not_change_bound_snapshot(self):
+        source = self.sources["base"]
+        class SourceEdit(HclDaemon):
+            def start(inner, c):
+                inp = next(a for a in c["args"] if a.endswith(",dst=/in,readonly")).split("src=")[1].split(",")[0]
+                with open(os.path.join(inp, "base.img"), "rb") as handle:
+                    self.assertEqual(handle.read(), ts.BASE_BYTES)
+                super().start(c)
+        def edit(args):
+            if args[0] == "create":
+                with open(source, "wb") as handle:
+                    handle.write(b"external path substituted")
+        result, _ = self.run_hcl(SourceEdit(self.clock, on_call=edit))
+        self.assertEqual(result["outcome"], "accepted")
+
+    def test_snapshot_mutated_during_run_is_rejected(self):
+        class Mutation(HclDaemon):
+            def start(inner, c):
+                super().start(c)
+                inp = next(a for a in c["args"] if a.endswith(",dst=/in,readonly")).split("src=")[1].split(",")[0]
+                path = os.path.join(inp, "base.img")
+                os.chmod(path, 0o600)
+                with open(path, "r+b") as handle:
+                    handle.write(b"X")
+        result, _ = self.run_hcl(Mutation(self.clock))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "staged_inputs_changed"))
+        self.assertEqual(result["cleanup"], "verified")
+
+    def test_snapshot_rehash_expiry_uses_original_admission_deadline(self):
+        original = cr.stage_tools.hash_file
+        calls = []
+        def slow_hash(path, size=None, check=cr.stage_tools._noop):
+            if path.endswith("/base.img"):
+                def spend():
+                    calls.append(1)
+                    if len(calls) == 2:
+                        self.clock.now += 121
+                    check()
+                return original(path, size, spend)
+            return original(path, size, check)
+        with mock.patch.object(cr.stage_tools, "CHUNK", 32), mock.patch.object(cr.stage_tools, "hash_file", slow_hash):
+            result, daemon = self.run_hcl()
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "budget_exhausted"))
+        self.assertEqual(result["cleanup"], "verified")
+        self.assertEqual(result["workspace"], "removed")
+        self.assertEqual(self.record()["state"], "released")
+        self.assertEqual(len(calls), 2)
+
+    def test_mid_copy_expiry_uses_original_admission_deadline(self):
+        original = cr.stage_tools.copy_hash
+        calls = []
+        def slow_copy(path, dest, size, check):
+            def spend():
+                calls.append(1)
+                if len(calls) == 2:
+                    self.clock.now += 121
+                check()
+            return original(path, dest, size, spend)
+        with mock.patch.object(cr.stage_tools, "CHUNK", 32), mock.patch.object(cr.stage_tools, "copy_hash", slow_copy):
+            result, daemon = self.run_hcl()
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "budget_exhausted"))
+        self.assertEqual(daemon.calls, [])
+        self.assertEqual(result["workspace"], "removed")
+        self.assertEqual(len(calls), 2)
 
     def test_staged_bytes_changed_during_run_are_not_accepted(self):
         result, _ = self.run_hcl(HclDaemon(self.clock, tamper=True))

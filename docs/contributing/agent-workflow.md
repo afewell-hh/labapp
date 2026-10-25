@@ -217,6 +217,11 @@ here: see #145 (parent), #139 and #140.
   checks what it is actually allowed to run. The authority is the current
   `--allowedTools` in `.github/workflows/claude.yml` plus what the run
   permits, not memory or older comments.
+- **Preserve reviewable work.** Check commit/push/PR capabilities early. If edits
+  cannot be committed or pushed, deliver the exact unified diff or complete changed
+  files through the authorized issue/PR handoff (never secrets), so the lead/local
+  fallback can apply and review them. A description of uncommitted edits is not
+  a transferable patch. Do not change permissions to bypass a denial.
 - **Denied means handoff, not pass.** If a command is denied, the worker does
   not substitute a claim. It records the exact command and denial, supplies
   the correct command for someone else to run, and marks the dependent

@@ -286,11 +286,14 @@ default prints the plan only.
   member set, then only `packer` and the plugin are streamed by actual bytes, with
   CRC, to fresh 0700 paths (`O_EXCL|O_NOFOLLOW`); `LICENSE.txt` is validated but not
   extracted. The plugin gets a `_SHA256SUM` sidecar of exactly 64 hex bytes; there is
-  no `packer init`/install. The base image is hashed through one descriptor and bound
-  read-only; the repo's `labapp.pkr.hcl`, `host_verify.py` and guest files are
-  copied (never mounted from the tree).
-* Mounts: `/in` (tools, plugins, HCL, verifier, generated `validate.pkrvars.hcl`),
-  `/in/base.img` and `/out/work/cd` read-only; only fresh `/out` is writable. No
+  no `packer init`/install. The base image is copied and hashed through one stable
+  descriptor into owned `in/base.img` (0400), then rehashed after the run; no external
+  source pathname is bound. Every source parent is opened without following symlinks,
+  and sources inside the workspace (including aliases) are refused. The repo's
+  `labapp.pkr.hcl`, `host_verify.py` and guest files are copied (never mounted from
+  the tree).
+* Mounts: `/in` (tools, plugins, HCL, verifier, base snapshot and generated
+  `validate.pkrvars.hcl`) and `/out/work/cd` read-only; only fresh `/out` is writable. No
   network, capabilities, devices, host home, socket or credentials. `inputs` hashes a
   canonical manifest of staged bytes excluding the var-file; the var-file hash is
   recorded separately.
@@ -299,12 +302,14 @@ default prints the plan only.
   `validate -syntax-only`, full `validate -var-file=…`. Full validation executes the
   plugin's `describe`. Syntax-only does not load plugins; neither proves boot, KVM,
   QEMU/xorriso presence (checked only at build time) or VLAB.
-* Success needs container exit 0, all three steps 0, `Packer v1.16.2`, staged bytes
-  unchanged after the run, no cancellation/expiry and verified cleanup. Any nonzero
-  step is FAILED; an expected negative test is test evidence, never tool success.
+* Success needs container exit 0, all three steps 0, `Packer v1.16.2`, all seven
+  status/stdout/stderr files present as bounded regular files (no symlinks; empty
+  stdout/stderr is valid), staged bytes unchanged after the run, no cancellation/expiry
+  and verified cleanup. Any nonzero step is FAILED; an expected negative test is test evidence, never tool success.
   The probe's 124/137 rule is not reused.
-* Limits: same-user concurrent writers to the source files are out of scope (identity
-  is re-checked, not locked); `ulimit -f` bounds file size, not total `/out` bytes;
+* Limits: malicious same-user concurrent writers are out of scope (source descriptor
+  identity and copied bytes are checked, not locked); `ulimit -f` bounds file size,
+  not total `/out` bytes;
   the exact `packer version` output format and sidecar acceptance are UNRUN.
 
 ```bash

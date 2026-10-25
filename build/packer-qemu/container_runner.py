@@ -293,25 +293,24 @@ def unresolved_records(directory):
     return out
 
 
-def mounts(mode, workspace, base_src):
+def mounts(mode, workspace):
     """Fixed mounts. probe: the workspace is the only (writable) mount. hcl-check:
-    staged inputs and CD files read-only, the base image file read-only, and only
+    staged inputs (including the base snapshot) and CD files read-only, and only
     the fresh `out` tree writable."""
     if mode == "probe":
         return [f"--mount=type=bind,src={workspace},dst=/out"]
     return [f"--mount=type=bind,src={workspace}/in,dst=/in,readonly",
-            f"--mount=type=bind,src={base_src},dst=/in/base.img,readonly",
             f"--mount=type=bind,src={workspace}/out,dst=/out",
             f"--mount=type=bind,src={workspace}/cd,dst=/out/work/cd,readonly"]
 
 
 def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot-id>",
-                mode="probe", base_src="<base image>"):
+                mode="probe"):
     """Exact, fixed creation argv: no init, no restart, no pull, healthcheck off."""
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
-            *LIMITS[mode], "--log-driver=none", *mounts(mode, workspace, base_src),
+            *LIMITS[mode], "--log-driver=none", *mounts(mode, workspace),
             "--entrypoint=/bin/bash", image_id, "-c", ENTRY, "bash", str(deadline), boot_id,
             PROBE_SCRIPT if mode == "probe" else HCL_SCRIPT]
 
@@ -498,9 +497,8 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     if budget.work_left() < START_RESERVE + KILL_AFTER + MIN_TIMER:
         raise Expired()
     own["image_id"] = image_id
-    base_src = own["staged"]["base_source"] if own["staged"] else None
     argv = create_args(own["name"], own["label"], image_id, f"{uid}:{gid}", own["workspace"], own["deadline"],
-                       own["boot_id"], own["mode"], base_src)
+                       own["boot_id"], own["mode"])
     own["attempted"] = True
     own["ambiguous"] = "ambiguous_create"
     ledger.write("create_intent", image_id=image_id)       # durable BEFORE the daemon mutation
@@ -563,11 +561,19 @@ def read_step(out_dir, name, cap=STEP_CAP):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
             return None
-        raw = handle.read(cap + 1)
-    return None if len(raw) > cap else raw
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(cap + 1)
+        if len(raw) != info.st_size or stage_tools.identity(os.fstat(fd)) != stage_tools.identity(info):
+            return None
+        return raw
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def _accept_hcl(own, result, budget, clock, oom, code):
@@ -594,15 +600,20 @@ def _accept_hcl(own, result, budget, clock, oom, code):
         if data is not None:
             evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                               "excerpt": data[:EXCERPT].decode("ascii", "replace")}
+    invalid = sorted(name for name, data in raw.items() if data is None)
+    if invalid:
+        evidence["invalid_files"] = invalid
+        result["reason"] = "invalid_step_evidence"
+        return
     if oom or code != 0:
         result["reason"] = "unexpected_exit"
         return
     steps = raw["steps"]
-    if steps is None or steps.decode("ascii", "replace") != STEPS_EXPECTED:
+    if steps.decode("ascii", "replace") != STEPS_EXPECTED:
         result["reason"] = "tool_check_failed"
         return
     version = raw["version.out"]
-    if version is None or not VERSION_RE.fullmatch(version.decode("ascii", "replace")):
+    if not VERSION_RE.fullmatch(version.decode("ascii", "replace")):
         result["reason"] = "wrong_core_version"
         return
     try:
@@ -736,7 +747,7 @@ def main(argv=None):
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",
-                           mode=args.mode, base_src=files["base"] or "<base image>")
+                           mode=args.mode)
         print(json.dumps({"mode": args.mode, "executed": False, "image": PINNED_IMAGE, "create": plan}))
         return 0
     try:

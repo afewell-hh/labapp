@@ -65,20 +65,30 @@ def identity(info):
 
 def open_regular(path, limit):
     """Open without following symlinks; return (handle, fstat) for a bounded regular file."""
-    if not PATH_RE.match(path):
+    if not PATH_RE.fullmatch(path) or os.path.normpath(path) != path:
         raise StageError("unsafe input path")
+    # Resolve each parent through an anchored directory descriptor. O_NOFOLLOW
+    # on the leaf alone would still follow a symlinked or retargeted parent.
+    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        for part in path.split("/")[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(os.path.basename(path),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
     except OSError as exc:
-        raise StageError("input cannot be opened") from exc
-    handle = os.fdopen(fd, "rb")
+        raise StageError("input cannot be opened without following symlinks") from exc
+    finally:
+        os.close(parent)
     try:
-        info = os.fstat(handle.fileno())
+        info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             raise StageError("input is not a bounded regular file")
-        return handle, info
+        return os.fdopen(fd, "rb"), info
     except BaseException:
-        handle.close()
+        os.close(fd)
         raise
 
 
@@ -123,12 +133,31 @@ def hash_file(path, size=None, check=_noop):
     return digest.hexdigest(), identity(info)
 
 
-def file_identity(path):
-    """Cheap re-check of an already hashed file: lstat identity of a regular file."""
-    info = os.lstat(path)
-    if not stat.S_ISREG(info.st_mode):
-        raise StageError("input is no longer a regular file")
-    return identity(info)
+def copy_hash(path, dest, size, check=_noop):
+    """Copy/hash a pinned-size source through one stable FD into a new read-only file."""
+    handle, info = open_regular(path, size)
+    with handle:
+        if info.st_size != size:
+            raise StageError("input size differs from its pin")
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400)
+        with os.fdopen(fd, "wb") as out:
+            digest, total = hashlib.sha256(), 0
+            while True:
+                check()
+                chunk = handle.read(CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size:
+                    raise StageError("input grew while being copied")
+                digest.update(chunk)
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+            check()
+        if total != size or identity(os.fstat(handle.fileno())) != identity(info):
+            raise StageError("input changed while being copied")
+    return digest.hexdigest()
 
 
 def check_listing(zf, pin):
@@ -226,8 +255,11 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
     and base to caller-supplied files that must match the pins. Return the evidence."""
     if not HEX64_RE.match(nonce):
         raise StageError("nonce must be 64 lowercase hex characters")
+    for path in sources.values():
+        if os.path.commonpath((os.path.realpath(ws), os.path.realpath(path))) == os.path.realpath(ws):
+            raise StageError("source is inside the staging workspace")
     inp, out, cd = (make_dirs(ws, name) for name in ("in", "out", "cd"))
-    for name in ("home", "tmp", "cache", "work"):
+    for name in ("home", "tmp", "cache"):
         make_dirs(out, name)
     make_dirs(out, "work", "cd")      # mountpoint for the read-only CD bind, caller-owned
     tools = make_dirs(inp, "tools")
@@ -258,28 +290,27 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE):
     write_new(os.path.join(cd, "meta-data"), b"instance-id: labapp-build\n", 0o400)
     write_new(os.path.join(cd, "plan.txt"), b"", 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
-    lines = "".join(f"{hash_file(os.path.join(cd, n))[0]}  {n}\n" for n in sorted(os.listdir(cd))
+    lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
                     if n != "nonce")
     write_new(os.path.join(cd, "MANIFEST"), lines.encode(), 0o400)
     base_pin = pins["base"]
-    base_sha, base_id = hash_file(sources["base"], base_pin["size"], check)
+    base_sha = copy_hash(sources["base"], os.path.join(inp, "base.img"), base_pin["size"], check)
     if base_sha != base_pin["sha256"]:
         raise StageError("base image differs from its pin")
-    write_new(os.path.join(inp, "base.img"), b"", 0o400)       # mountpoint for the file bind
     inputs = hashlib.sha256(manifest(ws, base_sha, check)).hexdigest()
     var_bytes = vars_text(nonce, inputs, base_sha)
     write_new(os.path.join(inp, VARS_NAME), var_bytes, 0o400)
     return {"inputs": inputs, "vars_sha256": hashlib.sha256(var_bytes).hexdigest(),
-            "nonce": nonce, "base_sha256": base_sha, "base_identity": base_id,
-            "base_source": sources["base"],
+            "nonce": nonce, "base_sha256": base_sha, "base_size": base_pin["size"],
             "core_archive_sha256": pins["core"]["sha256"], "core_member_sha256": member_sha["core"],
             "plugin_archive_sha256": pins["plugin"]["sha256"],
             "plugin_member_sha256": member_sha["plugin"],
-            "hcl_sha256": hash_file(os.path.join(inp, "labapp.pkr.hcl"))[0]}
+            "hcl_sha256": hash_file(os.path.join(inp, "labapp.pkr.hcl"), check=check)[0]}
 
 
 def verify_staged(ws, staged, check=_noop):
     """After the run: staged bytes, var-file and base file are exactly what was recorded."""
     same = hashlib.sha256(manifest(ws, staged["base_sha256"], check)).hexdigest() == staged["inputs"]
-    same = same and hash_file(os.path.join(ws, "in", VARS_NAME))[0] == staged["vars_sha256"]
-    return same and file_identity(staged["base_source"]) == staged["base_identity"]
+    same = same and hash_file(os.path.join(ws, "in", VARS_NAME), check=check)[0] == staged["vars_sha256"]
+    return same and hash_file(os.path.join(ws, "in", "base.img"),
+                              staged["base_size"], check)[0] == staged["base_sha256"]
