@@ -373,8 +373,12 @@ def check_private_dir(path, uid, what):
 def released_record(record):
     """Only our complete terminal records permit reuse; malformed state holds."""
     try:
-        return (record["state"] == "released" and record["image"] == (PREPARED_RUNTIME["image_id"]
-                    if record.get("mode") == "runtime-check" else PINNED_IMAGE)
+        mode = record.get("mode", "probe")  # historical probe records predate the mode field
+        if mode not in MODES:
+            return False
+        expected_image = (require_runtime(mode)["image_id"] if mode in VM_MODES else
+                          PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else PINNED_IMAGE)
+        return (record["state"] == "released" and record["image"] == expected_image
                 and re.fullmatch(r"labapp-probe-[a-zA-Z0-9-]+", record["name"])
                 and record["label"] == "labapp.probe.run=" + record["name"][13:]
                 and (record["id"] is None or CONTAINER_ID_RE.fullmatch(record["id"]))
@@ -382,7 +386,7 @@ def released_record(record):
                 and 0 <= record["admitted_at"] < record["work_deadline"] < record["deadline"]
                 and isinstance(record["pid"], int) and record["pid"] > 0
                 and record["outcome"] in ("accepted", "failed") and "reason" in record)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, ValueError, AttributeError):
         return False
 
 

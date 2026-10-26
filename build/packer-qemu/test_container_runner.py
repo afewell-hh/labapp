@@ -197,6 +197,23 @@ def workspace_of(args):
     return next(a for a in args if a.startswith("--mount")).split("src=")[1].split(",")[0]
 
 
+class ReleasedModeIdentityTests(RunnerCase):
+    def test_prior_probe_hcl_and_runtime_records_preserve_their_fixed_identity(self):
+        result, _ = self.run_probe()
+        self.assertEqual(result["outcome"], "accepted")
+        record = self.record()
+        for mode, image in (("probe", cr.PINNED_IMAGE), ("hcl-check", cr.PINNED_IMAGE),
+                            ("runtime-check", cr.PREPARED_RUNTIME["image_id"])):
+            with self.subTest(mode=mode):
+                self.assertTrue(cr.released_record({**record, "mode": mode, "image": image}))
+                self.assertFalse(cr.released_record({**record, "mode": mode, "image": "sha256:" + "0" * 64}))
+        legacy = {k: v for k, v in record.items() if k != "mode"}
+        self.assertTrue(cr.released_record(legacy))
+        for mode in ("unknown", "", None, 7, []):
+            with self.subTest(mode=mode):
+                self.assertFalse(cr.released_record({**record, "mode": mode}))
+
+
 class CreateArgumentTests(RunnerCase):
     def test_fixed_restrictive_command_and_no_forbidden_options(self):
         result, daemon = self.run_probe()
