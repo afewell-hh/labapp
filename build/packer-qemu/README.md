@@ -464,6 +464,16 @@ policy and the complete installed package/version/architecture set before cache
 removal. This records APT's actual authenticated resolution, not an independent
 reimplementation of its signature verification.
 
+The fixed Docker export explicitly uses `compression=uncompressed` **and**
+`force-compression=true`. BuildKit v0.34.1 defaults to gzip; choosing uncompressed
+without force would affect only newly created layers and could leave inherited
+Ubuntu layers compressed. Its Docker variant accepts the shared compression
+attributes, and force applies conversion across the complete layer chain before
+containerd copies the blob bytes into the archive. The reader therefore expects
+uncompressed bytes for every config DiffID. Compressed or unexpected output
+fails closed; it does not introduce host decompression or relax any size/hash
+bound. Actual exporter execution remains unverified until separately scoped.
+
 The data-only host reader never extracts archive paths or runs candidate code.
 It bounds tar/member sizes/counts, rejects missing/duplicate/nonregular evidence,
 checks every exported layer against the config DiffIDs and binds the exact config
@@ -485,6 +495,12 @@ Primary sources read 2026-10-26 (upstream current docs; no runtime execution):
 [Buildx docker-container driver and defaults](https://docs.docker.com/build/builders/drivers/docker-container/),
 [pinned v0.38.1 JSON listing schema](https://github.com/docker/buildx/blob/v0.38.1/commands/ls.go),
 [pinned v0.38.1 driver source, including privileged bootstrap and removal](https://github.com/docker/buildx/blob/v0.38.1/driver/docker-container/driver.go),
+[BuildKit v0.34.1 Docker exporter and shared options](https://github.com/moby/buildkit/blob/v0.34.1/exporter/oci/export.go),
+[compression attribute parsing](https://github.com/moby/buildkit/blob/v0.34.1/util/compression/attrs.go),
+[default gzip](https://github.com/moby/buildkit/blob/v0.34.1/util/compression/compression.go#L72),
+[force across inherited/new layers](https://github.com/moby/buildkit/blob/v0.34.1/cache/remote.go#L33-L36),
+[uncompressed conversion](https://github.com/moby/buildkit/blob/v0.34.1/util/compression/uncompressed.go),
+[containerd v2.4.1 unchanged blob copy](https://github.com/containerd/containerd/blob/v2.4.1/core/images/archive/exporter.go#L429-L458),
 [Docker exporter / metadata / pull behavior](https://docs.docker.com/reference/cli/docker/buildx/build/),
 [pinned setup action source](https://github.com/docker/setup-buildx-action/blob/8d2750c68a42422c14e847fe6c8ac0403b4cbd6f/src/main.ts),
 [BuildKit v0.34.1 release](https://github.com/moby/buildkit/releases/tag/v0.34.1),

@@ -145,7 +145,8 @@ def evidence(out, state):
         require(diffids and all(HEX.fullmatch(x) for x in diffids), 'invalid DiffIDs')
         require(len(entry['Layers']) == len(diffids) <= 128, 'layer count mismatch')
         require(all(re.fullmatch(r'[A-Za-z0-9_./-]+', x) and '..' not in x.split('/') for x in entry['Layers']), 'bad layer path')
-        # Docker exporter writes uncompressed layers. Hash every layer against
+        # Fixed exporter forces every layer uncompressed (including inherited layers).
+        # Hash the actual bytes; compressed/unexpected exports fail closed against
         # the config's DiffIDs, including the final layer holding APT evidence.
         for layer, expected in zip(entry['Layers'], diffids):
             member = archive.getmember(layer)

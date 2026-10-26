@@ -1,9 +1,11 @@
 """Synthetic only: no Docker daemon, image, build, service, network, or VM."""
+import gzip
 import hashlib
 import io
 import json
 from pathlib import Path
 import subprocess
+import shlex
 import tempfile
 import unittest
 from unittest import mock
@@ -67,17 +69,20 @@ def archive_bytes(files):
     return out.getvalue()
 
 
-def candidate(out, missing=None, duplicate=None):
+def candidate(out, missing=None, duplicate=None, base=False, compressed=()):
     files = ['packages.txt', 'sources.txt', 'policy.txt', 'apt-config.txt',
              'apt-lists.tar', 'keyring.gpg', 'inrelease.sha256', 'indexes.sha256']
     members = [('usr/share/labapp-runtime/' + x, b'synthetic-only\n') for x in files if x != missing]
     if duplicate:
         members += [('usr/share/labapp-runtime/' + duplicate, b'duplicate')]
     layer = archive_bytes(members)
-    cfg = json.dumps({'rootfs': {'diff_ids': ['sha256:' + hashlib.sha256(layer).hexdigest()]}}).encode()
+    layers = [('base.tar', archive_bytes([('base.txt', b'synthetic inherited layer')]))] if base else []
+    layers.append(('layer.tar', layer))
+    cfg = json.dumps({'rootfs': {'diff_ids': ['sha256:' + hashlib.sha256(raw).hexdigest() for _, raw in layers]}}).encode()
     iid = 'sha256:' + hashlib.sha256(cfg).hexdigest()
-    manifest = json.dumps([{'Config': 'config.json', 'Layers': ['layer.tar']}]).encode()
-    (out / 'image.tar').write_bytes(archive_bytes([('manifest.json', manifest), ('config.json', cfg), ('layer.tar', layer)]))
+    manifest = json.dumps([{'Config': 'config.json', 'Layers': [name for name, _ in layers]}]).encode()
+    blobs = [(name, gzip.compress(raw, mtime=0) if name in compressed else raw) for name, raw in layers]
+    (out / 'image.tar').write_bytes(archive_bytes([('manifest.json', manifest), ('config.json', cfg), *blobs]))
     (out / 'iid.txt').write_text(iid)
     (out / 'metadata.json').write_text(json.dumps({'containerimage.config.digest': iid}))
     (out / 'Dockerfile').write_text('synthetic-only')
@@ -219,6 +224,59 @@ class Ownership(unittest.TestCase):
 
 
 class Export(unittest.TestCase):
+    def test_actual_fixed_shell_requests_forced_uncompressed_docker_export(self):
+        # Execute only the fixed shell with fake functions: neither Docker nor
+        # Python helper/build commands execute. This observes the real argv.
+        script = Path(prep.__file__).with_name('runtime-prepare.sh')
+        harness = r'''docker() { printf '%q ' "$@" >> "$TRACE"; printf '\n' >> "$TRACE"; }
+python3() {
+    if [[ $3 = - ]]; then
+        while IFS= read -r ignored; do :; done
+        printf '%s\n' "$FAKE_BUILDKIT"
+    fi
+}
+source "$1"
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'labapp-runtime').mkdir()
+            trace = root / 'trace'
+            subprocess.run(['/bin/bash', '-c', harness, 'fake-only', str(script)], check=True,
+                env={'PATH': '/usr/bin:/bin', 'HOME': directory, 'RUNNER_TEMP': directory,
+                     'DOCKER_CONFIG': str(root / 'config'), 'RUNTIME_RUN': '123-1',
+                     'FAKE_BUILDKIT': prep.BUILDKIT_IMAGE, 'TRACE': str(trace)})
+            calls = [shlex.split(line) for line in trace.read_text().splitlines()]
+            build, = [args for args in calls if 'build' in args]
+            output = build[build.index('--output') + 1]
+            self.assertEqual(output, f'type=docker,dest={root}/labapp-runtime/out/image.tar,'
+                'compression=uncompressed,force-compression=true')
+            self.assertNotIn('--load', build)
+            self.assertEqual([x.name for x in (root / 'labapp-runtime/context').iterdir()], ['Dockerfile'])
+
+    def test_forced_uncompressed_two_layer_contract_preserves_diffids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out, record = Path(directory), state()
+            candidate(out, base=True)
+            prep.evidence(out, record)
+            self.assertEqual(len(record['diffids']), 2)
+            self.assertEqual((out / 'packages.txt').read_bytes(), b'synthetic-only\n')
+            self.assertEqual(record['tar_sha256'], prep.digest(out / 'image.tar'))
+
+    def test_compressed_inherited_or_new_layer_is_rejected_without_decompression(self):
+        for compressed in [('base.tar',), ('layer.tar',), ('base.tar', 'layer.tar')]:
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as directory:
+                out, record = Path(directory), state()
+                candidate(out, base=True, compressed=compressed)
+                with mock.patch.object(gzip, 'decompress', side_effect=AssertionError('must not decompress')), \
+                     self.assertRaisesRegex(ValueError, 'layer hash mismatch'):
+                    prep.evidence(out, record)
+                self.assertNotIn('tar_sha256', record)
+                self.assertFalse((out / 'packages.txt').exists())
+                record['cleanup'] = 'verified'
+                with self.assertRaises(ValueError):
+                    prep.seal(out, record, 'success', 'success')
+                self.assertFalse((out / 'SHA256SUMS').exists())
+
     def test_complete_evidence_and_cleanup_are_hash_bound_before_seal(self):
         with tempfile.TemporaryDirectory() as directory:
             out, record = Path(directory), state()

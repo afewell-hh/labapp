@@ -28,8 +28,10 @@ docker --host unix:///var/run/docker.sock --config "$DOCKER_CONFIG" buildx inspe
 python3 -I -B "$component/runtime_prepare.py" bind
 # Missing FROM/BuildKit images CAN be fetched; digest pins authenticate content.
 # Default platform is explicit; this runtime candidate proves no ARM/VM support.
+# Force normalization of inherited AND new layers: the data-only reader hashes
+# uncompressed tar bytes as DiffIDs. BuildKit otherwise defaults to gzip.
 docker --host unix:///var/run/docker.sock --config "$DOCKER_CONFIG" buildx build \
   --builder "$builder" --platform linux/amd64 --no-cache --provenance=false \
-  --output "type=docker,dest=$root/out/image.tar" \
+  --output "type=docker,dest=$root/out/image.tar,compression=uncompressed,force-compression=true" \
   --iidfile "$root/out/iid.txt" --metadata-file "$root/out/metadata.json" "$root/context"
 python3 -I -B "$component/runtime_prepare.py" evidence
