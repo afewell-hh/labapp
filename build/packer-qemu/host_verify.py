@@ -24,6 +24,10 @@ Any guest receipt, SHUTDOWN event or socket EOF afterwards is a failure.
 With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
 cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
 in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
+In the same mode one optional, strict `LABAPP-QEMU v1 ...` line (fixed literals plus bounded
+integers/flags, run-bound by nonce and inputs, at most one) is retained as the closed
+`qemu_witness` object; anything malformed, duplicate or stale fails. The observer does not
+require it: the runner requires it for `qemu-fixture` and rejects it for every other mode.
 In the same mode, one run-bound `LABAPP-DIAG v1 ... step=N exit=N reason=token` line sent before
 a failing receipt adds only those three fixed-shape fields to the failure reason. The observer
 never prints other guest bytes.
@@ -65,6 +69,14 @@ DIAG_PREFIX = b"LABAPP-DIAG"
 DIAG_RE = re.compile(
     rb"^LABAPP-DIAG v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
     rb"step=([0-9]{1,2}) exit=([0-9]{1,3}) reason=([a-z][a-z0-9-]{0,31})$")
+# Fixed `qemu-fixture` guest summary (guest/assert-qemu.py). Every field is a literal or a bounded
+# integer/flag; the guest emits it only after its own installer/witness checks passed, and the
+# runner independently revalidates the resulting object. Nothing else from the guest is kept.
+QEMU_PREFIX = b"LABAPP-QEMU"
+QEMU_RE = re.compile(
+    rb"^LABAPP-QEMU v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
+    rb"accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
+    rb"i1=1:([0-9]{1,3}) i2=0:([0-9]{1,3}) w=([0-9]{1,3}) net=([01])([01])([01])$")
 CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ARMED_KIND = "labapp-expiry-armed v1"
@@ -299,17 +311,33 @@ class Qmp:
         self.shutdown_ok = True
 
 
+def qemu_summary(groups):
+    """The closed object kept for a matched LABAPP-QEMU line (regex groups 3..8)."""
+    one, two, wit, route, ca, dns = groups[2:]
+    return {"accelerator": "kvm", "exit": 33, "uid": 0, "nonce_equal": True,
+            "backing_unchanged": True, "workspace_removed": True,
+            "install1": {"changed": True, "seconds": int(one)},
+            "install2": {"changed": False, "seconds": int(two)},
+            "witness_seconds": int(wit),
+            "network": {"default_route": route == b"1", "ca_bundle": ca == b"1",
+                        "resolver": dns == b"1"}}
+
+
 def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
-            require_sentinel_evidence=False, on_armed=None):
+            require_sentinel_evidence=False, on_armed=None, captured=None):
     """Drive both connected nonblocking sockets to a verdict; raise Failure.
 
     The serial socket is attached and registered before `cont` is ever sent, so
-    the guest cannot run before the receipt reader exists.
+    the guest cannot run before the receipt reader exists. With sentinel evidence required,
+    at most ONE strict run-bound LABAPP-QEMU line is also accepted and, when a `captured`
+    dict is supplied, kept as captured["qemu_witness"]. Its presence is not required here;
+    the runner requires it for `qemu-fixture` and rejects it everywhere else.
     """
     want = (nonce.encode(), inputs.encode())
     qlines = Lines(QMP_LINE_MAX, QMP_TOTAL_MAX, True)
     slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False,
-                   (EVIDENCE_PREFIX, DIAG_PREFIX) if require_sentinel_evidence else None)
+                   (EVIDENCE_PREFIX, DIAG_PREFIX, QEMU_PREFIX) if require_sentinel_evidence else None)
+    qemu_seen = False
     expiry = on_armed is not None
     proto, receipt_ok, armed = Qmp(expiry), False, False
     evidence_ok = False
@@ -372,6 +400,18 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                                 raise Failure("stale-or-wrong-sentinel-evidence")
                             evidence_ok = True
                             continue
+                        if require_sentinel_evidence and line.startswith(QEMU_PREFIX):
+                            found = QEMU_RE.fullmatch(line)
+                            if not found:
+                                raise Failure("malformed-qemu-witness")
+                            if qemu_seen:
+                                raise Failure("duplicate-qemu-witness")
+                            if found.groups()[:2] != want:
+                                raise Failure("stale-or-wrong-qemu-witness")
+                            qemu_seen = True
+                            if captured is not None:
+                                captured["qemu_witness"] = qemu_summary(found.groups())
+                            continue
                         if require_sentinel_evidence and line.startswith(DIAG_PREFIX):
                             found = DIAG_RE.fullmatch(line)
                             if not found:
@@ -412,10 +452,12 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
         sel.close()
 
 
-def write_result(path, nonce, inputs, cloud_init=None):
+def write_result(path, nonce, inputs, cloud_init=None, qemu_witness=None):
     result = {"nonce": nonce, "inputs": inputs, "shutdown": "guest-shutdown", "receipt": "ok"}
     if cloud_init is not None:
         result["cloud_init"] = cloud_init
+    if qemu_witness is not None:
+        result["qemu_witness"] = qemu_witness
     body = json.dumps(result, sort_keys=True).encode() + b"\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -467,11 +509,12 @@ def verify(args, clock=time.monotonic):
         if witness:
             def on_armed():
                 arm_expiry(witness, args.nonce, args.inputs)
+        captured = {}
         cloud_init = observe(qmp, serial, args.nonce, args.inputs, deadline, clock,
-                             getattr(args, "require_sentinel_evidence", False), on_armed)
+                             getattr(args, "require_sentinel_evidence", False), on_armed, captured)
         if clock() >= deadline:
             raise Failure("timeout")
-        write_result(args.result, args.nonce, args.inputs, cloud_init)
+        write_result(args.result, args.nonce, args.inputs, cloud_init, captured.get("qemu_witness"))
     finally:
         if witness:
             # A later observer failure must revoke arming even if Packer cleanup hangs.

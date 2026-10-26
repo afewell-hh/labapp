@@ -29,8 +29,8 @@ SENTINEL_VARS_NAME = "sentinel.pkrvars.hcl"
 VARS_NAMES = (VARS_NAME, SENTINEL_VARS_NAME)     # generated, excluded from the overall identity
 VERIFY_SECONDS = 30
 GUEST_FILES = ("user-data", "guest-build.sh")
-TASKS = ("hcl-check", "sentinel", "sentinel-expiry", "fixture")
-VM_TASKS = ("sentinel", "sentinel-expiry", "fixture")      # same guest-receipt identity
+TASKS = ("hcl-check", "sentinel", "sentinel-expiry", "fixture", "qemu-fixture")
+VM_TASKS = ("sentinel", "sentinel-expiry", "fixture", "qemu-fixture")      # same guest-receipt identity
 ARTIFACT_LIMIT = 1 << 32      # bound for hashing the disposable sentinel output
 # Sentinel guest assertions. Staged 0444 so `ubuntu` can read the copy made by user-data
 # (cp -a keeps modes; ISO Rock Ridge modes are UNVERIFIED until the tiny ISO check).
@@ -47,6 +47,14 @@ PROVISION_FILES = ("install-hhfab.py", "hhfab_release.py")
 PROBE_FILE = "component_prerequisites.py"
 OWNER_UID = 1000          # the cloud image's dedicated `ubuntu` user; baseline asserts the mapping
 FIXTURE_ASSERT = "assert-fixture.py"
+# Fixed networked QEMU fixture: the UNCHANGED build/provision network installer (install-qemu.py with its
+# siblings) runs twice and the UNCHANGED KVM witness once; guest/assert-qemu.py only observes. Every file is
+# root-run only (0400, no nonroot reader), so nothing here widens the sentinel/fixture access.
+QEMU_PROVISION_FILES = ("install-qemu.py", "qemu_offline.py", "hhfab_release.py", "qemu_witness.py")
+QEMU_ASSERT = "assert-qemu.py"
+_QEMU_STEP = f"root /usr/bin/python3 -I -B @IN@/{QEMU_ASSERT} "
+QEMU_PLAN = (SENTINEL_PLAN.decode() + _QEMU_STEP + "baseline\n" + _QEMU_STEP + "install 1\n"
+             + _QEMU_STEP + "install 2\n" + _QEMU_STEP + "witness\n").encode()
 HHFAB_VERSION = "0.50.4"
 ARCHIVE_NAME = f"hhfab-linux-amd64-v{HHFAB_VERSION}.tar.gz"
 _INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VERSION} "
@@ -298,7 +306,9 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
     written, so it reflects the original budget actually left).
     fixture stages the sentinel inputs plus the fixed hhfab plan, assert-fixture.py, the
     byte-identical install-hhfab.py/hhfab_release.py and the pinned archive (`sources["archive"]`)
-    on the CD, so all of them are covered by the MANIFEST/receipt identity."""
+    on the CD, so all of them are covered by the MANIFEST/receipt identity.
+    qemu-fixture stages the sentinel inputs plus the byte-identical install-qemu.py, qemu_offline.py,
+    hhfab_release.py and qemu_witness.py, `guest/assert-qemu.py` and the fixed QEMU plan (no archive)."""
     if task not in TASKS:
         raise StageError("unknown staging task")
     if task == "fixture" and "archive" not in sources:
@@ -358,8 +368,17 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         if copy_hash(sources["archive"], os.path.join(cd, archive_pin["file"]), archive_pin["size"],
                      check, 0o444) != archive_pin["sha256"]:
             raise StageError("hhfab archive differs from its pin")
+    if task == "qemu-fixture":
+        # Four byte-identical provisioning modules plus the observer-only adapter; no archive,
+        # download list or capture exists here: the guest installer reaches the pinned snapshot itself.
+        for name in QEMU_PROVISION_FILES:
+            write_new(os.path.join(cd, name),
+                      read_file(os.path.join(provision_dir, name), TEXT_LIMIT, check), 0o400)
+        write_new(os.path.join(cd, QEMU_ASSERT),
+                  read_file(os.path.join(repo_dir, "guest", QEMU_ASSERT), TEXT_LIMIT, check), 0o400)
+    plans = {"fixture": FIXTURE_PLAN, "qemu-fixture": QEMU_PLAN}
     write_new(os.path.join(cd, "plan.txt"),
-              FIXTURE_PLAN if task == "fixture" else SENTINEL_PLAN if task in VM_TASKS else b"", 0o400)
+              plans.get(task, SENTINEL_PLAN if task in VM_TASKS else b""), 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
     lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
                     if n != "nonce")

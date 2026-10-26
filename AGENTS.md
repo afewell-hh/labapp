@@ -52,7 +52,10 @@ Codex does not document an import mechanism, so this file uses plain links;
   runtime identity; actual execution still requires separately scoped lead authorization.
   The fixed `fixture` mode stages the unchanged pinned hhfab installer and archive,
   verifies two installs and isolated refusals, and also requires separately scoped
-  lead execution. Results and remaining gates live in GitHub.
+  lead execution. The fixed `qemu-fixture` mode (#292) is the only mode with ordinary outbound
+  Docker bridge networking (not allowlisted egress); it runs the unchanged QEMU network installer
+  twice and the KVM witness, and its source activation likewise needs separately scoped lead
+  execution. Results and remaining gates live in GitHub.
 - `docs/runbooks/`: manual image build and troubleshooting
 - `docs/`: other docs ([index](docs/README.md)); `STUDENT_QUICK_START.md`: student guide
 - `_archive/`, `archive2/`: archived, not part of the current project
