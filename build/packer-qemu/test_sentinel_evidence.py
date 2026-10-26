@@ -10,6 +10,8 @@ import os
 import platform
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import tempfile
 import sys
 import time
@@ -52,6 +54,157 @@ class SummaryTests(unittest.TestCase):
         for nonce, inputs in (("invalid", "b" * 64), ("a" * 64, "b" * 65)):
             with self.assertRaises(ValueError):
                 se.record(b'{"status":"done"}', nonce, inputs)
+
+
+class RendererProcessTests(unittest.TestCase):
+    """Real subprocesses/pipes: the renderer's fixed statuses and the pipeline wrapper."""
+    GOOD = b'{"status":"done","errors":[],"recoverable_errors":{}}'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(os.path.realpath(tmp.name))
+        shutil.copy(HERE / "guest" / "sentinel-evidence.py", self.dir)
+        shutil.copy(HERE / "guest" / "assert-sentinel.sh", self.dir)
+        (self.dir / "nonce").write_text("a" * 64 + "\n")
+        (self.dir / "MANIFEST").write_bytes(b"m\n")
+        self.inputs = hashlib.sha256(b"m\n").hexdigest()
+        self.expected = ("\nLABAPP-EVIDENCE v1 nonce=" + "a" * 64 + " inputs=" + self.inputs
+                         + " cloud-init=done errors=0 recoverable=0\n").encode()
+
+    def render(self, data, stdout=subprocess.PIPE):
+        proc = subprocess.run([sys.executable, "-I", str(self.dir / "sentinel-evidence.py")],
+                              input=data, stdout=stdout, stderr=subprocess.PIPE, timeout=20)
+        return proc
+
+    def test_valid_record_is_byte_exact_and_status_zero(self):
+        proc = self.render(self.GOOD)
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, self.expected, b""))
+
+    def test_invalid_and_oversized_input_is_status_1_with_no_output(self):
+        for data in (b"not json", b'{"status":"running"}', b'{"status":"done"}' + b" " * se.STATUS_CAP):
+            proc = self.render(data)
+            self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (1, b"", b""))
+
+    def test_output_write_failures_are_fixed_handled_statuses_not_interpreter_120(self):
+        with open("/dev/full", "wb", buffering=0) as full:
+            proc = self.render(self.GOOD, stdout=full)
+        self.assertEqual((proc.returncode, proc.stderr), (se.WRITE_ENOSPC, b""))
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            proc = self.render(self.GOOD, stdout=write_end)
+        finally:
+            os.close(write_end)
+        self.assertEqual((proc.returncode, proc.stderr), (se.WRITE_EPIPE, b""))
+
+    def test_emit_handles_partial_writes_interrupts_and_stalls(self):
+        calls = []
+
+        def fake(fd, view):
+            calls.append(bytes(view))
+            if len(calls) == 1:
+                raise InterruptedError()
+            return 3
+        with mock.patch.object(se.os, "write", fake):
+            self.assertEqual(se.emit(b"abcdefg"), 0)
+        self.assertEqual(calls, [b"abcdefg", b"abcdefg", b"defg", b"g"])
+        with mock.patch.object(se.os, "write", lambda fd, view: 0):
+            self.assertEqual(se.emit(b"abc"), se.WRITE_STALLED)
+
+    def test_emit_maps_errno_to_fixed_statuses_without_peer_text(self):
+        import errno
+        for code, status in ((errno.EPIPE, se.WRITE_EPIPE), (errno.ENOSPC, se.WRITE_ENOSPC),
+                             (errno.EIO, se.WRITE_EIO), (errno.EBADF, se.WRITE_OTHER)):
+            with mock.patch.object(se.os, "write", side_effect=OSError(code, "SECRET")):
+                self.assertEqual(se.emit(b"x"), status)
+
+    def pipeline(self, producer, out="/dev/null"):
+        """Run assert-sentinel.sh's root pipeline with a fake cloud-init and ttyS0 stand-in."""
+        bindir = self.dir / "bin"
+        bindir.mkdir(exist_ok=True)
+        fake = bindir / "cloud-init"
+        fake.write_text("#!/bin/bash\n" + producer + "\n")
+        fake.chmod(0o755)
+        script = (self.dir / "assert-sentinel.sh").read_text()
+        # Only the fixed root-identity and device/reason paths are redirected for the test.
+        script = (script.split("[[ $(id -u)")[0]
+                  + "uid=$(id -u); want=root\n"
+                  + "set -Eeuo pipefail\n" + "if [[ $want == root ]]; then"
+                  + script.split("if [[ $want == root ]]; then", 1)[1])
+        script = script.replace("/dev/ttyS0", out).replace("/run/labapp-reason", str(self.dir / "reason"))
+        path = self.dir / "run.sh"
+        path.write_text(script)
+        env = {"PATH": "%s:%s" % (bindir, os.environ["PATH"])}
+        proc = subprocess.run(["bash", str(path), "root"], env=env, cwd=str(self.dir),
+                              capture_output=True, timeout=20)
+        reason = self.dir / "reason"
+        return proc, reason.read_text() if reason.exists() else None
+
+    def test_wrapper_classifies_actual_oversize_and_broken_pipe_producers(self):
+        # The first producer really writes 1 MiB through the pipe (not subprocess input=).
+        # The second keeps writing until the bounded renderer closes its input. A separate
+        # distribution timeout bounds the synthetic producer even if this test regresses.
+        producers = [
+            "exec /usr/bin/python3 -I -B -c 'import os; "
+            "view=memoryview(b\"PEER_TEXT\" * 131072);\n"
+            "while view: view=view[os.write(1, view):]'",
+            "exec /usr/bin/timeout --kill-after=1s 2s /usr/bin/yes PEER_TEXT",
+        ]
+        for producer in producers:
+            with self.subTest(producer=producer):
+                start = time.monotonic()
+                proc, reason = self.pipeline(producer)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(proc.returncode, 1)
+                found = re.fullmatch(r"pipe-p([0-9]{1,3})-r1", reason)
+                self.assertIsNotNone(found)
+                self.assertGreater(int(found.group(1)), 0)
+                self.assertLessEqual(int(found.group(1)), 255)
+                self.assertLessEqual(len(reason), 32)
+                self.assertLess(len(proc.stdout) + len(proc.stderr), 4096)
+                self.assertNotIn(b"PEER_TEXT", proc.stdout + proc.stderr)
+                (self.dir / "reason").unlink()
+
+    def test_wrapper_classifies_serial_redirection_open_failure(self):
+        good = "printf '%s' '%s'" % (self.GOOD.decode(), "")
+        start = time.monotonic()
+        proc, reason = self.pipeline(good, out=str(self.dir / "missing-parent" / "tty"))
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(proc.returncode, 1)
+        found = re.fullmatch(r"pipe-p([0-9]{1,3})-r1", reason)
+        self.assertIsNotNone(found)
+        # The producer can finish its small write before the renderer's shell refuses
+        # the output redirection, or see SIGPIPE. Neither ordering permits acceptance.
+        self.assertLessEqual(int(found.group(1)), 255)
+        self.assertLessEqual(len(reason), 32)
+        self.assertLess(len(proc.stdout) + len(proc.stderr), 4096)
+        self.assertNotIn(self.GOOD, proc.stdout + proc.stderr)
+        self.assertFalse((self.dir / "missing-parent").exists())
+
+    def test_wrapper_accepts_valid_and_records_separate_statuses_for_failures(self):
+        good = "printf '%s' '%s'" % (self.GOOD.decode(), "")
+        proc, reason = self.pipeline(good, out=str(self.dir / "tty"))
+        self.assertEqual((proc.returncode, reason), (0, None))
+        self.assertEqual((self.dir / "tty").read_bytes(), self.expected)
+        for name in ("tty", "reason"):
+            if (self.dir / name).exists():
+                (self.dir / name).unlink()
+        cases = [("exit 3", "/dev/null", "pipe-p3-r1"),                       # producer fails, no input
+                 (good + "; exit 3", "/dev/null", "pipe-p3-r0"),               # valid output, producer nonzero
+                 ("echo SECRET", "/dev/null", "pipe-p0-r1"),                   # invalid input
+                 (good, "/dev/full", "pipe-p0-r%d" % se.WRITE_ENOSPC)]         # serial write failure
+        for producer, out, token in cases:
+            with self.subTest(token=token):
+                proc, reason = self.pipeline(producer, out=out)
+                self.assertEqual((proc.returncode, reason), (1, token))
+                self.assertRegex(token, r"^[a-z][a-z0-9-]{0,31}$")
+                self.assertNotIn(b"SECRET", proc.stdout + proc.stderr)
+                (self.dir / "reason").unlink()
+        # An earlier reason is never overwritten.
+        (self.dir / "reason").write_text("earlier")
+        proc, reason = self.pipeline("exit 3")
+        self.assertEqual((proc.returncode, reason), (1, "earlier"))
 
 
 spec = importlib.util.spec_from_file_location("assert_fixture", HERE / "guest" / "assert-fixture.py")
