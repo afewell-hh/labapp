@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import pwd
 import signal
+import stat
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -20,6 +22,10 @@ class ProbeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.work = Path(self.temporary.name)
         self.token = 'a' * 32
+        # These preexisting tests isolate other preflight requirements.
+        parent = patch.object(probe, 'validate_scratch_parent')
+        parent.start()
+        self.addCleanup(parent.stop)
 
     def service(self, fail=None, marker=True, foreign=False):
         calls = []
@@ -194,7 +200,390 @@ class ProbeTests(unittest.TestCase):
                 patch.object(signal, 'signal'), patch.object(signal, 'alarm'), contextlib.redirect_stdout(output):
             self.assertEqual(probe.main(), 1)
         self.assertNotIn('SECRET', output.getvalue())
-        self.assertIn('operational failure', output.getvalue())
+        self.assertIn('operational', output.getvalue())
+
+
+class PhaseTests(unittest.TestCase):
+    """The failure JSON names the failing action; success and exit codes are unchanged."""
+
+    def setUp(self):
+        self.addCleanup(probe.stage, 'unknown')
+        probe.stage('unknown')
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+
+    def fail_main(self):
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['probe', '--owner-uid', '1234', '--archive', '/archive']), \
+                patch.object(signal, 'signal'), patch.object(signal, 'alarm'), \
+                contextlib.redirect_stdout(output):
+            code = probe.main()
+        return code, output.getvalue()
+
+    def test_each_stage_failure_names_that_phase_and_stops(self):
+        stages = ['preflight', 'installer', 'systemd', 'kvm']
+        for index, name in enumerate(stages):
+            for error in (Refusal('prerequisite command failed'), Refusal('overall work deadline exceeded'),
+                          RuntimeError('SECRET'), KeyboardInterrupt()):
+                probe.STAGE = 'unknown'
+                temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+                with self.subTest(stage=name, error=type(error).__name__), \
+                        patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                        patch.object(probe, 'preflight', side_effect=error if name == 'preflight' else
+                                     (lambda *_: pwd.getpwuid(os.getuid()))), \
+                        patch.object(probe, 'installer_probe', side_effect=error if name == 'installer' else
+                                     (lambda *_: {})), \
+                        patch.object(probe, 'systemd_probe', side_effect=error if name == 'systemd' else
+                                     (lambda *_: {})) as systemd, \
+                        patch.object(probe, 'require', side_effect=error if name == 'kvm' else
+                                     (lambda *_, **__: b'')) as require:
+                    with self.assertRaises(type(error)):
+                        probe.probe(1234, Path('/archive'))
+                    self.assertEqual(probe.STAGE, name)
+                    if index < 2:
+                        systemd.assert_not_called()
+                    if index < 3:
+                        require.assert_not_called()
+
+    def test_failure_json_carries_only_allowlisted_phase(self):
+        for stage_name, expected in (('kvm', 'kvm'), ('bogus /path SECRET', 'unknown')):
+            probe.STAGE = stage_name
+            with patch.object(probe, 'probe', side_effect=Refusal('prerequisite command failed')):
+                code, text = self.fail_main()
+            self.assertEqual(code, 1)
+            data = json_loads(text)
+            self.assertEqual(data, {'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
+                                    'category': 'refusal', 'phase': expected, 'action': 'none', 'execution_mount': 'none'})
+            self.assertNotIn('SECRET', text)
+
+    def test_unexpected_exception_and_timeout_keep_stage_phase(self):
+        for error in (RuntimeError('SECRET'), KeyboardInterrupt(), Refusal('overall work deadline exceeded')):
+            probe.STAGE = 'installer'
+            with patch.object(probe, 'probe', side_effect=error):
+                code, text = self.fail_main()
+            self.assertEqual((code, json_loads(text)['phase']), (1, 'installer'))
+            self.assertNotIn('SECRET', text)
+
+    def test_cleanup_failure_takes_precedence_over_original_error(self):
+        # Original KVM-stage failure, then the unit cleanup raises: reported as cleanup.
+        calls = []
+        def run(args, seconds=15, limit=4096):
+            calls.append(args[1] if len(args) > 1 else args[0])
+            return (1, b'') if 'stop' in args else (0, b'')
+        probe.STAGE = 'systemd'
+        with patch.object(probe, 'run', run), \
+                patch.object(probe, 'unit_properties', return_value={'LoadState': 'not-found'}), \
+                patch.object(probe, 'require', side_effect=Refusal('prerequisite command failed')):
+            with self.assertRaisesRegex(Refusal, 'stop failed'):
+                probe.systemd_probe(Path(self.temporary.name))
+        self.assertEqual(probe.STAGE, 'cleanup')
+
+    def test_successful_cleanup_preserves_original_phase(self):
+        probe.STAGE = 'systemd'
+        with patch.object(probe, 'run', return_value=(0, b'')), \
+                patch.object(probe, 'unit_properties', return_value={'LoadState': 'not-found'}), \
+                patch.object(probe, 'require', side_effect=Refusal('prerequisite command failed')):
+            with self.assertRaisesRegex(Refusal, 'prerequisite command failed'):
+                probe.systemd_probe(Path(self.temporary.name))
+        self.assertEqual(probe.STAGE, 'systemd')
+
+    def test_workspace_cleanup_failure_is_cleanup_not_kvm(self):
+        temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+        temp.cleanup = mock_raise(OSError('SECRET'))
+        owner = pwd.getpwuid(os.getuid())
+        probe.STAGE = 'unknown'
+        with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                patch.object(probe, 'preflight', return_value=owner), \
+                patch.object(probe, 'installer_probe', return_value={}), \
+                patch.object(probe, 'systemd_probe', return_value={}), \
+                patch.object(probe, 'require', return_value=b''):
+            with self.assertRaises(OSError):
+                probe.probe(1234, Path('/archive'))
+        self.assertEqual(probe.STAGE, 'cleanup')
+
+    def test_success_report_is_unchanged_and_exit_zero(self):
+        owner = pwd.getpwuid(os.getuid())
+        temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+        with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                patch.object(probe, 'preflight', return_value=owner), \
+                patch.object(probe, 'installer_probe', return_value={}), \
+                patch.object(probe, 'systemd_probe', return_value={}), \
+                patch.object(probe, 'require', return_value=b''):
+            report = probe.probe(1234, Path('/archive'))
+        self.assertEqual(sorted(report), ['caller_uid', 'checks', 'python', 'schema'])
+        self.assertEqual(sorted(report['checks']), ['installer', 'kvm', 'systemd'])
+        self.assertNotIn('phase', report)
+
+
+class InstallerDiagnosticTests(unittest.TestCase):
+    setUp = PhaseTests.setUp
+    fail_main = PhaseTests.fail_main
+    # Reuse only test setup/report helper; no real installer, identity changes or privileged work.
+    def exercise(self, action, failure, mount=0):
+        owner = pwd.getpwuid(os.getuid())
+        workspace = Path(self.temporary.name)
+        calls = []
+        def chown(*_):
+            calls.append('chown')
+            if action == 'chown':
+                raise failure
+        def run(args, seconds=15, limit=4096):
+            name = ('firstinstall', 'rerun', 'cli')[sum(c in ('firstinstall', 'rerun', 'cli') for c in calls)]
+            calls.append(name)
+            if name == action:
+                if isinstance(failure, BaseException):
+                    raise failure
+                return failure
+            return 0, {'firstinstall': b'hhfab install: installed\n',
+                       'rerun': b'hhfab install: unchanged\n', 'cli': b'hhfab version v0.50.4\n'}[name]
+        def snapshot(*_):
+            name = 'snapshot-rerun' if 'snapshot-first' in calls else 'snapshot-first'
+            calls.append(name)
+            if action == name:
+                raise failure
+            return (1, 2, 3, 4, 5)
+        def operation(*_):
+            probe.stage('installer')
+            if action == 'mkdir':
+                with patch.object(Path, 'mkdir', side_effect=failure):
+                    return probe.installer_probe(owner, workspace, Path('/archive'))
+            return probe.installer_probe(owner, workspace, Path('/archive'))
+        with patch.object(probe, 'probe', operation), patch.object(probe, 'run', run), \
+                patch.object(os, 'chown', chown), patch.object(probe, 'installed_snapshot', snapshot), \
+                patch.object(os, 'statvfs', side_effect=mount if isinstance(mount, Exception) else None,
+                             return_value=type('Flags', (), {'f_flag': mount})()):
+            code, text = self.fail_main()
+        data = json_loads(text)
+        self.assertEqual(code, 1)
+        self.assertEqual((data['phase'], data['action']), ('installer', action))
+        self.assertNotIn('SECRET', text)
+        self.assertNotIn('reason', data)
+        self.assertEqual(data['execution_mount'], ('unknown' if isinstance(mount, Exception) else
+                         'noexec' if mount & os.ST_NOEXEC else 'exec') if action == 'cli' else 'none')
+        order = ['chown', 'firstinstall', 'snapshot-first', 'rerun', 'snapshot-rerun', 'cli']
+        self.assertEqual(calls, [] if action == 'mkdir' else order[:order.index(action)+1])
+        (workspace / 'install').rmdir() if (workspace / 'install').exists() else None
+        return data['category']
+
+    def test_actions_are_attributed_before_failure_and_stop_later_work(self):
+        for action in ('mkdir', 'chown', 'firstinstall', 'snapshot-first', 'rerun', 'snapshot-rerun', 'cli'):
+            for error, category in ((OSError('SECRET'), 'operational'), (PermissionError('SECRET'), 'permission'), (Refusal('SECRET'), 'refusal'),
+                                    (KeyboardInterrupt(), 'interrupted'),
+                                    (Refusal('overall work deadline exceeded'), 'timeout')):
+                with self.subTest(action=action, category=category):
+                    self.assertEqual(self.exercise(action, error), category)
+
+    def test_command_status_output_and_snapshot_mismatches_are_distinct(self):
+        for action in ('firstinstall', 'rerun', 'cli'):
+            for reply, category in (((4, b'SECRET'), 'nonzero'), ((0, b'SECRET'), 'mismatch'),
+                                     (Refusal('command timeout'), 'timeout'),
+                                     (Refusal('command output overflow'), 'overflow')):
+                with self.subTest(action=action, category=category):
+                    self.assertEqual(self.exercise(action, reply), category)
+        for action in ('snapshot-first', 'snapshot-rerun'):
+            self.assertEqual(self.exercise(action, Refusal('installed binary verification failed')), 'mismatch')
+
+    def test_real_tiny_child_helper_timeout_and_overflow_are_classified(self):
+        for script, seconds, limit, expected in (
+                ('import time; time.sleep(5)', .1, 64, 'timeout'),
+                ('import os; os.write(2,b"SECRET"*10000)', 2, 64, 'overflow')):
+            with self.subTest(expected=expected):
+                with self.assertRaises(Refusal) as caught:
+                    probe.run([sys.executable, '-I', '-B', '-c', script], seconds, limit)
+                self.assertEqual(probe.failure_category(caught.exception), expected)
+
+    def test_cli_mount_observation_is_fixed_and_failure_does_not_skip_cli(self):
+        for mount in (0, os.ST_NOEXEC, PermissionError('SECRET')):
+            self.assertEqual(self.exercise('cli', PermissionError('SECRET'), mount), 'permission')
+
+    def test_probe_cleanup_preserves_cli_metadata_or_overrides_all_of_it(self):
+        for cleanup_fails in (False, True):
+            temporary = tempfile.TemporaryDirectory(dir=self.temporary.name)
+            self.addCleanup(temporary.cleanup)
+            def installer(*_):
+                probe.stage('installer', 'cli', 'noexec')
+                raise PermissionError('SECRET')
+            with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temporary), \
+                    patch.object(probe, 'preflight', return_value=pwd.getpwuid(os.getuid())), \
+                    patch.object(probe, 'installer_probe', installer), \
+                    patch.object(probe, 'systemd_probe') as systemd, \
+                    patch.object(temporary, 'cleanup', side_effect=OSError('SECRET') if cleanup_fails else None):
+                code, text = self.fail_main()
+            data = json_loads(text)
+            self.assertEqual(code, 1)
+            expected = ('cleanup', 'none', 'none', 'operational') if cleanup_fails else \
+                       ('installer', 'cli', 'noexec', 'permission')
+            self.assertEqual(tuple(data[k] for k in ('phase', 'action', 'execution_mount', 'category')), expected)
+            systemd.assert_not_called()
+            self.assertNotIn('SECRET', text)
+
+    def test_cleanup_restores_both_phase_and_installer_action(self):
+        probe.stage('installer', 'rerun')
+        previous = probe.stage('cleanup')
+        self.assertEqual((probe.STAGE, probe.ACTION), ('cleanup', 'none'))
+        probe.stage(*previous)
+        self.assertEqual((probe.STAGE, probe.ACTION), ('installer', 'rerun'))
+        self.assertEqual(probe.EXECUTION_MOUNT, 'none')
+        probe.stage('installer', 'cli', 'noexec')
+        previous = probe.stage('cleanup')
+        self.assertEqual(probe.EXECUTION_MOUNT, 'none')
+        probe.stage(*previous)
+        self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), ('installer', 'cli', 'noexec'))
+
+
+class ScratchTests(unittest.TestCase):
+    """Trust refusal precedes work; real temporary children alone are removed."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name)
+        self.parent.chmod(0o755)
+        self.addCleanup(probe.stage, 'unknown')
+
+    @staticmethod
+    def trusted_info():
+        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+    def test_parent_chain_rejects_untrusted_mode_owner_symlink_and_file(self):
+        chain = (Path('/'), Path('/var'), Path('/var/lib'))
+        bad = ((stat.S_IFDIR | 0o755, 1000), (stat.S_IFDIR | 0o775, 0),
+               (stat.S_IFDIR | 0o757, 0), (stat.S_IFLNK | 0o777, 0),
+               (stat.S_IFREG | 0o755, 0), (stat.S_IFDIR | 0o750, 0))
+        for directory in chain:
+            for mode, uid in bad:
+                def info(path):
+                    return SimpleNamespace(st_mode=mode, st_uid=uid) if path == directory else self.trusted_info()
+                with self.subTest(directory=directory, mode=oct(mode), uid=uid), \
+                        patch.object(probe, 'SCRATCH_PARENT', Path('/var/lib')), \
+                        patch.object(Path, 'lstat', info), patch.object(os, 'statvfs') as flags, \
+                        self.assertRaises(Refusal):
+                    probe.validate_scratch_parent()
+                flags.assert_not_called()
+
+    def test_invalid_parent_or_mount_refuses_before_any_owned_work(self):
+        # Call real probe+preflight with only root identity simulated; no host root,
+        # systemd, installer or KVM access occurs even on the refusal path.
+        for state in ('missing', 'symlink', 'noexec', 'unavailable'):
+            info = self.trusted_info()
+            if state == 'symlink':
+                info.st_mode = stat.S_IFLNK | 0o777
+            with self.subTest(state=state), patch.object(os, 'geteuid', return_value=0), \
+                    patch.object(Path, 'lstat', side_effect=FileNotFoundError() if state == 'missing' else None,
+                                 return_value=info), \
+                    patch.object(os, 'statvfs', side_effect=OSError('SECRET') if state == 'unavailable' else None,
+                                 return_value=SimpleNamespace(f_flag=os.ST_NOEXEC if state == 'noexec' else 0)), \
+                    patch.object(probe.tempfile, 'TemporaryDirectory') as temporary, \
+                    patch.object(probe, 'installer_probe') as installer, \
+                    patch.object(probe, 'systemd_probe') as systemd, patch.object(probe, 'require') as require:
+                with self.assertRaises((Refusal, OSError)):
+                    probe.probe(1234, Path('/archive'))
+                self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), ('preflight', 'none', 'none'))
+                for action in (temporary, installer, systemd, require):
+                    action.assert_not_called()
+
+    def test_exec_parent_validates_without_mutation(self):
+        inspected = []
+        def info(path):
+            inspected.append(path)
+            return self.trusted_info()
+        with patch.object(Path, 'lstat', info), \
+                patch.object(os, 'statvfs', return_value=SimpleNamespace(f_flag=0)) as flags, \
+                patch.object(Path, 'mkdir') as mkdir, patch.object(os, 'chown') as chown:
+            probe.validate_scratch_parent()
+        self.assertEqual(inspected, [Path('/'), Path('/var'), Path('/var/lib')])
+        flags.assert_called_once_with(Path('/var/lib'))
+        mkdir.assert_not_called()
+        chown.assert_not_called()
+
+    def test_real_workspace_creation_modes_and_exact_cleanup(self):
+        sibling = self.parent / 'unrelated'
+        sibling.write_bytes(b'preserve')
+        owner = pwd.getpwuid(os.getuid())
+        original_lstat = Path.lstat
+        original_temporary = tempfile.TemporaryDirectory
+        seen = []
+        events = []
+        # Real private test filesystem, simulated root-owned metadata for its
+        # fixed test parent chain only. Owned children retain real uid/mode stats.
+        def info(path):
+            return self.trusted_info() if path == self.parent or path in self.parent.parents else original_lstat(path)
+        def preflight(*_):
+            probe.validate_scratch_parent()
+            return owner
+        def temporary(*args, **kwargs):
+            self.assertEqual(kwargs['dir'], self.parent)
+            instance = original_temporary(*args, **kwargs)
+            self.assertNotIn(Path(instance.name), seen)
+            seen.append(Path(instance.name))
+            self.assertTrue(seen[-1].name.startswith('labapp-prereq-'))
+            self.assertEqual(stat.S_IMODE(seen[-1].stat().st_mode), 0o700)
+            return instance
+        def run(args, seconds=15, limit=4096):
+            workspace = seen[-1]
+            self.assertEqual(workspace.parent, self.parent)
+            self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o711)
+            self.assertEqual(stat.S_IMODE((workspace / 'install').stat().st_mode), 0o700)
+            name = ('first', 'rerun', 'cli')[len(events)]
+            events.append(name)
+            return 0, {'first': b'hhfab install: installed\n',
+                       'rerun': b'hhfab install: unchanged\n', 'cli': b'hhfab version v0.50.4\n'}[name]
+        for failure in ('none', 'cli', 'cleanup'):
+            events.clear()
+            def require(args, seconds=15, expected=None):
+                if args[-1] == '--version' and failure != 'none':
+                    probe.stage('installer', 'cli', 'exec')
+                    raise PermissionError('SECRET')
+                return original_require(args, seconds, expected)
+            def make_temp(*args, **kwargs):
+                instance = temporary(*args, **kwargs)
+                if failure == 'cleanup':
+                    original_cleanup = instance.cleanup
+                    # Failure leaves this one owned test child for explicit test teardown.
+                    self.addCleanup(original_cleanup)
+                    instance.cleanup = mock_raise(OSError('SECRET'))
+                return instance
+            original_require = probe.require
+            with self.subTest(failure=failure), patch.object(probe, 'SCRATCH_PARENT', self.parent), \
+                    patch.object(Path, 'lstat', info), patch.object(probe, 'preflight', preflight), \
+                    patch.object(os, 'statvfs', return_value=SimpleNamespace(f_flag=0)), \
+                    patch.object(probe.tempfile, 'TemporaryDirectory', make_temp), \
+                    patch.object(os, 'chown') as chown, patch.object(probe, 'run', run), \
+                    patch.object(probe, 'installed_snapshot', return_value=(1, 2, 3, 4, 5)), \
+                    patch.object(probe, 'systemd_probe', return_value={}) as systemd, \
+                    patch.object(probe, 'require', require):
+                if failure == 'none':
+                    # KVM is injected separately; no kernel operation is executed.
+                    def succeed(args, seconds=15, expected=None):
+                        return b'root-api12-create-vm\n' if args[-1] == probe.KVM else require(args, seconds, expected)
+                    with patch.object(probe, 'require', succeed):
+                        report = probe.probe(owner.pw_uid, Path('/archive'))
+                    self.assertEqual(report['checks']['installer']['cli'], 'passed')
+                    self.assertEqual(report['checks']['installer']['uid'], owner.pw_uid)
+                    self.assertEqual(events, ['first', 'rerun', 'cli'])
+                    systemd.assert_called_once_with(seen[-1])
+                else:
+                    with self.assertRaises(OSError if failure == 'cleanup' else PermissionError):
+                        probe.probe(owner.pw_uid, Path('/archive'))
+                    expected = ('cleanup', 'none', 'none') if failure == 'cleanup' else ('installer', 'cli', 'exec')
+                    self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), expected)
+                    self.assertEqual(events, ['first', 'rerun'])
+                    systemd.assert_not_called()
+                chown.assert_called_once_with(seen[-1] / 'install', owner.pw_uid, owner.pw_gid)
+            self.assertEqual(sibling.read_bytes(), b'preserve')
+            self.assertEqual(seen[-1].exists(), failure == 'cleanup')
+            self.assertTrue(all(not workspace.exists() for workspace in seen[:-1]))
+
+
+def json_loads(text):
+    import json
+    return json.loads(text)
+
+
+def mock_raise(error):
+    def raiser(*_):
+        raise error
+    return raiser
 
 
 if __name__ == '__main__':

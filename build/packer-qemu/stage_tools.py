@@ -42,6 +42,10 @@ SENTINEL_PLAN = (f"root /bin/bash @IN@/{ASSERT_NAME} root\n"
 # The sentinel root+ubuntu/cloud-init steps come first and supply the pre-seal evidence line.
 PROVISION_DIR = os.path.normpath(os.path.join(HERE, "..", "provision"))
 PROVISION_FILES = ("install-hhfab.py", "hhfab_release.py")
+# Shared prerequisite probe, staged 0400 (run by root only). Its nonroot child reads the
+# installer pair and the archive, so exactly those are staged 0444.
+PROBE_FILE = "component_prerequisites.py"
+OWNER_UID = 1000          # the cloud image's dedicated `ubuntu` user; baseline asserts the mapping
 FIXTURE_ASSERT = "assert-fixture.py"
 HHFAB_VERSION = "0.50.4"
 ARCHIVE_NAME = f"hhfab-linux-amd64-v{HHFAB_VERSION}.tar.gz"
@@ -49,7 +53,8 @@ _INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VE
             f"--archive @IN@/{ARCHIVE_NAME}\n")
 _ASSERT = f"root /usr/bin/python3 -I -B @IN@/{FIXTURE_ASSERT} "
 FIXTURE_PLAN = (SENTINEL_PLAN.decode() + _ASSERT + "baseline\n" + _INSTALL + _ASSERT + "snapshot\n"
-                + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n").encode()
+                + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n"
+                + _ASSERT + f"prereq {OWNER_UID} @IN@/{ARCHIVE_NAME}\n").encode()
 
 # members: name -> (unix permission bits, uncompressed size, CRC32) from the #262 listing
 PINS = {
@@ -160,14 +165,15 @@ def hash_file(path, size=None, check=_noop, limit=FILE_LIMIT):
     return digest.hexdigest(), identity(info)
 
 
-def copy_hash(path, dest, size, check=_noop):
+def copy_hash(path, dest, size, check=_noop, mode=0o400):
     """Copy/hash a pinned-size source through one stable FD into a new read-only file."""
     handle, info = open_regular(path, size)
     with handle:
         if info.st_size != size:
             raise StageError("input size differs from its pin")
-        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400)
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
         with os.fdopen(fd, "wb") as out:
+            os.fchmod(out.fileno(), mode)  # exact fresh-file contract, independent of caller umask
             digest, total = hashlib.sha256(), 0
             while True:
                 check()
@@ -203,6 +209,7 @@ def check_listing(zf, pin):
 def write_new(path, data, mode):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), mode)
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
@@ -340,12 +347,16 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         # provisioning modules are copied byte-for-byte; the archive is pinned and bounded.
         write_new(os.path.join(cd, FIXTURE_ASSERT),
                   read_file(os.path.join(repo_dir, "guest", FIXTURE_ASSERT), TEXT_LIMIT, check), 0o400)
+        # Installer pair and archive are 0444 for the nonroot probe child (user-data makes the
+        # root-owned staging parents 0755); the root-run probe stays 0400 and the nonce private.
         for name in PROVISION_FILES:
             write_new(os.path.join(cd, name),
-                      read_file(os.path.join(provision_dir, name), TEXT_LIMIT, check), 0o400)
+                      read_file(os.path.join(provision_dir, name), TEXT_LIMIT, check), 0o444)
+        write_new(os.path.join(cd, PROBE_FILE),
+                  read_file(os.path.join(provision_dir, PROBE_FILE), TEXT_LIMIT, check), 0o400)
         archive_pin = pins["hhfab"]
         if copy_hash(sources["archive"], os.path.join(cd, archive_pin["file"]), archive_pin["size"],
-                     check) != archive_pin["sha256"]:
+                     check, 0o444) != archive_pin["sha256"]:
             raise StageError("hhfab archive differs from its pin")
     write_new(os.path.join(cd, "plan.txt"),
               FIXTURE_PLAN if task == "fixture" else SENTINEL_PLAN if task in VM_TASKS else b"", 0o400)

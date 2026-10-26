@@ -27,6 +27,11 @@ for name in $(compgen -e); do
 done
 
 if [[ $want == root ]]; then
+  # Fixture-only trust/access guard runs in existing root step 1, before ubuntu step 2.
+  # Minimal sentinel omits this file and retains the same two-step plan.
+  if [[ -f ${BASH_SOURCE[0]%/*}/assert-fixture.py ]]; then
+    /usr/bin/python3 -I -B "${BASH_SOURCE[0]%/*}/assert-fixture.py" staging
+  fi
   # Read the full bounded status, validate it, and emit only a fixed summary.
   # pipefail rejects a failed cloud-init command; overlong output is never truncated
   # into an accepted record. Only root runs this before guest-build.sh seals.

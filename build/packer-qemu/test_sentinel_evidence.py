@@ -11,10 +11,12 @@ import platform
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -232,7 +234,11 @@ class FixtureAssertionTests(unittest.TestCase):
         here = os.path.join(self.root, "in")
         os.mkdir(here)
         self.cfg = af.Config(here, install_dir=self.bin, state=os.path.join(self.root, "state"),
-                             reason=os.path.join(self.root, "reason"), ubuntu_prefix=(), top=self.root)
+                             reason=os.path.join(self.root, "reason"), ubuntu_prefix=(), top=self.root,
+                             lookup=lambda name: types.SimpleNamespace(pw_uid=1000, pw_gid=1000))
+        staging = mock.patch.object(af, "staging_access")
+        staging.start()  # legacy phase tests isolate staging; dedicated tests below exercise it
+        self.addCleanup(staging.stop)
         self.cfg.installer = str(PROVISION / "install-hhfab.py")
         self.cfg.archive = os.path.join(here, "archive.tar.gz")
         self.write(self.cfg.archive, bytes(range(256)) * 16, 0o400)
@@ -268,6 +274,197 @@ class FixtureAssertionTests(unittest.TestCase):
         self.install()
         self.run_phase("snapshot")
 
+    def probe_output(self, code, payload):
+        """Run the prereq phase with the bounded helper replaced by a canned probe result."""
+        data = payload if isinstance(payload, bytes) else json.dumps(payload, sort_keys=True).encode()
+        with mock.patch.object(af, "command", return_value=subprocess.CompletedProcess([], code, data)) as run:
+            result = af.run(["prereq", "1000", "/in/archive.tar.gz"], self.cfg)
+        return result, run
+
+    def failure(self, phase="kvm", **extra):
+        value = {"schema": af.PROBE_SCHEMA, "outcome": "failed", "category": "refusal", "action": "none", "execution_mount": "none",
+                 "phase": phase}
+        value.update(extra)
+        if value['action'] == 'cli' and 'execution_mount' not in extra:
+            value['execution_mount'] = 'unknown'
+        return value
+
+    def test_prereq_maps_every_allowed_phase_to_a_short_fixed_token(self):
+        for phase in ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown"):
+            result, run = self.probe_output(1, self.failure(phase))
+            self.assertEqual(result, 1)
+            token = self.reason()
+            self.assertEqual(token, "prereq-" + ("inst-none" if phase == "installer" else phase) + "-refusal")
+            self.assertLessEqual(len(token), 32)
+            self.assertRegex(token, af.REASON_RE)
+            os.unlink(self.cfg.reason)
+        argv = run.call_args.args[1]
+        self.assertEqual(argv, ["/usr/bin/python3", "-B", self.cfg.probe, "--owner-uid", "1000",
+                                "--archive", "/in/archive.tar.gz"])
+
+    def good_probe(self):
+        return {"schema": af.PROBE_SCHEMA, "caller_uid": 0, "python": "3.12.3",
+                "checks": {"installer": {"version": af.VERSION, "sha256": af.MEMBER_SHA256,
+                    "mode": "0755", "uid": 1000, "gid": 1000, "supplementary_groups": [],
+                    "rerun": "unchanged", "cli": "passed"},
+                    "systemd": {"pid1": "systemd", "result": "success", "exec_main_status": 0,
+                        "marker": "matched", "cleanup": "verified-absent"},
+                    "kvm": {"uid": 0, "api_version": 12, "create_vm": "passed",
+                        "scope": "root-device-api-only", "l2_execution": "unproven"}}}
+
+    def test_prereq_success_requires_the_exact_schema_and_checks(self):
+        good = self.good_probe()
+        result, _ = self.probe_output(0, good)
+        self.assertEqual((result, self.reason()), (0, None))
+        # Every required success field, including all nested values, is enforced.
+        paths = [(key,) for key in good]
+        paths += [("checks", name) for name in good["checks"]]
+        paths += [("checks", name, key) for name, check in good["checks"].items() for key in check]
+        for path in paths:
+            for mutation in ("missing", "malformed"):
+                bad = json.loads(json.dumps(good))
+                target = bad
+                for part in path[:-1]:
+                    target = target[part]
+                if mutation == "missing":
+                    del target[path[-1]]
+                else:
+                    target[path[-1]] = None
+                with self.subTest(path=path, mutation=mutation):
+                    result, _ = self.probe_output(0, bad)
+                    self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                    os.unlink(self.cfg.reason)
+        for bad in (dict(good, outcome="failed"), dict(good, phase="kvm"),
+                    dict(good, caller_uid=False), dict(good, caller_uid=1),
+                    dict(good, python="3.9.1"), dict(good, python="SECRET"), b"not json", b"[]"):
+            result, _ = self.probe_output(0, bad)
+            self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_inconsistent_nested_success_values_and_types_are_refused(self):
+        changes = [("installer", "uid", 1001), ("installer", "gid", 0),
+                   ("installer", "uid", 1000.0), ("installer", "gid", True),
+                   ("installer", "supplementary_groups", [1000]), ("installer", "rerun", "installed"),
+                   ("installer", "sha256", "0" * 64), ("installer", "cli", "failed"),
+                   ("installer", "mode", "0777"), ("installer", "version", "9.9.9"),
+                   ("systemd", "exec_main_status", False), ("systemd", "cleanup", "uncertain"),
+                   ("systemd", "result", "failed"), ("systemd", "marker", "wrong"),
+                   ("kvm", "uid", False), ("kvm", "api_version", 11),
+                   ("kvm", "create_vm", "failed"), ("kvm", "l2_execution", "proven")]
+        for check, key, value in changes:
+            bad = self.good_probe()
+            bad["checks"][check][key] = value
+            with self.subTest(check=check, key=key, value=value):
+                result, _ = self.probe_output(0, bad)
+                self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                os.unlink(self.cfg.reason)
+
+    def test_prereq_duplicate_keys_nonfinite_and_failure_missing_fields_are_invalid(self):
+        good = json.dumps(self.good_probe()).encode()
+        failure = json.dumps(self.failure()).encode()
+        cases = [(0, b"[" * 1500 + b"0" + b"]" * 1500),
+                 (1, b"[" * 1500 + b"0" + b"]" * 1500),
+                 (0, good[:-1] + b',"caller_uid":0}'),
+                 (0, good.replace(b'"api_version": 12', b'"api_version":12,"api_version":12')),
+                 (1, failure[:-1] + b',"phase":"kvm"}'),
+                 (1, failure.replace(b'"category": "refusal"', b'"category":NaN'))]
+        for key in self.failure():
+            bad = self.failure()
+            del bad[key]
+            cases.append((1, bad))
+        for code, payload in cases:
+            result, _ = self.probe_output(code, payload)
+            self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_installer_actions_categories_and_impossible_combinations(self):
+        for action, short in af.PROBE_ACTIONS.items():
+            for category in af.PROBE_CATEGORIES:
+                invalid = ((action in ('none', 'mkdir', 'chown') and category in ('nonzero', 'overflow', 'mismatch'))
+                           or (action.startswith('snapshot-') and category in ('nonzero', 'overflow')))
+                result, _ = self.probe_output(1, self.failure('installer', action=action, category=category))
+                token = self.reason()
+                self.assertEqual((result, token), (1, 'prereq-invalid' if invalid else
+                                                  'prereq-inst-' + short + '-' + category + ('-uk' if action == 'cli' else '')))
+                self.assertRegex(token, af.REASON_RE)
+                self.assertLessEqual(len(token), 32)
+                os.unlink(self.cfg.reason)
+        for phase in af.PROBE_PHASES:
+            if phase != 'installer':
+                for category in af.PROBE_CATEGORIES:
+                    result, _ = self.probe_output(1, self.failure(phase, category=category))
+                    invalid = ((phase in ('preflight', 'unknown') and category in ('nonzero', 'overflow', 'mismatch'))
+                               or (phase == 'cleanup' and category in ('nonzero', 'mismatch')))
+                    self.assertEqual(self.reason(), 'prereq-invalid' if invalid else 'prereq-' + phase + '-' + category)
+                    self.assertLessEqual(len(self.reason()), 32)
+                    os.unlink(self.cfg.reason)
+        for bad in (self.failure('kvm', action='cli'), self.failure('installer', action='SECRET'),
+                    self.failure(category='SECRET'), self.failure(action=[]), self.failure(category={}),
+                    self.failure('installer', action=True), self.failure('installer', action=7)):
+            self.probe_output(1, bad)
+            self.assertEqual(self.reason(), 'prereq-invalid')
+            os.unlink(self.cfg.reason)
+
+    def test_cli_mount_metadata_is_strict_and_only_fixed_tokens_are_exported(self):
+        for mount, short in (('exec', 'ex'), ('noexec', 'nx'), ('unknown', 'uk')):
+            self.probe_output(1, self.failure('installer', action='cli', category='permission', execution_mount=mount))
+            self.assertEqual(self.reason(), 'prereq-inst-cli-permission-' + short)
+            os.unlink(self.cfg.reason)
+        for mount in ('none', '', 'SECRET', True, 1, None, [], {}):
+            self.probe_output(1, self.failure('installer', action='cli', execution_mount=mount))
+            self.assertEqual(self.reason(), 'prereq-invalid')
+            os.unlink(self.cfg.reason)
+        for payload in (self.failure('installer', action='rerun', execution_mount='noexec'),
+                        self.failure('cleanup', execution_mount='exec')):
+            self.probe_output(1, payload)
+            self.assertEqual(self.reason(), 'prereq-invalid')
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_external_cutoff_reserves_unit_cleanup_but_does_not_extend_service(self):
+        # 210 work + 40 cleanup + three 2s reaps fits under300; final helper reap2.
+        self.assertEqual(af.PROBE_SECONDS, 300)
+        self.assertGreaterEqual(af.PROBE_SECONDS - (210 + 15 + 10 + 15 + 3 * 2), 44)
+        self.assertLess(af.PROBE_SECONDS + 2, 1500)
+        _, run = self.probe_output(0, self.good_probe())
+        self.assertEqual(run.call_args.args[2], 300)
+
+    def test_prereq_rejects_malformed_inconsistent_or_unexpected_output(self):
+        cases = [(1, b"{"), (1, b"\xff"), (1, b"[]"), (1, self.failure("network")),
+                 (1, self.failure(phase=["kvm"])), (1, self.failure(outcome="passed")),
+                 (1, self.failure(schema="x")), (1, self.failure(extra="SECRET")),
+                 (1, self.failure(reason=7)), (2, self.failure()), (0, self.failure()),
+                 (-9, self.failure()), (1, {"schema": af.PROBE_SCHEMA, "outcome": "failed"})]
+        for code, payload in cases:
+            with self.subTest(code=code, payload=payload):
+                result, _ = self.probe_output(code, payload)
+                self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                os.unlink(self.cfg.reason)
+
+    def test_prereq_overflow_and_deadline_use_fixed_classifications_without_peer_text(self):
+        # `command` maps the helper's Refusal to these Check tokens (existing behavior).
+        for token, expected in (("output-bound", "prereq-invalid"), ("prereq-timeout", "prereq-timeout")):
+            with mock.patch.object(af, "command", side_effect=af.Check(token)):
+                self.assertEqual(af.run(["prereq", "1000", "/in/a"], self.cfg), 1)
+            self.assertEqual(self.reason(), expected)
+            os.unlink(self.cfg.reason)
+
+    def test_real_output_cap_applies_to_the_probe_capture(self):
+        script = os.path.join(self.root, "loud.py")
+        self.write(script, b"print('X' * 10000)\n", 0o600)
+        self.cfg.probe = script
+        self.cfg.installer = str(PROVISION / "install-hhfab.py")
+        if not os.path.exists("/usr/bin/python3"):
+            self.skipTest("no /usr/bin/python3")
+        self.assertEqual(af.run(["prereq", "1000", "/in/a"], self.cfg), 1)
+        self.assertEqual(self.reason(), "prereq-invalid")
+
+    def test_prereq_arguments_are_strict(self):
+        for argv in (["prereq"], ["prereq", "0", "/a"], ["prereq", "1000", "relative"],
+                     ["prereq", "1000", "/a", "extra"], ["prereq", "1; id", "/a"]):
+            with mock.patch.object(af, "command") as run:
+                self.assertEqual(af.run(argv, self.cfg), 2, argv)
+            run.assert_not_called()
+
     def test_pins_and_version_match_the_unchanged_installer_and_stager(self):
         import stage_tools
         archive_size, archive_sha, member_size, member_sha = release.PINS["0.50.4"]
@@ -285,6 +482,25 @@ class FixtureAssertionTests(unittest.TestCase):
         self.run_phase("verify")
         with open(self.other, "rb") as handle:
             self.assertEqual(handle.read(), b"unrelated\n")
+
+    def test_baseline_requires_ubuntu_to_be_the_explicit_dedicated_nonroot_owner(self):
+        import stage_tools
+        self.assertEqual(af.Config("/in").owner_uid, stage_tools.OWNER_UID)     # plan and guest agree
+        for entry in (types.SimpleNamespace(pw_uid=0, pw_gid=0),       # root
+                      types.SimpleNamespace(pw_uid=1001, pw_gid=1001),  # a different user
+                      types.SimpleNamespace(pw_uid=1000, pw_gid=0)):    # root primary group
+            self.cfg.lookup = lambda name, entry=entry: entry
+            self.run_phase("baseline", 1, "owner-map")
+        def missing(name):
+            raise KeyError(name)
+        self.cfg.lookup = missing
+        self.run_phase("baseline", 1, "owner-map")
+        self.assertFalse(os.path.exists(self.cfg.state))        # nothing recorded before the refusal
+
+    def test_baseline_staging_refusal_uses_existing_reason_before_state_creation(self):
+        with mock.patch.object(af, "staging_access", side_effect=af.Check("staging-input")):
+            self.run_phase("baseline", 1, "staging-input")
+        self.assertFalse(os.path.exists(self.cfg.state))
 
     def test_baseline_refuses_unsafe_directory_or_existing_target_without_deleting_anything(self):
         self.install()
@@ -423,6 +639,180 @@ class FixtureAssertionTests(unittest.TestCase):
         for token in tokens:
             self.assertRegex(token, af.REASON_RE)
 
+
+
+
+class GuestModeNormalizationTests(unittest.TestCase):
+    """Run the shipped shell function on owned temporary files, without guest/privileged work."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.public = ("assert-sentinel.sh", "sentinel-evidence.py", "install-hhfab.py",
+                       "hhfab_release.py", "hhfab-linux-amd64-v0.50.4.tar.gz")
+
+    def normalize(self):
+        return subprocess.run(["/bin/bash", "-c", 'umask 077; source "$1"; IN=$2; normalize_input_modes',
+                               "mode-test", str(HERE / "guest" / "guest-build.sh"), str(self.root)],
+                              env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=5)
+
+    def sdk_copy(self, name):
+        # SDK0.6.11 AddFile: os.Create (0666 before umask) + io.Copy, no copied mode.
+        previous = os.umask(0o077)
+        try:
+            fd = os.open(str(self.root / name), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
+            with os.fdopen(fd, "wb") as output:
+                output.write(("inert " + name).encode())
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE((self.root / name).stat().st_mode), 0o600)
+
+    def test_sdk_mode_loss_is_normalized_for_minimal_and_fixture_without_changing_bytes(self):
+        for fixture in (False, True):
+            with self.subTest(fixture=fixture):
+                for old in self.root.iterdir():
+                    old.unlink()
+                names = (self.public if fixture else self.public[:2]) + ("nonce", "MANIFEST", "plan.txt", "guest-build.sh")
+                for name in names:
+                    self.sdk_copy(name)
+                before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+                result = self.normalize()
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+                self.assertEqual({p.name: p.read_bytes() for p in self.root.iterdir()}, before)
+                for name in names:
+                    expected = 0o444 if name in self.public else 0o600 if name == "nonce" else 0o400
+                    self.assertEqual(stat.S_IMODE((self.root / name).stat().st_mode), expected, name)
+
+    def test_symlink_refusal_does_not_chmod_the_outside_target(self):
+        with tempfile.TemporaryDirectory() as other:
+            target = Path(other) / "outside"
+            target.write_bytes(b"outside")
+            target.chmod(0o600)
+            (self.root / "alias").symlink_to(target)
+            result = self.normalize()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_unreadable_bash_script_exit126_matches_failure_class_and_normalization_fixes_it(self):
+        path = self.root / "assert-sentinel.sh"
+        path.write_text("#!/bin/bash\nexit 0\n")
+        path.chmod(0)
+        first = subprocess.run(["/bin/bash", str(path)], capture_output=True, timeout=5)
+        self.assertEqual(first.returncode, 126)
+        (self.root / "nonce").write_bytes(b"nonce")
+        self.assertEqual(self.normalize().returncode, 0)
+        second = subprocess.run(["/bin/bash", str(path)], capture_output=True, timeout=5)
+        self.assertEqual(second.returncode, 0)
+
+    def test_normalization_and_optional_staging_guard_precede_first_ubuntu_step(self):
+        runner = (HERE / "guest" / "guest-build.sh").read_text().split("main() {", 1)[1]
+        self.assertLess(runner.index("check_inputs"), runner.index("normalize_input_modes"))
+        self.assertLess(runner.index("normalize_input_modes"), runner.index("run_plan"))
+        sentinel = (HERE / "guest" / "assert-sentinel.sh").read_text()
+        self.assertIn('if [[ -f ${BASH_SOURCE[0]%/*}/assert-fixture.py ]]; then', sentinel)
+        self.assertIn('/usr/bin/python3 -I -B "${BASH_SOURCE[0]%/*}/assert-fixture.py" staging', sentinel)
+        self.assertIn("staging", af.PHASES)
+        self.assertIs(af.PHASES["staging"], af.staging_access)
+
+class GuestStagingTests(unittest.TestCase):
+    """Unprivileged synthetic metadata/access checks, not proof of a root-owned guest copy."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.realpath(self.tmp.name)
+        os.chmod(self.root, 0o755)
+        self.here = os.path.join(self.root, "in")
+        os.mkdir(self.here, 0o755)
+        self.cfg = af.Config(self.here, top=self.root, staging_uid=os.geteuid(), ubuntu_prefix=(),
+                             owner_uid=os.geteuid())
+        for name in ("install-hhfab.py", "hhfab_release.py"):
+            shutil.copyfile(PROVISION / name, os.path.join(self.here, name))
+            os.chmod(os.path.join(self.here, name), 0o444)
+        Path(self.cfg.archive).write_bytes(b"synthetic archive, never installed")
+        os.chmod(self.cfg.archive, 0o444)
+        self.nonce = os.path.join(self.here, "nonce")
+        Path(self.nonce).write_bytes(b"private")
+        os.chmod(self.nonce, 0o600)
+
+    def test_trusted_metadata_accepts_exact_modes_and_owner(self):
+        af.staging_metadata(self.cfg)
+        self.assertEqual(af.Config("/in").staging_uid, 0)
+
+    def test_parent_modes_owner_and_symlink_are_refused(self):
+        for mode in (0o700, 0o775, 0o777):
+            os.chmod(self.here, mode)
+            with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+                af.staging_metadata(self.cfg)
+        os.chmod(self.here, 0o755)
+        self.cfg.staging_uid = os.geteuid() + 1
+        with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+            af.staging_metadata(self.cfg)
+        self.cfg.staging_uid = os.geteuid()
+        alias = os.path.join(self.root, "alias")
+        os.symlink(self.here, alias)
+        self.cfg.here = alias
+        with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+            af.staging_metadata(self.cfg)
+
+    def test_each_input_and_nonce_refuse_wrong_modes_symlinks_and_hardlinks(self):
+        for name, good in (("install-hhfab.py", 0o444), ("hhfab_release.py", 0o444),
+                           (os.path.basename(self.cfg.archive), 0o444), ("nonce", 0o600)):
+            path = os.path.join(self.here, name)
+            for mode in (0o400 if good == 0o444 else 0o644, 0o666):
+                os.chmod(path, mode)
+                with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                    af.staging_metadata(self.cfg)
+            os.chmod(path, good)
+            extra = os.path.join(self.root, "extra")
+            os.link(path, extra)
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+            os.unlink(extra)
+            os.rename(path, extra)
+            os.symlink(extra, path)
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+            os.unlink(path)
+            os.rename(extra, path)
+
+    def test_input_owner_mismatch_is_refused_independently_of_parent_owner(self):
+        original = os.lstat
+        def metadata(path):
+            info = original(path)
+            if path == self.cfg.archive:
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(af.os, "lstat", side_effect=metadata):
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+
+    @unittest.skipUnless(os.geteuid() > 0 and os.path.exists("/proc/1/mem"), "nonroot Linux access check")
+    def test_same_uid_private_nonce_is_rejected_by_the_actual_data_only_child(self):
+        # A host same-UID read is intentionally NOT a successful guest privacy proof.
+        with self.assertRaisesRegex(af.Check, "^staging-access$"):
+            af.staging_access(self.cfg)
+
+    @unittest.skipUnless(os.geteuid() > 0 and os.path.exists("/proc/1/mem"), "nonroot Linux access check")
+    def test_actual_readonly_sibling_import_and_read_under_sanitized_child_environment(self):
+        # /proc/1/mem is an independently inaccessible lower-layer stand-in, not a guest nonce.
+        with self.assertRaises(PermissionError):
+            open("/proc/1/mem", "rb")
+        argv = ["/usr/bin/env", "-i", "PATH=" + af.SAFE_PATH, "HOME=/home/ubuntu", "LC_ALL=C.UTF-8",
+                "/usr/bin/python3", "-I", "-B", "-c", af.ACCESS_CHILD, self.here,
+                "/proc/1/mem", str(os.geteuid())]
+        done = af.command(self.cfg, argv, 20, "staging-timeout", {"PATH": af.SAFE_PATH})
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertEqual(sorted(os.listdir(self.here)),
+                         ["hhfab-linux-amd64-v0.50.4.tar.gz", "hhfab_release.py", "install-hhfab.py", "nonce"])
+
+    def test_access_failure_and_unexpected_output_are_bounded_fixed_refusals(self):
+        for code, output in ((1, b"private peer output"), (0, b"unexpected")):
+            with mock.patch.object(af, "command", return_value=subprocess.CompletedProcess([], code, output)):
+                with self.assertRaisesRegex(af.Check, "^staging-access$"):
+                    af.staging_access(self.cfg)
 
 if __name__ == "__main__":
     unittest.main()

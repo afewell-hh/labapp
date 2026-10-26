@@ -3,7 +3,8 @@
 Root only, explicit existing nonroot --owner-uid and absolute --archive. Keep the
 unchanged install-hhfab.py and hhfab_release.py siblings. No cwd/env overrides,
 network, package installation, user changes or cloud access. Trusted lead must
-exclude concurrent changes to payload/archive and /run; never run on production.
+exclude concurrent changes to payload/archive and /var/lib (including ancestors);
+never run on production.
 The nonroot owner must be dedicated/idle: this is not a hostile multiuser sandbox.
 """
 import argparse
@@ -25,6 +26,12 @@ ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 PYTHON = "/usr/bin/python3"
+SCRATCH_PARENT = Path("/var/lib")
+# Fixed failure-phase allowlist; STAGE names the action in progress, never child output.
+PHASES = ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown")
+STAGE = "unknown"
+ACTION = "none"
+EXECUTION_MOUNT = "none"
 # This wrapper drops supplementary groups, then gid/uid before exec; no shell.
 DROP = ("import os,sys; uid=int(sys.argv[1]); gid=int(sys.argv[2]); "
         "os.setgroups([]); os.setgid(gid); os.setuid(uid); os.chdir(sys.argv[3]); "
@@ -42,20 +49,69 @@ finally:
 """
 
 
+def stage(name, action="none", execution_mount="none"):
+    global STAGE, ACTION, EXECUTION_MOUNT
+    previous = STAGE, ACTION, EXECUTION_MOUNT
+    STAGE, ACTION, EXECUTION_MOUNT = name, action, execution_mount
+    return previous
+
+
+def installer_action(name):
+    global ACTION, EXECUTION_MOUNT
+    ACTION = name
+    EXECUTION_MOUNT = "unknown" if name == "cli" else "none"
+
+
+class DiagnosticRefusal(Refusal):
+    """Local fixed category; never accepts command output as diagnostic text."""
+    def __init__(self, category, message):
+        super().__init__(message)
+        self.category = category
+
+
+def failure_category(error):
+    if isinstance(error, PermissionError):
+        return "permission"
+    if isinstance(error, DiagnosticRefusal):
+        return error.category
+    if isinstance(error, Refusal):
+        return {"command timeout": "timeout", "overall work deadline exceeded": "timeout",
+                "command output overflow": "overflow",
+                "installed binary verification failed": "mismatch",
+                "rerun changed binary": "mismatch",
+                "installed CLI version mismatch": "mismatch"}.get(str(error), "refusal")
+    return "interrupted" if isinstance(error, KeyboardInterrupt) else "operational"
+
+
 def run(args, seconds=15, limit=4096):
     return bounded(args, seconds, limit=limit, env=ENV)
 
 
 def require(args, seconds=15, expected=None):
     code, output = run(args, seconds)
-    if code or (expected is not None and output != expected):
-        raise Refusal("prerequisite command failed")
+    if code:
+        raise DiagnosticRefusal("nonzero", "prerequisite command failed")
+    if expected is not None and output != expected:
+        raise DiagnosticRefusal("mismatch", "prerequisite command output mismatch")
     return output
+
+
+def validate_scratch_parent():
+    # Fixed existing parent only. Validate the whole chain without following a
+    # symlink; trusted lead excludes concurrent changes while this probe runs.
+    for directory in (*reversed(SCRATCH_PARENT.parents), SCRATCH_PARENT):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or info.st_mode & 0o022 or info.st_mode & 0o111 != 0o111):
+            raise Refusal("scratch parent must be real, root-owned, trusted and traversable")
+    if os.statvfs(SCRATCH_PARENT).f_flag & os.ST_NOEXEC:
+        raise Refusal("scratch filesystem must permit execution")
 
 
 def preflight(uid, archive):
     if os.geteuid() != 0 or uid <= 0 or sys.version_info < (3, 10):
         raise Refusal("requires root, Python 3.10+ and explicit nonroot owner")
+    validate_scratch_parent()
     owner = pwd.getpwuid(uid)
     if owner.pw_gid == 0:
         raise Refusal("owner primary group must be nonroot")
@@ -87,17 +143,31 @@ def installed_snapshot(binary, uid):
 
 def installer_probe(owner, workspace, archive):
     destination = workspace / 'install'
+    installer_action('mkdir')
     destination.mkdir(mode=0o700)
+    installer_action('chown')
     os.chown(destination, owner.pw_uid, owner.pw_gid)
     installer = Path(__file__).resolve().with_name('install-hhfab.py')
     args = [PYTHON, str(installer), '--version', VERSION,
             '--install-dir', str(destination), '--archive', str(archive)]
+    installer_action('firstinstall')
     require(as_owner(owner, destination, args), 65, b'hhfab install: installed\n')
     binary = destination / 'hhfab'
+    installer_action('snapshot-first')
     before = installed_snapshot(binary, owner.pw_uid)
+    installer_action('rerun')
     require(as_owner(owner, destination, args), 65, b'hhfab install: unchanged\n')
+    installer_action('snapshot-rerun')
     if before != installed_snapshot(binary, owner.pw_uid):
         raise Refusal("rerun changed binary")
+    installer_action('cli')
+    # Observation only, in this process's actual mount namespace. Failure to observe
+    # must not replace or skip the original CLI action. No mount/path text is exported.
+    global EXECUTION_MOUNT
+    try:
+        EXECUTION_MOUNT = "noexec" if os.statvfs(destination).f_flag & os.ST_NOEXEC else "exec"
+    except OSError:
+        pass
     output = require(as_owner(owner, destination, [str(binary), '--version']), 20)
     if not re.fullmatch(rb'hhfab version v?0\.50\.4\n?', output):
         raise Refusal("installed CLI version mismatch")
@@ -161,25 +231,39 @@ def systemd_probe(workspace):
         # Defer repeated interruption while bounded stop/reset/absence checks run.
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK,
                                           {signal.SIGTERM, signal.SIGINT, signal.SIGALRM})
+        # A cleanup failure replaces the original error and is reported as cleanup;
+        # a successful cleanup leaves the original failing phase untouched.
+        previous = stage('cleanup')
         try:
             cleanup_unit(unit)
+            stage(*previous)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def probe(uid, archive):
+    stage('preflight')
     owner = preflight(uid, archive)
     report = {'schema': 'labapp-component-prerequisites-v1', 'caller_uid': os.geteuid(),
               'python': '.'.join(map(str, sys.version_info[:3])), 'checks': {}}
-    # Trusted /run parent, root-only namespace; owner gets only its install dir.
-    with tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir='/run') as temporary:
-        workspace = Path(temporary)
+    # Preflight validated the fixed executable parent; only this random child
+    # is created/removed. Owner gets traversal and its private install directory.
+    temporary = tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir=SCRATCH_PARENT)
+    try:
+        workspace = Path(temporary.name)
         workspace.chmod(0o711)
+        stage('installer')
         report['checks']['installer'] = installer_probe(owner, workspace, archive)
+        stage('systemd')
         report['checks']['systemd'] = systemd_probe(workspace)
+        stage('kvm')
         require([PYTHON, '-I', '-c', KVM], 10, b'root-api12-create-vm\n')
         report['checks']['kvm'] = {'uid': 0, 'api_version': 12, 'create_vm': 'passed',
                                    'scope': 'root-device-api-only', 'l2_execution': 'unproven'}
+    finally:
+        previous = stage('cleanup')
+        temporary.cleanup()
+        stage(*previous)
     return report
 
 
@@ -200,7 +284,10 @@ def main():
     except (Exception, KeyboardInterrupt) as error:
         # Never export raw child output, exception text or paths.
         print(json.dumps({'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
-                          'reason': str(error) if isinstance(error, Refusal) else 'operational failure'}))
+                          'category': failure_category(error),
+                          'phase': STAGE if STAGE in PHASES else 'unknown',
+                          'action': ACTION if STAGE == 'installer' else 'none',
+                          'execution_mount': EXECUTION_MOUNT if STAGE == 'installer' and ACTION == 'cli' else 'none'}))
         return 1
     finally:
         signal.alarm(0)

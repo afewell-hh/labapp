@@ -333,7 +333,7 @@ sudo /usr/bin/python3 /trusted/provision/component_prerequisites.py \
 
 The archive and trusted script directory must be readable/traversable by that
 owner. The probe does not change external file permissions. The caller excludes
-concurrent changes to these inputs, their ancestors and `/run`; the selected
+concurrent changes to these inputs, their ancestors and `/var/lib` (including its ancestors); the selected
 owner must be dedicated and idle. This is not a hostile multiuser sandbox.
 The current directory is irrelevant and children receive fixed clean environments.
 Required tools are fixed `/usr/bin/python3`, `/usr/bin/systemd-run`,
@@ -341,8 +341,13 @@ Required tools are fixed `/usr/bin/python3`, `/usr/bin/systemd-run`,
 prerequisites fail without fallback. Protect the root script/import directory
 from writes by the selected owner.
 
-A root-owned unique `/run/labapp-prereq-*` directory permits traversal only;
-its install child belongs to the selected owner. The existing installer runs
+Preflight requires the fixed existing `/var/lib` and each ancestor to be a real
+non-symlink root-owned directory, unwritable by group/others and traversable by
+the nonroot owner. `statvfs` must confirm its filesystem permits execution;
+unavailable observations or `ST_NOEXEC` fail before workspace creation. There is
+no parent creation, permission/ownership change, remount, `TMPDIR` lookup or fallback.
+A root-owned random exclusive `/var/lib/labapp-prereq-*` directory has mode0711;
+its mode0700 install child belongs to the selected owner. The existing installer runs
 unchanged as that UID/primary GID with supplementary groups cleared, then reruns.
 The probe verifies the pinned binary hash/size, owner, mode0755 and unchanged
 inode/timestamps; the actual installed `--version` smoke also runs as that
@@ -371,6 +376,24 @@ external300s ceiling with cleanup grace in any future access orchestration;
 that ceiling must not replace the cloud lease. Only fixed sanitized JSON is
 printed; child output, paths, journal, credentials and arbitrary exceptions are
 never exported. A failed check exits1 and gives no overall passing claim.
+
+The failure JSON carries only fixed `phase`, `action`, `category` and
+`execution_mount` values alongside schema/outcome. The phase names the failed stage:
+`preflight`, `installer`, `systemd`, `kvm`, `cleanup` or `unknown`. Installer actions are `mkdir`, `chown`, `firstinstall`, `snapshot-first`, `rerun`,
+`snapshot-rerun` and `cli`; other phases use action `none`. Actions are set before
+work starts. Categories distinguish helper `timeout`/`overflow`, command `nonzero`,
+expected-output or installed-state `mismatch`, actual `PermissionError` as
+`permission`, other exceptions as `operational`, interruption as `interrupted`,
+and other refusals as `refusal`. Arbitrary exception/refusal text is not exported.
+Immediately before CLI execution, `statvfs` observes the destination's effective
+`ST_NOEXEC` flag as `exec` or `noexec`; an unavailable observation is `unknown`
+and still executes the CLI. Other failures use `execution_mount: none`. This
+observation does not establish why a child failed or change any mount. A failing
+cleanup (unit stop/reset/absence or workspace removal) replaces the original error
+and is reported as `cleanup`; a successful cleanup keeps the original phase, action and mount observation. The
+phase is metadata only: it never repairs or retries anything and does not change
+the success output, exit codes, deadlines or child cleanup. A missing KVM device
+is not assumed; only a failure while the `kvm` action runs reports `kvm`.
 
 Run the offline suite (also required by existing hhfab install CI):
 
