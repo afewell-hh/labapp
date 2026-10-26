@@ -11,6 +11,8 @@ import os
 import re
 import signal
 import stat
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -500,20 +502,24 @@ class FixtureStagingTests(ts.StageCase):
         staged = self.fixture()
         self.assertEqual(sorted(os.listdir(os.path.join(self.ws, "cd"))),
                          sorted(["MANIFEST", "assert-sentinel.sh", "assert-fixture.py", "guest-build.sh",
-                                 "hhfab_release.py", "install-hhfab.py", st.ARCHIVE_NAME, "meta-data", "nonce",
+                                 "component_prerequisites.py", "hhfab_release.py", "install-hhfab.py", st.ARCHIVE_NAME, "meta-data", "nonce",
                                  "plan.txt", "sentinel-evidence.py", "user-data"]))
-        for name in st.PROVISION_FILES:       # byte-identical copies of the provisioning modules
+        for name in (*st.PROVISION_FILES, st.PROBE_FILE):       # byte-identical copies of the provisioning modules
             with open(os.path.join(PROVISION, name), "rb") as handle:
                 self.assertEqual(self.read("cd", name), handle.read(), name)
         with open(os.path.join(HERE, "guest", st.FIXTURE_ASSERT), "rb") as handle:
             self.assertEqual(self.read("cd", st.FIXTURE_ASSERT), handle.read())
         self.assertEqual(self.read("cd", st.ARCHIVE_NAME), ARCHIVE_BYTES)
         manifest = self.read("cd", "MANIFEST").decode()
-        for name in (st.FIXTURE_ASSERT, *st.PROVISION_FILES, st.ARCHIVE_NAME, "plan.txt"):
+        for name in (st.FIXTURE_ASSERT, *st.PROVISION_FILES, st.PROBE_FILE, st.ARCHIVE_NAME, "plan.txt"):
             self.assertRegex(manifest, r"(?m)^[0-9a-f]{64}  " + re.escape(name) + "$")
         self.assertIn(hashlib.sha256(ARCHIVE_BYTES).hexdigest() + "  " + st.ARCHIVE_NAME, manifest)
-        for name in (st.FIXTURE_ASSERT, *st.PROVISION_FILES, st.ARCHIVE_NAME):
-            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", name)).st_mode), 0o400, name)
+        modes = {name: stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", name)).st_mode)
+                 for name in os.listdir(os.path.join(self.ws, "cd"))}
+        for name in (*st.PROVISION_FILES, st.ARCHIVE_NAME):     # the nonroot probe child reads exactly these
+            self.assertEqual(modes[name], 0o444, name)
+        for name in (st.FIXTURE_ASSERT, st.PROBE_FILE, "nonce"):    # root-only; the nonce stays private
+            self.assertEqual(modes[name], 0o400, name)
         self.assertEqual(staged["hhfab_archive_sha256"], hashlib.sha256(ARCHIVE_BYTES).hexdigest())
         text = self.read("in", st.SENTINEL_VARS_NAME).decode()
         self.assertIn("require_sentinel_evidence = true\n", text)       # no new HCL flag or wire protocol
@@ -529,10 +535,30 @@ class FixtureStagingTests(ts.StageCase):
         self.assertEqual(self.read("cd", "plan.txt").decode().splitlines(), [
             "root /bin/bash @IN@/assert-sentinel.sh root", "ubuntu /bin/bash @IN@/assert-sentinel.sh ubuntu",
             check + "baseline", install, check + "snapshot", install, check + "verify",
-            check + "negatives", check + "smoke"])
+            check + "negatives", check + "smoke",
+            "root /usr/bin/python3 -B @IN@/component_prerequisites.py --owner-uid 1000 "
+            "--archive @IN@/hhfab-linux-amd64-v0.50.4.tar.gz"])
+        self.assertEqual(st.OWNER_UID, 1000)       # explicit dedicated owner, never root's 0
         self.assertEqual(st.FIXTURE_PLAN.decode().count("install-hhfab.py"), 2)
         self.assertNotIn("--install-dir", st.FIXTURE_PLAN.decode())      # the default /usr/local/bin
         self.assertNotIn("curl", st.FIXTURE_PLAN.decode())
+
+    def test_staged_probe_imports_its_sibling_and_parses_from_the_cd_directory(self):
+        # Harmless: --help only imports the sibling hhfab_release and prints usage (no root work).
+        self.fixture()
+        script = os.path.join(self.ws, "cd", st.PROBE_FILE)
+        done = subprocess.run([sys.executable, "-B", script, "--help"], cwd="/", env={}, input=b"",
+                              capture_output=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b"--owner-uid", done.stdout)
+
+    def test_guest_staging_parents_are_traversable_and_the_nonce_is_made_private(self):
+        with open(os.path.join(HERE, "guest", "user-data")) as handle:
+            text = handle.read()
+        self.assertIn("install -d -m 0755 -o root -g root /var/lib/labapp-build /var/lib/labapp-build/in", text)
+        self.assertLess(text.index("cp -a"), text.index("chmod 0755 /var/lib/labapp-build/in"))
+        self.assertLess(text.index("chmod 0755 /var/lib/labapp-build/in"),
+                        text.index("chmod 0600 /var/lib/labapp-build/in/nonce"))
 
     def test_real_archive_pin_matches_the_provisioning_pin_exactly(self):
         sys_path = os.path.join(PROVISION, "hhfab_release.py")

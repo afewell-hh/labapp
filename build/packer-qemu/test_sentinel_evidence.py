@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -232,7 +233,8 @@ class FixtureAssertionTests(unittest.TestCase):
         here = os.path.join(self.root, "in")
         os.mkdir(here)
         self.cfg = af.Config(here, install_dir=self.bin, state=os.path.join(self.root, "state"),
-                             reason=os.path.join(self.root, "reason"), ubuntu_prefix=(), top=self.root)
+                             reason=os.path.join(self.root, "reason"), ubuntu_prefix=(), top=self.root,
+                             lookup=lambda name: types.SimpleNamespace(pw_uid=1000, pw_gid=1000))
         self.cfg.installer = str(PROVISION / "install-hhfab.py")
         self.cfg.archive = os.path.join(here, "archive.tar.gz")
         self.write(self.cfg.archive, bytes(range(256)) * 16, 0o400)
@@ -285,6 +287,20 @@ class FixtureAssertionTests(unittest.TestCase):
         self.run_phase("verify")
         with open(self.other, "rb") as handle:
             self.assertEqual(handle.read(), b"unrelated\n")
+
+    def test_baseline_requires_ubuntu_to_be_the_explicit_dedicated_nonroot_owner(self):
+        import stage_tools
+        self.assertEqual(af.Config("/in").owner_uid, stage_tools.OWNER_UID)     # plan and guest agree
+        for entry in (types.SimpleNamespace(pw_uid=0, pw_gid=0),       # root
+                      types.SimpleNamespace(pw_uid=1001, pw_gid=1001),  # a different user
+                      types.SimpleNamespace(pw_uid=1000, pw_gid=0)):    # root primary group
+            self.cfg.lookup = lambda name, entry=entry: entry
+            self.run_phase("baseline", 1, "owner-map")
+        def missing(name):
+            raise KeyError(name)
+        self.cfg.lookup = missing
+        self.run_phase("baseline", 1, "owner-map")
+        self.assertFalse(os.path.exists(self.cfg.state))        # nothing recorded before the refusal
 
     def test_baseline_refuses_unsafe_directory_or_existing_target_without_deleting_anything(self):
         self.install()

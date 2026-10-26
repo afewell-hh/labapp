@@ -454,13 +454,25 @@ Nothing is acquired here and no archive cache is created or authorized; the call
 ownership, retention and disposition stay outside this repository until the lead records them.
 
 * Staged on the CD and covered by the MANIFEST/receipt identity: byte-identical
-  `build/provision/install-hhfab.py` and `hhfab_release.py`, the pinned archive, `guest/assert-fixture.py`.
+  `build/provision/install-hhfab.py`, `hhfab_release.py` and `component_prerequisites.py`, the pinned archive, `guest/assert-fixture.py`.
 * Fixed plan (steps are numbered for diagnostics): 1-2 the sentinel root/`ubuntu`/cloud-init assertions;
   3 `baseline` (real unwritable-by-others directory chain, no `hhfab`, no stage leftover; records unrelated entries);
   4 `/usr/bin/python3 -B install-hhfab.py --version 0.50.4 --archive ...` as root, cwd `/`, sanitized environment, default
   `/usr/local/bin`; 5 `snapshot` (exact member hash, regular/single-link/0755/owner, unrelated entries untouched, no
   `.hhfab-stage-*`, inode/size/mtime/ctime recorded); 6 the identical installer argv again; 7 `verify` (rerun left the same inode and times, so it
-  answered `unchanged`, and nothing else changed); 8 `negatives`; 9 `smoke`.
+  answered `unchanged`, and nothing else changed); 8 `negatives`; 9 `smoke`; 10 the unchanged
+  `build/provision/component_prerequisites.py` as root with `--owner-uid 1000 --archive ...` (last, so steps 1-9 keep their
+  numbers). `baseline` also requires `ubuntu` to be uid 1000 with a nonzero primary group (token `owner-map`), so the probe never
+  runs against root or an unintended user. The probe checks PID1/systemd transient-unit start/result/cleanup, a stripped-groups
+  nonroot private install twice plus its CLI, then root `/dev/kvm` API 12 and VM-handle creation. It runs no L2 vCPU and proves
+  neither nonroot KVM nor VLAB; `-cpu host` does not guarantee nested devices, and a missing guest `/dev/kvm` means that host cannot
+  provide this validation, not that the image or GCP is invalid. A nonzero exit is preserved: no TCG, permission, module or retry repair.
+* Staged modes: the installer pair and archive are `0444` (the probe's nonroot child reads and imports them; `user-data` makes
+  `/var/lib/labapp-build` and `.../in` root-owned `0755`); the probe, `assert-fixture.py`, plan and MANIFEST are `0400`, and
+  the nonce is `0600` after the copy. The probe is MANIFEST/receipt covered like the other files.
+* Probe diagnostics: step 10 failure reports only `step=10 exit=N reason=plan-step`. The unchanged probe's JSON reason is
+  deliberately not exported and it exits 1 for installer, systemd and KVM failures alike, so a missing guest `/dev/kvm` cannot be told
+  from an earlier probe failure without changing the probe or adding a wrapper step; neither is done here.
 * `negatives` run the unchanged installer against ISOLATED owned directories under `/run`, never `/usr/local/bin`: a
   same-size corrupted copy of the archive against nonmatching prior bytes (never executed) and against an absent
   target must exit 1 with exactly the archive checksum/size refusal and leave those bytes, mode and times and the directory
@@ -470,7 +482,7 @@ ownership, retention and disposition stay outside this repository until the lead
   requires the anchored `hhfab version v?0.50.4` (optional final newline) used by `component_prerequisites.py`.
 * Diagnostics: a failing plan step makes `guest-build.sh` send one `LABAPP-DIAG v1 ... step=N exit=N reason=token` line
   before the failure receipt; `token` is a fixed word from `/run/labapp-reason` written by `assert-fixture.py`
-  (`dir-state`, `target-present`, `stage-leftover`, `install-state`, `dir-preserved`, `rerun-state`, `archive-integrity`, `bad-version`,
+  (`owner-map`, `dir-state`, `target-present`, `stage-leftover`, `install-state`, `dir-preserved`, `rerun-state`, `archive-integrity`, `bad-version`,
   `neg-state`, `negative-timeout`, `state-missing`, `cli-run`, `cli-version`, `cli-timeout`, `output-bound`, `internal`) or `plan-step`. The observer validates it against the run's nonce and
   inputs and appends only those fields to its failure reason; the runner keeps that bounded text as
   `evidence.observer_failure` beyond the 2 KiB excerpt. No guest stdout/stderr is exported.

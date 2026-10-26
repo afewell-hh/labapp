@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -41,9 +42,12 @@ class Check(Exception):
 
 class Config:
     def __init__(self, here, install_dir="/usr/local/bin", state="/run/labapp-fixture",
-                 reason="/run/labapp-reason", ubuntu_prefix=("runuser", "-u", "ubuntu", "--"), top="/"):
+                 reason="/run/labapp-reason", ubuntu_prefix=("runuser", "-u", "ubuntu", "--"), top="/",
+                 owner_uid=1000, lookup=pwd.getpwnam):
         self.here = here
         self.top = top
+        self.owner_uid = owner_uid      # must equal stage_tools.OWNER_UID (a host test checks)
+        self.lookup = lookup
         self.install_dir = install_dir
         self.state = state
         self.reason = reason
@@ -120,6 +124,13 @@ def installed_state(cfg, others):
 
 
 def baseline(cfg):
+    # The prerequisite probe is given --owner-uid explicitly: `ubuntu` must be that dedicated
+    # nonroot user (nonroot primary group); never silently fall back to root.
+    try:
+        owner = cfg.lookup("ubuntu")
+    except KeyError:
+        raise Check("owner-map") from None
+    need(owner.pw_uid == cfg.owner_uid > 0 and owner.pw_gid > 0, "owner-map")
     real_directories(cfg.install_dir, cfg.top, "dir-state")
     now = listing(cfg.install_dir)
     need("hhfab" not in now, "target-present")
