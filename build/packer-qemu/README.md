@@ -568,7 +568,8 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   `dpkg-query` for exactly the pinned packages and versions, a clean `dpkg --audit` and the identity
   (inode, size, mtime, ctime, SHA256) of the four regular payloads plus the required `socat -> socat1` link identity, which must be identical after the rerun. The
   witness report must be KVM, exit 33, nonce equal, unchanged backing, removed scratch, uid 0 and the same pins.
-  No fallback, retry, permission repair, module load or TCG exists anywhere; a nonzero step is a failure.
+  The adapter adds no retry, fallback, permission repair, module load or TCG. The unchanged shared installer
+  retains its one native APT transport retry within the same 210 s/180 s bounds; a nonzero step is a failure.
 * Remaining host contract (#295), within those same fourteen actions: baseline inventories native `sudo`,
   `openssh-client` and `less` using fixed `dpkg-query` package/status/architecture/version and file-owner
   queries. The commands must resolve under the fixed PATH to canonical `/usr/bin/sudo`, `ssh` and `less`,
