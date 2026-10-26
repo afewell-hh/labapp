@@ -24,6 +24,9 @@ Any guest receipt, SHUTDOWN event or socket EOF afterwards is a failure.
 With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
 cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
 in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
+In the same mode, one run-bound `LABAPP-DIAG v1 ... step=N exit=N reason=token` line sent before
+a failing receipt adds only those three fixed-shape fields to the failure reason. The observer
+never prints other guest bytes.
 The receipt alone is never enough: observation continues until a normal guest
 shutdown. QEMU process exit, EOF or a vanished socket is never accepted alone.
 
@@ -58,6 +61,10 @@ EVIDENCE_PREFIX = b"LABAPP-EVIDENCE"
 EVIDENCE_RE = re.compile(
     rb"^LABAPP-EVIDENCE v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
     rb"cloud-init=done errors=0 recoverable=0$")
+DIAG_PREFIX = b"LABAPP-DIAG"
+DIAG_RE = re.compile(
+    rb"^LABAPP-DIAG v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
+    rb"step=([0-9]{1,2}) exit=([0-9]{1,3}) reason=([a-z][a-z0-9-]{0,31})$")
 CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ARMED_KIND = "labapp-expiry-armed v1"
@@ -302,10 +309,11 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
     want = (nonce.encode(), inputs.encode())
     qlines = Lines(QMP_LINE_MAX, QMP_TOTAL_MAX, True)
     slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False,
-                   EVIDENCE_PREFIX if require_sentinel_evidence else None)
+                   (EVIDENCE_PREFIX, DIAG_PREFIX) if require_sentinel_evidence else None)
     expiry = on_armed is not None
     proto, receipt_ok, armed = Qmp(expiry), False, False
     evidence_ok = False
+    diag = None
     qmp_open = serial_open = True
     drain_until = None
     watching_write = False
@@ -364,6 +372,16 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                                 raise Failure("stale-or-wrong-sentinel-evidence")
                             evidence_ok = True
                             continue
+                        if require_sentinel_evidence and line.startswith(DIAG_PREFIX):
+                            found = DIAG_RE.fullmatch(line)
+                            if not found:
+                                raise Failure("malformed-guest-diagnostic")
+                            if found.groups()[:2] != want:
+                                raise Failure("stale-or-wrong-guest-diagnostic")
+                            if diag is None:        # the first failing step is the useful one
+                                diag = " step=%d exit=%d reason=%s" % (
+                                    int(found.group(3)), int(found.group(4)), found.group(5).decode("ascii"))
+                            continue
                         if not line.startswith(RECEIPT_PREFIX):
                             continue
                         if expiry:
@@ -374,7 +392,7 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                         if receipt_ok:
                             raise Failure("duplicate-receipt")
                         if found.group(3) == b"fail":
-                            raise Failure("guest-reported-failure")
+                            raise Failure("guest-reported-failure" + (diag or ""))
                         if (found.group(1), found.group(2)) != want:
                             raise Failure("stale-or-wrong-receipt")
                         receipt_ok = True

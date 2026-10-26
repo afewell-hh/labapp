@@ -474,6 +474,230 @@ class StagingTests(ts.StageCase):
         self.assertFalse(st.verify_staged(self.ws, staged))
 
 
+ARCHIVE_BYTES = b"synthetic hhfab release archive, never extracted\n" * 50
+PROVISION = os.path.join(os.path.dirname(HERE), "provision")
+
+
+def with_archive(sources, pins, directory):
+    """Add the synthetic hhfab archive source and its synthetic pin."""
+    path = os.path.join(directory, "hhfab-archive")
+    with open(path, "wb") as handle:
+        handle.write(ARCHIVE_BYTES)
+    pins = dict(pins, hhfab={"file": st.ARCHIVE_NAME, "size": len(ARCHIVE_BYTES),
+                             "sha256": hashlib.sha256(ARCHIVE_BYTES).hexdigest()})
+    return dict(sources, archive=path), pins
+
+
+class FixtureStagingTests(ts.StageCase):
+    def setUp(self):
+        super().setUp()
+        self.sources, self.pins = with_archive(self.sources, self.pins, self.inputs)
+
+    def fixture(self, **kw):
+        return self.stage(task="fixture", verify_seconds=kw.pop("seconds", 600), **kw)
+
+    def test_cd_has_the_unchanged_module_pair_verifier_archive_and_the_fixed_plan(self):
+        staged = self.fixture()
+        self.assertEqual(sorted(os.listdir(os.path.join(self.ws, "cd"))),
+                         sorted(["MANIFEST", "assert-sentinel.sh", "assert-fixture.py", "guest-build.sh",
+                                 "hhfab_release.py", "install-hhfab.py", st.ARCHIVE_NAME, "meta-data", "nonce",
+                                 "plan.txt", "sentinel-evidence.py", "user-data"]))
+        for name in st.PROVISION_FILES:       # byte-identical copies of the provisioning modules
+            with open(os.path.join(PROVISION, name), "rb") as handle:
+                self.assertEqual(self.read("cd", name), handle.read(), name)
+        with open(os.path.join(HERE, "guest", st.FIXTURE_ASSERT), "rb") as handle:
+            self.assertEqual(self.read("cd", st.FIXTURE_ASSERT), handle.read())
+        self.assertEqual(self.read("cd", st.ARCHIVE_NAME), ARCHIVE_BYTES)
+        manifest = self.read("cd", "MANIFEST").decode()
+        for name in (st.FIXTURE_ASSERT, *st.PROVISION_FILES, st.ARCHIVE_NAME, "plan.txt"):
+            self.assertRegex(manifest, r"(?m)^[0-9a-f]{64}  " + re.escape(name) + "$")
+        self.assertIn(hashlib.sha256(ARCHIVE_BYTES).hexdigest() + "  " + st.ARCHIVE_NAME, manifest)
+        for name in (st.FIXTURE_ASSERT, *st.PROVISION_FILES, st.ARCHIVE_NAME):
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", name)).st_mode), 0o400, name)
+        self.assertEqual(staged["hhfab_archive_sha256"], hashlib.sha256(ARCHIVE_BYTES).hexdigest())
+        text = self.read("in", st.SENTINEL_VARS_NAME).decode()
+        self.assertIn("require_sentinel_evidence = true\n", text)       # no new HCL flag or wire protocol
+        self.assertNotIn("fixture", text)
+        self.assertEqual(staged["guest_receipt"], hashlib.sha256(self.read("cd", "MANIFEST")).hexdigest())
+        self.assertTrue(st.verify_staged(self.ws, staged))
+
+    def test_plan_runs_the_installer_twice_with_identical_argv_between_fixed_assertions(self):
+        self.fixture()
+        install = ("root /usr/bin/python3 -B @IN@/install-hhfab.py --version 0.50.4 "
+                   "--archive @IN@/hhfab-linux-amd64-v0.50.4.tar.gz")
+        check = "root /usr/bin/python3 -I -B @IN@/assert-fixture.py "
+        self.assertEqual(self.read("cd", "plan.txt").decode().splitlines(), [
+            "root /bin/bash @IN@/assert-sentinel.sh root", "ubuntu /bin/bash @IN@/assert-sentinel.sh ubuntu",
+            check + "baseline", install, check + "snapshot", install, check + "verify",
+            check + "negatives", check + "smoke"])
+        self.assertEqual(st.FIXTURE_PLAN.decode().count("install-hhfab.py"), 2)
+        self.assertNotIn("--install-dir", st.FIXTURE_PLAN.decode())      # the default /usr/local/bin
+        self.assertNotIn("curl", st.FIXTURE_PLAN.decode())
+
+    def test_real_archive_pin_matches_the_provisioning_pin_exactly(self):
+        sys_path = os.path.join(PROVISION, "hhfab_release.py")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hhfab_release_for_pins", sys_path)
+        release = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(release)
+        size, sha, _, _ = release.PINS["0.50.4"]
+        self.assertEqual((st.PINS["hhfab"]["size"], st.PINS["hhfab"]["sha256"]), (size, sha))
+        self.assertEqual((size, sha), (59692810, "a8e6d1b8d0f752d7586c29201add3ff174d330c87fa25a3bdadec43f6c1376b6"))
+        self.assertEqual(st.PINS["hhfab"]["file"], st.ARCHIVE_NAME)
+
+    def test_wrong_missing_or_symlinked_archive_is_rejected(self):
+        with open(self.sources["archive"], "r+b") as handle:
+            handle.write(b"X")                                          # same size, different bytes
+        with self.assertRaises(st.StageError):
+            self.fixture()
+        self.setUp()
+        with open(self.sources["archive"], "ab") as handle:
+            handle.write(b"X")
+        with self.assertRaises(st.StageError):
+            self.fixture()
+        self.setUp()
+        del self.sources["archive"]
+        with self.assertRaises(st.StageError):
+            self.fixture()
+        self.setUp()
+        link = os.path.join(self.inputs, "link")
+        os.symlink(self.sources["archive"], link)
+        self.sources["archive"] = link
+        with self.assertRaises(st.StageError):
+            self.fixture()
+
+    def test_archive_changed_after_staging_is_detected_and_other_tasks_stage_no_archive(self):
+        staged = self.fixture()
+        path = os.path.join(self.ws, "cd", st.ARCHIVE_NAME)
+        os.chmod(path, 0o600)
+        with open(path, "ab") as handle:
+            handle.write(b"x")
+        self.assertFalse(st.verify_staged(self.ws, staged))
+        self.setUp()
+        self.stage(task="sentinel", verify_seconds=600)
+        self.assertNotIn(st.ARCHIVE_NAME, os.listdir(os.path.join(self.ws, "cd")))
+
+
+class FixtureRunnerTests(SentinelCase):
+    def setUp(self):
+        super().setUp()
+        self.sources, pins = with_archive(self.sources, cr.stage_tools.PINS, os.path.join(os.path.dirname(self.root), "src"))
+        patcher = mock.patch.object(cr.stage_tools, "PINS", pins)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_fixture(self, daemon=None, delay=0.0, sources=None, **kw):
+        daemon = daemon or SentinelDaemon(self.clock)
+        result = cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+                              admitted_at=self.clock() - delay, uid=os.getuid() or 1000, mode="fixture",
+                              sources=self.sources if sources is None else sources, **kw)
+        return result, daemon
+
+    def test_profile_is_30_plus_15_minutes_from_original_admission_with_sentinel_access_only(self):
+        self.assertEqual(cr.PROFILES["fixture"], (1800, 900))
+        result, daemon = self.run_fixture()
+        record = self.record()
+        self.assertEqual(record["work_deadline"] - record["admitted_at"], 1800)
+        self.assertEqual(record["deadline"] - record["work_deadline"], 900)
+        self.assertEqual(result["evidence"]["verify_seconds"], 1800 - cr.SENTINEL_RESERVE)
+        args = self.create_call(daemon)
+        self.assertEqual(args[-1], cr.SENTINEL_SCRIPT)
+        self.assertEqual([a for a in args if a.startswith("--device")], ["--device=/dev/kvm"])
+        self.assertEqual(len([a for a in args if a.startswith("--mount=")]), 3)
+        self.assertEqual(cr.LIMITS["fixture"], cr.LIMITS["sentinel"])
+
+    def test_accepted_run_binds_the_archive_identity_and_the_existing_receipt(self):
+        result, _ = self.run_fixture()
+        self.assertEqual((result["outcome"], result["reason"]), ("accepted", None))
+        self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
+        evidence = result["evidence"]
+        self.assertEqual((evidence["task"], evidence["hhfab_archive_sha256"]),
+                         ("fixture", hashlib.sha256(ARCHIVE_BYTES).hexdigest()))
+        self.assertEqual(evidence["cloud_init"], {"status": "done", "errors": 0, "recoverable_errors": 0})
+        self.assertTrue(evidence["artifact"]["deleted"])
+        self.assertEqual(self.record()["mode"], "fixture")
+        self.assertTrue(cr.released_record(self.record()))
+        self.assertNotIn("observer_failure", evidence)
+
+    def test_exactly_the_four_pinned_sources_are_required_and_other_modes_refuse_the_archive(self):
+        daemon = SentinelDaemon(self.clock)
+        without = {k: v for k, v in self.sources.items() if k != "archive"}
+        for sources in (without, dict(self.sources, extra="/x"), None):
+            with self.subTest(keys=sorted(sources or ())), self.assertRaises(ValueError):
+                self.run_fixture(daemon, sources=sources or {})
+        with self.assertRaises(ValueError):
+            cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock,
+                         uid=os.getuid() or 1000, mode="sentinel", sources=self.sources)
+        self.assertEqual(daemon.calls, [])
+
+    def test_exhausted_original_budget_never_reaches_the_daemon(self):
+        result, daemon = self.run_fixture(delay=1700.0)
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "budget_exhausted"))
+        self.assertEqual(daemon.calls, [])
+
+    def test_failure_keeps_the_bounded_observer_reason_beyond_the_excerpt(self):
+        class Failing(SentinelDaemon):
+            def start(inner, container):
+                super().start(container)
+                out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                with open(os.path.join(out, "build.out"), "w") as handle:
+                    handle.write("noise\n" * 1000 + "    qemu.labapp (shell-local): host-verify: failed reason="
+                                 "guest-reported-failure step=8 exit=1 reason=archive-integrity\n"
+                                 "host-verify: failed reason=SECRET text with spaces\n")
+        result, _ = self.run_fixture(Failing(self.clock, steps="build 1\n"))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "build_failed"))
+        self.assertEqual(result["evidence"]["observer_failure"],
+                         "guest-reported-failure step=8 exit=1 reason=archive-integrity")
+        self.assertGreater(result["evidence"]["build.out"]["bytes"], cr.EXCERPT)
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertEqual(result["cleanup"], "verified")
+
+    def test_stale_receipt_input_change_and_uncertain_cleanup_remain_failures_or_holds(self):
+        result, _ = self.run_fixture(SentinelDaemon(self.clock, receipt="stale"))
+        self.assertEqual(result["reason"], "stale_or_malformed_receipt")
+        self.setUp()
+        result, _ = self.run_fixture(SentinelDaemon(self.clock, tamper=True))
+        self.assertEqual(result["reason"], "staged_inputs_changed")
+        self.setUp()
+        result, _ = self.run_fixture(SentinelDaemon(self.clock, mode="rm_lost"))
+        self.assertEqual((result["outcome"], result["cleanup"]), ("hold", "uncertain"))
+
+    def test_cli_requires_the_archive_only_for_the_fixture_and_never_contacts_docker_for_the_plan(self):
+        base = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "fixture",
+                "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cr.main(base), 2)
+            self.assertEqual(cr.main(base + ["--archive-file", "relative"]), 2)
+            self.assertEqual(cr.main(["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "sentinel",
+                                      "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c",
+                                      "--archive-file", "/d"]), 2)
+            self.assertEqual(cr.main(["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--archive-file", "/d"]), 2)
+        with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cr.main(base + ["--archive-file", "/d"]), 0)
+        plan = json.loads(out.getvalue())
+        self.assertEqual((plan["mode"], plan["executed"]), ("fixture", False))
+        self.assertIn("--device=/dev/kvm", plan["create"])
+        owned = ["--workspace-root", self.root, "--ledger-dir", self.ledger, "--mode", "fixture",
+                 "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c"]
+        with mock.patch.object(cr, "Backend", return_value=object()), \
+                mock.patch.object(cr, "run_probe", return_value={"outcome": "accepted"}) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cr.main(owned + ["--archive-file", "/d", "--execute"]), 0)
+        self.assertEqual(run.call_args.kwargs["mode"], "fixture")
+        self.assertEqual(run.call_args.kwargs["sources"]["archive"], "/d")
+
+
+class GuestDiagnosticSourceTests(unittest.TestCase):
+    def test_guest_runner_sends_only_a_validated_token_step_and_exit_before_the_failure_receipt(self):
+        text = open(os.path.join(HERE, "guest", "guest-build.sh")).read()
+        self.assertIn("trap 'emit_diag; emit fail' ERR", text)
+        self.assertIn("LABAPP-DIAG v1 nonce=%s inputs=%s step=%d exit=%d reason=%s", text)
+        self.assertIn("^[a-z][a-z0-9-]{0,31}$", text)
+        self.assertIn("head -c 33", text)           # bounded token read
+        self.assertIn("! -L $REASON", text)
+
+
 class RuntimeSourceTests(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(HERE, "runtime", "Dockerfile")) as handle:

@@ -33,25 +33,28 @@ import stage_tools
 # build/provision (qemu_offline.py BASE, CI K3D_TEST_IMAGE). Never pulled.
 PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac"
 # probe: 30 s work + 20 s cleanup, measured from one admission time, no renewal.
-# The proposed sentinel (15+5 min) and fixture (30+15 min) profiles are VM-mode
-# allocations and are intentionally not accepted here.
+# The sentinel (15+5 min) and hhfab fixture (30+15 min) profiles are VM-mode allocations
+# (proposed, unmeasured); source activation never authorizes execution.
+# fixture: 30 min work INCLUDING staging from admission + 15 min cleanup, no renewal.
 # hcl-check: 120 s work INCLUDING all staging from admission + 30 s cleanup, no renewal.
 # runtime-check: 90 s work + 30 s cleanup, no staging or renewal.
 # sentinel: 15 min work INCLUDING staging from admission + 5 min cleanup, no renewal.
 # sentinel-expiry: 300 s work INCLUDING staging + 120 s cleanup, no renewal. A failure-only
 # proof: a paused KVM guest must outlive >=60 s until THIS container's own timer ends it.
 PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30),
-            "sentinel-expiry": (300, 120)}
+            "sentinel-expiry": (300, 120), "fixture": (1800, 900)}
 MODES = tuple(PROFILES)
-VM_MODES = ("sentinel", "sentinel-expiry")      # the only modes that receive /dev/kvm
-STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry")
+VM_MODES = ("sentinel", "sentinel-expiry", "fixture")      # the only modes that receive /dev/kvm
+STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry", "fixture")
+SOURCE_KEYS = {"core", "plugin", "base"}
+FIXTURE_SOURCE_KEYS = SOURCE_KEYS | {"archive"}       # fixture adds the pinned hhfab archive
 # Proposed explicit bounds, not measured requirements. The sentinel guest is 4 vCPU /
 # 8 GiB (labapp.pkr.hcl); the container adds headroom for QEMU, Packer and the observer.
 LIMITS = {"runtime-check": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128"),
           "sentinel": ("--memory=10g", "--memory-swap=10g", "--cpus=5", "--pids-limit=512")}
-LIMITS["sentinel-expiry"] = LIMITS["sentinel"]
+LIMITS["sentinel-expiry"] = LIMITS["fixture"] = LIMITS["sentinel"]
 # Preparation artifact accepted in #266 comment 6406373578. Bound to original source
 # 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
 # comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
@@ -145,6 +148,11 @@ SENTINEL_SCRIPT = ("ulimit -f 8388608 || exit 125; umask 077; "
                    '/in/labapp.pkr.hcl > /out/build.out 2> /out/build.err < /dev/null; '
                    'echo "build $?" >> /out/steps; exit 0')
 SENTINEL_STEPS = "build 0\n"
+# host_verify.py prints `host-verify: failed reason=<token>[ step=N exit=N reason=<token>]` once;
+# Packer prefixes the line, so search for just the fixed-shape text.
+OBSERVER_FAILURE_RE = re.compile(
+    r"host-verify: failed reason=([a-z][a-z0-9-]{0,40}(?: step=\d{1,2} exit=\d{1,3} reason=[a-z][a-z0-9-]{0,31})?)\r?$",
+    re.MULTILINE)
 ARTIFACT = ("work", "out", "labapp.qcow2")
 
 
@@ -435,7 +443,8 @@ def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot
     sentinel adds exactly /dev/kvm and its numeric group; nothing else widens."""
     kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode in VM_MODES else []
     script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT,
-              "sentinel-expiry": SENTINEL_SCRIPT, "runtime-check": RUNTIME_SCRIPT}[mode]
+              "sentinel-expiry": SENTINEL_SCRIPT, "fixture": SENTINEL_SCRIPT,
+              "runtime-check": RUNTIME_SCRIPT}[mode]
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
@@ -579,8 +588,9 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     uid, gid = (os.getuid() if uid is None else uid), (os.getgid() if gid is None else gid)
     if mode not in MODES:
         raise ValueError("unknown mode")
-    if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == {"core", "plugin", "base"}):
-        raise ValueError(f"{mode} needs exactly the core, plugin and base input files")
+    keys = FIXTURE_SOURCE_KEYS if mode == "fixture" else SOURCE_KEYS
+    if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == keys):
+        raise ValueError(f"{mode} needs exactly the {', '.join(sorted(keys))} input files")
     if mode in VM_MODES:
         require_runtime(mode)
     w, c = PROFILES[mode]
@@ -668,13 +678,13 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     if own["mode"] in STAGED_MODES:
         # Staging starts after admission and spends the same absolute budget.
         extra = {}
-        if own["mode"] == "sentinel":
+        if own["mode"] in ("sentinel", "fixture"):
             def verify_budget():
                 left = int(budget.work_left()) - SENTINEL_RESERVE
                 if left < SENTINEL_MIN_VERIFY:
                     raise Expired()
                 return left
-            extra = {"task": "sentinel", "verify_seconds": verify_budget}
+            extra = {"task": own["mode"], "verify_seconds": verify_budget}
         elif own["mode"] == "sentinel-expiry":
             def expiry_budget():
                 if budget.work_left() < EXPIRY_MIN_REMAINING:
@@ -744,7 +754,7 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     if own["mode"] == "hcl-check":
         _accept_hcl(own, result, budget, clock, oom, code)
         return
-    if own["mode"] == "sentinel":
+    if own["mode"] in ("sentinel", "fixture"):
         _accept_sentinel(own, result, budget, clock, oom, code)
         return
     if own["mode"] == "sentinel-expiry":
@@ -920,6 +930,9 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
                 "plugin_member_sha256": staged["plugin_member_sha256"], "exit_code": code,
                 "command": "packer build -var-file=sentinel.pkrvars.hcl labapp.pkr.hcl",
                 "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    if own["mode"] == "fixture":
+        evidence["task"] = "fixture"
+        evidence["hhfab_archive_sha256"] = staged["hhfab_archive_sha256"]
     result["evidence"] = evidence
     raw = {n: read_step(out, n) for n in ("steps", "build.out", "build.err")}
     raw["verified.json"] = read_step(os.path.join(out, "work"), "verified.json", RESULT_CAP)
@@ -928,6 +941,10 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
             evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
             if name != "verified.json":
                 evidence[name]["excerpt"] = data[:EXCERPT].decode("ascii", "replace")
+    # The observer's bounded failure line can sit beyond the excerpt; keep only its fixed fields.
+    found = OBSERVER_FAILURE_RE.findall((raw["build.out"] or b"").decode("ascii", "replace"))
+    if found:
+        evidence["observer_failure"] = found[-1]
     invalid = sorted(name for name, data in raw.items() if data is None)
     if invalid:
         evidence["invalid_files"] = invalid
@@ -1193,6 +1210,7 @@ def parse(argv):
     p.add_argument("--mode", choices=MODES, default="probe", help="fixed task (default: probe)")
     for key in ("core", "plugin", "base"):
         p.add_argument(f"--{key}-file", help=f"hcl-check: pinned {key} input file (absolute path)")
+    p.add_argument("--archive-file", help="fixture only: caller-supplied pinned hhfab release archive (absolute path)")
     return p.parse_args(argv)
 
 
@@ -1203,11 +1221,17 @@ def main(argv=None):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
+    if args.mode == "fixture":
+        files["archive"] = args.archive_file
+    elif args.archive_file is not None:
+        print("--archive-file is only for --mode fixture", file=sys.stderr)
+        return EXIT["usage"]
     if args.mode not in STAGED_MODES and any(files.values()):
-        print("input files are only for --mode hcl-check or sentinel", file=sys.stderr)
+        print("input files are only for --mode hcl-check, sentinel, sentinel-expiry or fixture", file=sys.stderr)
         return EXIT["usage"]
     if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
-        print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file", file=sys.stderr)
+        print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file"
+              + (" and --archive-file" if args.mode == "fixture" else ""), file=sys.stderr)
         return EXIT["usage"]
     if args.mode in VM_MODES and args.execute:
         try:

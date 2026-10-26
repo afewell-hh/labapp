@@ -574,6 +574,11 @@ def evidence(nonce=NONCE, inputs=INPUTS):
             "cloud-init=done errors=0 recoverable=0\n").encode()
 
 
+def diag(nonce=NONCE, inputs=INPUTS, step=8, exit=1, reason="archive-integrity"):
+    return (f"LABAPP-DIAG v1 nonce={nonce} inputs={inputs} step={step} exit={exit} "
+            f"reason={reason}\n").encode()
+
+
 class SentinelEvidenceTests(unittest.TestCase):
     def run_case(self, serial, expected=None, required=True):
         fake = Fake(self)
@@ -618,6 +623,28 @@ class SentinelEvidenceTests(unittest.TestCase):
         # Including a valid prefix before excess bytes must not accept a truncation.
         with mock.patch.object(host_verify, "SERIAL_TOTAL_MAX", 16):
             self.run_case(evidence() + receipt(), "output-limit")
+
+    def test_failing_receipt_carries_only_the_fixed_guest_diagnostic(self):
+        self.run_case(diag() + receipt(status="fail"),
+                      r"^guest-reported-failure step=8 exit=1 reason=archive-integrity$")
+        self.run_case(evidence() + diag(step=4, exit=137, reason="plan-step") + diag(step=9) + receipt(status="fail"),
+                      r"^guest-reported-failure step=4 exit=137 reason=plan-step$")      # first one wins
+        self.run_case(receipt(status="fail"), r"^guest-reported-failure$")                # no diagnostic: unchanged
+
+    def test_malformed_stale_or_oversize_diagnostics_fail_without_echo(self):
+        cases = [(diag().replace(b"reason=archive-integrity", b"reason=Bad Reason"), "malformed-guest-diagnostic"),
+                 (diag().replace(b"v1 ", b"v1 extra=secret "), "malformed-guest-diagnostic"),
+                 (diag(step=100), "malformed-guest-diagnostic"),
+                 (diag(exit=1000), "malformed-guest-diagnostic"),
+                 (diag().rstrip() + b"x" * host_verify.SERIAL_LINE_MAX + b"\n", "line-limit"),
+                 (diag(nonce="0" * 64), "stale-or-wrong-guest-diagnostic"),
+                 (diag(inputs="0" * 64), "stale-or-wrong-guest-diagnostic")]
+        for line, reason in cases:
+            with self.subTest(reason=reason, line=line[:60]):
+                self.run_case(line + receipt(status="fail"), "^" + reason + "$")
+
+    def test_diagnostic_lines_are_not_interpreted_without_the_evidence_mode(self):
+        self.run_case(diag() + receipt(status="fail"), "^guest-reported-failure$", required=False)
 
     def test_missing_evidence_still_obeys_original_deadline(self):
         fake = Fake(self)
