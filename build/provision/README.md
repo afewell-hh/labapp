@@ -553,6 +553,18 @@ timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 ```
 
+Ordinary HTTP/digest refusals require a native integer nonzero exit and the
+expected bounded status evidence. A supervisor timeout or output overflow is a
+fixture failure; only the dedicated hang case expects the external timeout.
+The shared bounded runner optionally observes the new session leader inside its
+cleanup boundary. This fixture records its PID/PGID/session/start tick and checks
+`/proc` for any surviving owned group or session member, including orphan APT
+method children whose arguments contain no download path. It waits at most two
+seconds for reaping; preparation uses Docker `--init` to reap orphan APT
+method children. It fails closed on unknown census/identity, and never kills
+unrelated processes. The helper source change also invalidates earlier hashed
+module identities; existing captures and bundles are not rewritten.
+
 The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
 containers, then runs the unchanged QEMU module twice in each and checks actual
 signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. Base manifest digest is

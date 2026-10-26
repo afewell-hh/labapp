@@ -106,15 +106,57 @@ def serve():
         thread.join(5)
 
 
-def leftover(marker):
-    """Pids (other than ours) whose command line mentions marker."""
-    found = []
-    for entry in Path('/proc').iterdir():
-        if entry.name.isdigit() and int(entry.name) != os.getpid():
-            with contextlib.suppress(OSError):
-                if marker.encode() in (entry / 'cmdline').read_bytes():
-                    found.append(int(entry.name))
-    return found
+def process_identity(path):
+    """Linux stat identity: PID, PGID, session and start tick; no argv matching."""
+    value = path.read_text()
+    pid, rest = value.split(' (', 1)
+    fields = rest.rsplit(')', 1)[1].split()
+    return int(pid), int(fields[2]), int(fields[3]), int(fields[19])
+
+
+class OwnedGroup:
+    """Observe the new session leader, then prove no owned group/session survives."""
+    def __init__(self, proc=Path('/proc')):
+        self.proc, self.identity = proc, None
+
+    def started(self, pid):
+        identity = process_identity(self.proc / str(pid) / 'stat')
+        if identity[:3] != (pid, pid, pid):
+            raise Refusal('native transport process ownership unknown')
+        self.identity = identity
+
+    def remaining(self):
+        if self.identity is None:
+            raise Refusal('native transport process ownership unobserved')
+        leader, group, session, start = self.identity
+        found = []
+        entries = list(self.proc.iterdir())
+        if len(entries) > 4096:
+            raise Refusal('native transport process census overflow')
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                identity = process_identity(entry / 'stat')
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, IndexError):
+                raise Refusal('native transport process census unknown') from None
+            pid, pgid, sid, tick = identity
+            if pid == leader and tick != start:
+                raise Refusal('native transport leader identity changed')
+            if pgid == group or sid == session:
+                found.append(identity)
+        return found
+
+    def verify(self):
+        # SIGKILL is already issued by bounded(); this only observes exact owned
+        # identities while the container init reaps orphan method descendants.
+        deadline = time.monotonic() + 2
+        while self.remaining():
+            if time.monotonic() >= deadline:
+                raise Refusal('native transport owned process remains')
+            time.sleep(0.02)
 
 
 def production_retries():
@@ -124,7 +166,7 @@ def production_retries():
     return next(item.split('=', 1)[1] for item in apt if item.startswith('Acquire::Retries='))
 
 
-def transport(run=bounded, server=serve, scan=leftover, limit=15):
+def transport(run=bounded, server=serve, ownership=OwnedGroup, limit=15):
     """Native apt-helper over loopback HTTP; no package install, signature or TLS proof."""
     retries = production_retries()
     version = run(['/usr/bin/dpkg-query', '-W', '-f=${Version}', 'apt'], 10)[1].decode()
@@ -140,10 +182,15 @@ def transport(run=bounded, server=serve, scan=leftover, limit=15):
             if expected:
                 args.append('SHA256:' + expected)
             started = time.monotonic()
+            owned = ownership()
             try:
-                code, output = run(args, deadline, env=env)
+                code, output = run(args, deadline, env=env, on_start=owned.started)
             except Refusal as exc:
+                if name != '/hang' or str(exc) != 'command timeout':
+                    raise
                 code, output = str(exc), b''
+            finally:
+                owned.verify()
             seconds[name.strip('/')] = round(time.monotonic() - started, 3)
             return code, output, target
         attempts = 1 + int(retries)
@@ -152,17 +199,16 @@ def transport(run=bounded, server=serve, scan=leftover, limit=15):
             f'transient-then-success: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
         for name in ('/always502', '/always503'):
             code, output, target = fetch(name, 60)
-            assert code != 0 and hits[name] == attempts and not target.exists(), (
+            assert type(code) is int and code != 0 and re.search(name[-3:].encode() + rb'[ \t]+(?:Bad Gateway|Service Unavailable)\b', output) and hits[name] == attempts and not target.exists(), (
                 f'persistent {name}: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
         code, output, target = fetch('/permanent', 60)
-        assert code != 0 and hits['/permanent'] == 1 and not target.exists(), (
+        assert type(code) is int and code != 0 and re.search(rb'\b404[ \t]+Not Found\b', output) and hits['/permanent'] == 1 and not target.exists(), (
             f'permanent 404: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
         code, output, target = fetch('/baddigest', 60, '0' * 64)
-        assert code != 0 and b'mismatch' in output.lower() and hits['/baddigest'] <= attempts, (
+        assert type(code) is int and code != 0 and b'mismatch' in output.lower() and hits['/baddigest'] <= attempts, (
             f'bad digest: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
         code, output, target = fetch('/hang', 3)
-        assert code == 'command timeout' and scan(temporary) == [], (
-            f'external deadline/cleanup: code={code!r} remaining={scan(temporary)!r}')
+        assert code == 'command timeout', f'external deadline: code={code!r}'
         requests = dict(hits)
     return {'transport_fixture': True, 'apt_version': version, 'retries': retries, 'http_timeout': limit,
             'requests': requests, 'seconds': seconds, 'http_only_not_tls_or_signature_proof': True}

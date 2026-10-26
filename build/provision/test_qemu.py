@@ -3,13 +3,14 @@ import contextlib
 import os
 from pathlib import Path
 import runpy
+import signal
 import sys
 import tempfile
 import subprocess
 import json
 import test_bridge_ipv4_harness as ownership
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from hhfab_release import Refusal, bounded
 import qemu_container as container
@@ -173,6 +174,31 @@ class OwnershipTests(ownership.CleanupTests):
                                     env=env, capture_output=True, text=True, timeout=10)
             return result, json.loads(state_path.read_text())
 
+    def test_preparation_uses_init_without_changing_containment(self):
+        result, state = self.run_harness('success')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        creates = [args for args in state['calls'] if args[0] == 'create']
+        prep = [args for args in creates if 'prep' in args[args.index('--name') + 1]]
+        runtime = [args for args in creates if 'runtime' in args[args.index('--name') + 1]]
+        self.assertEqual(len(prep), 2)
+        self.assertEqual(len(runtime), 2)
+        for args in prep:
+            self.assertEqual(args[:2], ['create', '--init'])
+            self.assertEqual(args.count('--init'), 1)
+            self.assertIn('--memory=1g', args)
+            self.assertIn('--cpus=2', args)
+            self.assertIn('--pids-limit=128', args)
+            self.assertIn('--security-opt=no-new-privileges', args)
+            self.assertNotIn('--privileged', args)
+            self.assertFalse(any(arg.startswith(('--volume', '--mount', '--device', '--network=host')) for arg in args))
+            self.assertEqual(args[args.index('timeout'):args.index('timeout') + 3],
+                             ['timeout', '--kill-after=3s', '510s'])
+        for args in runtime:
+            self.assertNotIn('--init', args)
+            for flag in ('--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                         '--read-only', '--user=1000:1000', '--pids-limit=128'):
+                self.assertIn(flag, args)
+
     def assert_owned_removed(self, state):
         adjusted = json.loads(json.dumps(state).replace('labapp.qemu-test.run=', 'labapp.bridge-test.run=')
                               .replace('labapp-qemu-test:', 'labapp-bridge-test:'))
@@ -252,20 +278,23 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
         self.assertEqual(log, [('check', 100, b'out')])
 
     @staticmethod
-    def mocked_native(persistent_requests, leftovers, calls):
+    def mocked_native(persistent_requests, leftovers, calls, failure=None):
         """Mocked server/process boundary, scripted like the expected native apt-helper results."""
         hits = {}
         prefix = 'http://127.0.0.1:1'
         @contextlib.contextmanager
         def server():
             yield prefix, hits
-        def run(args, seconds, env=None):
+        def run(args, seconds, env=None, on_start=None):
             if args[0] == '/usr/bin/dpkg-query':
                 return 0, b'2.8.test'
+            on_start(42)
             calls.append((args, seconds, env))
             path = args[args.index('download-file') + 1][len(prefix):]
             hits[path] = (1 if path in ('/permanent', '/baddigest', '/hang')
                           else min(persistent_requests, 2) if path == '/transient' else persistent_requests)
+            if failure and path == failure[0]:
+                raise Refusal(failure[1])
             if path == '/transient':
                 Path(args[args.index('download-file') + 2]).write_bytes(container.BODY)
                 return 0, b''
@@ -275,8 +304,14 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
                 return 100, b'404  Not Found'
             if path == '/baddigest':
                 return 100, b'Hash Sum mismatch'
-            return 100, b'503  Service Unavailable'
-        return dict(run=run, server=server, scan=lambda marker: leftovers)
+            return 100, b'502  Bad Gateway' if path == '/always502' else b'503  Service Unavailable'
+        class Ownership:
+            def started(self, pid):
+                assert pid == 42
+            def verify(self):
+                if leftovers:
+                    raise Refusal('native transport owned process remains')
+        return dict(run=run, server=server, ownership=Ownership)
 
     def test_transport_fixture_exact_options_limits_and_deadline(self):
         calls = []
@@ -297,11 +332,82 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
         # A zero-retry client makes the transient case fail first.
         with self.assertRaisesRegex(AssertionError, 'transient-then-success'):
             container.transport(**self.mocked_native(1, [], []))
-        with self.assertRaisesRegex(AssertionError, 'external deadline'):
+        with self.assertRaisesRegex(Refusal, 'owned process remains'):
             container.transport(**self.mocked_native(2, [123], []))
         # More requests than one retry allows is unbounded retry.
         with self.assertRaisesRegex(AssertionError, 'persistent'):
             container.transport(**self.mocked_native(3, [], []))
+
+    def test_transport_supervisor_timeout_or_overflow_never_proves_native_refusal(self):
+        for path in ('/always502', '/always503', '/permanent', '/baddigest'):
+            for failure in ('command timeout', 'command output overflow'):
+                with self.subTest(path=path, failure=failure), self.assertRaisesRegex(Refusal, failure):
+                    container.transport(**self.mocked_native(2, [], [], (path, failure)))
+
+    def test_transport_requires_native_integer_exit_and_status_evidence(self):
+        for result in (('failure', b'502'), (True, b'502'), (100, b'unrelated'),
+                       (100, b'Failed to fetch http://127.0.0.1/always502: unrelated failure')):
+            native = self.mocked_native(2, [], [])
+            original = native['run']
+            def run(args, seconds, **kwargs):
+                answer = original(args, seconds, **kwargs)
+                return result if '/always502' in args[-2] else answer
+            native['run'] = run
+            with self.subTest(result=result), self.assertRaisesRegex(AssertionError, 'persistent'):
+                container.transport(**native)
+
+    @staticmethod
+    def stat(pid, group, session, tick, name='http'):
+        return f'{pid} ({name}) ' + ' '.join(['S', '1', str(group), str(session)] + ['0'] * 15 + [str(tick)])
+
+    def test_owned_group_detects_orphan_http_method_without_target_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '42').mkdir()
+            (root / '42' / 'stat').write_text(self.stat(42, 42, 42, 100, 'apt-helper'))
+            owned = container.OwnedGroup(root)
+            owned.started(42)
+            (root / '42' / 'stat').unlink()
+            (root / '42').rmdir()
+            (root / '43').mkdir()
+            (root / '43' / 'stat').write_text(self.stat(43, 42, 42, 101))
+            (root / '43' / 'cmdline').write_bytes(b'/usr/lib/apt/methods/http\x00')
+            self.assertEqual(owned.remaining(), [(43, 42, 42, 101)])
+            with patch.object(container.time, 'monotonic', side_effect=[0, 3]), self.assertRaisesRegex(Refusal, 'owned process remains'):
+                owned.verify()
+            (root / '43' / 'stat').unlink()
+            (root / '43' / 'cmdline').unlink()
+            (root / '43').rmdir()
+            owned.verify()
+
+    def test_owned_group_unknown_or_reused_identity_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owned = container.OwnedGroup(root)
+            with self.assertRaisesRegex(Refusal, 'unobserved'):
+                owned.verify()
+            (root / '42').mkdir()
+            path = root / '42' / 'stat'
+            path.write_text(self.stat(42, 42, 42, 100))
+            owned.started(42)
+            path.write_text(self.stat(42, 42, 42, 999))
+            with self.assertRaisesRegex(Refusal, 'identity changed'):
+                owned.verify()
+            path.write_text('malformed')
+            with self.assertRaisesRegex(Refusal, 'census unknown'):
+                owned.verify()
+
+    def test_bounded_observer_exception_still_kills_owned_group_and_reaps(self):
+        proc = Mock(pid=42)
+        with patch('hhfab_release.subprocess.Popen', return_value=proc), patch('hhfab_release.os.killpg') as kill:
+            def reject(pid):
+                self.assertEqual(pid, 42)
+                raise Refusal('observer failure')
+            with self.assertRaisesRegex(Refusal, 'observer failure'):
+                bounded(['/native'], 3, on_start=reject)
+        kill.assert_called_once_with(42, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=2)
+        proc.stdout.close.assert_called_once_with()
 
 
 if __name__ == '__main__':
