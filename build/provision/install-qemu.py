@@ -29,7 +29,7 @@ ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
 def call(args, seconds=10):
     code, out = bounded(args, seconds, env=ENV)
     if code:
-        raise Refusal("command failed: " + Path(args[0]).name)
+        raise Refusal(f"command failed: {Path(args[0]).name!r} code={code!r} output_tail={out[-4096:]!r}")
     return out
 
 
