@@ -10,10 +10,15 @@ Phases: baseline (root, identities, bounded network facts), `install 1` / `insta
 `python3 -B install-qemu.py`, no arguments, ordinary network mode: run 1 must change the guest, run 2 must be
 a package/artifact no-change rerun (APT still authenticates and executes), and native dpkg/artifact state must match the pins and stay identical), witness (the
 unchanged `qemu_witness.py`: real `-accel kvm -cpu host`, nonce, exit 33, unchanged backing, removed scratch;
-then ONE strict run-bound `LABAPP-QEMU v2` line on the serial console). The same four phases also observe
+then ONE strict run-bound `LABAPP-QEMU v3` line on the serial console). The same four phases also observe
 native sudo/ssh/less packages and trusted executable identities before/after installation. Witness additionally
 checks only ubuntu's fixed noninteractive sudo root identity command and root's nonmutating TUNGETFEATURES
-query. TAP creation and bridge operations remain unrun; no official VLAB binary/helper is invoked.
+query, then ONE finite FD-owned nonpersistent TAP operation (`tap_witness`): refuse a preexisting fixed
+interface name, TUNSETIFF `IFF_TAP|IFF_NO_PI` (never TUNSETPERSIST) on the trusted /dev/net/tun descriptor,
+verify the exact interface/type while the descriptor is open, close it and require the interface absent. The
+guest root's namespace is the guest's own, not the host's. Bridge, IP, route and official VLAB helper
+operations remain unrun; no official VLAB binary/helper is invoked. The retained line is `LABAPP-QEMU v3`
+(`v2` and its `tap_create=unrun` meaning are unchanged and no longer emitted by this adapter).
 
 A failing phase writes ONE fixed reason token to /run/labapp-reason (read and validated by guest-build.sh,
 which adds the plan step and exit code to its bounded diagnostic line) and exits 1. Tokens never contain
@@ -22,6 +27,7 @@ reports the failing installer run and its bounded wall time (the evidence #281 n
 installer or witness output is ever echoed. KVM/witness caller remains root; the additional sudo identity
 check starts as ubuntu UID1000. Neither proves student readiness. These new checks are UNRUN in a guest.
 """
+import contextlib
 import fcntl
 import hashlib
 import importlib.util
@@ -31,7 +37,10 @@ import os
 import pwd
 import re
 import shutil
+import signal
+import socket
 import stat
+import struct
 import sys
 import time
 
@@ -64,6 +73,11 @@ REMAINING = (("sudo", "sudo", 0o4755), ("openssh-client", "ssh", 0o755), ("less"
 VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.+:~\-]{0,63}\Z")
 HOST_OUTPUT_CAP = 4096
 TUNGETFEATURES = 0x800454cf  # Linux amd64 _IOR('T', 207, unsigned int); query only
+TUNSETIFF = 0x400454ca       # Linux amd64 _IOW('T', 202, int); TUNSETPERSIST is never issued
+IFF_TUN, IFF_TAP, IFF_NO_PI, IFF_PERSIST, IFF_TUN_EXCL = 0x0001, 0x0002, 0x1000, 0x0800, 0x8000
+ARPHRD_ETHER = 1
+TAP_NAME = "labapp-tap0"     # fixed, safe, <= 15 bytes; a preexisting interface of this name is refused
+TAP_SECONDS = 10             # whole finite operation; inside the existing 1800 s work + 900 s cleanup windows
 
 
 class Check(Exception):
@@ -74,7 +88,7 @@ class Config:
     def __init__(self, here, state="/run/labapp-qemufixture", reason="/run/labapp-reason", tty="/dev/ttyS0",
                  route="/proc/net/route", resolver="/etc/resolv.conf", ca="/etc/ssl/certs/ca-certificates.crt",
                  euid=os.geteuid, run=None, clock=time.monotonic, owner=0, artifacts=PACKAGE_ARTIFACTS,
-                 inventory=None, tun=None, lookup=pwd.getpwnam):
+                 inventory=None, tun=None, lookup=pwd.getpwnam, tap_ops=None, tap_clock=time.monotonic):
         self.here, self.state, self.reason, self.tty = here, state, reason, tty
         self.route, self.resolver, self.ca = route, resolver, ca
         self.euid, self.clock = euid, clock
@@ -84,6 +98,8 @@ class Config:
         self.inventory = inventory or (lambda: remaining_inventory(self))
         self.tun = tun or tun_query
         self.lookup = lookup
+        self.tap_ops = tap_ops or TapOps()
+        self.tap_clock = tap_clock
 
     def path(self, name):
         return os.path.join(self.here, name)
@@ -299,6 +315,153 @@ def tun_query():
         raise Check("tun-api") from None
 
 
+class TapOps:
+    """The kernel-facing primitives of the finite TAP witness; offline tests substitute these five methods
+    (mocks cannot prove kernel authorization). Nothing here deletes, persists or configures an interface."""
+
+    def exists(self, name):
+        # CPython if_nametoindex discards errno. A successful inventory distinguishes
+        # absence from query failure without interpreting exception text.
+        rows = socket.if_nameindex()
+        need(isinstance(rows, list) and all(isinstance(row, tuple) and len(row) == 2
+             and type(row[0]) is int and row[0] > 0 and isinstance(row[1], str)
+             for row in rows), "tap-query")
+        return any(found == name for _, found in rows)
+
+    def open(self):
+        """The same trusted real /dev/net/tun character device 10:200 and descriptor identity as tun_query."""
+        try:
+            path = "/dev/net/tun"
+            trusted_parents(path, "tap-open")
+            before = os.lstat(path)
+            need(stat.S_ISCHR(before.st_mode) and before.st_uid == 0
+                 and (os.major(before.st_rdev), os.minor(before.st_rdev)) == (10, 200), "tap-open")
+            fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise Check("tap-open") from None
+        try:
+            opened = os.fstat(fd)
+            need((before.st_dev, before.st_ino, before.st_rdev, before.st_mode, before.st_uid, before.st_gid)
+                 == (opened.st_dev, opened.st_ino, opened.st_rdev, opened.st_mode, opened.st_uid, opened.st_gid),
+                 "tap-open")
+        except BaseException as exc:
+            os.close(fd)
+            if isinstance(exc, OSError):
+                raise Check("tap-open") from None
+            raise
+        return fd
+
+    def create(self, fd, name):
+        """TUNSETIFF IFF_TAP|IFF_NO_PI only; the descriptor owns the interface (no TUNSETPERSIST)."""
+        request = bytearray(struct.pack("16sH22x", name.encode("ascii"), IFF_TAP | IFF_NO_PI | IFF_TUN_EXCL))
+        try:
+            fcntl.ioctl(fd, TUNSETIFF, request, True)
+        except OSError:
+            raise Check("tap-create") from None
+        need(bytes(request[:16]).split(b"\0", 1)[0] == name.encode("ascii"), "tap-create")
+
+    def inspect(self, name):
+        """(ARPHRD type, tun_flags) of the named interface from its fixed sysfs attributes."""
+        base = "/sys/class/net/" + name
+        kind, flags = read_small(base + "/type"), read_small(base + "/tun_flags")
+        need(kind is not None and flags is not None, "tap-inspect")
+        try:
+            return int(kind.strip(), 10), int(flags.strip(), 16)
+        except ValueError:
+            raise Check("tap-inspect") from None
+
+    def close(self, fd):
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def tap_deadline():
+    """Interrupt this standalone main-thread guest operation; never replace an existing timer.
+
+    SIGTERM/SIGINT become cancellation failures so the owned descriptor's finally runs.
+    The timer stays armed through close/absence checks; default process termination
+    remains the outer guest/controller boundary if an uninterruptible kernel call stalls.
+    """
+    need(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), "tap-deadline")
+    previous = {}
+    def stop(signum, _frame):
+        raise Check("tap-deadline" if signum == signal.SIGALRM else "tap-cancelled")
+    try:
+        for signum in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(signum, stop)
+        signal.setitimer(signal.ITIMER_REAL, TAP_SECONDS)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def tap_witness(cfg):
+    with tap_deadline():
+        return tap_observe(cfg)
+
+
+def tap_observe(cfg):
+    """ONE finite ephemeral TAP operation; returns {"seconds": n} only after observing the interface
+    absent before, present with the exact type while the descriptor is open, and absent after close.
+
+    A preexisting interface of the fixed name is refused before any mutation and is never deleted or
+    repaired. The descriptor is always closed (also on cancellation) and no persistence is requested, so
+    closing is the only cleanup. Any failure, a close error, or an interface still present afterwards
+    raises a fixed token. A main-thread alarm interrupts the operation; monotonic checks additionally
+    refuse late results. No bridge, address, route or helper is touched.
+    """
+    ops = cfg.tap_ops
+    started = cfg.tap_clock()
+    try:
+        present = ops.exists(TAP_NAME)
+    except OSError:
+        raise Check("tap-query") from None
+    need(not present, "tap-collision")
+    need(cfg.tap_clock() - started <= TAP_SECONDS, "tap-deadline")
+    fd = failure = None
+    closed = True
+    try:
+        fd = ops.open()
+        ops.create(fd, TAP_NAME)
+        try:
+            owned = ops.exists(TAP_NAME)
+            kind, flags = ops.inspect(TAP_NAME) if owned else (None, None)
+        except OSError:
+            raise Check("tap-inspect") from None
+        need(owned, "tap-missing")
+        need(kind == ARPHRD_ETHER and flags == IFF_TAP | IFF_NO_PI,
+             "tap-type")
+        need(cfg.tap_clock() - started <= TAP_SECONDS, "tap-deadline")
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if fd is not None:
+            try:
+                ops.close(fd)
+            except BaseException as exc:
+                closed = False
+                if failure is None:
+                    failure = exc
+    leaked = None
+    if fd is not None:
+        try:
+            leaked = ops.exists(TAP_NAME)
+        except OSError:
+            leaked = None
+        if leaked:
+            raise Check("tap-after-present")
+    if not closed:
+        raise Check("tap-close")
+    if failure is not None:
+        raise failure
+    need(leaked is False, "tap-query")
+    spent = cfg.tap_clock() - started
+    need(spent <= TAP_SECONDS, "tap-deadline")
+    return {"seconds": whole_seconds(started, started + spent)}
+
+
 def baseline(cfg):
     need(cfg.euid() == 0, "not-root")
     for name in MODULES:
@@ -476,6 +639,7 @@ def witness(cfg):
     need(cfg.inventory() == two["remaining"] == one["remaining"] == base["remaining"], "host-drift")
     sudo_identity(cfg)
     cfg.tun()
+    tap = tap_witness(cfg)
     nonce = read_small(cfg.path("nonce"))
     manifest = read_small(cfg.path("MANIFEST"))
     need(nonce is not None and manifest is not None, "identity")
@@ -486,10 +650,11 @@ def witness(cfg):
     inventory = " ".join("%s=%s:%s" % (name, base["remaining"][package]["version"],
                                         base["remaining"][package]["sha256"])
                          for package, name, _ in REMAINING)
-    line = ("\nLABAPP-QEMU v2 nonce=%s inputs=%s accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
+    line = ("\nLABAPP-QEMU v3 nonce=%s inputs=%s accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
             "i1=1:%d i2=0:%d w=%d net=%s %s caller=1000 sudo_uid=0 arch=amd64 "
-            "tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun\n" %
-            (nonce, inputs, one["seconds"], two["seconds"], spent, flags, inventory))
+            "tun_open=1 tun_api=1 tap_flag=1 tap_create=passed tap_before=absent tap_owned=present "
+            "tap_after=absent tap_s=%d\n" %
+            (nonce, inputs, one["seconds"], two["seconds"], spent, flags, inventory, tap["seconds"]))
     emit_line(cfg, line.encode("ascii"))
 
 

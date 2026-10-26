@@ -5,6 +5,7 @@ witness line and its revalidation, guest adapter failure mapping, cleanup and de
 real guest, bridge network, mirror or KVM works (UNRUN gates in README.md)."""
 import contextlib
 import copy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -52,6 +53,17 @@ def qemu_line(nonce=thv.NONCE, inputs=thv.INPUTS, **more):
               "tap_flag": "1", "tap_create": "unrun", **more}
     return (f"LABAPP-QEMU v2 nonce={nonce} inputs={inputs} " + " ".join(f"{k}={v}" for k, v in fields.items())
             + "\n").encode()
+
+
+TAP_FIELDS = {"tap_create": "passed", "tap_before": "absent", "tap_owned": "present",
+              "tap_after": "absent", "tap_s": "2"}
+TAP_OBSERVATION = {"before": "absent", "owned": "present", "after": "absent", "seconds": 2}
+TAP_WITNESS = {**GOOD_WITNESS, "host_contract": {**HOST, "tap_create": "passed", "tap": TAP_OBSERVATION}}
+
+
+def tap_line(**more):
+    """The explicit v3 successor; v2 above keeps its `tap_create=unrun` meaning."""
+    return qemu_line(**{**TAP_FIELDS, **more}).replace(b" v2 ", b" v3 ", 1)
 
 
 # ---------------------------------------------------------------- staging
@@ -185,6 +197,7 @@ def _drop(body, witness):
 
 
 def _good(body, witness):
+    witness["host_contract"] = copy.deepcopy(TAP_WITNESS["host_contract"])
     body["qemu_witness"] = witness
 
 
@@ -197,7 +210,22 @@ def _not_a_dict(body, witness):
     body["qemu_witness"] = "ok"
 
 
+def _tap(change=None):
+    def apply(body, witness):
+        witness["host_contract"] = copy.deepcopy(TAP_WITNESS["host_contract"])
+        if change:
+            change(witness["host_contract"])
+        body["qemu_witness"] = witness
+    return apply
+
+
 VARIANTS = {
+    "old_unrun": lambda body, witness: body.update(qemu_witness=witness),
+    "tap_good": _tap(),
+    "tap_after_present": _tap(lambda h: h["tap"].update(after="present")),
+    "tap_missing_observation": _tap(lambda h: h.pop("tap")),
+    "tap_unrun_with_observation": _tap(lambda h: h.update(tap_create="unrun")),
+    "tap_seconds_bool": _tap(lambda h: h["tap"].update(seconds=True)),
     "good": _good, "missing": _drop, "missing_field": _missing_field, "not_a_dict": _not_a_dict,
     "extra_key": _set("extra", 1), "tcg": _set("accelerator", "tcg"), "upper_kvm": _set("accelerator", "KVM"),
     "exit_34": _set("exit", 34), "exit_float": _set("exit", 33.0), "exit_bool": _set("exit", True),
@@ -325,7 +353,7 @@ class AcceptanceTests(QemuRunnerCase):
         self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
         evidence = result["evidence"]
         self.assertEqual(evidence["task"], "qemu-fixture")
-        self.assertEqual(evidence["qemu_witness"], GOOD_WITNESS)
+        self.assertEqual(evidence["qemu_witness"], TAP_WITNESS)
         self.assertEqual(evidence["network"], "docker-bridge-outbound")
         self.assertEqual(evidence["claims"], cr.QEMU_CLAIMS)
         self.assertEqual(evidence["claims"]["caller_uid"], 0)
@@ -336,9 +364,16 @@ class AcceptanceTests(QemuRunnerCase):
         self.assertTrue(cr.released_record(self.record()))
         self.assertEqual(cr.unresolved_records(self.ledger), [])
 
+    def test_the_v3_tap_witness_is_retained_only_with_its_closed_observation(self):
+        result, _ = self.run_qemu(QemuDaemon(self.clock, "tap_good"))
+        self.assertEqual((result["outcome"], result["reason"]), ("accepted", None), result)
+        self.assertEqual(result["evidence"]["qemu_witness"], TAP_WITNESS)
+        self.assertEqual(result["evidence"]["claims"], cr.QEMU_CLAIMS)    # no new claim is added
+        self.assertEqual(result["cleanup"], "verified")
+
     def test_every_missing_forged_or_out_of_contract_witness_is_a_failure(self):
         for variant in VARIANTS:
-            if variant == "good":
+            if variant in ("good", "tap_good"):
                 continue
             with self.subTest(variant=variant):
                 self.setUp()
@@ -489,6 +524,65 @@ class ObserverTests(unittest.TestCase):
         self.assertLess(len(json.dumps(body).encode()), cr.RESULT_CAP)
         self.assertTrue(cr.qemu_witness_valid(witness))
 
+    def test_v3_maximum_fields_fit_caps_and_old_unrun_cannot_satisfy_new_receipt(self):
+        line = tap_line(tap_s="10", **{name: "1" * 64 + ":" + "a" * 64 for name in ("sudo", "ssh", "less")})
+        self.assertLess(len(line), hv.SERIAL_LINE_MAX)
+        witness = hv.qemu_summary(hv.QEMU_TAP_RE.fullmatch(line.rstrip(b"\n")).groups())
+        body = {"nonce": thv.NONCE, "inputs": thv.INPUTS, "receipt": "ok", "shutdown": "guest-shutdown",
+                "cloud_init": hv.CLOUD_INIT, "qemu_witness": witness}
+        staged = {"nonce": thv.NONCE, "guest_receipt": thv.INPUTS}
+        self.assertLess(len(json.dumps(body).encode()), cr.RESULT_CAP)
+        self.assertTrue(cr.receipt_matches(json.dumps(body).encode(), staged, True))
+        body["qemu_witness"] = GOOD_WITNESS
+        self.assertFalse(cr.receipt_matches(json.dumps(body).encode(), staged, True))
+
+    def test_v3_line_becomes_the_closed_tap_object_and_v2_keeps_its_unrun_meaning(self):
+        result = self.run_case(thv.evidence() + tap_line() + thv.receipt())
+        self.assertEqual(result["qemu_witness"], TAP_WITNESS)
+        self.assertTrue(cr.qemu_witness_valid(result["qemu_witness"]))
+        old = self.run_case(thv.evidence() + qemu_line() + thv.receipt())
+        self.assertEqual(old["qemu_witness"]["host_contract"]["tap_create"], "unrun")
+        self.assertNotIn("tap", old["qemu_witness"]["host_contract"])
+        self.assertIsNone(hv.QEMU_RE.fullmatch(tap_line().rstrip(b"\n")))
+        self.assertIsNone(hv.QEMU_TAP_RE.fullmatch(qemu_line().rstrip(b"\n")))
+
+    def test_malformed_v3_lines_fail_without_echo(self):
+        bad = [tap_line(tap_create="unrun"), tap_line(tap_before="present"), tap_line(tap_owned="absent"),
+               tap_line(tap_after="present"), tap_line(tap_s="100"), tap_line(tap_s="11"), tap_line(tap_s="-1"), tap_line(tap_s="x"),
+               tap_line(secret="1"), tap_line().rstrip(b"\n") + b" tail\n",
+               tap_line().replace(b" tap_s=2", b""), tap_line().replace(b" v3 ", b" v4 "),
+               qemu_line(tap_before="absent", tap_owned="present", tap_after="absent", tap_s="2"),
+               tap_line().replace(b"tap_create=passed tap_before=absent", b"tap_before=absent tap_create=passed")]
+        for line in bad:
+            with self.subTest(line=line[-90:]):
+                self.run_case(thv.evidence() + line + thv.receipt(), "^malformed-qemu-witness$")
+
+    def test_duplicate_stale_and_mixed_version_v3_lines_fail(self):
+        self.run_case(thv.evidence() + tap_line() * 2 + thv.receipt(), "^duplicate-qemu-witness$")
+        self.run_case(thv.evidence() + tap_line() + qemu_line() + thv.receipt(), "^duplicate-qemu-witness$")
+        self.run_case(thv.evidence() + tap_line(nonce="0" * 64) + thv.receipt(), "^stale-or-wrong-qemu-witness$")
+        self.run_case(thv.evidence() + tap_line(inputs="0" * 64) + thv.receipt(), "^stale-or-wrong-qemu-witness$")
+
+    def test_runner_revalidates_the_tap_object_strictly(self):
+        host = TAP_WITNESS["host_contract"]
+        bad = [{**host, "tap_create": "unrun"}, {**host, "tap_create": True}, {**host, "tap": None},
+               {**host, "tap": {**TAP_OBSERVATION, "before": "present"}},
+               {**host, "tap": {**TAP_OBSERVATION, "owned": "absent"}},
+               {**host, "tap": {**TAP_OBSERVATION, "after": "present"}},
+               {**host, "tap": {**TAP_OBSERVATION, "seconds": True}},
+               {**host, "tap": {**TAP_OBSERVATION, "seconds": 2.0}},
+               {**host, "tap": {**TAP_OBSERVATION, "seconds": -1}},
+               {**host, "tap": {**TAP_OBSERVATION, "seconds": 100}},
+               {**host, "tap": {**TAP_OBSERVATION, "extra": 1}},
+               {**host, "tap": {k: v for k, v in TAP_OBSERVATION.items() if k != "after"}},
+               {**HOST, "tap": TAP_OBSERVATION},                    # `unrun` with an observation
+               {**HOST, "tap_create": "passed"}]                    # `passed` without one
+        for contract in bad:
+            with self.subTest(contract=contract):
+                self.assertFalse(cr.qemu_witness_valid({**GOOD_WITNESS, "host_contract": contract}))
+        self.assertTrue(cr.qemu_witness_valid(TAP_WITNESS))
+        self.assertTrue(cr.qemu_witness_valid(GOOD_WITNESS))
+
     def test_absent_line_keeps_the_existing_result_for_other_modes(self):
         result = self.run_case(thv.evidence() + thv.receipt())
         self.assertNotIn("qemu_witness", result)
@@ -554,8 +648,66 @@ class Tick:
         return self.now
 
 
+class FakeTap:
+    """Ordered stand-in for aq.TapOps over a simulated interface table: no descriptor, interface, ioctl or
+    device is touched, so it cannot prove kernel authorization. `fail` maps a call (exists1..3, open, create,
+    inspect, close) to the exception it raises."""
+    FD = 41
+
+    def __init__(self):
+        self.log, self.fail, self.present = [], {}, False
+        self.silent_create = self.stays = False
+        self.kind, self.flags = aq.ARPHRD_ETHER, aq.IFF_TAP | aq.IFF_NO_PI
+        self.lookups = 0
+
+    def _raise(self, key):
+        if key in self.fail:
+            raise self.fail[key]
+
+    def exists(self, name):
+        assert name == aq.TAP_NAME
+        self.lookups += 1
+        self.log.append("exists")
+        self._raise("exists%d" % self.lookups)
+        return self.present
+
+    def open(self):
+        self.log.append("open")
+        self._raise("open")
+        return self.FD
+
+    def create(self, fd, name):
+        assert (fd, name) == (self.FD, aq.TAP_NAME)
+        self.log.append("create")
+        self._raise("create")
+        self.present = not self.silent_create
+
+    def inspect(self, name):
+        self.log.append("inspect")
+        self._raise("inspect")
+        return self.kind, self.flags
+
+    def close(self, fd):
+        assert fd == self.FD
+        self.log.append("close")
+        if not self.stays:
+            self.present = False        # the descriptor owned a nonpersistent interface
+        self._raise("close")
+
+
 class GuestCase(unittest.TestCase):
     def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.handlers = {}
+        def handler(signum, callback):
+            previous = self.handlers.get(signum, aq.signal.SIG_DFL)
+            self.handlers[signum] = callback
+            return previous
+        stack.enter_context(mock.patch.object(aq.signal, "getitimer", return_value=(0.0, 0.0)))
+        self.timer = stack.enter_context(mock.patch.object(aq.signal, "setitimer"))
+        stack.enter_context(mock.patch.object(aq.signal, "signal", side_effect=handler))
+        self.tap, self.tap_step = FakeTap(), 0.25
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         base = os.path.realpath(self.tmp.name)
@@ -597,6 +749,7 @@ class GuestCase(unittest.TestCase):
                          euid=lambda: euid, run=self.fake, clock=Tick(), owner=os.getuid(),
                          artifacts=(self.files["a1"], self.files["a2"]),
                          inventory=lambda: copy.deepcopy(self.remaining), tun=self.fake_tun,
+                         tap_ops=self.tap, tap_clock=Tick(self.tap_step),
                          lookup=lambda _: type("Owner", (), {"pw_uid": 1000, "pw_gid": 1000})())
 
     def fake_tun(self):
@@ -690,10 +843,13 @@ class GuestSuccessTests(GuestCase):
         line = self.tty()
         self.assertEqual(line.count(b"\n"), 2)       # one blank-framed record
         record = line.strip(b"\n")
-        found = hv.QEMU_RE.fullmatch(record)
+        self.assertIsNone(hv.QEMU_RE.fullmatch(record))     # the adapter no longer emits v2
+        found = hv.QEMU_TAP_RE.fullmatch(record)
         self.assertIsNotNone(found, record)
         self.assertEqual(found.groups()[:2], (NONCE_VALUE.encode(), self.inputs.encode()))
         witness = hv.qemu_summary(found.groups())
+        self.assertEqual(witness["host_contract"]["tap"],
+                         {"before": "absent", "owned": "present", "after": "absent", "seconds": 1})
         self.assertEqual(witness["install1"], {"changed": True, "seconds": 7})
         self.assertEqual(witness["install2"], {"changed": False, "seconds": 7})
         self.assertEqual(witness["network"], {"default_route": True, "ca_bundle": True, "resolver": True})
@@ -901,6 +1057,168 @@ class GuestFailureTests(GuestCase):
                 self.assertEqual(self.tty(), b"")
 
 
+PRIOR = [("baseline",), ("install", "1"), ("install", "2")]
+BASE_LOG = ["exists", "open", "create", "exists", "inspect", "close", "exists"]
+
+
+class GuestTapTests(GuestCase):
+    """The finite TAP witness against the ordered fake. Nothing real is opened, created or closed."""
+    fails = GuestFailureTests.fails
+
+    def test_success_observes_absent_then_present_then_absent_in_order_and_closes_once(self):
+        self.assertEqual(self.sequence(), [0, 0, 0, 0])
+        self.assertEqual(self.tap.log, BASE_LOG)
+        self.assertFalse(self.tap.present)
+        self.assertIn(b" tap_create=passed tap_before=absent tap_owned=present tap_after=absent tap_s=1\n",
+                      self.tty())
+
+    def test_a_preexisting_interface_is_refused_before_any_mutation_and_left_untouched(self):
+        self.tap.present = True
+        self.fails(PRIOR, ("witness",), r"^tap-collision$")
+        self.assertEqual(self.tap.log, ["exists"])       # no open, create, close or deletion
+        self.assertTrue(self.tap.present)
+
+    def test_each_failure_maps_to_one_fixed_token_and_always_closes_an_open_descriptor(self):
+        cases = [
+            ("exists1", OSError(), "tap-query", ["exists"]),
+            ("open", aq.Check("tap-open"), "tap-open", ["exists", "open"]),
+            ("create", aq.Check("tap-create"), "tap-create", ["exists", "open", "create", "close", "exists"]),
+            ("exists2", OSError(), "tap-inspect", ["exists", "open", "create", "exists", "close", "exists"]),
+            ("inspect", aq.Check("tap-inspect"), "tap-inspect",
+             ["exists", "open", "create", "exists", "inspect", "close", "exists"]),
+            ("inspect", OSError(), "tap-inspect",
+             ["exists", "open", "create", "exists", "inspect", "close", "exists"]),
+            ("close", OSError(), "tap-close", BASE_LOG),
+            ("exists3", OSError(), "tap-query", BASE_LOG)]
+        for key, exc, token, log in cases:
+            with self.subTest(key=key, token=token):
+                self.setUp()
+                self.tap.fail[key] = exc
+                self.fails(PRIOR, ("witness",), "^%s$" % token)
+                self.assertEqual(self.tap.log, log)
+
+    def test_a_missing_or_wrong_interface_fails_after_closing(self):
+        for change, token in ((dict(silent_create=True), "tap-missing"),
+                              (dict(kind=65534), "tap-type"), (dict(flags=aq.IFF_TUN | aq.IFF_NO_PI), "tap-type"),
+                              (dict(flags=aq.IFF_TAP), "tap-type"),
+                              (dict(flags=aq.IFF_TAP | aq.IFF_NO_PI | aq.IFF_PERSIST), "tap-type")):
+            with self.subTest(change=change):
+                self.setUp()
+                self.tap.__dict__.update(change)
+                self.fails(PRIOR, ("witness",), "^%s$" % token)
+                self.assertEqual(self.tap.log.count("close"), 1)
+                self.assertEqual(self.tap.log[-1], "exists")
+
+    def test_an_interface_present_after_close_is_reported_and_never_deleted_or_retried(self):
+        self.tap.stays = True
+        self.fails(PRIOR, ("witness",), r"^tap-after-present$")
+        self.assertEqual(self.tap.log, BASE_LOG)
+        self.assertTrue(self.tap.present)
+        self.setUp()
+        self.tap.stays, self.tap.fail["close"] = True, OSError()      # the leak outranks the close error
+        self.fails(PRIOR, ("witness",), r"^tap-after-present$")
+
+    def test_deadline_is_checked_before_mutation_and_after_the_owned_observation(self):
+        self.tap_step = 11.0
+        self.fails(PRIOR, ("witness",), r"^tap-deadline$")
+        self.assertEqual(self.tap.log, ["exists"])
+        self.setUp()
+        self.tap_step = 6.0
+        self.fails(PRIOR, ("witness",), r"^tap-deadline$")
+        self.assertEqual(self.tap.log, BASE_LOG)          # the late result is still cleaned up, never success
+
+    def test_cancellation_and_unexpected_errors_close_the_descriptor_without_a_success_line(self):
+        for stage, exc in (("create", KeyboardInterrupt()), ("inspect", KeyboardInterrupt()),
+                           ("inspect", SystemExit(143))):
+            with self.subTest(stage=stage, exc=exc):
+                self.setUp()
+                for step in PRIOR:
+                    self.assertEqual(self.go(*step), 0)
+                self.tap.fail[stage] = exc
+                with self.assertRaises(type(exc)):
+                    self.go("witness")
+                self.assertEqual(self.tap.log.count("close"), 1)
+                self.assertEqual(self.tap.log[-1], "exists")
+                self.assertFalse(self.tap.present)
+                self.assertEqual(self.tty(), b"")
+        self.setUp()
+        self.tap.fail["close"] = RuntimeError("SECRET")
+        self.fails(PRIOR, ("witness",), r"^tap-close$")
+
+    def test_deadline_and_termination_interrupt_operation_then_close_and_observe_absence(self):
+        for signum, token in ((aq.signal.SIGALRM, "tap-deadline"),
+                              (aq.signal.SIGTERM, "tap-cancelled"), (aq.signal.SIGINT, "tap-cancelled")):
+            with self.subTest(signum=signum):
+                self.setUp()
+                def interrupt(name):
+                    self.tap.log.append("inspect")
+                    self.handlers[signum](signum, None)
+                self.tap.inspect = interrupt
+                self.fails(PRIOR, ("witness",), "^" + token + "$")
+                self.assertEqual(self.tap.log, BASE_LOG)
+                self.assertFalse(self.tap.present)
+                self.assertEqual(self.timer.call_args_list,
+                    [mock.call(aq.signal.ITIMER_REAL, 10), mock.call(aq.signal.ITIMER_REAL, 0)])
+                self.assertTrue(all(v == aq.signal.SIG_DFL for v in self.handlers.values()))
+
+    def test_existing_timer_refuses_before_any_interface_observation(self):
+        with mock.patch.object(aq.signal, "getitimer", return_value=(3.0, 0.0)):
+            self.fails(PRIOR, ("witness",), r"^tap-deadline$")
+        self.assertEqual(self.tap.log, [])
+        self.timer.assert_not_called()
+
+    def test_a_tap_failure_never_follows_an_earlier_failure_and_runs_after_the_tun_query(self):
+        self.tun_result = aq.Check("tun-api")
+        self.fails(PRIOR, ("witness",), r"^tun-api$")
+        self.assertEqual(self.tap.log, [])
+
+    def test_real_primitives_use_exclusive_tap_nopi_and_inventory_absence(self):
+        ops = aq.TapOps()
+        with mock.patch.object(aq.socket, "if_nameindex", return_value=[(1, "lo")]):
+            self.assertFalse(ops.exists(aq.TAP_NAME))
+        with mock.patch.object(aq.socket, "if_nameindex", side_effect=OSError(errno.EPERM, "no")):
+            self.assertRaises(OSError, ops.exists, aq.TAP_NAME)
+        with mock.patch.object(aq.socket, "if_nameindex", return_value=[(7, aq.TAP_NAME)]):
+            self.assertTrue(ops.exists(aq.TAP_NAME))
+        for rows in (None, [(0, "lo")], [(True, "lo")], [(1, None)], [[1, "lo"]]):
+            with mock.patch.object(aq.socket, "if_nameindex", return_value=rows):
+                self.assertRaises(aq.Check, ops.exists, aq.TAP_NAME)
+        seen = []
+
+        def kernel(fd, request, arg, mutate):
+            seen.append((fd, request, bytes(arg), mutate))
+            return 0
+        with mock.patch.object(aq.fcntl, "ioctl", side_effect=kernel):
+            ops.create(9, aq.TAP_NAME)
+        self.assertEqual(len(seen), 1)
+        fd, request, arg, mutate = seen[0]
+        self.assertEqual((fd, request, mutate), (9, 0x400454ca, True))
+        self.assertEqual(arg[:16].rstrip(b"\0"), aq.TAP_NAME.encode())
+        self.assertEqual(int.from_bytes(arg[16:18], "little"), 0x9002)
+        with mock.patch.object(aq.fcntl, "ioctl", side_effect=OSError):
+            self.assertRaises(aq.Check, ops.create, 9, aq.TAP_NAME)
+        # Linux returns EBUSY for an interface racing the absence observation;
+        # EXCL forbids attaching it, and this boundary never deletes or repairs it.
+        with mock.patch.object(aq.fcntl, "ioctl", side_effect=OSError(errno.EBUSY, "collision")):
+            self.assertRaises(aq.Check, ops.create, 9, aq.TAP_NAME)
+        def other_name(fd, request, arg, mutate):
+            arg[:16] = b"other".ljust(16, b"\0")      # the kernel reported a different interface
+            return 0
+        with mock.patch.object(aq.fcntl, "ioctl", side_effect=other_name):
+            self.assertRaises(aq.Check, ops.create, 9, aq.TAP_NAME)
+
+    def test_inspect_reads_only_the_two_fixed_sysfs_attributes_and_refuses_malformed_text(self):
+        ops = aq.TapOps()
+        files = {"/sys/class/net/%s/type" % aq.TAP_NAME: b"1\n",
+                 "/sys/class/net/%s/tun_flags" % aq.TAP_NAME: b"0x1002\n"}
+        with mock.patch.object(aq, "read_small", side_effect=files.get):
+            self.assertEqual(ops.inspect(aq.TAP_NAME), (1, 0x1002))
+        for bad in ({}, {**files, "/sys/class/net/%s/type" % aq.TAP_NAME: b"x\n"},
+                    {**files, "/sys/class/net/%s/tun_flags" % aq.TAP_NAME: b"zz\n"}):
+            with mock.patch.object(aq, "read_small", side_effect=bad.get):
+                self.assertRaises(aq.Check, ops.inspect, aq.TAP_NAME)
+
+
 class SourceContractTests(unittest.TestCase):
     def test_adapter_has_no_network_repair_retry_or_shell_surface(self):
         with open(os.path.join(HERE, "guest", "assert-qemu.py")) as handle:
@@ -908,6 +1226,15 @@ class SourceContractTests(unittest.TestCase):
         for word in ("shell=True", "os.system", "apt-get", "curl", "wget", "tcg", "--offline", "--capture-state",
                      "chmod", "chown", "modprobe", "usermod", "adduser", "ip link", "dhclient", "resolvectl"):
             self.assertNotIn(word, source, word)
+
+    def test_adapter_requests_no_persistence_bridge_address_route_or_deletion(self):
+        with open(os.path.join(HERE, "guest", "assert-qemu.py")) as handle:
+            source = handle.read()
+        self.assertIn("0x400454ca", source)                # TUNSETIFF is the only mutating request
+        for word in ("0x400454cb", "TUNSETPERSIST =", "SIOCSIF", "SIOCBR", "RTM_NEW", "RTM_DEL", "AF_NETLINK",
+                     "unlink(", "os.remove", "rmtree", "/sbin/ip", "brctl", "tap-delete"):
+            self.assertNotIn(word, source, word)
+        self.assertEqual(source.count("fcntl.ioctl("), 2)  # TUNGETFEATURES query and TUNSETIFF only
 
     def test_plan_pins_only_the_adapter_and_witness_never_arguments_to_the_modules(self):
         plan = st.QEMU_PLAN.decode()

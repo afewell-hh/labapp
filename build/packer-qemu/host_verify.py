@@ -24,7 +24,7 @@ Any guest receipt, SHUTDOWN event or socket EOF afterwards is a failure.
 With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
 cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
 in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
-In the same mode one optional, strict `LABAPP-QEMU v2 ...` line (fixed literals plus bounded
+In the same mode one optional, strict `LABAPP-QEMU v2 ...` (TAP unrun) or `v3 ...` (finite TAP witness) line (fixed literals plus bounded
 integers/flags, run-bound by nonce and inputs, at most one) is retained as the closed
 `qemu_witness` object; anything malformed, duplicate or stale fails. The observer does not
 require it: the runner requires it for `qemu-fixture` and rejects it for every other mode.
@@ -73,14 +73,20 @@ DIAG_RE = re.compile(
 # integer/flag; the guest emits it only after its own installer/witness checks passed, and the
 # runner independently revalidates the resulting object. Nothing else from the guest is kept.
 QEMU_PREFIX = b"LABAPP-QEMU"
-QEMU_RE = re.compile(
-    rb"^LABAPP-QEMU v2 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
+# v2 keeps its meaning (TAP creation unrun). v3 is the explicit successor schema that adds ONE finite
+# ephemeral TAP witness: absent before, present while the guest owned the descriptor, absent after.
+_QEMU_BODY = (
+    rb"nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
     rb"accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
     rb"i1=1:([0-9]{1,3}) i2=0:([0-9]{1,3}) w=([0-9]{1,3}) net=([01])([01])([01]) "
     rb"sudo=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
     rb"ssh=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
     rb"less=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
-    rb"caller=1000 sudo_uid=0 arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun$")
+    rb"caller=1000 sudo_uid=0 arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=")
+QEMU_RE = re.compile(rb"^LABAPP-QEMU v2 " + _QEMU_BODY + rb"unrun$")
+QEMU_TAP_RE = re.compile(
+    rb"^LABAPP-QEMU v3 " + _QEMU_BODY
+    + rb"passed tap_before=absent tap_owned=present tap_after=absent tap_s=(10|[0-9])$")
 CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ARMED_KIND = "labapp-expiry-armed v1"
@@ -321,6 +327,12 @@ def qemu_summary(groups):
     native = {package: {"version": groups[index].decode("ascii"), "architecture": "amd64",
                         "sha256": groups[index + 1].decode("ascii")}
               for package, index in (("sudo", 8), ("openssh-client", 10), ("less", 12))}
+    host = {"native": native, "caller_uid": 1000, "sudo_uid": 0,
+            "tun_open": True, "tun_api": True, "tap_flag": True, "tap_create": "unrun"}
+    if len(groups) == 15:       # v3: closed TAP observations; only the bounded whole seconds vary
+        host["tap_create"] = "passed"
+        host["tap"] = {"before": "absent", "owned": "present", "after": "absent",
+                       "seconds": int(groups[14])}
     return {"accelerator": "kvm", "exit": 33, "uid": 0, "nonce_equal": True,
             "backing_unchanged": True, "workspace_removed": True,
             "install1": {"changed": True, "seconds": int(one)},
@@ -328,8 +340,12 @@ def qemu_summary(groups):
             "witness_seconds": int(wit),
             "network": {"default_route": route == b"1", "ca_bundle": ca == b"1",
                         "resolver": dns == b"1"},
-            "host_contract": {"native": native, "caller_uid": 1000, "sudo_uid": 0,
-                              "tun_open": True, "tun_api": True, "tap_flag": True, "tap_create": "unrun"}}
+            "host_contract": host}
+
+
+def qemu_match(line):
+    """The strict v2 (TAP unrun) or v3 (finite TAP witness passed) match, else None."""
+    return QEMU_RE.fullmatch(line) or QEMU_TAP_RE.fullmatch(line)
 
 
 def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
@@ -410,7 +426,7 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                             evidence_ok = True
                             continue
                         if require_sentinel_evidence and line.startswith(QEMU_PREFIX):
-                            found = QEMU_RE.fullmatch(line)
+                            found = qemu_match(line)
                             if not found:
                                 raise Failure("malformed-qemu-witness")
                             if qemu_seen:
