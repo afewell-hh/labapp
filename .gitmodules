@@ -1,0 +1,3 @@
+[submodule "archive2/reference/learn_content_scratchpad"]
+	path = archive2/reference/learn_content_scratchpad
+	url = https://github.com/afewell-hh/learn-content-scratchpad.git
