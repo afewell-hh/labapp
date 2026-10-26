@@ -65,7 +65,7 @@ timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Vers
 lane_failed=0
 for lane in 1 2; do
   echo "QEMU clean installation/runtime lane $lane"
-  prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$run_label" \
+  prep_id="$(timeout --kill-after=3s 15s docker create --init --name "$prep" --label "$run_label" \
     --memory=1g --cpus=2 --pids-limit=128 --security-opt=no-new-privileges \
     "$base" timeout --kill-after=3s 510s bash -ceu '
       apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 update
