@@ -402,6 +402,98 @@ The required offline suites run in the `portable-builder-offline` CI job; they
 exercise preparation, observer parsing and rejection of execution without
 launching Packer, QEMU, systemd units or other build processes.
 
+## Fixed hosted runtime preparation
+
+`runtime-prepare.sh` and the fixed `runtime_prepare.py` hooks are the preparation
+entrypoints. They are **not executed or enabled by this offline change**. The lead
+must apply/review the fixed manual workflow separately and record execution scope.
+The standard fresh GitHub-hosted Ubuntu 24.04 VM is the trust boundary: read-only
+checkout authority, no cloud/registry-write/SSH credentials or secret forwarding,
+private HOME and credential-free Docker config for every client call. Python
+3.10+ stdlib is sufficient; no repository-shadowed `-m` execution is required.
+Only a fresh directory containing a copied `runtime/Dockerfile` enters BuildKit;
+checkout auth and `.git` never enter the context. The CLI and builder are fixed,
+not caller options. `SENTINEL_RUNTIME` remains `None`; no VM gate changes.
+
+The workflow uses Docker's maintained Buildx docker-container driver. Its
+BuildKit container is **privileged by the driver**, independently of the later
+nonroot/capability-dropped VM task. This is acceptable only in the separately
+reviewed fresh managed-host scope. No extra manual privileged flag or rootless
+assumption is added. Explicit `restart-policy=no` and `provenance-add-gha=false`
+avoid automatic restart and implicit workflow-context provenance. The pinned
+setup-buildx action uses `driver: docker`, `name: default`, `use: false`, fixed
+`version: v0.38.1` and `cache-binary: false` solely to install the CLI; its source
+skips builder creation for that driver. The actual owned builder is created only
+after successful absence queries, in a private config, then bootstrapped explicitly.
+
+The hooks resolve builder name/driver/node/endpoint, full container ID, pinned
+BuildKit image and actual image ID, exact cache mount and inspected local volume
+identity before removal through `buildx rm`. Successful list queries must prove
+absence afterwards. Failed queries/removal, identity changes, unexplained vanished
+resources and partial creation leaving only an unattributable volume are HOLD;
+no global prune or deletion of preexisting images is allowed. Pulled base/BuildKit
+images are immutable dependency cache, retained until fresh-host disposal. Only
+owned builder/container/state volume are mutable daemon assets. There is no
+candidate image in the daemon: the Docker exporter writes `image.tar` directly;
+no `load`, reader container or candidate-image deletion is necessary. Copied
+source context, exported tar and evidence remain only for publication and fresh
+host disposal; no persistent host-cleanliness claim includes these retained files.
+
+Build execution remains in maintained workflow steps (17-minute work, 3-minute
+`always()` cleanup, 2-minute sealing, 25-minute job timeout). Normal failure and
+cancellation invoke the bounded cleanup step when GitHub permits it. Cancellation,
+job timeout, runner loss or SIGKILL can interrupt cleanup; these are managed-host
+bounds plus fresh-VM disposal, **not proof of universal daemon destruction**.
+Missing cleanup or any uncertainty prevents sealing/publication and runtime
+admission. Upload occurs only after work and cleanup succeed; cancellation fails
+the GitHub `success()` condition. Failed uploads do not admit any runtime. This
+workflow is not a durable local lease authority or a reusable self-hosted runner.
+
+The base must already contain compatible APT, HTTPS transport, a CA bundle,
+archive keyring and gpgv. The Dockerfile checks these before network work and
+fails closed if they are absent. Canonical's snapshot rewriting uses HTTPS even
+for HTTP archive source entries. There is no ambient-latest bootstrap, key TOFU,
+package-authentication bypass or Valid-Until override. Candidate root availability,
+signed-snapshot dependency closure, CA/base compatibility and firmware completeness
+remain unverified until separately authorized preparation; a refusal means HOLD.
+The final image layer retains complete APT list files (including signed InRelease
+and package indexes), their hashes, archive keyring, sources, APT configuration,
+policy and the complete installed package/version/architecture set before cache
+removal. This records APT's actual authenticated resolution, not an independent
+reimplementation of its signature verification.
+
+The data-only host reader never extracts archive paths or runs candidate code.
+It bounds tar/member sizes/counts, rejects missing/duplicate/nonregular evidence,
+checks every exported layer against the config DiffIDs and binds the exact config
+image ID to `iid.txt` and build metadata. Source commit/Dockerfile hash, image ID,
+DiffIDs, complete package/index provenance and exported tar hash precede sealing.
+`SHA256SUMS` includes provenance and the copied Dockerfile; it is written only
+after verified cleanup. Artifacts expire after 14 days; the lead must separately
+accept an immutable identity and its provenance before any sentinel admission.
+Same-user adversarial mutation races on the fresh trusted host are outside this
+boundary. No actual signed-index resolution, image build, tool/ISO test, KVM or VM
+is claimed by the synthetic suite.
+
+Required fake-backend tests are `test_runtime_prepare.py`, alongside existing
+portable-builder suites. Run them without credentials or Docker using a private
+HOME, `env -i`, and `python3 -I -B`, explicitly adding this component's absolute
+path to `sys.path` before unittest discovery. No suite may be silently absent.
+
+Primary sources read 2026-10-26 (upstream current docs; no runtime execution):
+[Buildx docker-container driver and defaults](https://docs.docker.com/build/builders/drivers/docker-container/),
+[pinned v0.38.1 driver source, including privileged bootstrap and removal](https://github.com/docker/buildx/blob/v0.38.1/driver/docker-container/driver.go),
+[Docker exporter / metadata / pull behavior](https://docs.docker.com/reference/cli/docker/buildx/build/),
+[pinned setup action source](https://github.com/docker/setup-buildx-action/blob/8d2750c68a42422c14e847fe6c8ac0403b4cbd6f/src/main.ts),
+[BuildKit v0.34.1 release](https://github.com/moby/buildkit/releases/tag/v0.34.1),
+[publisher Docker Hub digest metadata](https://hub.docker.com/v2/namespaces/moby/repositories/buildkit/tags/v0.34.1),
+[Canonical Noble snapshots](https://ubuntu.com/server/docs/how-to/software/snapshot-service/),
+[GitHub standard fresh hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+[GitHub timeout / cancellation conditions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+The builder index is `sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c`;
+publisher metadata is content identity, not image-signature or compatibility proof.
+The checkout/upload SHA pins are resolved from their official `v4` commit API;
+setup-buildx is resolved from official `v3`. The Ubuntu base pin remains unchanged.
+
 ## Runner preflight
 
 Hardware diagnostics read Linux x86_64, `/dev/kvm` user access, required tools,

@@ -44,7 +44,9 @@ Codex does not document an import mechanism, so this file uses plain links;
   fixed non-VM Docker `probe` and `hcl-check` tasks require separately scoped lead
   execution ([README](build/packer-qemu/README.md)). A fixed `sentinel` mode and an
   unbuilt `runtime/Dockerfile` exist offline only; sentinel refuses until the lead
-  accepts a concrete runtime image identity (#266). Results and remaining gates live in GitHub.
+  accepts a concrete runtime image identity (#266). Fixed hosted preparation hooks
+  (`runtime-prepare.sh`, `runtime_prepare.py`) build no VM and require separately
+  scoped lead execution. Results and remaining gates live in GitHub.
 - `docs/runbooks/`: manual image build and troubleshooting
 - `docs/`: other docs ([index](docs/README.md)); `STUDENT_QUICK_START.md`: student guide
 - `_archive/`, `archive2/`: archived, not part of the current project

@@ -10,7 +10,13 @@ FROM ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff3
 # Noble snapshot form) is written. Authentication stays on: the base image's own keyring
 # and APT's signature, hash and Valid-Until checks; no key download, no trusted=yes, no
 # allow-insecure/unauthenticated option. HTTP transport does not waive any of them.
-RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+RUN test -s /usr/share/keyrings/ubuntu-archive-keyring.gpg \
+ && dpkg-query -W apt ubuntu-keyring \
+ && test -s /etc/ssl/certs/ca-certificates.crt \
+ && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 2.7 \
+ && test -x /usr/lib/apt/methods/https \
+ && command -v gpgv \
+ && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
  && printf '%s\n' \
     'Types: deb' \
     'URIs: http://archive.ubuntu.com/ubuntu' \
@@ -42,6 +48,14 @@ RUN apt-get update \
  && mkdir -p /usr/share/labapp-runtime \
  && dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort \
     > /usr/share/labapp-runtime/packages.txt \
- && (cd /var/lib/apt/lists && sha256sum *InRelease) \
+ && apt-config dump > /usr/share/labapp-runtime/apt-config.txt \
+ && tar -C /var/lib/apt/lists -cf /usr/share/labapp-runtime/apt-lists.tar . \
+ && cp /usr/share/keyrings/ubuntu-archive-keyring.gpg /usr/share/labapp-runtime/keyring.gpg \
+ && cp /etc/apt/sources.list.d/labapp-snapshot.sources /usr/share/labapp-runtime/sources.txt \
+ && apt-cache policy > /usr/share/labapp-runtime/policy.txt \
+ && cp /var/lib/apt/lists/*InRelease /usr/share/labapp-runtime/ \
+ && (cd /var/lib/apt/lists && sha256sum *) \
+    > /usr/share/labapp-runtime/indexes.sha256 \
+ && (cd /usr/share/labapp-runtime && sha256sum *InRelease) \
     > /usr/share/labapp-runtime/inrelease.sha256 \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
