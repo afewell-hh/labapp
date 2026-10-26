@@ -9,6 +9,7 @@ nothing measured them: they are computed here from CRC-checked, size-bounded byt
 Same-user concurrent writers are outside this module's trust model.
 """
 import hashlib
+import json
 import io
 import os
 import re
@@ -105,9 +106,9 @@ def identity(info):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def open_regular(path, limit):
+def open_regular(path, limit, path_re=PATH_RE):
     """Open without following symlinks; return (handle, fstat) for a bounded regular file."""
-    if not PATH_RE.fullmatch(path) or os.path.normpath(path) != path:
+    if not path_re.fullmatch(path) or os.path.normpath(path) != path:
         raise StageError("unsafe input path")
     # Resolve each parent through an anchored directory descriptor. O_NOFOLLOW
     # on the leaf alone would still follow a symlinked or retargeted parent.
@@ -153,9 +154,9 @@ def read_file(path, limit, check=_noop):
     return b"".join(chunks)
 
 
-def hash_file(path, size=None, check=_noop, limit=FILE_LIMIT):
+def hash_file(path, size=None, check=_noop, limit=FILE_LIMIT, path_re=PATH_RE):
     """Return (sha256 hex, identity) of a regular file read once through one descriptor."""
-    handle, info = open_regular(path, limit if size is None else size)
+    handle, info = open_regular(path, limit if size is None else size, path_re)
     with handle:
         if size is not None and info.st_size != size:
             raise StageError("input size differs from its pin")
@@ -486,6 +487,168 @@ def control_identity(ws, check=_noop):
 def verify_control(ws, staged, check=_noop):
     """After the run: the read-only inputs are exactly what was recorded."""
     return control_identity(ws, check) == staged
+
+
+# Accepted #298 build-only v0.50.4 public observations (2026-10-26): test
+# references, not release pins/signatures. ORAS file.Store metadata is MEMORY ONLY;
+# these expected manifest digests do not prove the CLI selected those manifests.
+CONTROL_CACHE_REFERENCES = (('fabricator_k3s-airgap@v1.36.3-k3s1.oras',
+  'd6598184bf5ac9dd67210c98f8426e0b9a01412172be1e83fdaabeb6c129063c',
+  (('k3s', 82010274, '2f98a9f8fe5782479ee2d54e70a1b10a7f6fd4cae8d38ed3098452dc6eed76b5', False),
+   ('k3s-airgap-images-amd64.tar.gz',
+    263181910,
+    'e09e718f931ef094294781d3c35e58b84e2170acd5cc2edae075a20f58d1f89d',
+    False),
+   ('k3s-install.sh', 37118, '46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad', False))),
+ ('fabricator_toolbox@v0.15.0.oras',
+  'f0e50971cdfa3b9d069ae40b54df30d31f03eb6ebd89aeb67648a67fc91bd8da',
+  (('toolbox.tar', 184470016, '74a940d218fac144a8c019bb0aee1ddbf627f4f24c0c336104b7358712556a59', False),)),
+ ('fabricator_k9s@v0.50.18.oras',
+  '46599bfa7998e445d09914763c42687027f45d8bc11d344b1aff537f99ab5f4d',
+  (('k9s', 129171640, '239d5996131ab272ea8fa021294f0d464b8ce3c395d3a91b3dbf896d2f0760be', False),)),
+ ('fabricator_zot-airgap@v2.1.16.oras',
+  '60cc5ff528880fee28c57901247fdba71dcbd4ff14056709f4bffcf8fa01cd2f',
+  (('zot-airgap-images-amd64.tar.gz',
+    67755049,
+    'bb90030257e5de228e5b8f15fe17afa612375ac4b93f1ce1b36c46bf26d5b249',
+    False),
+   ('zot-chart.tgz', 12779, '629a56ba77e94ff9076f029160cd59cc3385f91687d7eccdb758ed0cc8dd5ad1', False))),
+ ('fabricator_flatcar-update@v4593.2.5.oras',
+  '029c3081893d1826b7ebc9d3fa80052a539b973d0a5dc5b05bde2bf8c867ee30',
+  (('flatcar_production_update.gz',
+    452011487,
+    '6f74286203549e5090b81e622d627202ed8dfc0c2f3e9e780ea9ac04da4eb0f6',
+    False),)),
+ ('fabricator_cert-manager-airgap@v1.20.2.oras',
+  'aeb635be56d37bbe8535cd44bfcbbc9af8a96dffd48e3688667d3795f7e12b8d',
+  (('cert-manager-airgap-images-amd64.tar.gz',
+    77570354,
+    '8534a85d3763d7330ec00c79a24faf4ee77874fe581eccc2e6bc83a1433239c4',
+    False),
+   ('cert-manager-chart.tgz', 147139, 'd2a50bd44a09d838c2576a8f3dfca1524597c7393cf8d82ab3ec8a465b9eeb79', False))),
+ ('fabricator_bash-completion@v2.16.0.oras',
+  '7c691e3dcb061ed163f24f2b68787dce1dc10d6824ce64379c86b0693c5a6330',
+  (('bash-completion', 618791, '1b924bc8e181b507bf8399a7501e35716dbf1d4d5805b2d0c750eea38ad9c717', True),)),
+ ('fabric_hhfctl@v0.133.0.oras',
+  'f973233a0da10c59cd6ae290a977f31aec5f52600e3a72b9fe439860c18e40b3',
+  (('hhfctl', 41918626, 'ef4b3753fff6104a355c5eecbae7b9d0bc64cdee6febf98fe7c95238852f0193', False),)),
+ ('fabricator_hhfabctl@v0.50.4.oras',
+  '2333edf8cf25902e76cc6fbdec41dad30ee4f963a7d291520af84c5b8fc4d44c',
+  (('hhfabctl', 44400802, '4c3314dfb44ba96496a00cc5419b467940908fb9803fbe41edd4ff41838059ec', False),)),
+ ('fabricator_control-usb-root@v4593.2.5-hh1.oras',
+  'ebf7ee191e0f1479932606627df9163661048ae5916c56b57fd39bbe7e2ee2d5',
+  (('boot', 2163295, 'f88027d50554606608e4d0c30598b979a96c4d39ce8b55b237ee00e93fde60d4', True),
+   ('EFI', 2122870, 'bcee95fb7a2570a83dd4f69d212d89f9efac3b626ec39906603bd19f570d4f3a', True),
+   ('images', 4384885, '8d2ba1a78bf26d9e66e44c071794e732656bb1faddcb9f393fdccfa51708c448', True),
+   ('flatcar_production_image.bin.bz2',
+    495630664,
+    'cefd3d62efdc15074327fa8171ea9b03d0649725fe37ee8d6e7c812c6ea02738',
+    False),
+   ('flatcar_production_pxe.vmlinuz',
+    34245760,
+    'fe0b7ef1f9f98acc00e1db22937cdc57456df860a372fdc8eb806298f767b676',
+    False),
+   ('flatcar_production_pxe_image.cpio.gz',
+    391744600,
+    '50b390c0bad46bf33cbce5e9afd1a557f96d56a8e1298e7920730e53e7c49efb',
+    False))))
+CONTROL_CACHE_PATH_RE = re.compile(r"^/[A-Za-z0-9_@./-]+$")
+CONTROL_CACHE_ENTRY_CAP = 200000
+CONTROL_CACHE_BYTE_CAP = 32 << 30
+CONTROL_CACHE_FINGERPRINT = hashlib.sha256(json.dumps(
+    CONTROL_CACHE_REFERENCES, separators=(',', ':')).encode('ascii')).hexdigest()
+
+
+def verify_control_cache(cache, check=_noop):
+    """Audit named official ORAS cache payloads only. No network, unpacker or downloader.
+    Root selection and four original packed-directory descriptors remain unverified.
+    Symlinks/special files are refused; only fixed names, counts and hashes escape.
+    """
+    count = total = files = directories = 0
+
+    def children(directory):
+        nonlocal count
+        # Anchor every parent; a symlinked intermediate directory never escapes.
+        fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for part in directory.split('/')[1:]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            result = []
+            with os.scandir(fd) as items:
+                for item in items:
+                    check()
+                    count += 1
+                    if count > CONTROL_CACHE_ENTRY_CAP:
+                        raise StageError("control cache entry bound exceeded")
+                    result.append((item.name, item.stat(follow_symlinks=False)))
+            return sorted(result)
+        finally:
+            os.close(fd)
+
+    if {name for name, _ in children(cache)} != {'v1'}:
+        raise StageError("unexpected control cache version")
+    cache = os.path.join(cache, 'v1')  # exact artificer.Version in v0.50.4
+    expected = {row[0] for row in CONTROL_CACHE_REFERENCES}
+    if {name for name, _ in children(cache)} != expected:
+        raise StageError("unexpected control cache roots")
+    fingerprints = {}
+    for root, _, entries in CONTROL_CACHE_REFERENCES:
+        check()
+        base = os.path.join(cache, root)
+        if {name for name, _ in children(base)} != {e[0] for e in entries}:
+            raise StageError("unexpected control cache contents")
+        for name, size, digest, unpacked in entries:
+            path = os.path.join(base, name)
+            if not unpacked:
+                sha, _ = hash_file(path, size=size, check=check, path_re=CONTROL_CACHE_PATH_RE)
+                if sha != digest:
+                    raise StageError("control payload identity differs")
+                files += 1
+                total += size
+                if total > CONTROL_CACHE_BYTE_CAP:
+                    raise StageError("control cache byte bound exceeded")
+                continue
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                raise StageError("invalid unpacked control payload")
+            tree = hashlib.sha256()
+            stack = [(path, '')]
+            tree_count = tree_bytes = 0
+            while stack:
+                check()
+                parent, relative = stack.pop()
+                for child_name, info in children(parent):
+                    check()
+                    tree_count += 1
+                    rel = relative + '/' + child_name
+                    child_path = os.path.join(parent, child_name)
+                    if stat.S_ISDIR(info.st_mode):
+                        kind, sha = 'dir', ''
+                        stack.append((child_path, rel))
+                    elif stat.S_ISREG(info.st_mode):
+                        kind = 'file'
+                        sha, identity_now = hash_file(child_path, check=check, limit=12 << 30, path_re=CONTROL_CACHE_PATH_RE)
+                        if identity_now != identity(info):
+                            raise StageError("control cache payload changed")
+                        tree_bytes += info.st_size
+                        total += info.st_size
+                    else:
+                        raise StageError("control cache alias or special entry")
+                    if total > CONTROL_CACHE_BYTE_CAP:
+                        raise StageError("control cache byte bound exceeded")
+                    tree.update(json.dumps([rel, kind, info.st_size if kind == 'file' else 0, sha],
+                                           ensure_ascii=True, separators=(',', ':')).encode('ascii') + b'\n')
+            if tree_count == 0:
+                raise StageError("empty unpacked control payload")
+            directories += 1
+            fingerprints[root + '/' + name] = {'sha256': tree.hexdigest(), 'entries': tree_count,
+                                                'bytes': tree_bytes}
+    return {'expected_reference_sha256': CONTROL_CACHE_FINGERPRINT, 'roots': len(expected),
+            'regular_payloads_verified': files, 'unpacked_directories': directories,
+            'unpacked_content': fingerprints, 'payload_bytes_hashed': total,
+            'root_manifest_selection_verified': False, 'packed_directory_descriptors_verified': False,
+            'signatures_verified': False}
 
 
 def verify_staged(ws, staged, check=_noop):

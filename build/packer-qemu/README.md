@@ -623,28 +623,49 @@ to the public registry, and independent exact-head review.
   empty credential store `--import-host-upstream` yields an anonymous upstream stanza (source-read, not run).
 * Steps: `cold` (workdir `w1`), `noop` (the same command again in `w1`), then a fresh `init`/`validate`/assertion in
   `w2` and `warm` (same cache, fresh workdir). v0.50.4 `build` has no `--force`/`--clean`, and `recipe.buildInstall`
-  skips when the stored input hash matches and the ISO exists. So `noop` is a **hash-skip no-op**, never called a
-  cache-reusing rebuild; the runner records `hash_skip_noop` only if the ISO's size, inode and mtime are unchanged and
-  `rebuilt_in_place` otherwise. `warm` is the faithful comparison; its network transfer is NOT observed, only cache
+  skips when the stored input hash matches and the ISO exists. The second command is never called a cache-reusing rebuild; the runner records
+  `unchanged_metadata_noop_candidate` if size, inode and second-resolution mtime are unchanged and
+  `rebuilt_in_place` otherwise. Matching metadata alone does not prove unchanged bytes or an internal hash skip. `warm` is the faithful comparison; its network transfer is NOT observed, only cache
   size before/after (`warm_cache_growth_apparent_kib`).
-* Bounds actually enforced (all proposed, unmeasured): `ulimit -f 8 GiB` per file; a host free-space precondition
+* Bounds actually enforced (lead-approved experiment thresholds, unmeasured): `ulimit -f 12 GiB` per file; a host free-space precondition
   (`CONTROL_MIN_FREE`, 40 GiB) before any workspace exists; and a host `lstat` walk of `/out` every 5 s that fails the
   run above `CONTROL_OWNED_CAP` (32 GiB allocated) or 200000 entries, plus a final walk at exit. **There is no
   filesystem or directory quota.** Growth between samples can overshoot, so the recorded peak is a sampled lower
   bound; hard links are counted per name; per-phase byte attribution is not measured (only cache/workdir `du` after
-  `cold` and `warm`). The declared 2,273,598,059-byte total from #298 counts stored layers, not installed or peak size.
+  `cold` and `warm`). The exact v0.50.4 recipe creates 10,189,046,784 logical bytes (9 GiB + 500 MiB +
+  two 33-sector GPT areas + 1 MiB), so 12 GiB permits that operation with about 2.51 GiB per-file headroom.
+  The 32 GiB sampled cap allows two files up to 12 GiB plus an experimental 8 GiB cache/payload/temporary envelope;
+  40 GiB initial free space adds 8 GiB reserve. Cache expansion and actual simultaneous allocation remain unknown:
+  these thresholds can refuse the experiment and do not guarantee fit. The declared 2,273,598,059-byte total from
+  #298 counts stored layers, not installed or peak size.
 * Acceptance needs exit 0, all nine recorded steps exiting 0 in order and each under 1800000 ms, exactly one
-  `<type>--<name>--install-usb.iso` (regular, no symlink) in each of `w1/result` and `w2/result`, cold ISO size equal
-  to the recorded `stat`, and unchanged staged inputs. Failed, overflowing, OOM-killed or timed-out builds fail; the
-  ISO output filename pattern comes from `recipe.buildInstall` source and is NOT confirmed against a real run.
+  `control--control-1--install-usb.iso` (regular, no symlink) in each of `w1/result` and `w2/result`, final first-workdir ISO size equal
+  to the post-noop recorded `stat`, and unchanged staged inputs. Failed, overflowing, OOM-killed or timed-out builds fail; the
+  ISO output name comes from `recipe.buildInstall` and the fixed init template, and is NOT confirmed against a real run.
+* The post-run cache audit requires the exact official `/out/cache/v1` layout and ten source-derived build-only `name@version.oras` roots and
+  their nineteen expected named payloads from accepted #298 observations (excluding `flatcar-vlab`). It hashes
+  and size-checks fifteen retained regular payloads and fingerprints the contents of four unpacked directories
+  with no symlink following, at most 200000 entries / 32 GiB hashed bytes and the original work deadline. Missing,
+  extra or mismatched payloads refuse acceptance. Symlinks and special entries refuse the experiment. Retained
+  evidence includes the expected-reference fingerprint, counts/bytes and four content fingerprints, with no raw
+  filenames from inside those trees. The exact vendored ORAS file store retains unnamed manifests/config and
+  descriptor mappings **in memory only**, so on-disk cache auditing cannot establish selected root manifests or
+  four packed-directory descriptor correspondences. Those remain explicitly **unverified**, as do signatures;
+  this is component measurement scope, not reproducible artifact acceptance. No new query/downloader is added.
 * Disposal and receipts: the container and the whole owned workspace (cache, workdirs, ISOs) are removed on success,
   failure, timeout and signal, and absence is proved in `_finish`; an uncertain removal is a `hold`. Retained are
-  closed numbers, hashes, per-log byte count and SHA256, and for a failing step only a bounded stderr excerpt; never
-  raw `fab.yaml`, credentials or journals. The ISO hash/size is recorded before deletion.
+  closed step names/exit codes, numbers, hashes and per-log byte count/SHA256; no raw peer text,
+  `fab.yaml`, credentials or journals. All phase logs must be regular and at most 2 MiB for success. The ISO hash/size is recorded before deletion.
 * Does not prove: a release pin, registry signatures (public manifest digests are reference identities only), the
   outer Labapp image, the full VLAB, student readiness, other platforms or whether the runtime contains every
   native library the static binary needs (a recorded first-run refusal). `hhfab` also logs to `/var/log/hhfab.log`;
   the read-only root may make that fail, which would also be reported, not worked around.
+* Primary sources inspected 2026-10-26: exact v0.50.4
+  [recipe](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/fab/recipe/build.go),
+  [init template](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/fab/initconfig.tmpl.yaml),
+  [downloader](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/artificer/downloader.go) and
+  [vendored ORAS file store](https://github.com/githedgehog/fabricator/blob/v0.50.4/vendor/oras.land/oras-go/v2/content/file/file.go).
+  Accepted public reference observations and their scope: #298 comments 6424683927, 6424750734 and 6424762711.
 * Offline tests: `test_control_build.py` (synthetic archive and container; CI runs it through the existing
   `test_*.py` discovery). Python tests were not run by the authoring worker; see issue #299 for the handoff.
 

@@ -52,6 +52,117 @@ def fake_release(release):
     return module
 
 
+def synthetic_cache_references():
+    return tuple((root, manifest, tuple((name, len(MEMBER), hashlib.sha256(MEMBER).hexdigest(), unpacked)
+                                       for name, _, _, unpacked in entries))
+                 for root, manifest, entries in st.CONTROL_CACHE_REFERENCES)
+
+
+def write_cache(cache, references):
+    cache = os.path.join(cache, 'v1')
+    os.mkdir(cache)
+    for root, _, entries in references:
+        base = os.path.join(cache, root)
+        os.mkdir(base)
+        for name, _, _, unpacked in entries:
+            target = os.path.join(base, name)
+            if unpacked:
+                os.mkdir(target)
+                target = os.path.join(target, 'synthetic-file')
+            with open(target, 'wb') as handle:
+                handle.write(MEMBER)
+
+
+class CacheIdentityTests(unittest.TestCase):
+    def test_fixed_build_only_references_are_exact_accepted_subset(self):
+        rows = st.CONTROL_CACHE_REFERENCES
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(sum(len(entries) for _, _, entries in rows), 19)
+        self.assertEqual(sum(size for _, _, entries in rows for _, size, _, _ in entries), 2273598059)
+        self.assertEqual(sum(unpacked for _, _, entries in rows for _, _, _, unpacked in entries), 4)
+        self.assertNotIn('flatcar-vlab', repr(rows))
+        self.assertEqual(st.CONTROL_CACHE_FINGERPRINT, hashlib.sha256(json.dumps(
+            rows, separators=(',', ':')).encode('ascii')).hexdigest())
+
+    def test_all_regular_payloads_hash_and_directory_contents_have_safe_fingerprints(self):
+        references = synthetic_cache_references()
+        with tempfile.TemporaryDirectory() as cache, mock.patch.object(st, 'CONTROL_CACHE_REFERENCES', references):
+            write_cache(cache, references)
+            receipt = st.verify_control_cache(cache)
+            self.assertEqual((receipt['roots'], receipt['regular_payloads_verified'], receipt['unpacked_directories']),
+                             (10, 15, 4))
+            self.assertFalse(receipt['root_manifest_selection_verified'])
+            self.assertFalse(receipt['packed_directory_descriptors_verified'])
+            first = next(iter(receipt['unpacked_content']))
+            with open(os.path.join(cache, 'v1', first, 'synthetic-file'), 'wb') as handle:
+                handle.write(b'changed content')
+            self.assertNotEqual(st.verify_control_cache(cache)['unpacked_content'][first]['sha256'],
+                                receipt['unpacked_content'][first]['sha256'])
+            self.assertNotIn('synthetic-file', json.dumps(receipt))
+            self.assertNotIn(MEMBER.decode().strip(), json.dumps(receipt))
+
+    def test_missing_extra_drift_and_aliases_refuse_without_following(self):
+        references = synthetic_cache_references()
+        root, _, entries = references[0]
+        for scenario in ('missing_root', 'extra_root', 'missing_file', 'extra_file', 'drift', 'root_alias', 'file_alias'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as cache, mock.patch.object(
+                    st, 'CONTROL_CACHE_REFERENCES', references):
+                write_cache(cache, references)
+                target = os.path.join(cache, 'v1', root, entries[0][0])
+                if scenario == 'missing_root':
+                    import shutil
+                    shutil.rmtree(os.path.join(cache, 'v1', root))
+                elif scenario == 'extra_root':
+                    os.mkdir(os.path.join(cache, 'v1', 'unexpected'))
+                elif scenario == 'extra_file':
+                    open(os.path.join(cache, 'v1', root, 'unexpected'), 'wb').close()
+                elif scenario == 'root_alias':
+                    os.rename(os.path.join(cache, 'v1', root), os.path.join(cache, 'v1', root + '-moved'))
+                    os.symlink(root + '-moved', os.path.join(cache, 'v1', root))
+                else:
+                    os.unlink(target)
+                    if scenario == 'drift':
+                        with open(target, 'wb') as handle:
+                            handle.write(b'x' * len(MEMBER))
+                    elif scenario == 'file_alias':
+                        os.symlink('/etc/passwd', target)
+                with self.assertRaises((st.StageError, OSError)):
+                    st.verify_control_cache(cache)
+
+    def test_cache_version_is_exact_and_cannot_be_a_directory_alias(self):
+        references = synthetic_cache_references()
+        for scenario in ('missing', 'extra', 'alias'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as cache, mock.patch.object(
+                    st, 'CONTROL_CACHE_REFERENCES', references):
+                write_cache(cache, references)
+                if scenario == 'extra':
+                    os.mkdir(os.path.join(cache, 'v2'))
+                elif scenario == 'alias':
+                    import shutil
+                    shutil.rmtree(os.path.join(cache, 'v1'))
+                    os.symlink('/etc', os.path.join(cache, 'v1'))
+                else:
+                    os.rename(os.path.join(cache, 'v1'), os.path.join(cache, 'v2'))
+                with self.assertRaises((st.StageError, OSError)):
+                    st.verify_control_cache(cache)
+
+    def test_cache_entry_and_byte_caps_refuse(self):
+        references = synthetic_cache_references()
+        for key in ('CONTROL_CACHE_ENTRY_CAP', 'CONTROL_CACHE_BYTE_CAP'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as cache, mock.patch.object(
+                    st, 'CONTROL_CACHE_REFERENCES', references), mock.patch.object(st, key, 1):
+                write_cache(cache, references)
+                with self.assertRaises(st.StageError):
+                    st.verify_control_cache(cache)
+
+    def test_cache_scan_preserves_original_deadline(self):
+        references = synthetic_cache_references()
+        with tempfile.TemporaryDirectory() as cache, mock.patch.object(st, 'CONTROL_CACHE_REFERENCES', references):
+            write_cache(cache, references)
+            with self.assertRaises(cr.Expired):
+                st.verify_control_cache(cache, check=lambda: (_ for _ in ()).throw(cr.Expired()))
+
+
 class StageControlCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -66,7 +177,7 @@ class StageControlCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def stage(self, sources=None, **kw):
-        return st.stage_control(self.ws, sources or {"archive": self.archive}, pins=self.pins, **kw)
+        return st.stage_control(self.ws, sources if sources is not None else {"archive": self.archive}, pins=self.pins, **kw)
 
     def mode(self, *parts):
         return os.stat(os.path.join(self.ws, *parts)).st_mode & 0o777
@@ -206,6 +317,12 @@ class FixedPlanTests(unittest.TestCase):
         self.assertEqual(mounts, ["--mount=type=bind,src=/w/in,dst=/in,readonly", "--mount=type=bind,src=/w/out,dst=/out"])
         self.assertFalse(any("docker.sock" in a or ".docker" in a for a in args))
 
+    def test_per_file_limit_exceeds_exact_recipe_raw_disk_with_fixed_headroom(self):
+        self.assertEqual(cr.CONTROL_RECIPE_DISK_BYTES, 10189046784)
+        self.assertEqual(cr.CONTROL_FILE_KIB * 1024, 12 << 30)
+        self.assertGreater(cr.CONTROL_FILE_KIB * 1024, cr.CONTROL_RECIPE_DISK_BYTES)
+        self.assertEqual((cr.CONTROL_OWNED_CAP, cr.CONTROL_MIN_FREE), (32 << 30, 40 << 30))
+
     def test_other_modes_keep_their_argv_and_networking(self):
         for mode in cr.MODES:
             if mode == "control-build":
@@ -266,6 +383,16 @@ class UpstreamAssertionTests(unittest.TestCase):
         self.assertEqual(self.check(self.GOOD), 0)
         self.assertEqual(self.check(self.GOOD.replace("username:\n", 'username: ""\n')), 0)
 
+    def test_other_generated_passwords_and_tokens_do_not_affect_registry_assertion(self):
+        full = self.GOOD + ('    control:\n      joinToken: secret-token\n'
+                            '      defaultUser:\n        password: secret-hash\n'
+                            '    fabric:\n      defaultSwitchUsers:\n'
+                            '        admin:\n          password: secret-hash\n'
+                            '---\nkind: ControlNode\nmetadata:\n  name: control-1\n')
+        self.assertEqual(self.check(full), 0)
+        self.assertNotEqual(self.check(self.GOOD.replace('    registry:', '    unrelated:')), 0)
+        self.assertNotEqual(self.check(self.GOOD.replace('  config:', '  unrelated:')), 0)
+
     def test_every_deviation_is_refused(self):
         variants = {
             "airgap": self.GOOD.replace("mode: upstream", "mode: airgap"),
@@ -316,6 +443,11 @@ class ControlDaemon(tsn.SentinelDaemon):
         mount = next(a for a in c["args"] if a.endswith(",dst=/out"))
         out = mount.split("src=")[1].split(",")[0]
         scenario = self.scenario
+        write_cache(os.path.join(out, 'cache'), st.CONTROL_CACHE_REFERENCES)
+        if scenario == 'cache_mismatch':
+            first = st.CONTROL_CACHE_REFERENCES[0]
+            with open(os.path.join(out, 'cache', 'v1', first[0], first[2][0][0]), 'ab') as handle:
+                handle.write(b'drift')
         steps = [(n, 0, 1500 + 100 * i) for i, n in enumerate(cr.CONTROL_STEPS)]
         if scenario == "step_fail":
             steps = steps[:3] + [("cold", 1, 900)]
@@ -325,6 +457,8 @@ class ControlDaemon(tsn.SentinelDaemon):
             steps[3] = ("cold", 0, cr.CONTROL_MS_CAP + 1)
         if scenario == "no_steps":
             steps = []
+        if scenario == "unknown_step":
+            steps[0] = ("secrettoken", 1, 900)
         self.write(out, "steps", "".join(f"{n} {code} {ms}\n" for n, code, ms in steps))
         for n, _, _ in steps:
             self.write(out, n + ".out", "ok\n")
@@ -336,6 +470,11 @@ class ControlDaemon(tsn.SentinelDaemon):
         if scenario == "noop_rebuilt":
             noop = f"noop {len(ISO1)} 4243 1700000500\n"
         self.write(out, "isostat", cold + noop)
+        if scenario == "missing_log":
+            os.unlink(os.path.join(out, "cold.out"))
+        if scenario == "oversize_log":
+            with open(os.path.join(out, "cold.err"), "wb") as handle:
+                handle.truncate(cr.STEP_CAP + 1)
         if scenario == "bad_sizes":
             self.write(out, "sizes", "cache_cold two 1\n")
         if scenario == "bad_isostat":
@@ -383,6 +522,7 @@ class ControlCase(tc.RunnerCase):
         real = st.stage_control
         for patcher in (mock.patch.object(cr, "PREPARED_RUNTIME", tsn.RUNTIME),
                         mock.patch.object(cr, "free_bytes", return_value=1 << 50),
+                        mock.patch.object(st, "CONTROL_CACHE_REFERENCES", synthetic_cache_references()),
                         mock.patch.object(st, "_release_module", return_value=fake_release(release)),
                         mock.patch.object(cr.stage_tools, "stage_control",
                                           side_effect=lambda ws, sources, check=st._noop: real(
@@ -402,7 +542,8 @@ class ControlCase(tc.RunnerCase):
         self.assertEqual(result["workspace"], "removed")
         self.assertEqual(daemon.containers, {})
         self.assertEqual(os.listdir(self.root), [])
-        self.assertEqual(self.record()["state"], "released")
+        with open(result["ledger"]) as handle:
+            self.assertEqual(json.load(handle)["state"], "released")
 
 
 class AcceptanceTests(ControlCase):
@@ -411,7 +552,7 @@ class AcceptanceTests(ControlCase):
         self.assertEqual((result["outcome"], result["reason"]), ("accepted", None), result)
         self.assert_fully_cleaned(result, daemon)
         evidence = result["evidence"]
-        self.assertEqual(evidence["noop"], "hash_skip_noop")
+        self.assertEqual(evidence["noop"], "unchanged_metadata_noop_candidate")
         self.assertEqual([s[0] for s in evidence["steps"]], list(cr.CONTROL_STEPS))
         self.assertEqual(evidence["iso"]["w1"], {"sha256": hashlib.sha256(ISO1).hexdigest(), "bytes": len(ISO1),
                                                  "name": ISO_NAME})
@@ -461,21 +602,28 @@ class FailClosedTests(ControlCase):
                    "bad_isostat": "invalid_step_evidence", "missing_iso": "iso_missing_or_invalid",
                    "symlink_iso": "iso_missing_or_invalid", "two_isos": "iso_missing_or_invalid",
                    "wrong_size": "iso_missing_or_invalid", "empty_iso": "iso_missing_or_invalid",
-                   "bad_exit": "unexpected_exit", "tamper": "staged_inputs_changed"}
+                   "bad_exit": "unexpected_exit", "tamper": "staged_inputs_changed",
+                   "missing_log": "invalid_step_evidence", "oversize_log": "invalid_step_evidence",
+                   "unknown_step": "build_failed", "cache_mismatch": "cache_identity_mismatch"}
         for scenario, reason in reasons.items():
             with self.subTest(scenario=scenario):
-                self.setUp()
                 result, daemon = self.run_control(scenario)
                 self.assertEqual(result["outcome"], "failed", result)
                 self.assertEqual(result["reason"], reason)
                 self.assert_fully_cleaned(result, daemon)
 
-    def test_failing_step_keeps_one_bounded_stderr_excerpt_and_hashes_only_otherwise(self):
+    def test_failing_step_keeps_only_closed_summary_and_log_hashes(self):
         result, _ = self.run_control("step_fail")
         failed = result["evidence"]["failed_step"]
         self.assertEqual((failed["name"], failed["exit"]), ("cold", 1))
-        self.assertEqual(failed["excerpt"], "failure detail\n")
+        self.assertEqual(failed, {"name": "cold", "exit": 1})
+        self.assertNotIn("failure detail", json.dumps(result))
         self.assertEqual(set(result["evidence"]["logs"]["cold.out"]), {"bytes", "sha256"})
+
+    def test_unknown_peer_step_names_are_never_retained(self):
+        result, _ = self.run_control("unknown_step")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertNotIn("secrettoken", json.dumps(result))
 
     def test_oom_kill_cannot_pass(self):
         result, daemon = self.run_control(daemon_kw={"mode": "oom"})

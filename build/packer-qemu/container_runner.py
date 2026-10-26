@@ -261,16 +261,45 @@ import sys
 raw = open(sys.argv[1], 'rb').read(1048577)
 if len(raw) > 1048576:
     sys.exit(3)
-lines = [line.strip() for line in raw.decode('utf-8').splitlines()]
-want = ['mode: upstream', 'repo: ghcr.io', 'prefix: githedgehog', 'noTLSVerify: false']
-empty = ['', '""', "''", 'null']
-ok = all(lines.count(item) == 1 for item in want)
-for key in ('username', 'password'):
-    found = [line for line in lines if line.startswith(key + ':')]
-    ok = ok and len(found) == 1 and found[0][len(key) + 1:].strip() in empty
+# Check only the exact generated spec.config.registry subtree. Other generated
+# user passwords and join tokens are unrelated and must never be exported.
+lines = raw.decode('utf-8').splitlines()
+path = []
+registry = []
+for line in lines:
+    text = line.strip()
+    if text == '---':
+        break
+    if not text or text.startswith('#'):
+        continue
+    indent = len(line) - len(line.lstrip(' '))
+    while path and path[-1][0] >= indent:
+        path.pop()
+    if ':' not in text:
+        if [entry[1] for entry in path][:3] == ['spec', 'config', 'registry']:
+            sys.exit(4)
+        continue
+    key, value = text.split(':', 1)
+    keys = [entry[1] for entry in path] + [key]
+    if keys[:3] == ['spec', 'config', 'registry']:
+        registry.append((keys[3:], value.strip()))
+    path.append((indent, key))
+want = [([], ''), (['mode'], 'upstream'), (['upstream'], ''),
+        (['upstream', 'repo'], 'ghcr.io'), (['upstream', 'prefix'], 'githedgehog'),
+        (['upstream', 'noTLSVerify'], 'false'), (['upstream', 'username'], ''),
+        (['upstream', 'password'], '')]
+# Official init emits empty scalars; accept their explicit quoted/null forms too.
+empty = ('', '\"\"', "''", 'null')
+normalized = [(keys, '' if keys in (['upstream', 'username'], ['upstream', 'password'])
+               and value in empty else value) for keys, value in registry]
+ok = normalized == want
 sys.exit(0 if ok else 4)
 '''
-CONTROL_FILE_KIB = 8388608     # per-file ulimit (8 GiB, proposed): bounds the ISO and any log; NOT a directory quota
+# Exact v0.50.4 recipe creates 9 GiB + 500 MiB + 2*(33*512) + 1 MiB =
+# 10,189,046,784 logical bytes before ISO finalization. 12 GiB leaves ~2.51 GiB
+# per-file headroom. Lead-approved experiment thresholds, not measured fit.
+CONTROL_RECIPE_DISK_BYTES = 9 * (1 << 30) + 501 * (1 << 20) + 2 * 33 * 512
+CONTROL_FILE_KIB = 12 * 1024 * 1024  # per-file ulimit, NOT a directory quota
 CONTROL_OWNED_CAP = 32 << 30   # sampled allocated-bytes ceiling for /out (proposed, unmeasured); NOT a quota
 CONTROL_MIN_FREE = 40 << 30    # host free-space precondition before the workspace exists (proposed, unmeasured)
 CONTROL_SAMPLE = 5             # seconds between host samples of the owned tree
@@ -1018,13 +1047,13 @@ def _control_iso(out, name):
             found = [item for item in items if CONTROL_ISO_RE.fullmatch(item.name)]
     except OSError:
         return None
-    return found[0].path if len(found) == 1 else None
+    return found[0].path if len(found) == 1 and found[0].name == "control--control-1--install-usb.iso" else None
 
 
 def _accept_control(own, result, budget, clock, oom, code):
     """Success needs exit 0, all nine recorded steps exiting 0 in order (init/validate/upstream assertion/cold
     build/no-op build/fresh init/validate/assertion/warm build), one bounded ISO in each workspace, a no-op
-    that provably left the cold ISO untouched (otherwise it is labelled rebuilt), unchanged staged bytes and
+    labelled from metadata without claiming an internal hash skip, unchanged staged bytes and
     (checked in _finish) verified removal of the container and the whole owned workspace."""
     out = os.path.join(own["workspace"], "out")
     staged = own["staged"]
@@ -1037,8 +1066,10 @@ def _accept_control(own, result, budget, clock, oom, code):
                            "min_free": CONTROL_MIN_FREE, "quota": False},
                 "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
     result["evidence"] = evidence
-    raw = {n: read_step(out, n) for n in ("steps", "sizes", "isostat")}
+    raw = {n: read_step(out, n, RESULT_CAP) for n in ("steps", "sizes", "isostat")}
     steps = _control_lines(raw["steps"], CONTROL_STEP_RE)
+    if steps is not None and (len(steps) > len(CONTROL_STEPS) or any(s[0] not in CONTROL_STEPS for s in steps)):
+        steps = None
     if steps is not None:
         evidence["steps"] = [[n, int(c), int(ms)] for n, c, ms in steps]
     for step in CONTROL_STEPS:
@@ -1048,11 +1079,8 @@ def _accept_control(own, result, budget, clock, oom, code):
                 evidence.setdefault("logs", {})[f"{step}.{suffix}"] = {
                     "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     failed = next((s for s in (steps or []) if s[1] != "0"), None)
-    if failed is not None:       # one bounded excerpt of the failing step's stderr, never a config or journal
-        data = read_step(out, failed[0] + ".err")
+    if failed is not None:
         evidence["failed_step"] = {"name": failed[0], "exit": int(failed[1])}
-        if data is not None:
-            evidence["failed_step"]["excerpt"] = data[:EXCERPT].decode("ascii", "replace")
     try:
         logical, allocated, entries = measure_tree(out)
     except (OSError, OutputBound):
@@ -1073,6 +1101,9 @@ def _accept_control(own, result, budget, clock, oom, code):
             s[1] != "0" or int(s[2]) > CONTROL_MS_CAP for s in steps):
         result["reason"] = "build_failed"
         return
+    if len(evidence.get("logs", {})) != 2 * len(CONTROL_STEPS):
+        result["reason"] = "invalid_step_evidence"
+        return
     sizes, stats = _control_lines(raw["sizes"], CONTROL_SIZE_RE), _control_lines(raw["isostat"], CONTROL_STAT_RE)
     if (sizes is None or [s[0] for s in sizes] != ["cache_cold", "w1_cold", "cache_warm", "w2_warm"]
             or stats is None or [s[0] for s in stats] != ["cold", "noop"]):
@@ -1084,10 +1115,9 @@ def _accept_control(own, result, budget, clock, oom, code):
     evidence["timing_seconds"] = seconds
     evidence["cache_kib"] = {"after_cold": kib["cache_cold"], "after_warm": kib["cache_warm"]}
     evidence["workspace_kib"] = {"w1_after_cold": kib["w1_cold"], "w2_after_warm": kib["w2_warm"]}
-    # The second build in the SAME workdir is a hash-skip when the cold ISO is byte-for-byte the same file
-    # (same size, inode and mtime): a no-op, never a cache-reusing rebuild. `warm` is the fresh-workdir build
-    # sharing only the cache; its transfer is unobserved, only cache growth is recorded.
-    evidence["noop"] = "hash_skip_noop" if cold == noop else "rebuilt_in_place"
+    # Matching metadata alone cannot prove unchanged bytes or an internal hash skip.
+    # `warm` is the fresh-workdir build sharing the cache; transfer is unobserved.
+    evidence["noop"] = "unchanged_metadata_noop_candidate" if cold == noop else "rebuilt_in_place"
     evidence["warm_cache_growth_apparent_kib"] = (kib["cache_warm"]["apparent_kib"]
                                                   - kib["cache_cold"]["apparent_kib"])
     check = lambda: _checkpoint(own, budget, clock)
@@ -1102,11 +1132,16 @@ def _accept_control(own, result, budget, clock, oom, code):
         except (OSError, stage_tools.StageError):
             result["reason"] = "iso_missing_or_invalid"
             return
-    if isos["w1"]["bytes"] != int(cold[0]) or isos["w1"]["bytes"] <= 0 or isos["w2"]["bytes"] <= 0:
+    if isos["w1"]["bytes"] != int(noop[0]) or isos["w1"]["bytes"] <= 0 or isos["w2"]["bytes"] <= 0:
         result["reason"] = "iso_missing_or_invalid"
         return
     evidence["iso"] = isos
     evidence["iso_equal"] = isos["w1"]["sha256"] == isos["w2"]["sha256"]
+    try:
+        evidence["cache_identity"] = stage_tools.verify_control_cache(os.path.join(out, "cache"), check)
+    except (OSError, stage_tools.StageError):
+        result["reason"] = "cache_identity_mismatch"
+        return
     try:
         intact = stage_tools.verify_control(own["workspace"], staged, check)
     except (OSError, stage_tools.StageError):
