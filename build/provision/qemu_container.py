@@ -1,18 +1,179 @@
 """Test-only runner inside owned Docker containers; never a cloud entrypoint."""
+import contextlib
+import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import sys
 import tempfile
+import threading
+import time
 
 from hhfab_release import Refusal, bounded, digest
+import qemu_offline
 import qemu_witness
+
+APT_HELPER = '/usr/lib/apt/apt-helper'
+TRANSPORT = re.compile(rb'(?i)\b50[0-9]\b|bad gateway|service unavailable|gateway time-?out|'
+                       rb'connection (timed out|failed|reset)|could not (connect|resolve)|'
+                       rb'temporary failure|timed out')
+BODY = b'labapp transport fixture\n'
+
+
+def apt_stage(args):
+    """Stage label for a fixed-installer APT command; None for non-APT commands."""
+    if args[0] != '/usr/bin/apt-get':
+        return None
+    if '--simulate' in args:
+        return 'simulate'
+    for stage in ('update', 'check'):
+        if args[-1] == stage:
+            return stage
+    return 'install' if 'install' in args else 'other'
+
+
+def recording_call(module, log):
+    """Replacement for the installer's call() that keeps stage, exit code and output."""
+    def call(args, seconds=10):
+        code, output = bounded(args, seconds, env=module['ENV'])
+        log.append((apt_stage(args), code, output))
+        if code:
+            raise Refusal(f'command failed: stage={apt_stage(args)} code={code!r}')
+        return output
+    return call
+
+
+def signature_proof(code, output):
+    """Only a real NO_PUBKEY authentication failure proves the signature refusal."""
+    if code != 0 and b'NO_PUBKEY' in output:
+        return
+    kind = ('succeeded' if code == 0 else 'transport-only failure' if TRANSPORT.search(output)
+            else 'unclassified failure')
+    raise AssertionError(f'stage=update empty-keyring {kind}, not signature proof: '
+                         f'code={code!r} output_tail={output[-4096:]!r}')
+
+
+def missing_pin_proof(log, name, version):
+    """Missing-version proof must reach simulation and fail with APT's exact pin error."""
+    trail = [(stage, code) for stage, code, _ in log if stage]
+    if ([stage for stage, _ in trail] != ['update', 'check', 'simulate']
+            or trail[0][1] != 0 or trail[1][1] != 0 or trail[2][1] == 0):
+        raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}')
+    output = log[-1][2]
+    if f"Version '{version}' for '{name}' was not found".encode() not in output:
+        raise AssertionError(f'simulation failure was not the invalid-pin outcome: output_tail={output[-4096:]!r}')
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        server = self.server
+        server.hits[self.path] = count = server.hits.get(self.path, 0) + 1
+        if self.path == '/permanent':
+            self.send_error(404)
+        elif self.path in ('/always502', '/always503'):
+            self.send_error(int(self.path[-3:]))
+        elif self.path == '/transient' and count == 1:
+            self.send_error(503)
+        elif self.path == '/hang':
+            server.release.wait(30)
+        else:
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(BODY)))
+            self.end_headers()
+            self.wfile.write(BODY)
+
+
+@contextlib.contextmanager
+def serve():
+    """Loopback-only bounded stdlib server; returns base URL and per-path request counts."""
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = True
+    server.hits, server.release = {}, threading.Event()
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}', server.hits
+    finally:
+        server.release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+def leftover(marker):
+    """Pids (other than ours) whose command line mentions marker."""
+    found = []
+    for entry in Path('/proc').iterdir():
+        if entry.name.isdigit() and int(entry.name) != os.getpid():
+            with contextlib.suppress(OSError):
+                if marker.encode() in (entry / 'cmdline').read_bytes():
+                    found.append(int(entry.name))
+    return found
+
+
+def production_retries():
+    """The Acquire::Retries value emitted by the shared production setup()."""
+    with tempfile.TemporaryDirectory(prefix='labapp-qemu-retries-') as temporary:
+        apt, _ = qemu_offline.setup(Path(temporary), 'unused')
+    return next(item.split('=', 1)[1] for item in apt if item.startswith('Acquire::Retries='))
+
+
+def transport(run=bounded, server=serve, scan=leftover, limit=15):
+    """Native apt-helper over loopback HTTP; no package install, signature or TLS proof."""
+    retries = production_retries()
+    version = run(['/usr/bin/dpkg-query', '-W', '-f=${Version}', 'apt'], 10)[1].decode()
+    options = ['-o', 'Acquire::Retries=' + retries, '-o', f'Acquire::http::Timeout={limit}',
+               '-o', 'Acquire::http::Proxy=DIRECT']
+    env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+    seconds = {}
+    with server() as (base, hits), tempfile.TemporaryDirectory(prefix='labapp-transport-') as temporary:
+        Path(temporary).chmod(0o755)
+        def fetch(name, deadline, expected=None):
+            target = Path(temporary) / name.strip('/')
+            args = [APT_HELPER, *options, 'download-file', base + name, str(target)]
+            if expected:
+                args.append('SHA256:' + expected)
+            started = time.monotonic()
+            try:
+                code, output = run(args, deadline, env=env)
+            except Refusal as exc:
+                code, output = str(exc), b''
+            seconds[name.strip('/')] = round(time.monotonic() - started, 3)
+            return code, output, target
+        attempts = 1 + int(retries)
+        code, output, target = fetch('/transient', 60, hashlib.sha256(BODY).hexdigest())
+        assert code == 0 and hits['/transient'] == 2 and target.read_bytes() == BODY, (
+            f'transient-then-success: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
+        for name in ('/always502', '/always503'):
+            code, output, target = fetch(name, 60)
+            assert code != 0 and hits[name] == attempts and not target.exists(), (
+                f'persistent {name}: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
+        code, output, target = fetch('/permanent', 60)
+        assert code != 0 and hits['/permanent'] == 1 and not target.exists(), (
+            f'permanent 404: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
+        code, output, target = fetch('/baddigest', 60, '0' * 64)
+        assert code != 0 and b'mismatch' in output.lower() and hits['/baddigest'] <= attempts, (
+            f'bad digest: code={code!r} hits={hits!r} output_tail={output[-2048:]!r}')
+        code, output, target = fetch('/hang', 3)
+        assert code == 'command timeout' and scan(temporary) == [], (
+            f'external deadline/cleanup: code={code!r} remaining={scan(temporary)!r}')
+        requests = dict(hits)
+    return {'transport_fixture': True, 'apt_version': version, 'retries': retries, 'http_timeout': limit,
+            'requests': requests, 'seconds': seconds, 'http_only_not_tls_or_signature_proof': True}
 
 
 def install():
+    # Native transport semantics first, so no public snapshot request is made
+    # if the retry/deadline behavior is not as the production policy assumes.
+    print(json.dumps(transport()), flush=True)
     module = runpy.run_path('/suite/install-qemu.py')
-    apt_before = {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()}
+    apt_before ={str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()}
     packages_before = module['installed']()
     # Exercise actual APT authentication failure against the official signed
     # snapshot with an owned empty trust keyring, before installing anything.
@@ -27,8 +188,7 @@ def install():
                 source = Path(next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist=')))
                 source.write_text(source.read_text().replace('/usr/share/keyrings/ubuntu-archive-keyring.gpg', str(key)))
                 code, output = bounded(args, seconds, env=module['ENV'])
-                assert code != 0 and b'NO_PUBKEY' in output, (
-                    f'signature-refusal check failed: code={code!r} output_tail={output[-4096:]!r}')
+                signature_proof(code, output)
                 raise Refusal('actual signature refusal')
             return original_call(args, seconds)
         globals_['call'] = rejected_trust
@@ -44,13 +204,16 @@ def install():
     # Unavailable explicit pin must fail at resolution, without package changes.
     original_pin = module['PINS']['qemu-system-x86']
     module['PINS']['qemu-system-x86'] = '999:0.invalid'
+    log = []
+    globals_['call'] = recording_call(module, log)
     try:
         module['install']()
     except Refusal:
-        pass
+        missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
     else:
         raise AssertionError('unavailable pin accepted')
     finally:
+        globals_['call'] = original_call
         module['PINS']['qemu-system-x86'] = original_pin
     assert module['installed']() == packages_before
     print(json.dumps({'actual_signature_refusal': True, 'actual_unavailable_pin_refusal': True,

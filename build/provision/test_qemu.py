@@ -1,4 +1,5 @@
 """Consequential offline failures; no host QEMU/APT invocation or cloud access."""
+import contextlib
 import os
 from pathlib import Path
 import runpy
@@ -11,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 from hhfab_release import Refusal, bounded
+import qemu_container as container
+import qemu_offline as offline_protocol
 import qemu_witness as witness
 
 INSTALL = Path(__file__).with_name('install-qemu.py')
@@ -174,6 +177,131 @@ class OwnershipTests(ownership.CleanupTests):
         adjusted = json.loads(json.dumps(state).replace('labapp.qemu-test.run=', 'labapp.bridge-test.run=')
                               .replace('labapp-qemu-test:', 'labapp-bridge-test:'))
         super().assert_owned_removed(adjusted)
+
+
+class RetryPolicyAndEvidenceTests(unittest.TestCase):
+    """Pure/mocked: no APT, HTTP server, loopback socket or container is used."""
+    NO_PUBKEY = b'W: GPG error: InRelease: NO_PUBKEY 871920D1991BC93C\n'
+
+    def test_setup_emits_one_retry_and_leaves_every_other_option_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apt, _ = offline_protocol.setup(root, '20261024T000000Z')
+        options = dict(item.split('=', 1) for item in apt[1:] if item != '-o')
+        self.assertEqual(apt[0], '/usr/bin/apt-get')
+        self.assertEqual(options['Acquire::Retries'], '1')
+        self.assertEqual({k: v for k, v in options.items() if not k.startswith('Dir::')}, {
+            'Acquire::Retries': '1', 'Acquire::https::Timeout': '15', 'Acquire::GzipIndexes': 'true',
+            'APT::Architecture': 'amd64', 'APT::Architectures::': 'amd64', 'DPkg::Lock::Timeout': '10',
+            'APT::Get::AllowUnauthenticated': 'false', 'Acquire::AllowInsecureRepositories': 'false',
+            'Acquire::AllowWeakRepositories': 'false', 'Acquire::AllowDowngradeToInsecureRepositories': 'false',
+            'Acquire::Check-Valid-Until': 'true', 'APT::Get::allow-Downgrades': 'false',
+            'APT::Get::allow-Change-Held-Packages': 'false'})
+        self.assertEqual(container.production_retries(), '1')
+
+    def test_protocol_identity_covers_setup_source_and_invalidates_old_state(self):
+        identity = offline_protocol.identity()
+        self.assertIn('qemu_offline.py', identity)
+        keys = {'format', 'base', 'module', 'status', 'architecture', 'foreign', 'holds', 'audit',
+                'selections_sha256', 'policy', 'keyring', 'apt_config_sha256', 'os_release_sha256'}
+        state = {key: '' for key in keys}
+        state.update(format='labapp-qemu-state-v1', base=offline_protocol.BASE, architecture='amd64',
+                     module={**identity, 'qemu_offline.py': '0' * 64})
+        with self.assertRaisesRegex(Refusal, 'module'):
+            offline_protocol.check_state(state, offline_protocol.BASE)
+
+    def test_stage_labels(self):
+        apt = '/usr/bin/apt-get'
+        self.assertEqual(container.apt_stage([apt, '-o', 'a=b', 'update']), 'update')
+        self.assertEqual(container.apt_stage([apt, 'check']), 'check')
+        self.assertEqual(container.apt_stage([apt, '--simulate', 'install', 'x=1']), 'simulate')
+        self.assertEqual(container.apt_stage([apt, '--yes', 'install', 'x=1']), 'install')
+        self.assertIsNone(container.apt_stage(['/usr/bin/dpkg', '--audit']))
+
+    def test_signature_proof_requires_real_authentication_failure(self):
+        container.signature_proof(100, self.NO_PUBKEY)
+        for code, output, kind in ((100, b'Err:1 https://x InRelease\n  502  Bad Gateway\n', 'transport-only'),
+                                   (100, b'Err:1 https://x InRelease\n  503  Service Unavailable\n', 'transport-only'),
+                                   (100, b'unrelated\n', 'unclassified'), (0, self.NO_PUBKEY, 'succeeded')):
+            with self.subTest(output=output), self.assertRaisesRegex(AssertionError, kind):
+                container.signature_proof(code, output)
+
+    def test_missing_pin_proof_requires_simulation_and_exact_pin_error(self):
+        pin = b"E: Version '999:0.invalid' for 'qemu-system-x86' was not found\n"
+        good = [('update', 0, b''), (None, 0, b''), ('check', 0, b''), ('simulate', 100, pin)]
+        container.missing_pin_proof(good, 'qemu-system-x86', '999:0.invalid')
+        bad = {
+            'transport at update': [('update', 100, b'503  Service Unavailable')],
+            'authentication at update': [('update', 100, self.NO_PUBKEY)],
+            'check failure': [('update', 0, b''), ('check', 100, pin)],
+            'unrelated simulate failure': good[:3] + [('simulate', 100, b'E: Unable to locate package')],
+            'other pin': good[:3] + [('simulate', 100, pin.replace(b'qemu-system-x86', b'socat'))],
+            'simulate accepted': good[:3] + [('simulate', 0, pin)],
+        }
+        for name, log in bad.items():
+            with self.subTest(name), self.assertRaises(AssertionError):
+                container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
+
+    def test_recording_call_keeps_stage_code_and_output(self):
+        log = []
+        module = {'ENV': {'APT_CONFIG': '/x'}}
+        with patch.object(container, 'bounded', return_value=(100, b'out')) as run:
+            with self.assertRaises(Refusal):
+                container.recording_call(module, log)(['/usr/bin/apt-get', 'check'], 7)
+        run.assert_called_once_with(['/usr/bin/apt-get', 'check'], 7, env=module['ENV'])
+        self.assertEqual(log, [('check', 100, b'out')])
+
+    @staticmethod
+    def mocked_native(persistent_requests, leftovers, calls):
+        """Mocked server/process boundary, scripted like the expected native apt-helper results."""
+        hits = {}
+        prefix = 'http://127.0.0.1:1'
+        @contextlib.contextmanager
+        def server():
+            yield prefix, hits
+        def run(args, seconds, env=None):
+            if args[0] == '/usr/bin/dpkg-query':
+                return 0, b'2.8.test'
+            calls.append((args, seconds, env))
+            path = args[args.index('download-file') + 1][len(prefix):]
+            hits[path] = (1 if path in ('/permanent', '/baddigest', '/hang')
+                          else min(persistent_requests, 2) if path == '/transient' else persistent_requests)
+            if path == '/transient':
+                Path(args[args.index('download-file') + 2]).write_bytes(container.BODY)
+                return 0, b''
+            if path == '/hang':
+                raise Refusal('command timeout')
+            if path == '/permanent':
+                return 100, b'404  Not Found'
+            if path == '/baddigest':
+                return 100, b'Hash Sum mismatch'
+            return 100, b'503  Service Unavailable'
+        return dict(run=run, server=server, scan=lambda marker: leftovers)
+
+    def test_transport_fixture_exact_options_limits_and_deadline(self):
+        calls = []
+        report = container.transport(**self.mocked_native(2, [], calls))
+        self.assertEqual(report['requests'], {'/transient': 2, '/always502': 2, '/always503': 2,
+                                              '/permanent': 1, '/baddigest': 1, '/hang': 1})
+        self.assertEqual((report['apt_version'], report['retries'], report['http_timeout']), ('2.8.test', '1', 15))
+        self.assertTrue(report['http_only_not_tls_or_signature_proof'])
+        for args, _, env in calls:
+            self.assertEqual(args[:8], [container.APT_HELPER, '-o', 'Acquire::Retries=1', '-o',
+                                        'Acquire::http::Timeout=15', '-o', 'Acquire::http::Proxy=DIRECT',
+                                        'download-file'])
+            self.assertTrue(args[8].startswith('http://127.0.0.1:'))
+            self.assertNotIn('APT_CONFIG', env)
+        self.assertEqual([seconds for _, seconds, _ in calls], [60, 60, 60, 60, 60, 3])
+
+    def test_transport_fixture_rejects_wrong_native_behavior_and_leftovers(self):
+        # A zero-retry client makes the transient case fail first.
+        with self.assertRaisesRegex(AssertionError, 'transient-then-success'):
+            container.transport(**self.mocked_native(1, [], []))
+        with self.assertRaisesRegex(AssertionError, 'external deadline'):
+            container.transport(**self.mocked_native(2, [123], []))
+        # More requests than one retry allows is unbounded retry.
+        with self.assertRaisesRegex(AssertionError, 'persistent'):
+            container.transport(**self.mocked_native(3, [], []))
 
 
 if __name__ == '__main__':
