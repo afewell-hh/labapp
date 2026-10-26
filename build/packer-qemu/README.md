@@ -1,6 +1,7 @@
 # Stock Packer/QEMU portability experiment (`build/packer-qemu/`)
 
-The **VM experiment remains disabled and unproven**. Fixed non-VM Docker `probe`,
+The **VM experiment requires separately scoped lead execution**; successful guest
+compatibility remains a live acceptance gate. Fixed non-VM Docker `probe`,
 `hcl-check` and `runtime-check` tasks are available under separately scoped lead execution. The
 experiment tests stock Packer core with the stock QEMU plugin,
 `communicator = "none"`, a NoCloud guest that runs the
@@ -21,7 +22,7 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
-| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe`, `hcl-check` and `runtime-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode is gated off until a runtime identity is accepted |
+| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe`, `hcl-check` and `runtime-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode pins its runtime identity and requires separate lead scope |
 | `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Separately gated runtime preparation recipe; guest assertions run by the sentinel plan |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
@@ -112,8 +113,8 @@ evidence of incompatibility.
   waived (SDK 0.6.11 `InsecureIgnoreHostKey`).
 * `WaitForShutdown` in the plugin treats any QEMU exit as shutdown, so Packer
   success alone proves nothing. The observer writes `verified.json` only after
-  both pieces of evidence (`O_EXCL`), bound to the nonce and digest. VM execution
-  is disabled; no runner accepts that marker or any VM build artifact.
+  both pieces of evidence (`O_EXCL`), bound to the nonce and digest. The fixed `sentinel` runner additionally validates the marker, staged inputs and
+  disposable artifact before accepting a trial; separate lead scope is required.
 
 ## Guest sequence (requires VM validation)
 
@@ -331,8 +332,9 @@ default prints the plan only.
 backend, exact name+label+ID cleanup and HOLD semantics. There is no image, command or
 runtime option. **It refuses before the lock, ledger, workspace, staging or any Docker
 call unless `container_runner.SENTINEL_RUNTIME` holds an accepted `image_id` and
-RootFS `diffids`; the shipped value is `None`** (no digest is invented). `supervise.py`
-stays execution-disabled.
+RootFS `diffids`; the fixed identity is `PREPARED_RUNTIME`**. This source gate is
+not execution authorization: each actual trial needs separate lead scope and
+reconciled shared-ledger admission. `supervise.py` stays execution-disabled.
 
 * Runtime: `runtime/Dockerfile` (that directory is the whole build context) derives from
   the full accepted Ubuntu digest, deletes ambient APT sources, writes one Deb822 source
@@ -388,10 +390,12 @@ stays execution-disabled.
   Runner evidence retains the validated summary and the result-file size/hash, with no
   raw result-file excerpt.
   Packer exit 0 or `verified.json` alone is not enough.
-* Unmet before any VM (HOLD): accepted runtime identity from a reviewed preparation
-  workflow with owned builder cleanup; named KVM runner and UID/GID mapping; ISO
-  Rock Ridge mode check; the unrun HCL attributes above; actual guest evidence emission;
-  measured resource caps and reserve; failure/hang trial, then one success.
+* Before each VM (HOLD if unmet): verify the accepted runtime identity and
+  preparation provenance, named KVM runner and UID/GID mapping, required tool/ISO
+  checks, reviewed HCL, original resource/time bounds and shared-ledger admission.
+  Independently accepted failure/hang cleanup and reconciliation must precede the
+  separately scoped success trial. Actual guest evidence, resource/reserve fit and
+  remaining compatibility gates are recorded in GitHub, never inferred from source activation.
 
 ### Fixed `sentinel-expiry` task (failure-only VM proof)
 
@@ -400,7 +404,7 @@ success trial. Same admission, single ledger, restricted container, exact `/dev/
 numeric group, exact cleanup and HOLD rules as `sentinel`; no image, command, QMP
 sequence or duration option. It refuses before the lock, ledger, workspace, staging or
 Docker unless `container_runner.EXPIRY_RUNTIME` holds an accepted identity (the fixed `PREPARED_RUNTIME`,
-separate from `SENTINEL_RUNTIME`, which remains `None`). This identity does not authorize
+separately gated from `SENTINEL_RUNTIME`). This identity does not authorize
 execution: each actual trial requires separately scoped lead authorization.
 
 * Budget: 300 s work INCLUDING staging from admission + 120 s cleanup, no renewal;
@@ -443,7 +447,7 @@ launching Packer, QEMU, systemd units or other build processes.
 artifact); no CLI/environment image, command or input override is accepted. Its
 identity remains bound to the original source and Dockerfile hashes recorded in
 GitHub even when recipe comments change. Preparation/import, actual tool results
-and subsequent VM acceptance are separate gates; `SENTINEL_RUNTIME` stays unset.
+and subsequent VM acceptance are separate gates; no tool check authorizes a VM trial.
 
 This mode reuses the existing admission ledger, absolute budget, cancellation and
 exact full-ID/name/label cleanup. It has 90 seconds work plus 30 seconds cleanup,
@@ -490,7 +494,7 @@ private HOME and credential-free Docker config for every client call. Python
 3.10+ stdlib is sufficient; no repository-shadowed `-m` execution is required.
 Only a fresh directory containing a copied `runtime/Dockerfile` enters BuildKit;
 checkout auth and `.git` never enter the context. The CLI and builder are fixed,
-not caller options. `SENTINEL_RUNTIME` remains `None`; no VM gate changes.
+not caller options. Preparation does not change VM execution scope or admission.
 
 The workflow uses Docker's maintained Buildx docker-container driver. Its
 BuildKit container is **privileged by the driver**, independently of the later

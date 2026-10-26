@@ -55,18 +55,18 @@ LIMITS["sentinel-expiry"] = LIMITS["sentinel"]
 # Preparation artifact accepted in #266 comment 6406373578. Bound to original source
 # 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
 # comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
-# requires separate lead authorization; this identity enables only runtime-check.
+# requires separate lead authorization for each fixed task.
 PREPARED_RUNTIME = {'image_id': 'sha256:64584cc2aac727f22d8cdbf5c7d8cd77c457089ec069f6c5fae08b1f3199b284',
  'diffids': ['sha256:32ab39660fd51c6dc3aae486b42d42bbe8fe4c1db78eaf57bb9c21198de48a16',
              'sha256:172d9fc216fc879d123ffe1f5300064d15678f43aab3947e295981a546981d9d',
              'sha256:24bfc479ac939d1a9ddad8b376ab4bb1d04e9f29dca3c73e7ed324bdd6dfb819',
              'sha256:faae59f53ff65efdcce8a5776891be45764c44942c0eaea1a31c08e69374bd82']}
-# A separate VM execution gate: preparation/tool acceptance does not set this.
+# Fixed successful-sentinel identity; source activation does not authorize execution.
+# Each actual trial requires separate lead scope and reconciled shared-ledger admission.
 # No CLI, environment or caller option can supply or override either identity.
-SENTINEL_RUNTIME = None
+SENTINEL_RUNTIME = PREPARED_RUNTIME
 # Failure-only identity for the fixed sentinel-expiry proof, separately lead-scoped in #266.
 # This concrete identity does not authorize execution; each live trial needs lead scope.
-# The successful-VM runtime remains unset.
 EXPIRY_RUNTIME = PREPARED_RUNTIME
 # The observer must outlive the container timer (<= 300 s), so its own and the shell-local
 # secondary timeouts are fixed at 300 seconds from their later start and can never fire first.
@@ -586,7 +586,7 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
     expected_image = (PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else
-                      require_runtime(mode)["image_id"] if mode == "sentinel-expiry" else PINNED_IMAGE)
+                      require_runtime(mode)["image_id"] if mode in VM_MODES else PINNED_IMAGE)
     if image != expected_image:
         raise ValueError("image must be the fixed identity for this task")
     if mode == "runtime-check" and sources is not None:
@@ -1216,7 +1216,8 @@ def main(argv=None):
             print(f"refused: {exc}", file=sys.stderr)
             return EXIT["usage"]
     image = (PREPARED_RUNTIME["image_id"] if args.mode == "runtime-check" else
-             (EXPIRY_RUNTIME or PREPARED_RUNTIME)["image_id"] if args.mode == "sentinel-expiry" else PINNED_IMAGE)
+             ((EXPIRY_RUNTIME if args.mode == "sentinel-expiry" else SENTINEL_RUNTIME)
+              or PREPARED_RUNTIME)["image_id"] if args.mode in VM_MODES else PINNED_IMAGE)
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",

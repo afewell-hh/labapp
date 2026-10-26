@@ -107,7 +107,7 @@ class SentinelCase(tc.RunnerCase):
 
     def run_sentinel(self, daemon=None, delay=0.0, **kw):
         daemon = daemon or SentinelDaemon(self.clock)
-        result = cr.run_probe(tc.IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+        result = cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
                               admitted_at=self.clock() - delay, uid=os.getuid() or 1000, mode="sentinel",
                               sources=self.sources, **kw)
         return result, daemon
@@ -163,6 +163,42 @@ class FailClosedTests(SentinelCase):
         plan = json.loads(out.getvalue())
         self.assertEqual((plan["mode"], plan["executed"], plan["runtime_accepted"]), ("sentinel", False, False))
         self.assertIn("--device=/dev/kvm", plan["create"])
+
+    def test_cli_accepted_runtime_matches_execution_identity_without_docker_contact(self):
+        argv = ["--workspace-root", self.root, "--ledger-dir", self.ledger, "--mode", "sentinel",
+                "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c"]
+        with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cr.main(argv), 0)
+        plan = json.loads(out.getvalue())
+        self.assertTrue(plan["runtime_accepted"])
+        self.assertEqual(plan["image"], RUNTIME["image_id"])
+        with mock.patch.object(cr, "Backend", return_value=object()), \
+                mock.patch.object(cr, "run_probe", return_value={"outcome": "accepted"}) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cr.main(argv + ["--execute"]), 0)
+        self.assertEqual(run.call_args.args[0], RUNTIME["image_id"])
+        self.assertEqual(run.call_args.kwargs["mode"], "sentinel")
+
+    def test_old_probe_image_is_rejected_before_staging_or_docker(self):
+        daemon = SentinelDaemon(self.clock)
+        with mock.patch.object(cr.stage_tools, "stage", side_effect=AssertionError):
+            with self.assertRaisesRegex(ValueError, "fixed identity"):
+                cr.run_probe(tc.IMAGE, self.root, self.ledger, daemon, clock=self.clock,
+                             uid=os.getuid() or 1000, mode="sentinel", sources=self.sources)
+        self.assertEqual(daemon.calls, [])
+        self.assertEqual(os.listdir(self.root), [])
+        self.assertFalse(any(name.endswith(".json") for name in os.listdir(self.ledger)))
+
+    def test_success_record_releases_only_with_accepted_mode_identity(self):
+        result, _ = self.run_sentinel()
+        self.assertEqual(result["outcome"], "accepted", result)
+        record = self.record()
+        self.assertTrue(cr.released_record(record))
+        self.assertEqual(cr.unresolved_records(self.ledger), [])
+        self.assertFalse(cr.released_record({**record, "image": cr.PINNED_IMAGE}))
+        with mock.patch.object(cr, "SENTINEL_RUNTIME", None):
+            self.assertFalse(cr.released_record(record))
 
     def test_cli_has_no_image_or_command_option_and_requires_all_input_files(self):
         base = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "sentinel"]
@@ -444,10 +480,10 @@ class RuntimeSourceTests(unittest.TestCase):
             self.text = handle.read()
         self.code = "\n".join(line for line in self.text.splitlines() if not line.lstrip().startswith("#"))
 
-    def test_shipped_runtime_identity_is_unset(self):
-        # Setting it needs a separately accepted concrete prepared image (README gate).
+    def test_shipped_runtime_identity_is_the_accepted_preparation(self):
+        self.assertEqual(cr.SENTINEL_RUNTIME, cr.PREPARED_RUNTIME)
         with open(os.path.join(HERE, "container_runner.py")) as handle:
-            self.assertEqual(re.findall(r"(?m)^SENTINEL_RUNTIME = (.*)$", handle.read()), ["None"])
+            self.assertEqual(re.findall(r"(?m)^SENTINEL_RUNTIME = (.*)$", handle.read()), ["PREPARED_RUNTIME"])
 
     def test_context_is_the_dockerfile_alone(self):
         self.assertEqual(os.listdir(os.path.join(HERE, "runtime")), ["Dockerfile"])
