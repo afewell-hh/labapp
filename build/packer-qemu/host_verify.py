@@ -24,7 +24,7 @@ Any guest receipt, SHUTDOWN event or socket EOF afterwards is a failure.
 With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
 cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
 in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
-In the same mode one optional, strict `LABAPP-QEMU v1 ...` line (fixed literals plus bounded
+In the same mode one optional, strict `LABAPP-QEMU v2 ...` line (fixed literals plus bounded
 integers/flags, run-bound by nonce and inputs, at most one) is retained as the closed
 `qemu_witness` object; anything malformed, duplicate or stale fails. The observer does not
 require it: the runner requires it for `qemu-fixture` and rejects it for every other mode.
@@ -74,9 +74,13 @@ DIAG_RE = re.compile(
 # runner independently revalidates the resulting object. Nothing else from the guest is kept.
 QEMU_PREFIX = b"LABAPP-QEMU"
 QEMU_RE = re.compile(
-    rb"^LABAPP-QEMU v1 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
+    rb"^LABAPP-QEMU v2 nonce=([0-9a-f]{64}) inputs=([0-9a-f]{64}) "
     rb"accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
-    rb"i1=1:([0-9]{1,3}) i2=0:([0-9]{1,3}) w=([0-9]{1,3}) net=([01])([01])([01])$")
+    rb"i1=1:([0-9]{1,3}) i2=0:([0-9]{1,3}) w=([0-9]{1,3}) net=([01])([01])([01]) "
+    rb"sudo=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
+    rb"ssh=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
+    rb"less=([0-9][A-Za-z0-9.+:~\-]{0,63}):([0-9a-f]{64}) "
+    rb"caller=1000 sudo_uid=0 arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun$")
 CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ARMED_KIND = "labapp-expiry-armed v1"
@@ -312,15 +316,20 @@ class Qmp:
 
 
 def qemu_summary(groups):
-    """The closed object kept for a matched LABAPP-QEMU line (regex groups 3..8)."""
-    one, two, wit, route, ca, dns = groups[2:]
+    """The closed object kept for a matched v2 line; no native command text or paths."""
+    one, two, wit, route, ca, dns = groups[2:8]
+    native = {package: {"version": groups[index].decode("ascii"), "architecture": "amd64",
+                        "sha256": groups[index + 1].decode("ascii")}
+              for package, index in (("sudo", 8), ("openssh-client", 10), ("less", 12))}
     return {"accelerator": "kvm", "exit": 33, "uid": 0, "nonce_equal": True,
             "backing_unchanged": True, "workspace_removed": True,
             "install1": {"changed": True, "seconds": int(one)},
             "install2": {"changed": False, "seconds": int(two)},
             "witness_seconds": int(wit),
             "network": {"default_route": route == b"1", "ca_bundle": ca == b"1",
-                        "resolver": dns == b"1"}}
+                        "resolver": dns == b"1"},
+            "host_contract": {"native": native, "caller_uid": 1000, "sudo_uid": 0,
+                              "tun_open": True, "tun_api": True, "tap_flag": True, "tap_create": "unrun"}}
 
 
 def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,

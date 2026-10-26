@@ -27,6 +27,11 @@ import test_stage_tools as ts
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROVISION = os.path.join(os.path.dirname(HERE), "provision")
 RUNTIME = tsn.RUNTIME
+NATIVE = {"sudo": {"version": "1.9.15p5-3ubuntu5.24.04.4", "architecture": "amd64", "sha256": "a" * 64},
+          "openssh-client": {"version": "1:9.6p1-3ubuntu13.20", "architecture": "amd64", "sha256": "b" * 64},
+          "less": {"version": "590-2ubuntu2.1", "architecture": "amd64", "sha256": "c" * 64}}
+HOST = {"native": NATIVE, "caller_uid": 1000, "sudo_uid": 0,
+        "tun_open": True, "tun_api": True, "tap_flag": True, "tap_create": "unrun"}
 
 spec = importlib.util.spec_from_file_location("assert_qemu", os.path.join(HERE, "guest", "assert-qemu.py"))
 aq = importlib.util.module_from_spec(spec)
@@ -35,13 +40,17 @@ spec.loader.exec_module(aq)
 GOOD_WITNESS = {"accelerator": "kvm", "exit": 33, "uid": 0, "nonce_equal": True, "backing_unchanged": True,
                 "workspace_removed": True, "install1": {"changed": True, "seconds": 41},
                 "install2": {"changed": False, "seconds": 12}, "witness_seconds": 3,
-                "network": {"default_route": True, "ca_bundle": True, "resolver": True}}
+                "network": {"default_route": True, "ca_bundle": True, "resolver": True}, "host_contract": HOST}
 
 
 def qemu_line(nonce=thv.NONCE, inputs=thv.INPUTS, **more):
     fields = {"accel": "kvm", "exit": "33", "uid": "0", "equal": "1", "backing": "1", "removed": "1",
-              "i1": "1:41", "i2": "0:12", "w": "3", "net": "111", **more}
-    return (f"LABAPP-QEMU v1 nonce={nonce} inputs={inputs} " + " ".join(f"{k}={v}" for k, v in fields.items())
+              "i1": "1:41", "i2": "0:12", "w": "3", "net": "111",
+              **{name: NATIVE[p]["version"] + ":" + NATIVE[p]["sha256"]
+                 for name, p in (("sudo", "sudo"), ("ssh", "openssh-client"), ("less", "less"))},
+              "caller": "1000", "sudo_uid": "0", "arch": "amd64", "tun_open": "1", "tun_api": "1",
+              "tap_flag": "1", "tap_create": "unrun", **more}
+    return (f"LABAPP-QEMU v2 nonce={nonce} inputs={inputs} " + " ".join(f"{k}={v}" for k, v in fields.items())
             + "\n").encode()
 
 
@@ -450,6 +459,35 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(flags["network"], {"default_route": False, "ca_bundle": True, "resolver": False})
         self.assertTrue(cr.qemu_witness_valid(flags))
 
+    def test_native_and_feasibility_objects_reject_missing_extra_wrong_type_and_false_claims(self):
+        bad = [None, [], {}, {**HOST, "extra": True}, {**HOST, "caller_uid": 0},
+               {**HOST, "sudo_uid": False}, {**HOST, "tun_api": 1}, {**HOST, "tun_open": False},
+               {**HOST, "tap_flag": False}, {**HOST, "tap_create": "passed"},
+               {**HOST, "native": []}, {**HOST, "native": {}}]
+        for package in NATIVE:
+            for change in ({"version": "x"}, {"version": "1" * 65}, {"version": "1\n"},
+                           {"version": 1}, {"sha256": "G" * 64}, {"sha256": 1},
+                           {"architecture": "arm64"}, {"extra": "SECRET"}):
+                native = copy.deepcopy(NATIVE)
+                native[package].update(change)
+                bad.append({**HOST, "native": native})
+            for key in NATIVE[package]:
+                native = copy.deepcopy(NATIVE)
+                del native[package][key]
+                bad.append({**HOST, "native": native})
+        for host in bad:
+            with self.subTest(host=host):
+                self.assertFalse(cr.qemu_witness_valid({**GOOD_WITNESS, "host_contract": host}))
+
+    def test_maximum_native_version_fields_fit_unchanged_transport_bounds(self):
+        line = qemu_line(**{name: "1" * 64 + ":" + "a" * 64 for name in ("sudo", "ssh", "less")})
+        self.assertLess(len(line), hv.SERIAL_LINE_MAX)
+        witness = hv.qemu_summary(hv.QEMU_RE.fullmatch(line.rstrip(b"\n")).groups())
+        body = {"nonce": thv.NONCE, "inputs": thv.INPUTS, "receipt": "ok", "shutdown": "guest-shutdown",
+                "cloud_init": hv.CLOUD_INIT, "qemu_witness": witness}
+        self.assertLess(len(json.dumps(body).encode()), cr.RESULT_CAP)
+        self.assertTrue(cr.qemu_witness_valid(witness))
+
     def test_absent_line_keeps_the_existing_result_for_other_modes(self):
         result = self.run_case(thv.evidence() + thv.receipt())
         self.assertNotIn("qemu_witness", result)
@@ -462,7 +500,11 @@ class ObserverTests(unittest.TestCase):
         bad = [qemu_line(accel="tcg"), qemu_line(accel="KVM"), qemu_line(exit="34"), qemu_line(uid="1000"),
                qemu_line(equal="0"), qemu_line(backing="0"), qemu_line(removed="0"), qemu_line(i1="0:41"),
                qemu_line(i2="1:12"), qemu_line(i1="1:1000"), qemu_line(w="-1"), qemu_line(net="112"),
-               qemu_line(net="11"), qemu_line(secret="1"), qemu_line().replace(b" v1 ", b" v2 "),
+               qemu_line(net="11"), qemu_line(secret="1"), qemu_line().replace(b" v2 ", b" v1 "),
+               qemu_line(caller="0"), qemu_line(sudo_uid="1000"), qemu_line(tun_open="0"),
+               qemu_line(tun_api="0"), qemu_line(tap_flag="0"), qemu_line(tap_create="passed"),
+               qemu_line(arch="arm64"), qemu_line(sudo="1:" + "G" * 64),
+               qemu_line(ssh="1" * 65 + ":" + "a" * 64), qemu_line(less="/path:" + "a" * 64),
                qemu_line().replace(b"LABAPP-QEMU", b"LABAPP-QEMU x"), qemu_line().rstrip(b"\n") + b" tail\n",
                qemu_line(nonce="G" * 64)]
         for line in bad:
@@ -544,15 +586,28 @@ class GuestCase(unittest.TestCase):
         self.witness_result = (0, (json.dumps(WITNESS_JSON) + "\n").encode())
         self.commands = []
         self.mutate = None
+        self.remaining = copy.deepcopy(NATIVE)
+        self.tun_result = None
+        self.sudo_result = (0, b"0\n")
 
     def cfg(self, euid=0):
         return aq.Config(self.here, state=self.state, reason=self.reason, tty=self.files["tty"],
                          route=self.files["route"], resolver=self.files["resolver"], ca=self.files["ca"],
                          euid=lambda: euid, run=self.fake, clock=Tick(), owner=os.getuid(),
-                         artifacts=(self.files["a1"], self.files["a2"]))
+                         artifacts=(self.files["a1"], self.files["a2"]),
+                         inventory=lambda: copy.deepcopy(self.remaining), tun=self.fake_tun,
+                         lookup=lambda _: type("Owner", (), {"pw_uid": 1000, "pw_gid": 1000})())
+
+    def fake_tun(self):
+        if self.tun_result:
+            raise self.tun_result
 
     def fake(self, argv, seconds):
         self.commands.append((list(argv), seconds))
+        if argv[0] == "/usr/sbin/runuser":
+            if isinstance(self.sudo_result, Exception):
+                raise self.sudo_result
+            return self.sudo_result
         if argv[0] == "/usr/bin/dpkg-query":
             rows = "".join(f"{n}\t{v}\tinstalled\n" for n, v in self.packages.items())
             return 0, (rows + "unrelated\t9\tinstalled\n").encode()
@@ -714,6 +769,31 @@ class GuestFailureTests(GuestCase):
     def test_the_second_run_failures_are_attributed_to_run_two(self):
         self.installs = [(0, install_json(True)), (1, b"x")]
         self.fails([("baseline",), ("install", "1")], ("install", "2"), r"^inst2-refused-s007$")
+
+    def test_remaining_host_version_hash_and_identity_drift_fail_at_each_boundary(self):
+        for phase in (1, 2, 3):
+            for field, value in (("version", "9"), ("sha256", "f" * 64), ("identity", [999])):
+                with self.subTest(phase=phase, field=field):
+                    self.setUp()
+                    self.assertEqual(self.go("baseline"), 0)
+                    if phase >= 2:
+                        self.assertEqual(self.go("install", "1"), 0)
+                    if phase == 3:
+                        self.assertEqual(self.go("install", "2"), 0)
+                    self.remaining["sudo"][field] = value
+                    step = ("install", str(phase)) if phase < 3 else ("witness",)
+                    self.assertEqual(self.go(*step), 1)
+                    self.assertEqual(self.token(), "host-drift")
+                    self.assertEqual(self.tty(), b"")
+
+    def test_sudo_and_tun_failures_never_emit_a_success_summary(self):
+        for result in ((1, b"SECRET"), (0, b"1000\n"), aq.Timeout("timeout"), aq.Timeout("output")):
+            self.setUp()
+            self.sudo_result = result
+            self.fails([("baseline",), ("install", "1"), ("install", "2")], ("witness",), r"^sudo-")
+        self.setUp()
+        self.tun_result = aq.Check("tun-api")
+        self.fails([("baseline",), ("install", "1"), ("install", "2")], ("witness",), r"^tun-api$")
 
     def test_malformed_or_out_of_contract_installer_output_is_rejected(self):
         good = json.loads(install_json(True))

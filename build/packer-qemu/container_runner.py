@@ -98,8 +98,11 @@ RESULT_CAP = 4096
 SENTINEL_KEYS = {"nonce", "inputs", "shutdown", "receipt", "cloud_init"}
 QEMU_KEYS = SENTINEL_KEYS | {"qemu_witness"}
 QEMU_WITNESS_KEYS = {"accelerator", "exit", "uid", "nonce_equal", "backing_unchanged", "workspace_removed",
-                     "install1", "install2", "witness_seconds", "network"}
+                     "install1", "install2", "witness_seconds", "network", "host_contract"}
 QEMU_NETWORK_KEYS = {"default_route", "ca_bundle", "resolver"}
+HOST_KEYS = {"native", "caller_uid", "sudo_uid", "tun_open", "tun_api", "tap_flag", "tap_create"}
+HOST_PACKAGES = {"sudo", "openssh-client", "less"}
+HOST_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.+:~\-]{0,63}\Z")
 QEMU_SECONDS_CAP = 999
 # What a passing qemu-fixture does and does not establish; retained in evidence verbatim.
 QEMU_CLAIMS = {"caller_uid": 0, "student_readiness": False, "full_vlab": False, "reboot": False,
@@ -925,6 +928,22 @@ def _seconds(value):
     return type(value) is int and 0 <= value <= QEMU_SECONDS_CAP
 
 
+def host_contract_valid(value):
+    """Fixed native observations and the narrow sudo/TUN claims, independently revalidated."""
+    if not isinstance(value, dict) or set(value) != HOST_KEYS:
+        return False
+    native = value["native"]
+    return (isinstance(native, dict) and set(native) == HOST_PACKAGES
+            and all(isinstance(row, dict) and set(row) == {"version", "architecture", "sha256"}
+                    and isinstance(row["version"], str) and HOST_VERSION_RE.fullmatch(row["version"])
+                    and _exact(row["architecture"], "amd64") and isinstance(row["sha256"], str)
+                    and re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
+                    for row in native.values())
+            and _exact(value["caller_uid"], 1000) and _exact(value["sudo_uid"], 0)
+            and all(_exact(value[k], True) for k in ("tun_open", "tun_api", "tap_flag"))
+            and _exact(value["tap_create"], "unrun"))
+
+
 def qemu_witness_valid(value):
     """The observer's closed qemu_witness object, revalidated as untrusted container output: exact
     keys and types, KVM, exit 33, root caller, nonce equality, unchanged backing, removed workspace,
@@ -941,7 +960,8 @@ def qemu_witness_valid(value):
                 and _exact(install2["changed"], False) and _seconds(install2["seconds"])
                 and _seconds(value["witness_seconds"])
                 and isinstance(network, dict) and set(network) == QEMU_NETWORK_KEYS
-                and all(type(flag) is bool for flag in network.values()))
+                and all(type(flag) is bool for flag in network.values())
+                and host_contract_valid(value["host_contract"]))
     except (KeyError, TypeError):
         return False
 
