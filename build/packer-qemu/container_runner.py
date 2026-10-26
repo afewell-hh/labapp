@@ -64,17 +64,19 @@ PREPARED_RUNTIME = {'image_id': 'sha256:64584cc2aac727f22d8cdbf5c7d8cd77c457089e
 # A separate VM execution gate: preparation/tool acceptance does not set this.
 # No CLI, environment or caller option can supply or override either identity.
 SENTINEL_RUNTIME = None
-# Failure-only identity for the fixed sentinel-expiry proof; a separate gate so the success
-# runtime stays unset. Activation (setting it to PREPARED_RUNTIME) needs separate lead review.
-EXPIRY_RUNTIME = None
+# Failure-only identity for the fixed sentinel-expiry proof, separately lead-scoped in #266.
+# This concrete identity does not authorize execution; each live trial needs lead scope.
+# The successful-VM runtime remains unset.
+EXPIRY_RUNTIME = PREPARED_RUNTIME
 # The observer must outlive the container timer (<= 300 s), so its own and the shell-local
-# secondary timeouts are set far above the work window and can never fire first.
-EXPIRY_VERIFY_SECONDS = 3600
+# secondary timeouts are fixed at 300 seconds from their later start and can never fire first.
+EXPIRY_VERIFY_SECONDS = 300
 EXPIRY_MIN_REMAINING = 150     # work left after staging for startup, paused dwell and exit
 EXPIRY_MIN_DWELL = 60          # armed witness must precede the container timer by this much
-ARMED_KEYS = {"kind", "armed", "armed_at", "nonce", "inputs"}
+ARMED_KEYS = {"kind", "armed", "armed_at", "nonce", "inputs", "boot_id"}
 ARMED_KIND = "labapp-expiry-armed v1"
-START_WITNESS_RE = re.compile(r"^start (\d{1,12}) (\d{1,4})\n$")# Proposed, unmeasured reservation inside the ORIGINAL work window for Docker calls, Packer
+START_WITNESS_RE = re.compile(r"^start (\d{1,12}) (\d{1,4})\n$")
+# Proposed, unmeasured reservation inside the ORIGINAL work window for Docker calls, Packer
 # start, ISO creation, disk conversion, rehash and result reads. The pinned plugin's
 # 5 min shutdown_timeout is NOT subtracted: with communicator=none the observer returns
 # only after guest shutdown, and a later shutdown wait returns at once.
@@ -579,7 +581,8 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
         require_runtime(mode)
     w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
-    expected_image = PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else PINNED_IMAGE
+    expected_image = (PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else
+                      require_runtime(mode)["image_id"] if mode == "sentinel-expiry" else PINNED_IMAGE)
     if image != expected_image:
         raise ValueError("image must be the fixed identity for this task")
     if mode == "runtime-check" and sources is not None:
@@ -724,6 +727,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         if status in ("exited", "dead"):
             break
         if budget.work_left() <= 0:
+            if own["mode"] == "sentinel-expiry":
+                own["exit_seen_at"] = clock()
+                _accept_expiry(own, result, budget, clock, oom, code, live=True)
             result["reason"] = "host_expiry"     # internal timer should have won
             return
         sleep(min(POLL, max(budget.work_left(), 0)))
@@ -959,8 +965,8 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
     result["exit_code"] = code
 
 
-def _armed_valid(raw, staged, n, t):
-    """The observer's armed witness is untrusted container output: exactly the five fixed keys,
+def _armed_valid(raw, staged, n, t, boot_id):
+    """The observer's armed witness is untrusted container output: exactly the six fixed keys,
     this run's nonce and guest-receipt identity, and a paused-state time that leaves at least
     EXPIRY_MIN_DWELL seconds before the container timer (start n, t seconds) fires."""
     try:
@@ -970,12 +976,32 @@ def _armed_valid(raw, staged, n, t):
         return False
     return (isinstance(body, dict) and set(body) == ARMED_KEYS and body["kind"] == ARMED_KIND
             and body["armed"] == "paused" and body["nonce"] == staged["nonce"]
-            and body["inputs"] == staged["guest_receipt"]
+            and body["inputs"] == staged["guest_receipt"] and body["boot_id"] == boot_id
             and type(body["armed_at"]) is int and n <= body["armed_at"]
             and (n + t) - body["armed_at"] >= EXPIRY_MIN_DWELL)
 
 
-def _accept_expiry(own, result, budget, clock, oom, code):
+def marker_absent(directory, name):
+    """True only for confirmed ENOENT beneath anchored, nonsymlink parents."""
+    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in directory.split("/")[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=parent)
+            os.close(parent)
+            parent = child
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        return False
+    except OSError:
+        return False
+    finally:
+        os.close(parent)
+
+
+def _accept_expiry(own, result, budget, clock, oom, code, live=False):
     """Accept a FAILURE-ONLY proof: the guest was paused by the sole observer (running, stop,
     paused all answered) and the container's own PID 1 timer ended Packer/QEMU at least
     EXPIRY_MIN_DWELL seconds later. It is never a successful guest or build: a completed build
@@ -998,23 +1024,25 @@ def _accept_expiry(own, result, budget, clock, oom, code):
     raw = {"build.out": read_step(out, "build.out"), "build.err": read_step(out, "build.err"),
            "witness": read_step(out, "witness", 256), "steps": read_step(out, "steps"),
            "armed.json": read_step(work, "armed.json", RESULT_CAP),
-           "verified.json": read_step(work, "verified.json", RESULT_CAP)}
+           "verified.json": read_step(work, "verified.json", RESULT_CAP),
+           "armed.failed": read_step(work, "armed.json.failed", RESULT_CAP)}
     for name, data in raw.items():
         if data is not None:
             evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
             if name in ("build.out", "build.err", "steps"):
                 evidence[name]["excerpt"] = data[:EXCERPT].decode("ascii", "replace")
+    if live:
+        return                 # evidence only; no acceptance or mutation of live output
+    if not marker_absent(work, "armed.json.failed"):
+        result["reason"] = "observer_failed"
+        return
     artifact = os.path.join(work, "out", "labapp.qcow2")
     try:
-        if os.path.lexists(artifact):
-            evidence["artifact"] = {"bytes": os.lstat(artifact).st_size}      # not hashed: disposable partial
-            os.unlink(artifact)
-            if os.path.lexists(artifact):
-                raise OSError("artifact still exists")
-            evidence["artifact"]["deleted"] = True
-    except OSError:
-        result["reason"] = "artifact_invalid_or_not_deleted"
-        return
+        handle, info = stage_tools.open_regular(artifact, stage_tools.ARTIFACT_LIMIT)
+        handle.close()
+        evidence["artifact"] = {"bytes": info.st_size, "disposal": "owned_workspace_cleanup"}
+    except (OSError, stage_tools.StageError):
+        pass                    # optional partial output; never follow aliases or unlink it here
     missing = sorted(n for n in ("build.out", "build.err", "witness") if raw[n] is None)
     if missing:
         evidence["invalid_files"] = missing
@@ -1023,10 +1051,10 @@ def _accept_expiry(own, result, budget, clock, oom, code):
     if oom or code not in EXPECTED_EXIT:
         result["reason"] = "unexpected_exit"
         return
-    if raw["verified.json"] is not None:
+    if not marker_absent(work, "verified.json"):
         result["reason"] = "unexpected_success_marker"
         return
-    if raw["steps"] is not None:
+    if not marker_absent(out, "steps"):
         result["reason"] = "build_completed_before_expiry"
         return
     match = START_WITNESS_RE.fullmatch(raw["witness"].decode("ascii", "replace"))
@@ -1034,18 +1062,24 @@ def _accept_expiry(own, result, budget, clock, oom, code):
     if not match or t != own["deadline"] - n - 1 - KILL_AFTER or t < MIN_TIMER or n < int(own["started_at"]) - 1:
         result["reason"] = "no_timer_witness"
         return
-    if own["exit_seen_at"] - own["started_at"] < t - 1:
+    if own["exit_seen_at"] < n + t:
         result["reason"] = "exited_before_timer"
         return
     if raw["armed.json"] is None:
         result["reason"] = "missing_armed_witness"
         return
-    if not _armed_valid(raw["armed.json"], staged, n, t):
+    if not _armed_valid(raw["armed.json"], staged, n, t, own["boot_id"]):
         result["reason"] = "invalid_or_short_armed_witness"
         return
+    def evidence_checkpoint():
+        # Work already ended; immutable reads use the original cleanup allocation,
+        # retaining 60 seconds for exact container/workspace cleanup. No renewal.
+        if own["cancelled"]:
+            raise Cancelled()
+        if clock() >= budget.deadline - 60:
+            raise Expired()
     try:
-        intact = stage_tools.verify_staged(own["workspace"], staged,
-                                           lambda: _checkpoint(own, budget, clock))
+        intact = stage_tools.verify_staged(own["workspace"], staged, evidence_checkpoint)
     except (OSError, stage_tools.StageError):
         intact = False
     if not intact:
@@ -1177,7 +1211,8 @@ def main(argv=None):
         except ValueError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return EXIT["usage"]
-    image = PREPARED_RUNTIME["image_id"] if args.mode == "runtime-check" else PINNED_IMAGE
+    image = (PREPARED_RUNTIME["image_id"] if args.mode == "runtime-check" else
+             (EXPIRY_RUNTIME or PREPARED_RUNTIME)["image_id"] if args.mode == "sentinel-expiry" else PINNED_IMAGE)
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",

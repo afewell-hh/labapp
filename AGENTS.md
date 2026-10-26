@@ -47,8 +47,8 @@ Codex does not document an import mechanism, so this file uses plain links;
   artifacts and tool checks do not enable VM execution. `runtime/Dockerfile`
   describes the separately gated preparation recipe. Fixed hosted preparation hooks
   (`runtime-prepare.sh`, `runtime_prepare.py`) build no VM and require separately
-  scoped lead execution. The fixed `sentinel-expiry` failure-only VM proof is likewise gated
-  off (`EXPIRY_RUNTIME=None`). Results and remaining gates live in GitHub.
+  scoped lead execution. The fixed `sentinel-expiry` failure-only VM proof has a concrete pinned
+  runtime identity; actual execution still requires separately scoped lead authorization. Results and remaining gates live in GitHub.
 - `docs/runbooks/`: manual image build and troubleshooting
 - `docs/`: other docs ([index](docs/README.md)); `STUDENT_QUICK_START.md`: student guide
 - `_archive/`, `archive2/`: archived, not part of the current project

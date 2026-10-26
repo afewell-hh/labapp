@@ -55,7 +55,7 @@ class ExpiryDaemon(tc.FakeDaemon):
         with open(os.path.join(ws, "cd", "MANIFEST"), "rb") as handle:
             guest = hashlib.sha256(handle.read()).hexdigest()
         good = {"kind": hv.ARMED_KIND, "armed": "paused", "armed_at": n + self.armed_offset,
-                "nonce": nonce, "inputs": guest}
+                "nonce": nonce, "inputs": guest, "boot_id": cr.host_boot_id()}
         armed = {
             "good": json.dumps(good),
             "stale_nonce": json.dumps({**good, "nonce": "1" * 64}),
@@ -118,7 +118,7 @@ class ExpiryCase(tc.RunnerCase):
 
     def run_expiry(self, daemon=None, delay=0.0, **kw):
         daemon = daemon or ExpiryDaemon(self.clock)
-        result = cr.run_probe(tc.IMAGE, self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
+        result = cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock, sleep=self.clock.sleep,
                               admitted_at=self.clock() - delay, uid=os.getuid() or 1000,
                               mode="sentinel-expiry", sources=self.sources, **kw)
         return result, daemon
@@ -131,7 +131,7 @@ class GateAndArgvTests(ExpiryCase):
                 mock.patch.object(cr.stage_tools, "stage", side_effect=AssertionError), \
                 mock.patch.object(cr, "kvm_preflight", side_effect=AssertionError):
             with self.assertRaises(ValueError):
-                cr.run_probe(tc.IMAGE, self.root, self.ledger, daemon, clock=self.clock,
+                cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock,
                              uid=os.getuid() or 1000, mode="sentinel-expiry", sources=self.sources)
         self.assertEqual((daemon.calls, os.listdir(self.root), os.listdir(self.ledger)), ([], [], []))
 
@@ -144,10 +144,10 @@ class GateAndArgvTests(ExpiryCase):
             with self.assertRaises(ValueError):      # success runtime does not enable the expiry proof
                 cr.require_runtime("sentinel-expiry")
 
-    def test_shipped_expiry_identity_is_unset(self):
+    def test_shipped_expiry_identity_is_concrete_and_success_unset(self):
         with open(os.path.join(HERE, "container_runner.py")) as handle:
             text = handle.read()
-        self.assertEqual(re.findall(r"(?m)^EXPIRY_RUNTIME = (.*)$", text), ["None"])
+        self.assertEqual(re.findall(r"(?m)^EXPIRY_RUNTIME = (.*)$", text), ["PREPARED_RUNTIME"])
         self.assertEqual(re.findall(r"(?m)^SENTINEL_RUNTIME = (.*)$", text), ["None"])
 
     def test_cli_execute_refused_and_plan_contacts_nothing(self):
@@ -221,9 +221,119 @@ class AcceptanceTests(ExpiryCase):
         for key in ("build.out", "build.err", "witness", "armed.json"):
             self.assertRegex(evidence[key]["sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn("verified.json", evidence)
-        self.assertTrue(evidence["artifact"]["deleted"])
+        self.assertEqual(evidence["artifact"]["disposal"], "owned_workspace_cleanup")
         self.assertEqual(daemon.containers, {})
         self.assertEqual((self.record()["state"], self.record()["mode"]), ("released", "sentinel-expiry"))
+
+    def test_post_expiry_rehash_uses_original_total_deadline_with_cleanup_reserve(self):
+        real = st.verify_staged
+        def slow(workspace, staged, check):
+            self.clock.now += 12
+            check()
+            return real(workspace, staged, check)
+        with mock.patch.object(st, "verify_staged", slow):
+            result, _ = self.run_expiry()
+        self.assertEqual((result["outcome"], result["cleanup"]), ("accepted", "verified"))
+        record = self.record()
+        self.assertGreater(self.clock.now, record["work_deadline"])
+        self.assertLess(self.clock.now, record["deadline"])
+        self.assertEqual(record["deadline"] - record["admitted_at"], 420)
+        self.setUp()
+        def exhausted(workspace, staged, check):
+            self.clock.now += 65
+            check()
+            return True
+        with mock.patch.object(st, "verify_staged", exhausted):
+            result, _ = self.run_expiry()
+        self.assertEqual((result["outcome"], result["reason"], result["cleanup"]),
+                         ("failed", "budget_exhausted", "verified"))
+
+    def test_secondary_timeout_is_fixed_and_later_than_original_deadline(self):
+        self.assertEqual(cr.EXPIRY_VERIFY_SECONDS, 300)
+
+    def test_artifact_parent_alias_cannot_delete_host_canary(self):
+        host = os.path.join(os.path.dirname(self.root), "host-output")
+        os.mkdir(host)
+        canary = os.path.join(host, "labapp.qcow2")
+        with open(canary, "wb") as handle:
+            handle.write(b"host-canary")
+        class Aliased(ExpiryDaemon):
+            def start(inner, container):
+                super().start(container)
+                out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                artifact_dir = os.path.join(out, "work", "out")
+                os.rename(artifact_dir, artifact_dir + "-owned")
+                os.symlink(host, artifact_dir)
+        result, _ = self.run_expiry(Aliased(self.clock))
+        self.assertEqual(result["cleanup"], "verified")
+        with open(canary, "rb") as handle:
+            self.assertEqual(handle.read(), b"host-canary")
+        self.assertNotIn("artifact", result["evidence"])
+
+    def test_invalid_marker_types_cannot_look_absent(self):
+        for marker in ("steps", "verified.json", "armed.json.failed"):
+            for kind in ("oversized", "symlink", "fifo"):
+                with self.subTest(marker=marker, kind=kind):
+                    self.setUp()
+                    class Marked(ExpiryDaemon):
+                        def start(inner, container):
+                            super().start(container)
+                            out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                            path = os.path.join(out, marker) if marker == "steps" else os.path.join(out, "work", marker)
+                            if kind == "oversized":
+                                with open(path, "wb") as handle:
+                                    handle.truncate(cr.STEP_CAP + 1)
+                            elif kind == "symlink":
+                                os.symlink("missing", path)
+                            else:
+                                os.mkfifo(path)
+                    result, _ = self.run_expiry(Marked(self.clock))
+                    self.assertEqual(result["outcome"], "failed")
+                    self.assertEqual(result["reason"], {"steps": "build_completed_before_expiry",
+                                     "verified.json": "unexpected_success_marker",
+                                     "armed.json.failed": "observer_failed"}[marker])
+
+    def test_host_expiry_retains_logs_without_accepting_or_mutating_live_output(self):
+        class Hung(ExpiryDaemon):
+            def start(inner, container):
+                super().start(container)
+                container["exit_at"] += 1000
+        result, _ = self.run_expiry(Hung(self.clock))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "host_expiry"))
+        self.assertIn("packer started", result["evidence"]["build.out"]["excerpt"])
+        self.assertIn("armed.json", result["evidence"])
+        self.assertEqual(result["cleanup"], "verified")
+
+    def test_wrong_boot_identity_is_not_a_fresh_witness(self):
+        class WrongBoot(ExpiryDaemon):
+            def start(inner, container):
+                super().start(container)
+                out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                path = os.path.join(out, "work", "armed.json")
+                with open(path) as handle:
+                    body = json.load(handle)
+                body["boot_id"] = "00000000-0000-0000-0000-000000000000"
+                with open(path, "w") as handle:
+                    json.dump(body, handle)
+        result, _ = self.run_expiry(WrongBoot(self.clock))
+        self.assertEqual(result["reason"], "invalid_or_short_armed_witness")
+
+    def test_later_observer_failure_revokes_arming_even_if_packer_hangs_until_timer(self):
+        class FailedObserver(ExpiryDaemon):
+            def start(inner, container):
+                super().start(container)
+                out = next(a for a in container["args"] if a.endswith(",dst=/out")).split("src=")[1].split(",")[0]
+                witness = os.path.join(out, "work", "armed.json")
+                args = hv.parse(["--qmp", "/q", "--serial", "/s", "--result", "/r", "--timeout", "300",
+                                 "--nonce", thv.NONCE, "--inputs", thv.INPUTS, "--expiry-witness", witness])
+                with mock.patch.object(hv, "connect", return_value=mock.Mock()), \
+                     mock.patch.object(hv, "observe", side_effect=hv.Failure("guest-reset")):
+                    with self.assertRaises(hv.Failure):
+                        hv.verify(args)
+                self.assertFalse(os.path.lexists(witness))
+        result, _ = self.run_expiry(FailedObserver(self.clock))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "observer_failed"))
+        self.assertEqual(result["cleanup"], "verified")
 
     def test_exit_137_after_timer_escalation_is_also_expiry(self):
         result, _ = self.run_expiry(ExpiryDaemon(self.clock, exit_code=137))
@@ -303,7 +413,7 @@ class AcceptanceTests(ExpiryCase):
                 os.rename(work, work + "-owned")
                 os.symlink(host, work)
         result, _ = self.run_expiry(Aliased(self.clock))
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "missing_armed_witness"))
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "observer_failed"))
         self.assertNotIn("armed.json", result["evidence"])
         self.assertNotIn("HOST_ONLY_CANARY", json.dumps(result))
 
@@ -329,13 +439,13 @@ class AcceptanceTests(ExpiryCase):
 
 class StagingTests(ts.StageCase):
     def test_expiry_staging_reuses_guest_inputs_and_asks_for_the_armed_witness(self):
-        staged = self.stage(task="sentinel-expiry", verify_seconds=3600)
+        staged = self.stage(task="sentinel-expiry", verify_seconds=300)
         text = self.read("in", st.SENTINEL_VARS_NAME).decode()
         manifest_hash = hashlib.sha256(self.read("cd", "MANIFEST")).hexdigest()
         self.assertEqual(staged["guest_receipt"], manifest_hash)
         self.assertNotEqual(staged["inputs"], staged["guest_receipt"])
         self.assertIn(f'inputs = "{manifest_hash}"', text)
-        self.assertIn("verify_seconds = 3600\n", text)
+        self.assertIn("verify_seconds = 300\n", text)
         self.assertIn("expiry_proof = true\n", text)
         self.assertNotIn("require_sentinel_evidence", text)
         self.assertEqual(sorted(os.listdir(os.path.join(self.ws, "cd"))),
@@ -477,29 +587,52 @@ class WitnessFileAndCliTests(unittest.TestCase):
 
     def test_witness_is_one_strict_exclusive_private_file(self):
         path = os.path.join(self.tmp.name, "armed.json")
-        hv.write_armed(path, thv.NONCE, thv.INPUTS, 1234.9)
+        hv.write_armed(path, thv.NONCE, thv.INPUTS, 1234.9, cr.host_boot_id())
         self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
         with open(path, "rb") as handle:
             raw = handle.read()
-        self.assertEqual(json.loads(raw), {"kind": hv.ARMED_KIND, "armed": "paused", "armed_at": 1234,
+        self.assertEqual(json.loads(raw), {"kind": hv.ARMED_KIND, "armed": "paused", "armed_at": 1235, "boot_id": cr.host_boot_id(),
                                            "nonce": thv.NONCE, "inputs": thv.INPUTS})
         with self.assertRaises(FileExistsError):
-            hv.write_armed(path, thv.NONCE, thv.INPUTS, 1)
+            hv.write_armed(path, thv.NONCE, thv.INPUTS, 1, cr.host_boot_id())
         link = os.path.join(self.tmp.name, "link.json")
         os.symlink(os.path.join(self.tmp.name, "elsewhere"), link)
         with self.assertRaises(OSError):
-            hv.write_armed(link, thv.NONCE, thv.INPUTS, 1)
+            hv.write_armed(link, thv.NONCE, thv.INPUTS, 1, cr.host_boot_id())
 
     def test_runner_and_observer_agree_on_the_witness_contract(self):
         self.assertEqual(cr.ARMED_KIND, hv.ARMED_KIND)
         path = os.path.join(self.tmp.name, "armed.json")
-        hv.write_armed(path, thv.NONCE, thv.INPUTS, 1100)
+        hv.write_armed(path, thv.NONCE, thv.INPUTS, 1100, cr.host_boot_id())
         with open(path, "rb") as handle:
             raw = handle.read()
         staged = {"nonce": thv.NONCE, "guest_receipt": thv.INPUTS}
-        self.assertTrue(cr._armed_valid(raw, staged, 1000, 200))        # 100 s dwell
-        self.assertFalse(cr._armed_valid(raw, staged, 1000, 150))       # 50 s dwell
-        self.assertFalse(cr._armed_valid(raw, staged, 1101, 500))       # armed before the timer began
+        self.assertTrue(cr._armed_valid(raw, staged, 1000, 200, cr.host_boot_id()))        # 100 s dwell
+        self.assertFalse(cr._armed_valid(raw, staged, 1000, 150, cr.host_boot_id()))       # 50 s dwell
+        self.assertFalse(cr._armed_valid(raw, staged, 1101, 500, cr.host_boot_id()))       # armed before the timer began
+
+    def test_prearm_rejects_under_sixty_seconds_before_creating_witness(self):
+        timer_path = os.path.join(self.tmp.name, "timer")
+        target = os.path.join(self.tmp.name, "armed.json")
+        real_open = os.open
+        def opened(path, *args, **kwargs):
+            return real_open(timer_path if path == "/out/witness" else path, *args, **kwargs)
+        with open(timer_path, "wb") as handle:
+            handle.write(b"start 900 160\n")
+        with mock.patch.object(hv.os, "open", opened), \
+             mock.patch.object(hv.time, "clock_gettime", return_value=1000.1):
+            with self.assertRaisesRegex(hv.Failure, "insufficient-expiry-dwell"):
+                hv.arm_expiry(target, thv.NONCE, thv.INPUTS)
+        self.assertFalse(os.path.lexists(target))
+        with open(timer_path, "wb") as handle:
+            handle.write(b"start 900 161\n")
+        with mock.patch.object(hv.os, "open", opened), \
+             mock.patch.object(hv.time, "clock_gettime", return_value=1000.1):
+            hv.arm_expiry(target, thv.NONCE, thv.INPUTS)
+        with open(target) as handle:
+            body = json.load(handle)
+        self.assertEqual(body["armed_at"], 1001)
+        self.assertEqual(body["boot_id"], cr.host_boot_id())
 
     def test_cli_flag_rules(self):
         base = ["--qmp", "/q", "--serial", "/s", "--result", "/r", "--timeout", "10",

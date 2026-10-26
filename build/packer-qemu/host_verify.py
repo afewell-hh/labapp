@@ -406,9 +406,9 @@ def write_result(path, nonce, inputs, cloud_init=None):
         os.fsync(handle.fileno())
 
 
-def write_armed(path, nonce, inputs, armed_at):
-    """One strict witness; armed_at is CLOCK_BOOTTIME seconds (floor) when paused was observed."""
-    body = json.dumps({"kind": ARMED_KIND, "armed": "paused", "armed_at": int(armed_at),
+def write_armed(path, nonce, inputs, armed_at, boot_id):
+    """One strict witness; armed_at is CLOCK_BOOTTIME seconds (ceiling) when paused was observed."""
+    body = json.dumps({"kind": ARMED_KIND, "armed": "paused", "armed_at": math.ceil(armed_at), "boot_id": boot_id,
                        "nonce": nonce, "inputs": inputs}, sort_keys=True).encode() + b"\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -417,23 +417,56 @@ def write_armed(path, nonce, inputs, armed_at):
         os.fsync(handle.fileno())
 
 
+def arm_expiry(path, nonce, inputs):
+    """Arm only with at least 60 actual seconds left on PID1's original timer."""
+    fd = os.open("/out/witness", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Failure("invalid-timer-witness")
+        raw = handle.read(257)
+    found = re.fullmatch(rb"start (\d{1,12}) (\d{1,4})\n", raw)
+    if not found:
+        raise Failure("invalid-timer-witness")
+    n, timer = map(int, found.groups())
+    now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    if not n <= now or n + timer - math.ceil(now) < 60:
+        raise Failure("insufficient-expiry-dwell")
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+        boot_id = handle.read(38).strip()
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id):
+        raise Failure("invalid-boot-id")
+    write_armed(path, nonce, inputs, now, boot_id)
+
+
 def verify(args, clock=time.monotonic):
     deadline = clock() + args.timeout
     qmp = serial = None
+    witness = getattr(args, "expiry_witness", None)
     try:
         serial = connect(args.serial, deadline, clock)  # receipt reader first
         qmp = connect(args.qmp, deadline, clock)
-        witness = getattr(args, "expiry_witness", None)
         on_armed = None
         if witness:
             def on_armed():
-                write_armed(witness, args.nonce, args.inputs, time.clock_gettime(time.CLOCK_BOOTTIME))
+                arm_expiry(witness, args.nonce, args.inputs)
         cloud_init = observe(qmp, serial, args.nonce, args.inputs, deadline, clock,
                              getattr(args, "require_sentinel_evidence", False), on_armed)
         if clock() >= deadline:
             raise Failure("timeout")
         write_result(args.result, args.nonce, args.inputs, cloud_init)
     finally:
+        if witness:
+            # A later observer failure must revoke arming even if Packer cleanup hangs.
+            # Default SIGTERM at the outer PID1 deadline does not run this finally.
+            try:
+                fd = os.open(witness + ".failed", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(b"observer-ended\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if os.path.lexists(witness):
+                    os.unlink(witness)
         for sock in (qmp, serial):
             if sock is not None:
                 sock.close()
