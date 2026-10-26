@@ -13,6 +13,7 @@ import io
 import os
 import re
 import stat
+import tarfile
 import zipfile
 import zlib
 
@@ -415,6 +416,76 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
             "plugin_archive_sha256": pins["plugin"]["sha256"],
             "plugin_member_sha256": member_sha["plugin"],
             "hcl_sha256": hash_file(os.path.join(inp, "labapp.pkr.hcl"), check=check)[0]}
+
+
+# Fixed `control-build` inputs: the pinned hhfab release archive (caller path, pinned size/SHA256), its sole pinned
+# binary member, the in-repo public curriculum wiring (never caller-supplied) and a freshly written EMPTY Docker
+# credential store. Nothing is downloaded or executed here.
+REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
+WIRING_PATH = os.path.join(REPO_ROOT, "wiringd.yaml")
+WIRING_SHA256 = "c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a"
+EMPTY_DOCKER_CONFIG = b'{"auths":{}}'
+CONTROL_FILES = ("hhfab", "wiringd.yaml", "docker/config.json")
+
+
+def _release_module(provision_dir):
+    """Load the UNCHANGED build/provision/hhfab_release.py (exact-member tar extraction) without touching sys.path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("labapp_hhfab_release", os.path.join(provision_dir, "hhfab_release.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stage_control(ws, sources, check=_noop, pins=PINS, provision_dir=PROVISION_DIR, wiring_path=WIRING_PATH):
+    """Create ws/in (read-only: hhfab, wiringd.yaml, docker/config.json) and ws/out (the only writable tree, with
+    empty home, tmp, cache, w1 and w2). `sources` is exactly {"archive": path}. Return the evidence."""
+    if set(sources) != {"archive"}:
+        raise StageError("control-build needs exactly the hhfab archive")
+    if os.path.commonpath((os.path.realpath(ws), os.path.realpath(sources["archive"]))) == os.path.realpath(ws):
+        raise StageError("source is inside the staging workspace")
+    inp, out = (make_dirs(ws, name) for name in ("in", "out"))
+    for name in ("home", "tmp", "cache", "w1", "w2"):
+        make_dirs(out, name)
+    docker = make_dirs(inp, "docker")
+    pin = pins["hhfab"]
+    release = _release_module(provision_dir)
+    version_pin = release.PINS[HHFAB_VERSION]
+    if (version_pin[0], version_pin[1]) != (pin["size"], pin["sha256"]):
+        raise StageError("hhfab pins disagree")
+    copy = os.path.join(inp, "archive.tgz")
+    if copy_hash(sources["archive"], copy, pin["size"], check, 0o400) != pin["sha256"]:
+        raise StageError("hhfab archive differs from its pin")
+    target = os.path.join(inp, "hhfab")
+    try:
+        from pathlib import Path
+        release.extract(Path(copy), Path(target), version_pin)     # exact sole member; size and SHA256 re-verified
+    except (release.Refusal, OSError, EOFError, zlib.error, tarfile.TarError) as exc:
+        raise StageError("hhfab member differs from its pin") from exc
+    os.chmod(target, 0o500)
+    os.unlink(copy)
+    check()
+    wiring = read_file(wiring_path, TEXT_LIMIT, check)
+    if hashlib.sha256(wiring).hexdigest() != WIRING_SHA256:
+        raise StageError("wiring differs from its pin")
+    write_new(os.path.join(inp, "wiringd.yaml"), wiring, 0o400)
+    write_new(os.path.join(docker, "config.json"), EMPTY_DOCKER_CONFIG, 0o400)
+    return control_identity(ws, check)
+
+
+def control_identity(ws, check=_noop):
+    """SHA256 of every staged input plus the exact file list (no extra or missing entry in in/)."""
+    base = os.path.join(ws, "in")
+    if sorted(walk(base)) != sorted(CONTROL_FILES):
+        raise StageError("unexpected staged control inputs")
+    hashes = {name: hash_file(os.path.join(base, name), check=check)[0] for name in CONTROL_FILES}
+    return {"hhfab_archive_sha256": PINS["hhfab"]["sha256"], "hhfab_member_sha256": hashes["hhfab"],
+            "wiring_sha256": hashes["wiringd.yaml"], "docker_config_sha256": hashes["docker/config.json"]}
+
+
+def verify_control(ws, staged, check=_noop):
+    """After the run: the read-only inputs are exactly what was recorded."""
+    return control_identity(ws, check) == staged
 
 
 def verify_staged(ws, staged, check=_noop):

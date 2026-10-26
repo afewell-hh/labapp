@@ -223,11 +223,11 @@ class QemuRunnerCase(tsn.SentinelCase):
 
 class NetworkScopeTests(QemuRunnerCase):
     def test_only_the_new_mode_is_networked_and_every_other_mode_stays_none(self):
-        self.assertEqual(cr.NETWORKED_MODES, ("qemu-fixture",))
+        self.assertEqual(cr.NETWORKED_MODES, ("qemu-fixture", "control-build"))
         for mode in cr.MODES:
             args = cr.create_args("n", "l", tc.IMAGE_ID, "1:1", "/w", 5, "b", mode)
             networks = [a for a in args if a.startswith("--network")]
-            expected = ["--network=bridge"] if mode == "qemu-fixture" else ["--network=none"]
+            expected = ["--network=bridge"] if mode in cr.NETWORKED_MODES else ["--network=none"]
             self.assertEqual(networks, expected, mode)
 
     def test_the_networked_container_gains_no_other_access(self):
@@ -268,7 +268,8 @@ class DeadlineAndAdmissionTests(QemuRunnerCase):
     def test_profile_and_every_other_profile_are_unchanged(self):
         self.assertEqual(cr.PROFILES, {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300),
                                        "runtime-check": (90, 30), "sentinel-expiry": (300, 120),
-                                       "fixture": (1800, 900), "qemu-fixture": (1800, 900)})
+                                       "fixture": (1800, 900), "qemu-fixture": (1800, 900),
+                                       "control-build": (1800, 900)})
         result, _ = self.run_qemu()
         record = self.record()
         self.assertEqual(record["work_deadline"] - record["admitted_at"], 1800)

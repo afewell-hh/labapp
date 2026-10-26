@@ -26,6 +26,7 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Separately gated runtime preparation recipe; guest assertions run by the sentinel plan |
 | `guest/assert-fixture.py` | Fixed hhfab `fixture` assertions between two runs of the unchanged installer (see "Fixed `fixture` task") |
 | `guest/assert-qemu.py` | Fixed `qemu-fixture` adapter around the unchanged QEMU installer (twice) and KVM witness (see "Fixed `qemu-fixture` task") |
+| `test_control_build.py` | Offline tests for the fixed non-VM `control-build` task (see "Fixed `control-build` task") |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing
@@ -544,8 +545,8 @@ staging + 900 s cleanup (no renewal, unmeasured), 10 GiB / 5 CPU / 512 PID caps 
 activation does not authorize execution:** every actual trial needs separately scoped lead authorization,
 independent exact-head review, runtime-identity preflight and reconciled shared-ledger admission.
 
-* Network: `qemu-fixture` is the ONLY mode whose outer container uses `--network=bridge` (Docker's default
-  bridge, ordinary outbound reachability) instead of `--network=none`. This is NOT hostname-allowlisted
+* Network: `qemu-fixture` and `control-build` (#299) are the ONLY modes whose outer container uses `--network=bridge`
+  (Docker's default bridge, ordinary outbound reachability) instead of `--network=none`. This is NOT hostname-allowlisted
   egress. The fixed local Unix daemon, no host network, no published port, communicator `none`, no
   `hostfwd`, nonroot caller, `--cap-drop=ALL`, `no-new-privileges`, read-only root, caps and exact `/dev/kvm`
   are unchanged, and every other mode (`NETWORKED_MODES`) stays `--network=none` (tested for all modes).
@@ -592,6 +593,60 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   without outbound reachability, DNS or CA bundle simply fails the first installer run with its token.
 * Offline tests: `test_qemu_fixture.py` covers synthetic staging, observer, runner and adapter failures.
   Actual guest networking, installation and KVM execution require separately scoped live evidence.
+
+### Fixed `control-build` task (non-VM official control-installer build measurement; source only)
+
+`--mode control-build --archive-file <pinned hhfab 0.50.4 tar.gz>` (#299) measures the UNCHANGED official
+`hhfab build --build-controls=true --build-gateways=false --build-mode=iso` in one disposable container with
+**no `/dev/kvm`**, using the existing full curriculum wiring (`wiringd.yaml`, SHA256 `c522c645…`, read from the
+repository and verified, never caller-supplied). v0.50.4 is a TEST lane because its archive and the accepted
+runtime are cached, not a selected release pin. **Source activation does not authorize execution:** the first
+run needs separately scoped lead authorization, an owned ledger/workspace and Docker daemon, outbound reachability
+to the public registry, and independent exact-head review.
+
+* Reuse, not a framework: the existing ledger, one-active-task admission lock, signal handling, `_cleanup`,
+  `PREPARED_RUNTIME` four-layer identity, `--cap-drop=ALL`, read-only root, `no-new-privileges`, 10 GiB / 5 CPU /
+  512 PID caps and the empty trusted Docker config. 1800 s work INCLUDING staging + 900 s cleanup, no renewal
+  (unmeasured). It is the second mode (with `qemu-fixture`) on Docker's default bridge, i.e. ordinary outbound
+  reachability, NOT hostname-allowlisted egress. No device, group, host network, published port, host socket, host
+  credential or inherited environment. Every other mode is unchanged.
+* Staged read-only under `/in`: the archive's sole binary member (extracted by the unchanged
+  `build/provision/hhfab_release.py`, member SHA256 `b7a5c774…`), `wiringd.yaml`, and `docker/config.json` containing
+  exactly `{"auths":{}}`. `/out` is the only writable tree (`home`, `tmp`, `cache`, `w1`, `w2`).
+* Fixed script (`env -i`, `HOME=/out/home`, `DOCKER_CONFIG=/in/docker`, `HHFAB_PREVIEW=true` only so the hidden flag
+  below is explicit and reproducible): `init --fabric-mode spine-leaf --dev --gateway=false --import-host-upstream
+  --registry-repo ghcr.io --registry-prefix githedgehog --wiring /in/wiringd.yaml`, `validate --hydrate-mode
+  if-not-present`, a bounded text assertion of the generated `registry` stanza (`mode: upstream`, `repo`, `prefix`,
+  `noTLSVerify: false`, empty username/password; only the exit status is kept), then `build` as above, all with
+  `--cache-dir /out/cache`. Flags were read from fabricator v0.50.4 source (`cmd/hhfab/main.go`,
+  `pkg/hhfab/cmdconfig.go`, `pkg/fab/initconfig.tmpl.yaml`, `pkg/fab/recipe/build.go`); none was executed. With an
+  empty credential store `--import-host-upstream` yields an anonymous upstream stanza (source-read, not run).
+* Steps: `cold` (workdir `w1`), `noop` (the same command again in `w1`), then a fresh `init`/`validate`/assertion in
+  `w2` and `warm` (same cache, fresh workdir). v0.50.4 `build` has no `--force`/`--clean`, and `recipe.buildInstall`
+  skips when the stored input hash matches and the ISO exists. So `noop` is a **hash-skip no-op**, never called a
+  cache-reusing rebuild; the runner records `hash_skip_noop` only if the ISO's size, inode and mtime are unchanged and
+  `rebuilt_in_place` otherwise. `warm` is the faithful comparison; its network transfer is NOT observed, only cache
+  size before/after (`warm_cache_growth_apparent_kib`).
+* Bounds actually enforced (all proposed, unmeasured): `ulimit -f 8 GiB` per file; a host free-space precondition
+  (`CONTROL_MIN_FREE`, 40 GiB) before any workspace exists; and a host `lstat` walk of `/out` every 5 s that fails the
+  run above `CONTROL_OWNED_CAP` (32 GiB allocated) or 200000 entries, plus a final walk at exit. **There is no
+  filesystem or directory quota.** Growth between samples can overshoot, so the recorded peak is a sampled lower
+  bound; hard links are counted per name; per-phase byte attribution is not measured (only cache/workdir `du` after
+  `cold` and `warm`). The declared 2,273,598,059-byte total from #298 counts stored layers, not installed or peak size.
+* Acceptance needs exit 0, all nine recorded steps exiting 0 in order and each under 1800000 ms, exactly one
+  `<type>--<name>--install-usb.iso` (regular, no symlink) in each of `w1/result` and `w2/result`, cold ISO size equal
+  to the recorded `stat`, and unchanged staged inputs. Failed, overflowing, OOM-killed or timed-out builds fail; the
+  ISO output filename pattern comes from `recipe.buildInstall` source and is NOT confirmed against a real run.
+* Disposal and receipts: the container and the whole owned workspace (cache, workdirs, ISOs) are removed on success,
+  failure, timeout and signal, and absence is proved in `_finish`; an uncertain removal is a `hold`. Retained are
+  closed numbers, hashes, per-log byte count and SHA256, and for a failing step only a bounded stderr excerpt; never
+  raw `fab.yaml`, credentials or journals. The ISO hash/size is recorded before deletion.
+* Does not prove: a release pin, registry signatures (public manifest digests are reference identities only), the
+  outer Labapp image, the full VLAB, student readiness, other platforms or whether the runtime contains every
+  native library the static binary needs (a recorded first-run refusal). `hhfab` also logs to `/var/log/hhfab.log`;
+  the read-only root may make that fail, which would also be reported, not worked around.
+* Offline tests: `test_control_build.py` (synthetic archive and container; CI runs it through the existing
+  `test_*.py` discovery). Python tests were not run by the authoring worker; see issue #299 for the handoff.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
