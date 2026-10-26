@@ -469,12 +469,23 @@ ownership, retention and disposition stay outside this repository until the lead
   provide this validation, not that the image or GCP is invalid. A nonzero exit is preserved: no TCG, permission, module or retry repair.
 * Staged modes: the installer pair and archive are `0444` (the probe's nonroot child reads and imports them; `user-data` makes
   `/var/lib/labapp-build` and `.../in` root-owned `0755`); the probe, `assert-fixture.py`, plan and MANIFEST are `0400`, and
-  the nonce is `0600` after the copy. Fresh-file modes are explicit even with umask `077`.
+  the nonce is `0600` after the copy. Fresh source-file modes are explicit even with umask `077`. The guest also normalizes
+  the copied flat input files after MANIFEST verification and before the plan: only the two
+  sentinel helpers and the fixture installer pair/archive become `0444`; other files are
+  `0400`, with nonce `0600`. Optional fixture files may be absent in minimal sentinel mode.
   The copy is recursively made root-owned after `cp -a`; baseline verifies every real, trusted,
   traversable parent and each required single-link regular file and its exact mode/owner. A bounded
   sanitized `ubuntu` Python child actually reads the pair/archive, imports the exact sibling, verifies
   those files are unwritable and cannot read the nonce, without executing hhfab or installer/probe work.
-  Failure uses the existing fixed `staging-*` reason path. The probe is MANIFEST/receipt covered like the other files.
+  The same staging-only guard runs during root sentinel step 1 before ubuntu step 2, preserving
+  plan numbering, and baseline repeats it before installation. Failure uses the existing fixed
+  `staging-*` reason path. The probe is MANIFEST/receipt covered like the other files.
+* CD metadata limitation (primary source read 2026-10-26): [QEMU plugin 1.1.7](https://github.com/hashicorp/packer-plugin-qemu/blob/v1.1.7/go.mod)
+  pins [SDK 0.6.11 StepCreateCD](https://github.com/hashicorp/packer-plugin-sdk/blob/v0.6.11/multistep/commonsteps/step_create_cdrom.go).
+  Its file-copy path uses `os.Create` and `io.Copy` without source-mode preservation; a public
+  source file can become `0600` under umask `077` before ISO creation. Source hash/mode tests
+  and direct xorriso checks therefore cannot establish the final guest copy's accessibility.
+  Guest normalization and actual early nonroot read/import/privacy assertions cover that boundary.
 * Probe diagnostics: step 10 failure reports only `step=10 exit=N reason=plan-step`. The unchanged probe's JSON reason is
   deliberately not exported and it exits 1 for installer, systemd and KVM failures alike, so a missing guest `/dev/kvm` cannot be told
   from an earlier probe failure without changing the probe or adding a wrapper step; neither is done here.

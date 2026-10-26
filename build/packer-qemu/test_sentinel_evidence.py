@@ -450,6 +450,80 @@ class FixtureAssertionTests(unittest.TestCase):
 
 
 
+
+class GuestModeNormalizationTests(unittest.TestCase):
+    """Run the shipped shell function on owned temporary files, without guest/privileged work."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.public = ("assert-sentinel.sh", "sentinel-evidence.py", "install-hhfab.py",
+                       "hhfab_release.py", "hhfab-linux-amd64-v0.50.4.tar.gz")
+
+    def normalize(self):
+        return subprocess.run(["/bin/bash", "-c", 'umask 077; source "$1"; IN=$2; normalize_input_modes',
+                               "mode-test", str(HERE / "guest" / "guest-build.sh"), str(self.root)],
+                              env={"PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=5)
+
+    def sdk_copy(self, name):
+        # SDK0.6.11 AddFile: os.Create (0666 before umask) + io.Copy, no copied mode.
+        previous = os.umask(0o077)
+        try:
+            fd = os.open(str(self.root / name), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
+            with os.fdopen(fd, "wb") as output:
+                output.write(("inert " + name).encode())
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE((self.root / name).stat().st_mode), 0o600)
+
+    def test_sdk_mode_loss_is_normalized_for_minimal_and_fixture_without_changing_bytes(self):
+        for fixture in (False, True):
+            with self.subTest(fixture=fixture):
+                for old in self.root.iterdir():
+                    old.unlink()
+                names = (self.public if fixture else self.public[:2]) + ("nonce", "MANIFEST", "plan.txt", "guest-build.sh")
+                for name in names:
+                    self.sdk_copy(name)
+                before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+                result = self.normalize()
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+                self.assertEqual({p.name: p.read_bytes() for p in self.root.iterdir()}, before)
+                for name in names:
+                    expected = 0o444 if name in self.public else 0o600 if name == "nonce" else 0o400
+                    self.assertEqual(stat.S_IMODE((self.root / name).stat().st_mode), expected, name)
+
+    def test_symlink_refusal_does_not_chmod_the_outside_target(self):
+        with tempfile.TemporaryDirectory() as other:
+            target = Path(other) / "outside"
+            target.write_bytes(b"outside")
+            target.chmod(0o600)
+            (self.root / "alias").symlink_to(target)
+            result = self.normalize()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_unreadable_bash_script_exit126_matches_failure_class_and_normalization_fixes_it(self):
+        path = self.root / "assert-sentinel.sh"
+        path.write_text("#!/bin/bash\nexit 0\n")
+        path.chmod(0)
+        first = subprocess.run(["/bin/bash", str(path)], capture_output=True, timeout=5)
+        self.assertEqual(first.returncode, 126)
+        (self.root / "nonce").write_bytes(b"nonce")
+        self.assertEqual(self.normalize().returncode, 0)
+        second = subprocess.run(["/bin/bash", str(path)], capture_output=True, timeout=5)
+        self.assertEqual(second.returncode, 0)
+
+    def test_normalization_and_optional_staging_guard_precede_first_ubuntu_step(self):
+        runner = (HERE / "guest" / "guest-build.sh").read_text().split("main() {", 1)[1]
+        self.assertLess(runner.index("check_inputs"), runner.index("normalize_input_modes"))
+        self.assertLess(runner.index("normalize_input_modes"), runner.index("run_plan"))
+        sentinel = (HERE / "guest" / "assert-sentinel.sh").read_text()
+        self.assertIn('if [[ -f ${BASH_SOURCE[0]%/*}/assert-fixture.py ]]; then', sentinel)
+        self.assertIn('/usr/bin/python3 -I -B "${BASH_SOURCE[0]%/*}/assert-fixture.py" staging', sentinel)
+        self.assertIn("staging", af.PHASES)
+        self.assertIs(af.PHASES["staging"], af.staging_access)
+
 class GuestStagingTests(unittest.TestCase):
     """Unprivileged synthetic metadata/access checks, not proof of a root-owned guest copy."""
     def setUp(self):

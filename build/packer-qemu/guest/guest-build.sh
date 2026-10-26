@@ -92,6 +92,23 @@ check_inputs() {
        <(awk '{print $2}' "$IN/MANIFEST" | sort) >/dev/null
 }
 
+# Pinned SDK StepCreateCD uses os.Create + io.Copy, not source-mode preservation.
+# After byte verification, establish guest access explicitly regardless of host umask/ISO
+# metadata. Ownership/traversable parents were set by user-data; nonce stays root-private.
+normalize_input_modes() {
+  local name
+  for name in "$IN"/*; do
+    [[ -f $name && ! -L $name ]] || return 1
+    chmod 0400 "$name"
+  done
+  for name in assert-sentinel.sh sentinel-evidence.py install-hhfab.py hhfab_release.py hhfab-linux-amd64-v0.50.4.tar.gz; do
+    if [[ -f $IN/$name ]]; then
+      chmod 0444 "$IN/$name"
+    fi
+  done
+  chmod 0600 "$IN/nonce"
+}
+
 run_plan() {
   local user rest home rc
   local -i step=0
@@ -128,6 +145,7 @@ main() {
   trap 'emit_diag; emit fail' ERR
   check_cloud_init
   check_inputs
+  normalize_input_modes
   run_plan
   seal
   sync
@@ -136,5 +154,6 @@ main() {
   systemctl --no-block poweroff
 }
 
-main "$@"
-exit
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

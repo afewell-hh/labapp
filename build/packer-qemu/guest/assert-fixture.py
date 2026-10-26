@@ -6,7 +6,7 @@ stdin /dev/null, between runs of the UNCHANGED build/provision/install-hhfab.py.
 Python 3.10+ stdlib only. It installs nothing into /usr/local/bin and never executes
 hhfab as root; the only execution of the installed binary is the nonroot `smoke`.
 
-Phases: baseline (before the first install), snapshot (after run 1), verify (after run 2),
+Phases: staging (root sentinel step 1 before ubuntu), baseline (before the first install), snapshot (after run 1), verify (after run 2),
 negatives (isolated refusals), smoke (nonroot CLI). A failed check writes ONE fixed
 reason token to /run/labapp-reason (read and validated by guest-build.sh, which adds the
 plan step and exit code to its bounded diagnostic line) and exits 1. No peer or tool
@@ -282,7 +282,7 @@ def smoke(cfg):
     need(VERSION_RE.fullmatch(done.stdout) is not None, "cli-version")
 
 
-PHASES = {"baseline": baseline, "snapshot": snapshot, "verify": verify,
+PHASES = {"staging": staging_access, "baseline": baseline, "snapshot": snapshot, "verify": verify,
           "negatives": negatives, "smoke": smoke}
 
 
