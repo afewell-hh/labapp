@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import pwd
 import signal
+import stat
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -20,6 +22,10 @@ class ProbeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.work = Path(self.temporary.name)
         self.token = 'a' * 32
+        # These preexisting tests isolate other preflight requirements.
+        parent = patch.object(probe, 'validate_scratch_parent')
+        parent.start()
+        self.addCleanup(parent.stop)
 
     def service(self, fail=None, marker=True, foreign=False):
         calls = []
@@ -423,6 +429,150 @@ class InstallerDiagnosticTests(unittest.TestCase):
         self.assertEqual(probe.EXECUTION_MOUNT, 'none')
         probe.stage(*previous)
         self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), ('installer', 'cli', 'noexec'))
+
+
+class ScratchTests(unittest.TestCase):
+    """Trust refusal precedes work; real temporary children alone are removed."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name)
+        self.parent.chmod(0o755)
+        self.addCleanup(probe.stage, 'unknown')
+
+    @staticmethod
+    def trusted_info():
+        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+    def test_parent_chain_rejects_untrusted_mode_owner_symlink_and_file(self):
+        chain = (Path('/'), Path('/var'), Path('/var/lib'))
+        bad = ((stat.S_IFDIR | 0o755, 1000), (stat.S_IFDIR | 0o775, 0),
+               (stat.S_IFDIR | 0o757, 0), (stat.S_IFLNK | 0o777, 0),
+               (stat.S_IFREG | 0o755, 0), (stat.S_IFDIR | 0o750, 0))
+        for directory in chain:
+            for mode, uid in bad:
+                def info(path):
+                    return SimpleNamespace(st_mode=mode, st_uid=uid) if path == directory else self.trusted_info()
+                with self.subTest(directory=directory, mode=oct(mode), uid=uid), \
+                        patch.object(probe, 'SCRATCH_PARENT', Path('/var/lib')), \
+                        patch.object(Path, 'lstat', info), patch.object(os, 'statvfs') as flags, \
+                        self.assertRaises(Refusal):
+                    probe.validate_scratch_parent()
+                flags.assert_not_called()
+
+    def test_invalid_parent_or_mount_refuses_before_any_owned_work(self):
+        # Call real probe+preflight with only root identity simulated; no host root,
+        # systemd, installer or KVM access occurs even on the refusal path.
+        for state in ('missing', 'symlink', 'noexec', 'unavailable'):
+            info = self.trusted_info()
+            if state == 'symlink':
+                info.st_mode = stat.S_IFLNK | 0o777
+            with self.subTest(state=state), patch.object(os, 'geteuid', return_value=0), \
+                    patch.object(Path, 'lstat', side_effect=FileNotFoundError() if state == 'missing' else None,
+                                 return_value=info), \
+                    patch.object(os, 'statvfs', side_effect=OSError('SECRET') if state == 'unavailable' else None,
+                                 return_value=SimpleNamespace(f_flag=os.ST_NOEXEC if state == 'noexec' else 0)), \
+                    patch.object(probe.tempfile, 'TemporaryDirectory') as temporary, \
+                    patch.object(probe, 'installer_probe') as installer, \
+                    patch.object(probe, 'systemd_probe') as systemd, patch.object(probe, 'require') as require:
+                with self.assertRaises((Refusal, OSError)):
+                    probe.probe(1234, Path('/archive'))
+                self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), ('preflight', 'none', 'none'))
+                for action in (temporary, installer, systemd, require):
+                    action.assert_not_called()
+
+    def test_exec_parent_validates_without_mutation(self):
+        inspected = []
+        def info(path):
+            inspected.append(path)
+            return self.trusted_info()
+        with patch.object(Path, 'lstat', info), \
+                patch.object(os, 'statvfs', return_value=SimpleNamespace(f_flag=0)) as flags, \
+                patch.object(Path, 'mkdir') as mkdir, patch.object(os, 'chown') as chown:
+            probe.validate_scratch_parent()
+        self.assertEqual(inspected, [Path('/'), Path('/var'), Path('/var/lib')])
+        flags.assert_called_once_with(Path('/var/lib'))
+        mkdir.assert_not_called()
+        chown.assert_not_called()
+
+    def test_real_workspace_creation_modes_and_exact_cleanup(self):
+        sibling = self.parent / 'unrelated'
+        sibling.write_bytes(b'preserve')
+        owner = pwd.getpwuid(os.getuid())
+        original_lstat = Path.lstat
+        original_temporary = tempfile.TemporaryDirectory
+        seen = []
+        events = []
+        # Real private test filesystem, simulated root-owned metadata for its
+        # fixed test parent chain only. Owned children retain real uid/mode stats.
+        def info(path):
+            return self.trusted_info() if path == self.parent or path in self.parent.parents else original_lstat(path)
+        def preflight(*_):
+            probe.validate_scratch_parent()
+            return owner
+        def temporary(*args, **kwargs):
+            self.assertEqual(kwargs['dir'], self.parent)
+            instance = original_temporary(*args, **kwargs)
+            self.assertNotIn(Path(instance.name), seen)
+            seen.append(Path(instance.name))
+            self.assertTrue(seen[-1].name.startswith('labapp-prereq-'))
+            self.assertEqual(stat.S_IMODE(seen[-1].stat().st_mode), 0o700)
+            return instance
+        def run(args, seconds=15, limit=4096):
+            workspace = seen[-1]
+            self.assertEqual(workspace.parent, self.parent)
+            self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o711)
+            self.assertEqual(stat.S_IMODE((workspace / 'install').stat().st_mode), 0o700)
+            name = ('first', 'rerun', 'cli')[len(events)]
+            events.append(name)
+            return 0, {'first': b'hhfab install: installed\n',
+                       'rerun': b'hhfab install: unchanged\n', 'cli': b'hhfab version v0.50.4\n'}[name]
+        for failure in ('none', 'cli', 'cleanup'):
+            events.clear()
+            def require(args, seconds=15, expected=None):
+                if args[-1] == '--version' and failure != 'none':
+                    probe.stage('installer', 'cli', 'exec')
+                    raise PermissionError('SECRET')
+                return original_require(args, seconds, expected)
+            def make_temp(*args, **kwargs):
+                instance = temporary(*args, **kwargs)
+                if failure == 'cleanup':
+                    original_cleanup = instance.cleanup
+                    # Failure leaves this one owned test child for explicit test teardown.
+                    self.addCleanup(original_cleanup)
+                    instance.cleanup = mock_raise(OSError('SECRET'))
+                return instance
+            original_require = probe.require
+            with self.subTest(failure=failure), patch.object(probe, 'SCRATCH_PARENT', self.parent), \
+                    patch.object(Path, 'lstat', info), patch.object(probe, 'preflight', preflight), \
+                    patch.object(os, 'statvfs', return_value=SimpleNamespace(f_flag=0)), \
+                    patch.object(probe.tempfile, 'TemporaryDirectory', make_temp), \
+                    patch.object(os, 'chown') as chown, patch.object(probe, 'run', run), \
+                    patch.object(probe, 'installed_snapshot', return_value=(1, 2, 3, 4, 5)), \
+                    patch.object(probe, 'systemd_probe', return_value={}) as systemd, \
+                    patch.object(probe, 'require', require):
+                if failure == 'none':
+                    # KVM is injected separately; no kernel operation is executed.
+                    def succeed(args, seconds=15, expected=None):
+                        return b'root-api12-create-vm\n' if args[-1] == probe.KVM else require(args, seconds, expected)
+                    with patch.object(probe, 'require', succeed):
+                        report = probe.probe(owner.pw_uid, Path('/archive'))
+                    self.assertEqual(report['checks']['installer']['cli'], 'passed')
+                    self.assertEqual(report['checks']['installer']['uid'], owner.pw_uid)
+                    self.assertEqual(events, ['first', 'rerun', 'cli'])
+                    systemd.assert_called_once_with(seen[-1])
+                else:
+                    with self.assertRaises(OSError if failure == 'cleanup' else PermissionError):
+                        probe.probe(owner.pw_uid, Path('/archive'))
+                    expected = ('cleanup', 'none', 'none') if failure == 'cleanup' else ('installer', 'cli', 'exec')
+                    self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), expected)
+                    self.assertEqual(events, ['first', 'rerun'])
+                    systemd.assert_not_called()
+                chown.assert_called_once_with(seen[-1] / 'install', owner.pw_uid, owner.pw_gid)
+            self.assertEqual(sibling.read_bytes(), b'preserve')
+            self.assertEqual(seen[-1].exists(), failure == 'cleanup')
+            self.assertTrue(all(not workspace.exists() for workspace in seen[:-1]))
 
 
 def json_loads(text):

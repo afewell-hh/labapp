@@ -333,7 +333,7 @@ sudo /usr/bin/python3 /trusted/provision/component_prerequisites.py \
 
 The archive and trusted script directory must be readable/traversable by that
 owner. The probe does not change external file permissions. The caller excludes
-concurrent changes to these inputs, their ancestors and `/run`; the selected
+concurrent changes to these inputs, their ancestors and `/var/lib` (including its ancestors); the selected
 owner must be dedicated and idle. This is not a hostile multiuser sandbox.
 The current directory is irrelevant and children receive fixed clean environments.
 Required tools are fixed `/usr/bin/python3`, `/usr/bin/systemd-run`,
@@ -341,8 +341,13 @@ Required tools are fixed `/usr/bin/python3`, `/usr/bin/systemd-run`,
 prerequisites fail without fallback. Protect the root script/import directory
 from writes by the selected owner.
 
-A root-owned unique `/run/labapp-prereq-*` directory permits traversal only;
-its install child belongs to the selected owner. The existing installer runs
+Preflight requires the fixed existing `/var/lib` and each ancestor to be a real
+non-symlink root-owned directory, unwritable by group/others and traversable by
+the nonroot owner. `statvfs` must confirm its filesystem permits execution;
+unavailable observations or `ST_NOEXEC` fail before workspace creation. There is
+no parent creation, permission/ownership change, remount, `TMPDIR` lookup or fallback.
+A root-owned random exclusive `/var/lib/labapp-prereq-*` directory has mode0711;
+its mode0700 install child belongs to the selected owner. The existing installer runs
 unchanged as that UID/primary GID with supplementary groups cleared, then reruns.
 The probe verifies the pinned binary hash/size, owner, mode0755 and unchanged
 inode/timestamps; the actual installed `--version` smoke also runs as that

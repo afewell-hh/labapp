@@ -3,7 +3,8 @@
 Root only, explicit existing nonroot --owner-uid and absolute --archive. Keep the
 unchanged install-hhfab.py and hhfab_release.py siblings. No cwd/env overrides,
 network, package installation, user changes or cloud access. Trusted lead must
-exclude concurrent changes to payload/archive and /run; never run on production.
+exclude concurrent changes to payload/archive and /var/lib (including ancestors);
+never run on production.
 The nonroot owner must be dedicated/idle: this is not a hostile multiuser sandbox.
 """
 import argparse
@@ -25,6 +26,7 @@ ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 PYTHON = "/usr/bin/python3"
+SCRATCH_PARENT = Path("/var/lib")
 # Fixed failure-phase allowlist; STAGE names the action in progress, never child output.
 PHASES = ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown")
 STAGE = "unknown"
@@ -94,9 +96,22 @@ def require(args, seconds=15, expected=None):
     return output
 
 
+def validate_scratch_parent():
+    # Fixed existing parent only. Validate the whole chain without following a
+    # symlink; trusted lead excludes concurrent changes while this probe runs.
+    for directory in (*reversed(SCRATCH_PARENT.parents), SCRATCH_PARENT):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or info.st_mode & 0o022 or info.st_mode & 0o111 != 0o111):
+            raise Refusal("scratch parent must be real, root-owned, trusted and traversable")
+    if os.statvfs(SCRATCH_PARENT).f_flag & os.ST_NOEXEC:
+        raise Refusal("scratch filesystem must permit execution")
+
+
 def preflight(uid, archive):
     if os.geteuid() != 0 or uid <= 0 or sys.version_info < (3, 10):
         raise Refusal("requires root, Python 3.10+ and explicit nonroot owner")
+    validate_scratch_parent()
     owner = pwd.getpwuid(uid)
     if owner.pw_gid == 0:
         raise Refusal("owner primary group must be nonroot")
@@ -231,8 +246,9 @@ def probe(uid, archive):
     owner = preflight(uid, archive)
     report = {'schema': 'labapp-component-prerequisites-v1', 'caller_uid': os.geteuid(),
               'python': '.'.join(map(str, sys.version_info[:3])), 'checks': {}}
-    # Trusted /run parent, root-only namespace; owner gets only its install dir.
-    temporary = tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir='/run')
+    # Preflight validated the fixed executable parent; only this random child
+    # is created/removed. Owner gets traversal and its private install directory.
+    temporary = tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir=SCRATCH_PARENT)
     try:
         workspace = Path(temporary.name)
         workspace.chmod(0o711)

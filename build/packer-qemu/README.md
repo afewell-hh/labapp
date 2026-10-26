@@ -464,7 +464,12 @@ ownership, retention and disposition stay outside this repository until the lead
   `build/provision/component_prerequisites.py` as root with `--owner-uid 1000 --archive ...` (last, so steps 1-9 keep their
   numbers). `baseline` also requires `ubuntu` to be uid 1000 with a nonzero primary group (token `owner-map`), so the probe never
   runs against root or an unintended user. The probe checks PID1/systemd transient-unit start/result/cleanup, a stripped-groups
-  nonroot private install twice plus its CLI, then root `/dev/kvm` API 12 and VM-handle creation. It runs no L2 vCPU and proves
+  nonroot private install twice plus its CLI, then root `/dev/kvm` API 12 and VM-handle creation.
+  Probe preflight requires existing `/var/lib` and ancestors to be real root-owned directories,
+  unwritable by group/others and traversable, with `/var/lib` on an executable filesystem (`statvfs`,
+  unavailable/noexec refuses). Only a random exclusive mode0711 `/var/lib/labapp-prereq-*` workspace
+  and its owner mode0700 install child are created and cleaned; no shared parent creation/chown,
+  remount, ambient `TMPDIR` or fallback occurs. The caller excludes concurrent parent/input changes. It runs no L2 vCPU and proves
   neither nonroot KVM nor VLAB; `-cpu host` does not guarantee nested devices, and a missing guest `/dev/kvm` means that host cannot
   provide this validation, not that the image or GCP is invalid. A nonzero exit is preserved: no TCG, permission, module or retry repair.
 * Staged modes: the installer pair and archive are `0444` (the probe's nonroot child reads and imports them; `user-data` makes
