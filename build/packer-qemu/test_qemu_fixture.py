@@ -205,7 +205,13 @@ VARIANTS = {
 
 
 class QemuRunnerCase(tsn.SentinelCase):
-    setUp = tsn.FixtureRunnerTests.setUp
+    def setUp(self):
+        super().setUp()
+        self.sources, pins = tsn.with_archive(self.sources, cr.stage_tools.PINS,
+                                              os.path.join(os.path.dirname(self.root), "src"))
+        patcher = mock.patch.object(cr.stage_tools, "PINS", pins)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_qemu(self, daemon=None, delay=0.0, mode="qemu-fixture", **kw):
         daemon = daemon or QemuDaemon(self.clock)
