@@ -141,6 +141,47 @@ class RendererProcessTests(unittest.TestCase):
         reason = self.dir / "reason"
         return proc, reason.read_text() if reason.exists() else None
 
+    def test_wrapper_classifies_actual_oversize_and_broken_pipe_producers(self):
+        # The first producer really writes 1 MiB through the pipe (not subprocess input=).
+        # The second keeps writing until the bounded renderer closes its input. A separate
+        # distribution timeout bounds the synthetic producer even if this test regresses.
+        producers = [
+            "exec /usr/bin/python3 -I -B -c 'import os; "
+            "view=memoryview(b\"PEER_TEXT\" * 131072);\n"
+            "while view: view=view[os.write(1, view):]'",
+            "exec /usr/bin/timeout --kill-after=1s 2s /usr/bin/yes PEER_TEXT",
+        ]
+        for producer in producers:
+            with self.subTest(producer=producer):
+                start = time.monotonic()
+                proc, reason = self.pipeline(producer)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(proc.returncode, 1)
+                found = re.fullmatch(r"pipe-p([0-9]{1,3})-r1", reason)
+                self.assertIsNotNone(found)
+                self.assertGreater(int(found.group(1)), 0)
+                self.assertLessEqual(int(found.group(1)), 255)
+                self.assertLessEqual(len(reason), 32)
+                self.assertLess(len(proc.stdout) + len(proc.stderr), 4096)
+                self.assertNotIn(b"PEER_TEXT", proc.stdout + proc.stderr)
+                (self.dir / "reason").unlink()
+
+    def test_wrapper_classifies_serial_redirection_open_failure(self):
+        good = "printf '%s' '%s'" % (self.GOOD.decode(), "")
+        start = time.monotonic()
+        proc, reason = self.pipeline(good, out=str(self.dir / "missing-parent" / "tty"))
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(proc.returncode, 1)
+        found = re.fullmatch(r"pipe-p([0-9]{1,3})-r1", reason)
+        self.assertIsNotNone(found)
+        # The producer can finish its small write before the renderer's shell refuses
+        # the output redirection, or see SIGPIPE. Neither ordering permits acceptance.
+        self.assertLessEqual(int(found.group(1)), 255)
+        self.assertLessEqual(len(reason), 32)
+        self.assertLess(len(proc.stdout) + len(proc.stderr), 4096)
+        self.assertNotIn(self.GOOD, proc.stdout + proc.stderr)
+        self.assertFalse((self.dir / "missing-parent").exists())
+
     def test_wrapper_accepts_valid_and_records_separate_statuses_for_failures(self):
         good = "printf '%s' '%s'" % (self.GOOD.decode(), "")
         proc, reason = self.pipeline(good, out=str(self.dir / "tty"))
