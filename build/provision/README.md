@@ -436,7 +436,9 @@ packages, and installed top-level pin drift. After authenticated index update,
 isolated `apt-get check` rejects unsatisfied base dependencies before simulation
 or installation can repair them. Installation refuses removals,
 downgrade authorization and hold override. Network requests have 15-second
-inactivity timeouts, zero retries and a 10-second dpkg-lock wait; APT work shares
+inactivity timeouts, native `Acquire::Retries=1` (one retry per item, not per
+command; APT retries transient HTTP errors, not 404 or digest mismatch, and a
+15-second timeout is not a total download deadline) and a 10-second dpkg-lock wait; APT work shares
 a 210-second elapsed budget, each child bounded to at most 180 seconds. Smaller
 pre/postflight queries each have a 10-second limit. The outer 240-second limit
 provides an independent invocation ceiling; the CLI also arms a235second alarm. APT failure can leave partial dpkg
@@ -544,9 +546,24 @@ student access, Linux boot, full VLAB, networking, reboot or image readiness.
 ```bash
 python3 -m unittest discover -s build/provision -p test_qemu.py -v
 python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
+# Separately scoped lead execution only: runs the loopback apt-helper transport
+# fixture (retry/404/digest/deadline; HTTP only, not TLS or signature proof)
+# before any public snapshot request, then strict signature/missing-pin checks.
 timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 ```
+
+Ordinary HTTP/digest refusals require a native integer nonzero exit and the
+expected bounded status evidence. A supervisor timeout or output overflow is a
+fixture failure; only the dedicated hang case expects the external timeout.
+The shared bounded runner optionally observes the new session leader inside its
+cleanup boundary. This fixture records its PID/PGID/session/start tick and checks
+`/proc` for any surviving owned group or session member, including orphan APT
+method children whose arguments contain no download path. It waits at most two
+seconds for reaping; preparation uses Docker `--init` to reap orphan APT
+method children. It fails closed on unknown census/identity, and never kills
+unrelated processes. The helper source change also invalidates earlier hashed
+module identities; existing captures and bundles are not rewritten.
 
 The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
 containers, then runs the unchanged QEMU module twice in each and checks actual

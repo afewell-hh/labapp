@@ -1,16 +1,20 @@
 """Consequential offline failures; no host QEMU/APT invocation or cloud access."""
+import contextlib
 import os
 from pathlib import Path
 import runpy
+import signal
 import sys
 import tempfile
 import subprocess
 import json
 import test_bridge_ipv4_harness as ownership
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from hhfab_release import Refusal, bounded
+import qemu_container as container
+import qemu_offline as offline_protocol
 import qemu_witness as witness
 
 INSTALL = Path(__file__).with_name('install-qemu.py')
@@ -170,10 +174,240 @@ class OwnershipTests(ownership.CleanupTests):
                                     env=env, capture_output=True, text=True, timeout=10)
             return result, json.loads(state_path.read_text())
 
+    def test_preparation_uses_init_without_changing_containment(self):
+        result, state = self.run_harness('success')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        creates = [args for args in state['calls'] if args[0] == 'create']
+        prep = [args for args in creates if 'prep' in args[args.index('--name') + 1]]
+        runtime = [args for args in creates if 'runtime' in args[args.index('--name') + 1]]
+        self.assertEqual(len(prep), 2)
+        self.assertEqual(len(runtime), 2)
+        for args in prep:
+            self.assertEqual(args[:2], ['create', '--init'])
+            self.assertEqual(args.count('--init'), 1)
+            self.assertIn('--memory=1g', args)
+            self.assertIn('--cpus=2', args)
+            self.assertIn('--pids-limit=128', args)
+            self.assertIn('--security-opt=no-new-privileges', args)
+            self.assertNotIn('--privileged', args)
+            self.assertFalse(any(arg.startswith(('--volume', '--mount', '--device', '--network=host')) for arg in args))
+            self.assertEqual(args[args.index('timeout'):args.index('timeout') + 3],
+                             ['timeout', '--kill-after=3s', '510s'])
+        for args in runtime:
+            self.assertNotIn('--init', args)
+            for flag in ('--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                         '--read-only', '--user=1000:1000', '--pids-limit=128'):
+                self.assertIn(flag, args)
+
     def assert_owned_removed(self, state):
         adjusted = json.loads(json.dumps(state).replace('labapp.qemu-test.run=', 'labapp.bridge-test.run=')
                               .replace('labapp-qemu-test:', 'labapp-bridge-test:'))
         super().assert_owned_removed(adjusted)
+
+
+class RetryPolicyAndEvidenceTests(unittest.TestCase):
+    """Pure/mocked: no APT, HTTP server, loopback socket or container is used."""
+    NO_PUBKEY = b'W: GPG error: InRelease: NO_PUBKEY 871920D1991BC93C\n'
+
+    def test_setup_emits_one_retry_and_leaves_every_other_option_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apt, _ = offline_protocol.setup(root, '20261024T000000Z')
+        options = dict(item.split('=', 1) for item in apt[1:] if item != '-o')
+        self.assertEqual(apt[0], '/usr/bin/apt-get')
+        self.assertEqual(options['Acquire::Retries'], '1')
+        self.assertEqual({k: v for k, v in options.items() if not k.startswith('Dir::')}, {
+            'Acquire::Retries': '1', 'Acquire::https::Timeout': '15', 'Acquire::GzipIndexes': 'true',
+            'APT::Architecture': 'amd64', 'APT::Architectures::': 'amd64', 'DPkg::Lock::Timeout': '10',
+            'APT::Get::AllowUnauthenticated': 'false', 'Acquire::AllowInsecureRepositories': 'false',
+            'Acquire::AllowWeakRepositories': 'false', 'Acquire::AllowDowngradeToInsecureRepositories': 'false',
+            'Acquire::Check-Valid-Until': 'true', 'APT::Get::allow-Downgrades': 'false',
+            'APT::Get::allow-Change-Held-Packages': 'false'})
+        self.assertEqual(container.production_retries(), '1')
+
+    def test_protocol_identity_covers_setup_source_and_invalidates_old_state(self):
+        identity = offline_protocol.identity()
+        self.assertIn('qemu_offline.py', identity)
+        keys = {'format', 'base', 'module', 'status', 'architecture', 'foreign', 'holds', 'audit',
+                'selections_sha256', 'policy', 'keyring', 'apt_config_sha256', 'os_release_sha256'}
+        state = {key: '' for key in keys}
+        state.update(format='labapp-qemu-state-v1', base=offline_protocol.BASE, architecture='amd64',
+                     module={**identity, 'qemu_offline.py': '0' * 64})
+        with self.assertRaisesRegex(Refusal, 'module'):
+            offline_protocol.check_state(state, offline_protocol.BASE)
+
+    def test_stage_labels(self):
+        apt = '/usr/bin/apt-get'
+        self.assertEqual(container.apt_stage([apt, '-o', 'a=b', 'update']), 'update')
+        self.assertEqual(container.apt_stage([apt, 'check']), 'check')
+        self.assertEqual(container.apt_stage([apt, '--simulate', 'install', 'x=1']), 'simulate')
+        self.assertEqual(container.apt_stage([apt, '--yes', 'install', 'x=1']), 'install')
+        self.assertIsNone(container.apt_stage(['/usr/bin/dpkg', '--audit']))
+
+    def test_signature_proof_requires_real_authentication_failure(self):
+        container.signature_proof(100, self.NO_PUBKEY)
+        for code, output, kind in ((100, b'Err:1 https://x InRelease\n  502  Bad Gateway\n', 'transport-only'),
+                                   (100, b'Err:1 https://x InRelease\n  503  Service Unavailable\n', 'transport-only'),
+                                   (100, b'unrelated\n', 'unclassified'), (0, self.NO_PUBKEY, 'succeeded')):
+            with self.subTest(output=output), self.assertRaisesRegex(AssertionError, kind):
+                container.signature_proof(code, output)
+
+    def test_missing_pin_proof_requires_simulation_and_exact_pin_error(self):
+        pin = b"E: Version '999:0.invalid' for 'qemu-system-x86' was not found\n"
+        good = [('update', 0, b''), (None, 0, b''), ('check', 0, b''), ('simulate', 100, pin)]
+        container.missing_pin_proof(good, 'qemu-system-x86', '999:0.invalid')
+        bad = {
+            'transport at update': [('update', 100, b'503  Service Unavailable')],
+            'authentication at update': [('update', 100, self.NO_PUBKEY)],
+            'check failure': [('update', 0, b''), ('check', 100, pin)],
+            'unrelated simulate failure': good[:3] + [('simulate', 100, b'E: Unable to locate package')],
+            'other pin': good[:3] + [('simulate', 100, pin.replace(b'qemu-system-x86', b'socat'))],
+            'simulate accepted': good[:3] + [('simulate', 0, pin)],
+        }
+        for name, log in bad.items():
+            with self.subTest(name), self.assertRaises(AssertionError):
+                container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
+
+    def test_recording_call_keeps_stage_code_and_output(self):
+        log = []
+        module = {'ENV': {'APT_CONFIG': '/x'}}
+        with patch.object(container, 'bounded', return_value=(100, b'out')) as run:
+            with self.assertRaises(Refusal):
+                container.recording_call(module, log)(['/usr/bin/apt-get', 'check'], 7)
+        run.assert_called_once_with(['/usr/bin/apt-get', 'check'], 7, env=module['ENV'])
+        self.assertEqual(log, [('check', 100, b'out')])
+
+    @staticmethod
+    def mocked_native(persistent_requests, leftovers, calls, failure=None):
+        """Mocked server/process boundary, scripted like the expected native apt-helper results."""
+        hits = {}
+        prefix = 'http://127.0.0.1:1'
+        @contextlib.contextmanager
+        def server():
+            yield prefix, hits
+        def run(args, seconds, env=None, on_start=None):
+            if args[0] == '/usr/bin/dpkg-query':
+                return 0, b'2.8.test'
+            on_start(42)
+            calls.append((args, seconds, env))
+            path = args[args.index('download-file') + 1][len(prefix):]
+            hits[path] = (1 if path in ('/permanent', '/baddigest', '/hang')
+                          else min(persistent_requests, 2) if path == '/transient' else persistent_requests)
+            if failure and path == failure[0]:
+                raise Refusal(failure[1])
+            if path == '/transient':
+                Path(args[args.index('download-file') + 2]).write_bytes(container.BODY)
+                return 0, b''
+            if path == '/hang':
+                raise Refusal('command timeout')
+            if path == '/permanent':
+                return 100, b'404  Not Found'
+            if path == '/baddigest':
+                return 100, b'Hash Sum mismatch'
+            return 100, b'502  Bad Gateway' if path == '/always502' else b'503  Service Unavailable'
+        class Ownership:
+            def started(self, pid):
+                assert pid == 42
+            def verify(self):
+                if leftovers:
+                    raise Refusal('native transport owned process remains')
+        return dict(run=run, server=server, ownership=Ownership)
+
+    def test_transport_fixture_exact_options_limits_and_deadline(self):
+        calls = []
+        report = container.transport(**self.mocked_native(2, [], calls))
+        self.assertEqual(report['requests'], {'/transient': 2, '/always502': 2, '/always503': 2,
+                                              '/permanent': 1, '/baddigest': 1, '/hang': 1})
+        self.assertEqual((report['apt_version'], report['retries'], report['http_timeout']), ('2.8.test', '1', 15))
+        self.assertTrue(report['http_only_not_tls_or_signature_proof'])
+        for args, _, env in calls:
+            self.assertEqual(args[:8], [container.APT_HELPER, '-o', 'Acquire::Retries=1', '-o',
+                                        'Acquire::http::Timeout=15', '-o', 'Acquire::http::Proxy=DIRECT',
+                                        'download-file'])
+            self.assertTrue(args[8].startswith('http://127.0.0.1:'))
+            self.assertNotIn('APT_CONFIG', env)
+        self.assertEqual([seconds for _, seconds, _ in calls], [60, 60, 60, 60, 60, 3])
+
+    def test_transport_fixture_rejects_wrong_native_behavior_and_leftovers(self):
+        # A zero-retry client makes the transient case fail first.
+        with self.assertRaisesRegex(AssertionError, 'transient-then-success'):
+            container.transport(**self.mocked_native(1, [], []))
+        with self.assertRaisesRegex(Refusal, 'owned process remains'):
+            container.transport(**self.mocked_native(2, [123], []))
+        # More requests than one retry allows is unbounded retry.
+        with self.assertRaisesRegex(AssertionError, 'persistent'):
+            container.transport(**self.mocked_native(3, [], []))
+
+    def test_transport_supervisor_timeout_or_overflow_never_proves_native_refusal(self):
+        for path in ('/always502', '/always503', '/permanent', '/baddigest'):
+            for failure in ('command timeout', 'command output overflow'):
+                with self.subTest(path=path, failure=failure), self.assertRaisesRegex(Refusal, failure):
+                    container.transport(**self.mocked_native(2, [], [], (path, failure)))
+
+    def test_transport_requires_native_integer_exit_and_status_evidence(self):
+        for result in (('failure', b'502'), (True, b'502'), (100, b'unrelated'),
+                       (100, b'Failed to fetch http://127.0.0.1/always502: unrelated failure')):
+            native = self.mocked_native(2, [], [])
+            original = native['run']
+            def run(args, seconds, **kwargs):
+                answer = original(args, seconds, **kwargs)
+                return result if '/always502' in args[-2] else answer
+            native['run'] = run
+            with self.subTest(result=result), self.assertRaisesRegex(AssertionError, 'persistent'):
+                container.transport(**native)
+
+    @staticmethod
+    def stat(pid, group, session, tick, name='http'):
+        return f'{pid} ({name}) ' + ' '.join(['S', '1', str(group), str(session)] + ['0'] * 15 + [str(tick)])
+
+    def test_owned_group_detects_orphan_http_method_without_target_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '42').mkdir()
+            (root / '42' / 'stat').write_text(self.stat(42, 42, 42, 100, 'apt-helper'))
+            owned = container.OwnedGroup(root)
+            owned.started(42)
+            (root / '42' / 'stat').unlink()
+            (root / '42').rmdir()
+            (root / '43').mkdir()
+            (root / '43' / 'stat').write_text(self.stat(43, 42, 42, 101))
+            (root / '43' / 'cmdline').write_bytes(b'/usr/lib/apt/methods/http\x00')
+            self.assertEqual(owned.remaining(), [(43, 42, 42, 101)])
+            with patch.object(container.time, 'monotonic', side_effect=[0, 3]), self.assertRaisesRegex(Refusal, 'owned process remains'):
+                owned.verify()
+            (root / '43' / 'stat').unlink()
+            (root / '43' / 'cmdline').unlink()
+            (root / '43').rmdir()
+            owned.verify()
+
+    def test_owned_group_unknown_or_reused_identity_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owned = container.OwnedGroup(root)
+            with self.assertRaisesRegex(Refusal, 'unobserved'):
+                owned.verify()
+            (root / '42').mkdir()
+            path = root / '42' / 'stat'
+            path.write_text(self.stat(42, 42, 42, 100))
+            owned.started(42)
+            path.write_text(self.stat(42, 42, 42, 999))
+            with self.assertRaisesRegex(Refusal, 'identity changed'):
+                owned.verify()
+            path.write_text('malformed')
+            with self.assertRaisesRegex(Refusal, 'census unknown'):
+                owned.verify()
+
+    def test_bounded_observer_exception_still_kills_owned_group_and_reaps(self):
+        proc = Mock(pid=42)
+        with patch('hhfab_release.subprocess.Popen', return_value=proc), patch('hhfab_release.os.killpg') as kill:
+            def reject(pid):
+                self.assertEqual(pid, 42)
+                raise Refusal('observer failure')
+            with self.assertRaisesRegex(Refusal, 'observer failure'):
+                bounded(['/native'], 3, on_start=reject)
+        kill.assert_called_once_with(42, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=2)
+        proc.stdout.close.assert_called_once_with()
 
 
 if __name__ == '__main__':
