@@ -163,6 +163,128 @@ class CacheIdentityTests(unittest.TestCase):
                 st.verify_control_cache(cache, check=lambda: (_ for _ in ()).throw(cr.Expired()))
 
 
+class CacheFailureReceiptTests(unittest.TestCase):
+    SECRET = 'secret-token-filename-or-peer-text'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = os.path.realpath(self.tmp.name)
+        self.references = synthetic_cache_references()
+        patcher = mock.patch.object(st, 'CONTROL_CACHE_REFERENCES', self.references)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        write_cache(self.cache, self.references)
+
+    def path(self, root=0, payload=None):
+        base = os.path.join(self.cache, 'v1', self.references[root][0])
+        return base if payload is None else os.path.join(base, self.references[root][2][payload][0])
+
+    def refused(self, stage, reason):
+        with self.assertRaises(st.CacheAuditRefusal) as raised:
+            st.verify_control_cache(self.cache)
+        receipt = raised.exception.receipt
+        self.assertEqual((receipt['status'], receipt['stage'], receipt['reason']), ('refused', stage, reason))
+        self.assertNotIn(self.SECRET, json.dumps(receipt))
+        self.assertNotIn(self.cache, json.dumps(receipt))
+        self.assertNotIn('unpacked_content', receipt)
+        self.assertNotIn('expected_reference_sha256', receipt)
+        return receipt
+
+    def test_entry_set_refusal_counts_do_not_reveal_unknown_names(self):
+        os.mkdir(os.path.join(self.cache, self.SECRET))
+        receipt = self.refused('version', 'entry_set')
+        self.assertEqual([receipt[k] for k in ('observed_count', 'expected_count', 'missing_count', 'extra_count')],
+                         [2, 1, 0, 1])
+        self.assertNotIn('root_index', receipt)
+
+    def test_extra_root_and_payload_are_distinguished_by_closed_stage_and_index(self):
+        os.mkdir(os.path.join(self.cache, 'v1', self.SECRET))
+        receipt = self.refused('roots', 'entry_set')
+        self.assertEqual(receipt['extra_count'], 1)
+        os.rmdir(os.path.join(self.cache, 'v1', self.SECRET))
+        open(os.path.join(self.path(1), self.SECRET), 'wb').close()
+        receipt = self.refused('payloads', 'entry_set')
+        self.assertEqual(receipt['root_index'], 1)
+        self.assertNotIn('payload_index', receipt)
+        self.assertEqual(receipt['regular_payloads_verified'], 3)
+
+    def test_non_directory_second_root_reports_roots_not_previous_payload_stage(self):
+        import shutil
+        shutil.rmtree(self.path(1))
+        open(self.path(1), 'wb').close()
+        receipt = self.refused('roots', 'entry_type')
+        self.assertEqual(receipt['root_index'], 1)
+        self.assertNotIn('payload_index', receipt)
+
+    def test_payload_size_and_hash_have_fixed_expected_indices_and_completed_counts(self):
+        target = self.path(0, 1)
+        with open(target, 'ab') as handle:
+            handle.write(b'drift')
+        receipt = self.refused('regular', 'file_size')
+        self.assertEqual((receipt['root_index'], receipt['payload_index'], receipt['regular_payloads_verified']), (0, 1, 1))
+        self.assertEqual(receipt['expected_bytes'], len(MEMBER))
+        with open(target, 'wb') as handle:
+            handle.write(b'x' * len(MEMBER))
+        receipt = self.refused('regular', 'file_hash')
+        self.assertEqual(receipt['payload_bytes_hashed'], 2 * len(MEMBER))
+        self.assertEqual(receipt['regular_payloads_verified'], 1)
+
+    def test_alias_empty_unpacked_tree_and_unsafe_name_remain_refused(self):
+        target = self.path(6, 0)
+        leaf = os.path.join(target, 'synthetic-file')
+        os.unlink(leaf)
+        receipt = self.refused('unpacked', 'empty_tree')
+        self.assertEqual((receipt['root_index'], receipt['payload_index']), (6, 0))
+        os.symlink('/etc/passwd', leaf)
+        self.refused('unpacked', 'entry_type')
+        os.unlink(leaf)
+        with open(os.path.join(target, self.SECRET + ' unsafe'), 'wb') as handle:
+            handle.write(b'synthetic')
+        self.refused('unpacked', 'path_policy')
+
+    def test_helper_filesystem_and_unknown_errors_never_export_messages(self):
+        for error, reason in ((OSError(self.SECRET), 'filesystem'),
+                              (st.StageError(self.SECRET), 'file_refused'),
+                              (st.StageError('input changed while being read'), 'file_changed')):
+            with self.subTest(reason=reason), mock.patch.object(st, 'hash_file', side_effect=error):
+                receipt = self.refused('regular', reason)
+                self.assertEqual((receipt['root_index'], receipt['payload_index']), (0, 0))
+
+    def test_changed_file_identity_is_distinguished_without_serializing_path(self):
+        original = st.hash_file
+        def changed(*args, **kwargs):
+            sha, identity = original(*args, **kwargs)
+            return sha, (identity[0], identity[1], identity[2] + 1, *identity[3:])
+        with mock.patch.object(st, 'hash_file', side_effect=changed):
+            self.refused('regular', 'file_changed')
+
+    def test_entry_and_byte_overflows_keep_partial_counters_and_refuse(self):
+        with mock.patch.object(st, 'CONTROL_CACHE_ENTRY_CAP', 1):
+            receipt = self.refused('roots', 'entry_bound')
+            self.assertEqual(receipt['entries_scanned'], 2)
+        with mock.patch.object(st, 'CONTROL_CACHE_BYTE_CAP', 1):
+            receipt = self.refused('regular', 'byte_bound')
+            self.assertEqual(receipt['regular_payloads_verified'], 1)
+
+    def test_closed_constructor_rejects_unknown_fields_and_bounds_numeric_export(self):
+        for args, kwargs in ((('secret', 'file_hash'), {}), (('regular', self.SECRET), {}),
+                             (('regular', 'file_hash'), {'observed_name': self.SECRET}),
+                             (('regular', 'file_hash'), {'root_index': 10}),
+                             (('regular', 'file_hash'), {'payload_index': 6}),
+                             (('regular', 'file_hash'), {'entries_scanned': -1})):
+            with self.assertRaises(ValueError) as raised:
+                st.CacheAuditRefusal(*args, **kwargs)
+            self.assertNotIn(self.SECRET, str(raised.exception))
+        receipt = st.CacheAuditRefusal('regular', 'file_size', observed_bytes=1 << 100).receipt
+        self.assertEqual(receipt['observed_bytes'], 1 << 40)
+
+    def test_expiry_during_hash_is_not_reclassified_as_a_cache_refusal(self):
+        with mock.patch.object(st, 'hash_file', side_effect=cr.Expired()):
+            with self.assertRaises(cr.Expired):
+                st.verify_control_cache(self.cache)
+
+
 class StageControlCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -611,6 +733,52 @@ class FailClosedTests(ControlCase):
                 self.assertEqual(result["outcome"], "failed", result)
                 self.assertEqual(result["reason"], reason)
                 self.assert_fully_cleaned(result, daemon)
+
+    def test_cache_refusal_retains_successful_staged_rehash_and_exact_cleanup(self):
+        result, daemon = self.run_control('cache_mismatch')
+        self.assertEqual(result['reason'], 'cache_identity_mismatch')
+        self.assertEqual(result['evidence']['staged_inputs_verification'], 'passed')
+        self.assertEqual(result['evidence']['cache_audit']['status'], 'refused')
+        self.assertEqual(result['evidence']['cache_audit']['reason'], 'file_size')
+        self.assertNotIn('cache_identity', result['evidence'])
+        self.assert_fully_cleaned(result, daemon)
+
+    def test_staged_rehash_precedes_output_hashes_and_cache_audit(self):
+        events = []
+        verify, audit, hashed = st.verify_control, st.verify_control_cache, st.hash_file
+        def rehash(*args, **kwargs):
+            events.append('staged')
+            return verify(*args, **kwargs)
+        def cache(*args, **kwargs):
+            events.append('cache')
+            return audit(*args, **kwargs)
+        def output(*args, **kwargs):
+            if args[0].endswith('.iso'):
+                events.append('iso')
+            return hashed(*args, **kwargs)
+        with mock.patch.object(st, 'verify_control', side_effect=rehash), mock.patch.object(
+                st, 'verify_control_cache', side_effect=cache), mock.patch.object(st, 'hash_file', side_effect=output):
+            result, daemon = self.run_control('cache_mismatch')
+        self.assertEqual(events, ['staged', 'iso', 'iso', 'cache'])
+        self.assert_fully_cleaned(result, daemon)
+
+    def test_staged_refusal_never_reaches_cache_or_output_hashing(self):
+        with mock.patch.object(st, 'verify_control_cache') as cache:
+            result, daemon = self.run_control('tamper')
+        cache.assert_not_called()
+        self.assertEqual(result['evidence']['staged_inputs_verification'], 'failed')
+        self.assertEqual(result['evidence']['cache_audit'], {'status': 'not_run'})
+        self.assertNotIn('iso', result['evidence'])
+        self.assert_fully_cleaned(result, daemon)
+
+    def test_expired_cache_audit_preserves_incomplete_status_and_cleanup(self):
+        with mock.patch.object(st, 'verify_control_cache', side_effect=cr.Expired()):
+            result, daemon = self.run_control()
+        self.assertEqual(result['reason'], 'budget_exhausted')
+        self.assertEqual(result['evidence']['staged_inputs_verification'], 'passed')
+        self.assertEqual(result['evidence']['cache_audit'], {'status': 'incomplete'})
+        self.assertNotIn('cache_identity', result['evidence'])
+        self.assert_fully_cleaned(result, daemon)
 
     def test_failing_step_keeps_only_closed_summary_and_log_hashes(self):
         result, _ = self.run_control("step_fail")

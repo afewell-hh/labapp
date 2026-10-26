@@ -1058,6 +1058,7 @@ def _accept_control(own, result, budget, clock, oom, code):
     out = os.path.join(own["workspace"], "out")
     staged = own["staged"]
     evidence = {"image_id": own["image_id"], "runtime_diffids": PREPARED_RUNTIME["diffids"], "task": "control-build",
+                "staged_inputs_verification": "not_run", "cache_audit": {"status": "not_run"},
                 "inputs": staged, "exit_code": code, "oom_killed": oom, "claims": dict(CONTROL_CLAIMS),
                 "network": "docker-bridge-outbound", "commands": {
                     "init": "hhfab " + CONTROL_INIT, "validate": "hhfab " + CONTROL_VALIDATE,
@@ -1121,6 +1122,15 @@ def _accept_control(own, result, budget, clock, oom, code):
     evidence["warm_cache_growth_apparent_kib"] = (kib["cache_warm"]["apparent_kib"]
                                                   - kib["cache_cold"]["apparent_kib"])
     check = lambda: _checkpoint(own, budget, clock)
+    evidence["staged_inputs_verification"] = "incomplete"
+    try:
+        intact = stage_tools.verify_control(own["workspace"], staged, check)
+    except (OSError, stage_tools.StageError):
+        intact = False
+    evidence["staged_inputs_verification"] = "passed" if intact else "failed"
+    if not intact:
+        result["reason"] = "staged_inputs_changed"
+        return
     isos = {}
     for name in ("w1", "w2"):
         path = _control_iso(out, name)
@@ -1137,18 +1147,18 @@ def _accept_control(own, result, budget, clock, oom, code):
         return
     evidence["iso"] = isos
     evidence["iso_equal"] = isos["w1"]["sha256"] == isos["w2"]["sha256"]
+    evidence["cache_audit"] = {"status": "incomplete"}
     try:
         evidence["cache_identity"] = stage_tools.verify_control_cache(os.path.join(out, "cache"), check)
-    except (OSError, stage_tools.StageError):
+    except stage_tools.CacheAuditRefusal as exc:
+        evidence["cache_audit"] = exc.receipt
         result["reason"] = "cache_identity_mismatch"
         return
-    try:
-        intact = stage_tools.verify_control(own["workspace"], staged, check)
     except (OSError, stage_tools.StageError):
-        intact = False
-    if not intact:
-        result["reason"] = "staged_inputs_changed"
+        evidence["cache_audit"] = {"status": "refused", "stage": "unknown", "reason": "unclassified"}
+        result["reason"] = "cache_identity_mismatch"
         return
+    evidence["cache_audit"] = {"status": "passed"}
     result["outcome"], result["reason"], result["exit_code"] = "accepted", None, code
 
 

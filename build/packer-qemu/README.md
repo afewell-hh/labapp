@@ -652,6 +652,20 @@ to the public registry, and independent exact-head review.
   descriptor mappings **in memory only**, so on-disk cache auditing cannot establish selected root manifests or
   four packed-directory descriptor correspondences. Those remain explicitly **unverified**, as do signatures;
   this is component measurement scope, not reproducible artifact acceptance. No new query/downloader is added.
+* Independent staged-input rehash runs after valid phase evidence and before ISO hashing/cache audit. Its
+  `staged_inputs_verification` is `not_run`, `incomplete`, `passed` or `failed`; a failure refuses the task and
+  prevents the cache audit. `cache_audit.status` likewise distinguishes `not_run`, `incomplete`, `passed` and
+  `refused`. A refused audit retains only closed `stage`/`reason` codes, optional zero-based expected
+  `root_index`/`payload_index` from `CONTROL_CACHE_REFERENCES`, and bounded numeric observed/expected/missing/extra
+  counts plus completed verification counters (numeric exports saturate at 2^40). `payload_bytes_hashed` counts
+  completed stable file hashes, including a later expected-SHA mismatch; `regular_payloads_verified` counts only
+  completed expected-size/SHA matches. It never exports actual names, paths, exception text or partial
+  fingerprints as a successful `cache_identity`. Stages distinguish version/root/payload-entry checks, regular
+  payloads and unpacked trees; reasons distinguish entry sets, path/type/size/SHA/change checks, empty trees,
+  entry/byte bounds and filesystem/refused-helper failures. Expiry and cancellation retain incomplete status and
+  their original lifecycle outcome. These diagnostics classify a current refusal; they cannot recover the subtype
+  of an earlier generic refusal after disposal. Strict expected references, acceptance, limits and cleanup remain
+  unchanged.
 * Disposal and receipts: the container and the whole owned workspace (cache, workdirs, ISOs) are removed on success,
   failure, timeout and signal, and absence is proved in `_finish`; an uncertain removal is a `hold`. Retained are
   closed step names/exit codes, numbers, hashes and per-log byte count/SHA256; no raw peer text,

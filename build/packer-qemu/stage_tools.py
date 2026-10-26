@@ -559,16 +559,46 @@ CONTROL_CACHE_FINGERPRINT = hashlib.sha256(json.dumps(
     CONTROL_CACHE_REFERENCES, separators=(',', ':')).encode('ascii')).hexdigest()
 
 
+class CacheAuditRefusal(StageError):
+    """Closed cache-only diagnostic; never retain exception messages or observed names."""
+    STAGES = {'version', 'roots', 'payloads', 'regular', 'unpacked'}
+    REASONS = {'entry_set', 'path_policy', 'entry_type', 'file_size', 'file_hash', 'file_changed',
+               'file_refused', 'empty_tree', 'entry_bound', 'byte_bound', 'filesystem'}
+    COUNTS = {'entries_scanned', 'payload_bytes_hashed', 'regular_payloads_verified',
+              'unpacked_directories_fingerprinted', 'observed_count', 'expected_count',
+              'missing_count', 'extra_count', 'observed_bytes', 'expected_bytes'}
+
+    def __init__(self, stage, reason, **fields):
+        if stage not in self.STAGES or reason not in self.REASONS or set(fields) - self.COUNTS - {'root_index', 'payload_index'}:
+            raise ValueError('invalid cache refusal fields')
+        receipt = {'status': 'refused', 'stage': stage, 'reason': reason}
+        for key, value in fields.items():
+            if type(value) is not int or value < 0:
+                raise ValueError('invalid cache refusal count')
+            if key in ('root_index', 'payload_index'):
+                if value > (9 if key == 'root_index' else 5):
+                    raise ValueError('invalid cache refusal index')
+                receipt[key] = value
+            else:
+                receipt[key] = min(value, 1 << 40)
+        self.receipt = receipt
+        super().__init__('cache audit refused')
+
+
 def verify_control_cache(cache, check=_noop):
-    """Audit named official ORAS cache payloads only. No network, unpacker or downloader.
-    Root selection and four original packed-directory descriptors remain unverified.
-    Symlinks/special files are refused; only fixed names, counts and hashes escape.
+    """Audit named official ORAS payloads only; errors carry closed partial counters.
+    Root selection and original packed-directory descriptors remain unverified.
     """
     count = total = files = directories = 0
+    stage, indices = 'version', {}
+
+    def refuse(reason, **counts):
+        raise CacheAuditRefusal(stage, reason, **indices, entries_scanned=count,
+                                payload_bytes_hashed=total, regular_payloads_verified=files,
+                                unpacked_directories_fingerprinted=directories, **counts)
 
     def children(directory):
         nonlocal count
-        # Anchor every parent; a symlinked intermediate directory never escapes.
         fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             for part in directory.split('/')[1:]:
@@ -581,70 +611,107 @@ def verify_control_cache(cache, check=_noop):
                     check()
                     count += 1
                     if count > CONTROL_CACHE_ENTRY_CAP:
-                        raise StageError("control cache entry bound exceeded")
+                        refuse('entry_bound')
                     result.append((item.name, item.stat(follow_symlinks=False)))
-            return sorted(result)
+            return dict(sorted(result))
         finally:
             os.close(fd)
 
-    if {name for name, _ in children(cache)} != {'v1'}:
-        raise StageError("unexpected control cache version")
-    cache = os.path.join(cache, 'v1')  # exact artificer.Version in v0.50.4
-    expected = {row[0] for row in CONTROL_CACHE_REFERENCES}
-    if {name for name, _ in children(cache)} != expected:
-        raise StageError("unexpected control cache roots")
-    fingerprints = {}
-    for root, _, entries in CONTROL_CACHE_REFERENCES:
-        check()
-        base = os.path.join(cache, root)
-        if {name for name, _ in children(base)} != {e[0] for e in entries}:
-            raise StageError("unexpected control cache contents")
-        for name, size, digest, unpacked in entries:
-            path = os.path.join(base, name)
-            if not unpacked:
-                sha, _ = hash_file(path, size=size, check=check, path_re=CONTROL_CACHE_PATH_RE)
-                if sha != digest:
-                    raise StageError("control payload identity differs")
-                files += 1
-                total += size
-                if total > CONTROL_CACHE_BYTE_CAP:
-                    raise StageError("control cache byte bound exceeded")
-                continue
-            if not stat.S_ISDIR(os.lstat(path).st_mode):
-                raise StageError("invalid unpacked control payload")
-            tree = hashlib.sha256()
-            stack = [(path, '')]
-            tree_count = tree_bytes = 0
-            while stack:
-                check()
-                parent, relative = stack.pop()
-                for child_name, info in children(parent):
-                    check()
-                    tree_count += 1
-                    rel = relative + '/' + child_name
-                    child_path = os.path.join(parent, child_name)
-                    if stat.S_ISDIR(info.st_mode):
-                        kind, sha = 'dir', ''
-                        stack.append((child_path, rel))
-                    elif stat.S_ISREG(info.st_mode):
-                        kind = 'file'
-                        sha, identity_now = hash_file(child_path, check=check, limit=12 << 30, path_re=CONTROL_CACHE_PATH_RE)
-                        if identity_now != identity(info):
-                            raise StageError("control cache payload changed")
-                        tree_bytes += info.st_size
-                        total += info.st_size
-                    else:
-                        raise StageError("control cache alias or special entry")
+    def exact_entries(observed, expected):
+        if set(observed) != set(expected):
+            refuse('entry_set', observed_count=len(observed), expected_count=len(expected),
+                   missing_count=len(set(expected) - set(observed)), extra_count=len(set(observed) - set(expected)))
+
+    def checked_hash(path, info, size=None):
+        if not CONTROL_CACHE_PATH_RE.fullmatch(path) or os.path.normpath(path) != path:
+            refuse('path_policy')
+        if not stat.S_ISREG(info.st_mode):
+            refuse('entry_type')
+        if (size is not None and info.st_size != size) or info.st_size > 12 << 30:
+            refuse('file_size', observed_bytes=info.st_size, expected_bytes=size if size is not None else 12 << 30)
+        sha, identity_now = hash_file(path, size=size, check=check, limit=12 << 30, path_re=CONTROL_CACHE_PATH_RE)
+        if identity_now != identity(info):
+            refuse('file_changed')
+        return sha
+
+    try:
+        top = children(cache)
+        exact_entries(top, {'v1'})
+        if not stat.S_ISDIR(top['v1'].st_mode):
+            refuse('entry_type')
+        cache = os.path.join(cache, 'v1')
+        stage = 'roots'
+        roots = children(cache)
+        exact_entries(roots, {row[0] for row in CONTROL_CACHE_REFERENCES})
+        fingerprints = {}
+        for root_index, (root, _, entries) in enumerate(CONTROL_CACHE_REFERENCES):
+            indices = {'root_index': root_index}
+            stage = 'roots'
+            check()
+            if not stat.S_ISDIR(roots[root].st_mode):
+                refuse('entry_type')
+            stage = 'payloads'
+            base = os.path.join(cache, root)
+            payloads = children(base)
+            exact_entries(payloads, {e[0] for e in entries})
+            for payload_index, (name, size, digest, unpacked) in enumerate(entries):
+                indices = {'root_index': root_index, 'payload_index': payload_index}
+                path = os.path.join(base, name)
+                stage = 'unpacked' if unpacked else 'regular'
+                if not unpacked:
+                    sha = checked_hash(path, payloads[name], size)
+                    total += size
+                    if sha != digest:
+                        refuse('file_hash')
+                    files += 1
                     if total > CONTROL_CACHE_BYTE_CAP:
-                        raise StageError("control cache byte bound exceeded")
-                    tree.update(json.dumps([rel, kind, info.st_size if kind == 'file' else 0, sha],
-                                           ensure_ascii=True, separators=(',', ':')).encode('ascii') + b'\n')
-            if tree_count == 0:
-                raise StageError("empty unpacked control payload")
-            directories += 1
-            fingerprints[root + '/' + name] = {'sha256': tree.hexdigest(), 'entries': tree_count,
-                                                'bytes': tree_bytes}
-    return {'expected_reference_sha256': CONTROL_CACHE_FINGERPRINT, 'roots': len(expected),
+                        refuse('byte_bound')
+                    continue
+                if not stat.S_ISDIR(payloads[name].st_mode):
+                    refuse('entry_type')
+                tree = hashlib.sha256()
+                stack = [(path, '')]
+                tree_count = tree_bytes = 0
+                while stack:
+                    check()
+                    parent, relative = stack.pop()
+                    for child_name, info in children(parent).items():
+                        check()
+                        tree_count += 1
+                        rel = relative + '/' + child_name
+                        child_path = os.path.join(parent, child_name)
+                        if stat.S_ISDIR(info.st_mode):
+                            kind, sha = 'dir', ''
+                            stack.append((child_path, rel))
+                        elif stat.S_ISREG(info.st_mode):
+                            kind = 'file'
+                            sha = checked_hash(child_path, info)
+                            tree_bytes += info.st_size
+                            total += info.st_size
+                        else:
+                            refuse('entry_type')
+                        if total > CONTROL_CACHE_BYTE_CAP:
+                            refuse('byte_bound')
+                        tree.update(json.dumps([rel, kind, info.st_size if kind == 'file' else 0, sha],
+                                               ensure_ascii=True, separators=(',', ':')).encode('ascii') + b'\n')
+                if tree_count == 0:
+                    refuse('empty_tree')
+                directories += 1
+                fingerprints[root + '/' + name] = {'sha256': tree.hexdigest(), 'entries': tree_count,
+                                                  'bytes': tree_bytes}
+    except CacheAuditRefusal:
+        raise
+    except OSError:
+        refuse('filesystem')
+    except StageError as exc:
+        # These are fixed local helper messages, never serialized. Unknown messages
+        # receive one closed fallback, including arbitrary peer-bearing exceptions.
+        reason = {'unsafe input path': 'path_policy',
+                  'input grew while being read': 'file_changed',
+                  'input changed while being read': 'file_changed',
+                  'input size differs from its pin': 'file_size'}.get(str(exc), 'file_refused')
+        refuse('filesystem' if isinstance(exc.__cause__, OSError) else reason)
+    return {'expected_reference_sha256': CONTROL_CACHE_FINGERPRINT, 'roots': len(roots),
             'regular_payloads_verified': files, 'unpacked_directories': directories,
             'unpacked_content': fingerprints, 'payload_bytes_hashed': total,
             'root_manifest_selection_verified': False, 'packed_directory_descriptors_verified': False,
