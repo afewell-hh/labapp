@@ -500,7 +500,12 @@ ownership, retention and disposition stay outside this repository until the lead
   before the failure receipt; `token` is a fixed word from `/run/labapp-reason` written by `assert-fixture.py`
   (`owner-map`, `dir-state`, `target-present`, `stage-leftover`, `install-state`, `dir-preserved`, `rerun-state`, `archive-integrity`, `bad-version`,
   `neg-state`, `negative-timeout`, `state-missing`, `cli-run`, `cli-version`, `cli-timeout`, `output-bound`, `internal`) or `plan-step`. The observer validates it against the run's nonce and
-  inputs and appends only those fields to its failure reason; the runner keeps that bounded text as
+  inputs and appends only those fields to its failure reason. The `prereq <owner-uid> <archive>` assertion phase runs
+  `/usr/bin/python3 -B component_prerequisites.py --owner-uid U --archive A` through the same bounded helper (4 KiB, 240 s
+  wrapper deadline above the probe's 210 s alarm), strictly parses the fixed schema/outcome/phase/exit, and maps only an
+  allowed phase to `prereq-preflight|installer|systemd|kvm|cleanup|unknown`; malformed, inconsistent, overlong or
+  unexpected-exit output is `prereq-invalid` and a deadline is `prereq-timeout`. It is for the step-10 probe invocation
+  of the stacked fixture; this branch has no step 10, so the plan is unchanged here. The runner keeps that bounded text as
   `evidence.observer_failure` beyond the 2 KiB excerpt. No guest stdout/stderr is exported.
 * Budget: 1800 s work INCLUDING staging from admission + 900 s cleanup, no renewal (proposed, unmeasured).
   The staged 60 MB CD file and the two extractions are unmeasured; large-ISO readback is a separate offline-checkable

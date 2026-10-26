@@ -197,5 +197,128 @@ class ProbeTests(unittest.TestCase):
         self.assertIn('operational failure', output.getvalue())
 
 
+class PhaseTests(unittest.TestCase):
+    """The failure JSON names the failing action; success and exit codes are unchanged."""
+
+    def setUp(self):
+        self.addCleanup(setattr, probe, 'STAGE', 'unknown')
+        probe.STAGE = 'unknown'
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+
+    def fail_main(self):
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['probe', '--owner-uid', '1234', '--archive', '/archive']), \
+                patch.object(signal, 'signal'), patch.object(signal, 'alarm'), \
+                contextlib.redirect_stdout(output):
+            code = probe.main()
+        return code, output.getvalue()
+
+    def test_each_stage_failure_names_that_phase_and_stops(self):
+        stages = ['preflight', 'installer', 'systemd', 'kvm']
+        for index, name in enumerate(stages):
+            for error in (Refusal('prerequisite command failed'), Refusal('overall work deadline exceeded'),
+                          RuntimeError('SECRET'), KeyboardInterrupt()):
+                probe.STAGE = 'unknown'
+                temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+                with self.subTest(stage=name, error=type(error).__name__), \
+                        patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                        patch.object(probe, 'preflight', side_effect=error if name == 'preflight' else
+                                     (lambda *_: pwd.getpwuid(os.getuid()))), \
+                        patch.object(probe, 'installer_probe', side_effect=error if name == 'installer' else
+                                     (lambda *_: {})), \
+                        patch.object(probe, 'systemd_probe', side_effect=error if name == 'systemd' else
+                                     (lambda *_: {})) as systemd, \
+                        patch.object(probe, 'require', side_effect=error if name == 'kvm' else
+                                     (lambda *_, **__: b'')) as require:
+                    with self.assertRaises(type(error)):
+                        probe.probe(1234, Path('/archive'))
+                    self.assertEqual(probe.STAGE, name)
+                    if index < 2:
+                        systemd.assert_not_called()
+                    if index < 3:
+                        require.assert_not_called()
+
+    def test_failure_json_carries_only_allowlisted_phase(self):
+        for stage_name, expected in (('kvm', 'kvm'), ('bogus /path SECRET', 'unknown')):
+            probe.STAGE = stage_name
+            with patch.object(probe, 'probe', side_effect=Refusal('prerequisite command failed')):
+                code, text = self.fail_main()
+            self.assertEqual(code, 1)
+            data = json_loads(text)
+            self.assertEqual(data, {'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
+                                    'reason': 'prerequisite command failed', 'phase': expected})
+            self.assertNotIn('SECRET', text)
+
+    def test_unexpected_exception_and_timeout_keep_stage_phase(self):
+        for error in (RuntimeError('SECRET'), KeyboardInterrupt(), Refusal('overall work deadline exceeded')):
+            probe.STAGE = 'installer'
+            with patch.object(probe, 'probe', side_effect=error):
+                code, text = self.fail_main()
+            self.assertEqual((code, json_loads(text)['phase']), (1, 'installer'))
+            self.assertNotIn('SECRET', text)
+
+    def test_cleanup_failure_takes_precedence_over_original_error(self):
+        # Original KVM-stage failure, then the unit cleanup raises: reported as cleanup.
+        calls = []
+        def run(args, seconds=15, limit=4096):
+            calls.append(args[1] if len(args) > 1 else args[0])
+            return (1, b'') if 'stop' in args else (0, b'')
+        probe.STAGE = 'systemd'
+        with patch.object(probe, 'run', run), \
+                patch.object(probe, 'unit_properties', return_value={'LoadState': 'not-found'}), \
+                patch.object(probe, 'require', side_effect=Refusal('prerequisite command failed')):
+            with self.assertRaisesRegex(Refusal, 'stop failed'):
+                probe.systemd_probe(Path(self.temporary.name))
+        self.assertEqual(probe.STAGE, 'cleanup')
+
+    def test_successful_cleanup_preserves_original_phase(self):
+        probe.STAGE = 'systemd'
+        with patch.object(probe, 'run', return_value=(0, b'')), \
+                patch.object(probe, 'unit_properties', return_value={'LoadState': 'not-found'}), \
+                patch.object(probe, 'require', side_effect=Refusal('prerequisite command failed')):
+            with self.assertRaisesRegex(Refusal, 'prerequisite command failed'):
+                probe.systemd_probe(Path(self.temporary.name))
+        self.assertEqual(probe.STAGE, 'systemd')
+
+    def test_workspace_cleanup_failure_is_cleanup_not_kvm(self):
+        temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+        temp.cleanup = mock_raise(OSError('SECRET'))
+        owner = pwd.getpwuid(os.getuid())
+        probe.STAGE = 'unknown'
+        with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                patch.object(probe, 'preflight', return_value=owner), \
+                patch.object(probe, 'installer_probe', return_value={}), \
+                patch.object(probe, 'systemd_probe', return_value={}), \
+                patch.object(probe, 'require', return_value=b''):
+            with self.assertRaises(OSError):
+                probe.probe(1234, Path('/archive'))
+        self.assertEqual(probe.STAGE, 'cleanup')
+
+    def test_success_report_is_unchanged_and_exit_zero(self):
+        owner = pwd.getpwuid(os.getuid())
+        temp = tempfile.TemporaryDirectory(dir=self.temporary.name)
+        with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temp), \
+                patch.object(probe, 'preflight', return_value=owner), \
+                patch.object(probe, 'installer_probe', return_value={}), \
+                patch.object(probe, 'systemd_probe', return_value={}), \
+                patch.object(probe, 'require', return_value=b''):
+            report = probe.probe(1234, Path('/archive'))
+        self.assertEqual(sorted(report), ['caller_uid', 'checks', 'python', 'schema'])
+        self.assertEqual(sorted(report['checks']), ['installer', 'kvm', 'systemd'])
+        self.assertNotIn('phase', report)
+
+
+def json_loads(text):
+    import json
+    return json.loads(text)
+
+
+def mock_raise(error):
+    def raiser(*_):
+        raise error
+    return raiser
+
+
 if __name__ == '__main__':
     unittest.main()
