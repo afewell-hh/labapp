@@ -16,6 +16,11 @@ Success requires BOTH, from the one QEMU instance this run owns:
   1. a guest receipt line on the private serial socket carrying this run's
      nonce and input digest with status=ok, and
   2. a QMP SHUTDOWN event with data.guest == true and reason "guest-shutdown".
+With --expiry-witness FILE (fixed expiry proof, mutually exclusive with success mode) the
+observer never succeeds: after `cont` is acknowledged it requires query-status running,
+`stop`, then query-status paused, writes ONE bounded armed witness bound to this run's
+nonce and inputs, and keeps both sockets until the container's own timer ends the proof.
+Any guest receipt, SHUTDOWN event or socket EOF afterwards is a failure.
 With --require-sentinel-evidence, also require one fixed, run-bound pre-seal
 cloud-init summary (done, zero errors/recoverable errors), retained as cloud_init
 in the result. Ordinary observations ignore these evidence lines and keep the four-key result.
@@ -55,6 +60,7 @@ EVIDENCE_RE = re.compile(
     rb"cloud-init=done errors=0 recoverable=0$")
 CLOUD_INIT = {"status": "done", "errors": 0, "recoverable_errors": 0}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+ARMED_KIND = "labapp-expiry-armed v1"
 
 
 class Failure(Exception):
@@ -188,17 +194,39 @@ STARTUP = (("qmp_capabilities", "hv-1", _empty, "qmp-negotiation"),
            ("cont", "hv-4", _empty, "qmp-cont"))
 
 
+def _status(ret, status, running):
+    return (isinstance(ret, dict) and {"status", "running"} <= set(ret)
+            and set(ret) <= {"status", "running", "singlestep"}
+            and ret["status"] == status and ret["running"] is running)
+
+
+def _running(ret):
+    return _status(ret, "running", True)
+
+
+def _paused(ret):
+    return _status(ret, "paused", False)
+
+
+# Expiry proof only, after `cont` is acknowledged: running, stop, paused.
+EXPIRY_STEPS = (("query-status", "hv-5", _running, "qmp-not-running"),
+                ("stop", "hv-6", _empty, "qmp-stop"),
+                ("query-status", "hv-7", _paused, "qmp-not-paused"))
+
+
 class Qmp:
     """QMP state machine: greeting -> startup commands (one in flight) -> running."""
 
-    def __init__(self):
+    def __init__(self, expiry=False):
+        self.expiry = expiry
+        self.steps = STARTUP + EXPIRY_STEPS if expiry else STARTUP
         self.state, self.step, self.out = "greeting", 0, bytearray()
         self.shutdown_ok = False
         self.inflight = None
         self.cont_sent = False
 
     def _send_next(self):
-        command, ident = STARTUP[self.step][:2]
+        command, ident = self.steps[self.step][:2]
         self.out += json.dumps({"execute": command, "id": ident}).encode() + b"\n"
 
     def sent(self, count):
@@ -209,8 +237,8 @@ class Qmp:
             return
         del self.out[:count]
         if not self.out:
-            self.inflight = STARTUP[self.step][1]
-            if STARTUP[self.step][0] == "cont":
+            self.inflight = self.steps[self.step][1]
+            if self.steps[self.step][0] == "cont":
                 self.cont_sent = True
 
     def handle(self, msg):
@@ -228,14 +256,14 @@ class Qmp:
     def _response(self, msg):
         if self.state != "startup" or self.inflight is None:
             raise Failure("qmp-unexpected-response")
-        _, ident, check, reason = STARTUP[self.step]
+        _, ident, check, reason = self.steps[self.step]
         if msg["id"] != ident:  # also rejects replays of an already-answered id
             raise Failure("qmp-id-mismatch")
         if "error" in msg or not check(msg["return"]):
             raise Failure(reason)
         self.inflight = None
         self.step += 1
-        if self.step == len(STARTUP):
+        if self.step == len(self.steps):
             self.state = "running"
         else:
             self._send_next()
@@ -252,6 +280,8 @@ class Qmp:
             raise Failure("guest-reset")
         if msg["event"] != "SHUTDOWN":
             return  # interleaved events (RESUME, STOP, ...) are not evidence
+        if self.expiry:
+            raise Failure("shutdown-during-expiry-proof")
         if not self.cont_sent:
             raise Failure("early-shutdown")
         if self.shutdown_ok:
@@ -263,7 +293,7 @@ class Qmp:
 
 
 def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
-            require_sentinel_evidence=False):
+            require_sentinel_evidence=False, on_armed=None):
     """Drive both connected nonblocking sockets to a verdict; raise Failure.
 
     The serial socket is attached and registered before `cont` is ever sent, so
@@ -273,7 +303,8 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
     qlines = Lines(QMP_LINE_MAX, QMP_TOTAL_MAX, True)
     slines = Lines(SERIAL_LINE_MAX, SERIAL_TOTAL_MAX, False,
                    EVIDENCE_PREFIX if require_sentinel_evidence else None)
-    proto, receipt_ok = Qmp(), False
+    expiry = on_armed is not None
+    proto, receipt_ok, armed = Qmp(expiry), False, False
     evidence_ok = False
     qmp_open = serial_open = True
     drain_until = None
@@ -335,6 +366,8 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                             continue
                         if not line.startswith(RECEIPT_PREFIX):
                             continue
+                        if expiry:
+                            raise Failure("guest-receipt-during-expiry-proof")
                         found = RECEIPT_RE.match(line)
                         if not found:
                             raise Failure("malformed-receipt")
@@ -352,6 +385,9 @@ def observe(qmp, serial, nonce, inputs, deadline, clock=time.monotonic,
                     continue
                 for line in qlines.feed(data):
                     proto.handle(parse_json(line))
+                    if expiry and proto.state == "running" and not armed:
+                        armed = True    # right after the last actual response, before any later line
+                        on_armed()      # then wait for the container's outer timer
                     if proto.shutdown_ok and drain_until is None:
                         drain_until = clock() + DRAIN_GRACE
     finally:
@@ -370,18 +406,67 @@ def write_result(path, nonce, inputs, cloud_init=None):
         os.fsync(handle.fileno())
 
 
+def write_armed(path, nonce, inputs, armed_at, boot_id):
+    """One strict witness; armed_at is CLOCK_BOOTTIME seconds (ceiling) when paused was observed."""
+    body = json.dumps({"kind": ARMED_KIND, "armed": "paused", "armed_at": math.ceil(armed_at), "boot_id": boot_id,
+                       "nonce": nonce, "inputs": inputs}, sort_keys=True).encode() + b"\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def arm_expiry(path, nonce, inputs):
+    """Arm only with at least 60 actual seconds left on PID1's original timer."""
+    fd = os.open("/out/witness", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Failure("invalid-timer-witness")
+        raw = handle.read(257)
+    found = re.fullmatch(rb"start (\d{1,12}) (\d{1,4})\n", raw)
+    if not found:
+        raise Failure("invalid-timer-witness")
+    n, timer = map(int, found.groups())
+    now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    if not n <= now or n + timer - math.ceil(now) < 60:
+        raise Failure("insufficient-expiry-dwell")
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+        boot_id = handle.read(38).strip()
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id):
+        raise Failure("invalid-boot-id")
+    write_armed(path, nonce, inputs, now, boot_id)
+
+
 def verify(args, clock=time.monotonic):
     deadline = clock() + args.timeout
     qmp = serial = None
+    witness = getattr(args, "expiry_witness", None)
     try:
         serial = connect(args.serial, deadline, clock)  # receipt reader first
         qmp = connect(args.qmp, deadline, clock)
+        on_armed = None
+        if witness:
+            def on_armed():
+                arm_expiry(witness, args.nonce, args.inputs)
         cloud_init = observe(qmp, serial, args.nonce, args.inputs, deadline, clock,
-                             getattr(args, "require_sentinel_evidence", False))
+                             getattr(args, "require_sentinel_evidence", False), on_armed)
         if clock() >= deadline:
             raise Failure("timeout")
         write_result(args.result, args.nonce, args.inputs, cloud_init)
     finally:
+        if witness:
+            # A later observer failure must revoke arming even if Packer cleanup hangs.
+            # Default SIGTERM at the outer PID1 deadline does not run this finally.
+            try:
+                fd = os.open(witness + ".failed", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(b"observer-ended\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if os.path.lexists(witness):
+                    os.unlink(witness)
         for sock in (qmp, serial):
             if sock is not None:
                 sock.close()
@@ -396,7 +481,13 @@ def parse(argv):
     parser.add_argument("--nonce", required=True)
     parser.add_argument("--inputs", required=True)
     parser.add_argument("--require-sentinel-evidence", action="store_true")
+    parser.add_argument("--expiry-witness")
     args = parser.parse_args(argv)
+    if args.expiry_witness is not None:
+        if args.require_sentinel_evidence:
+            parser.error("--expiry-witness excludes --require-sentinel-evidence")
+        if not os.path.isabs(args.expiry_witness):
+            parser.error("expiry witness path must be absolute")
     if not HEX64.match(args.nonce) or not HEX64.match(args.inputs):
         parser.error("nonce and inputs must be 64 lowercase hex digits")
     if not 1 <= args.timeout <= 3600:

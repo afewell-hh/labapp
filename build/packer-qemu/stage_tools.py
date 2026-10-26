@@ -29,7 +29,8 @@ SENTINEL_VARS_NAME = "sentinel.pkrvars.hcl"
 VARS_NAMES = (VARS_NAME, SENTINEL_VARS_NAME)     # generated, excluded from the overall identity
 VERIFY_SECONDS = 30
 GUEST_FILES = ("user-data", "guest-build.sh")
-TASKS = ("hcl-check", "sentinel")
+TASKS = ("hcl-check", "sentinel", "sentinel-expiry")
+VM_TASKS = ("sentinel", "sentinel-expiry")      # same guest inputs and guest-receipt identity
 ARTIFACT_LIMIT = 1 << 32      # bound for hashing the disposable sentinel output
 # Sentinel guest assertions. Staged 0444 so `ubuntu` can read the copy made by user-data
 # (cp -a keeps modes; ISO Rock Ridge modes are UNVERIFIED until the tiny ISO check).
@@ -268,7 +269,8 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
     sentinel stages the assertion script and plan BEFORE the CD MANIFEST, passes
     SHA256(cd/MANIFEST) (exactly what guest-build.sh puts in its receipt) as the
     observer `inputs`, keeps the overall in/+cd/ digest as `inputs` EVIDENCE, and
-    takes `verify_seconds` (an int or a callable evaluated when the var-file is
+    takes `verify_seconds` (sentinel-expiry stages the identical guest inputs but asks the
+    observer for the armed witness; its verify_seconds must exceed the work window) (an int or a callable evaluated when the var-file is
     written, so it reflects the original budget actually left)."""
     if task not in TASKS:
         raise StageError("unknown staging task")
@@ -307,11 +309,11 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         write_new(os.path.join(cd, name),
                   read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o400)
     write_new(os.path.join(cd, "meta-data"), b"instance-id: labapp-build\n", 0o400)
-    if task == "sentinel":
+    if task in VM_TASKS:
         for name in (ASSERT_NAME, "sentinel-evidence.py"):
             write_new(os.path.join(cd, name),
                       read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o444)
-    write_new(os.path.join(cd, "plan.txt"), SENTINEL_PLAN if task == "sentinel" else b"", 0o400)
+    write_new(os.path.join(cd, "plan.txt"), SENTINEL_PLAN if task in VM_TASKS else b"", 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
     lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
                     if n != "nonce")
@@ -322,13 +324,15 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         raise StageError("base image differs from its pin")
     inputs = hashlib.sha256(manifest(ws, base_sha, check)).hexdigest()
     extra = {}
-    if task == "sentinel":
+    if task in VM_TASKS:
         # Guest receipt identity, distinct from the overall `inputs` above.
         guest_receipt = hash_file(os.path.join(cd, "MANIFEST"), check=check)[0]
         seconds = verify_seconds() if callable(verify_seconds) else verify_seconds
         if not isinstance(seconds, int) or isinstance(seconds, bool) or not 1 <= seconds <= 86400:
             raise StageError("sentinel needs a verification time within the remaining budget")
-        var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + b"require_sentinel_evidence = true\n"
+        # The expiry proof never succeeds, so it asks for the armed witness instead of evidence.
+        flag = b"expiry_proof = true\n" if task == "sentinel-expiry" else b"require_sentinel_evidence = true\n"
+        var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + flag
         vars_name = SENTINEL_VARS_NAME
         extra = {"guest_receipt": guest_receipt, "verify_seconds": seconds}
     else:

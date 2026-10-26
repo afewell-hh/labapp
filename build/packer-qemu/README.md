@@ -393,6 +393,39 @@ stays execution-disabled.
   Rock Ridge mode check; the unrun HCL attributes above; actual guest evidence emission;
   measured resource caps and reserve; failure/hang trial, then one success.
 
+### Fixed `sentinel-expiry` task (failure-only VM proof)
+
+`--mode sentinel-expiry` is the deterministic failure/expiry proof that precedes any
+success trial. Same admission, single ledger, restricted container, exact `/dev/kvm` plus
+numeric group, exact cleanup and HOLD rules as `sentinel`; no image, command, QMP
+sequence or duration option. It refuses before the lock, ledger, workspace, staging or
+Docker unless `container_runner.EXPIRY_RUNTIME` holds an accepted identity (the fixed `PREPARED_RUNTIME`,
+separate from `SENTINEL_RUNTIME`, which remains `None`). This identity does not authorize
+execution: each actual trial requires separately scoped lead authorization.
+
+* Budget: 300 s work INCLUDING staging from admission + 120 s cleanup, no renewal;
+  staging is rejected if under 150 s of work remain. After expiry, immutable input
+  revalidation may consume the original cleanup allocation, retaining 60 s for exact
+  cleanup; every operation remains bounded by the original 420 s total deadline. The observer and shell-local timeouts
+  are fixed 300 s from their later start so the original container PID 1 deadline wins.
+* Observer (`--expiry-witness FILE`, selected by `expiry_proof = true`; excludes
+  success mode): after the usual serial attach, greeting, prelaunch, KVM and `cont`
+  acknowledgement it requires `query-status` running, `stop`, then `query-status` paused
+  (QEMU 8.2 `RunState` `paused`: "guest has been paused via the 'stop' command"). Only
+  then it writes one strict `armed.json` (kind, `paused`, CLOCK_BOOTTIME `armed_at` rounded upward, boot ID,
+  nonce, `guest_receipt`) only when at least 60 s of the PID1 timer remain, and stays alive. Any observer return
+  revokes arming and writes a bounded failure marker before Packer cleanup. Any later receipt line, SHUTDOWN event, wrong
+  response or socket EOF fails; it never writes `verified.json`.
+* Accepted only if: container exit 124/137 (not OOM), no `steps` file and no
+  `verified.json`, valid timer witness, exit not before the timer, and an `armed.json`
+  matching this run's nonce and `guest_receipt` that leaves at least 60 s before the
+  timer; staged bytes unchanged and cleanup verified. A bounded regular partial artifact is size-recorded without following aliases;
+  disposal uses the existing exact owned-workspace cleanup, never individual path deletion. The result carries `proof: expected_expiry` and `build_success: false`; it
+  is never a successful guest or build.
+* Unproven here: that a paused guest survives to the timer under the real plugin, that
+  Packer/QEMU descendants vanish with the container (an independent client-loss probe
+  is a separate lead step), and every UNRUN HCL attribute above.
+
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
 python3 -I /abs/build/packer-qemu/supervise.py --preflight-only
