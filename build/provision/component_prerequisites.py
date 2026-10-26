@@ -25,6 +25,9 @@ ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 PYTHON = "/usr/bin/python3"
+# Fixed failure-phase allowlist; STAGE names the action in progress, never child output.
+PHASES = ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown")
+STAGE = "unknown"
 # This wrapper drops supplementary groups, then gid/uid before exec; no shell.
 DROP = ("import os,sys; uid=int(sys.argv[1]); gid=int(sys.argv[2]); "
         "os.setgroups([]); os.setgid(gid); os.setuid(uid); os.chdir(sys.argv[3]); "
@@ -40,6 +43,12 @@ try:
 finally:
  for fd in reversed(fds): os.close(fd)
 """
+
+
+def stage(name):
+    global STAGE
+    previous, STAGE = STAGE, name
+    return previous
 
 
 def run(args, seconds=15, limit=4096):
@@ -161,25 +170,38 @@ def systemd_probe(workspace):
         # Defer repeated interruption while bounded stop/reset/absence checks run.
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK,
                                           {signal.SIGTERM, signal.SIGINT, signal.SIGALRM})
+        # A cleanup failure replaces the original error and is reported as cleanup;
+        # a successful cleanup leaves the original failing phase untouched.
+        previous = stage('cleanup')
         try:
             cleanup_unit(unit)
+            stage(previous)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def probe(uid, archive):
+    stage('preflight')
     owner = preflight(uid, archive)
     report = {'schema': 'labapp-component-prerequisites-v1', 'caller_uid': os.geteuid(),
               'python': '.'.join(map(str, sys.version_info[:3])), 'checks': {}}
     # Trusted /run parent, root-only namespace; owner gets only its install dir.
-    with tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir='/run') as temporary:
-        workspace = Path(temporary)
+    temporary = tempfile.TemporaryDirectory(prefix='labapp-prereq-', dir='/run')
+    try:
+        workspace = Path(temporary.name)
         workspace.chmod(0o711)
+        stage('installer')
         report['checks']['installer'] = installer_probe(owner, workspace, archive)
+        stage('systemd')
         report['checks']['systemd'] = systemd_probe(workspace)
+        stage('kvm')
         require([PYTHON, '-I', '-c', KVM], 10, b'root-api12-create-vm\n')
         report['checks']['kvm'] = {'uid': 0, 'api_version': 12, 'create_vm': 'passed',
                                    'scope': 'root-device-api-only', 'l2_execution': 'unproven'}
+    finally:
+        previous = stage('cleanup')
+        temporary.cleanup()
+        stage(previous)
     return report
 
 
@@ -200,7 +222,8 @@ def main():
     except (Exception, KeyboardInterrupt) as error:
         # Never export raw child output, exception text or paths.
         print(json.dumps({'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
-                          'reason': str(error) if isinstance(error, Refusal) else 'operational failure'}))
+                          'reason': str(error) if isinstance(error, Refusal) else 'operational failure',
+                          'phase': STAGE if STAGE in PHASES else 'unknown'}))
         return 1
     finally:
         signal.alarm(0)

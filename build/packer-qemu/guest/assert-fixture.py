@@ -50,6 +50,7 @@ class Config:
         self.ubuntu_prefix = tuple(ubuntu_prefix)
         self.archive = os.path.join(here, "hhfab-linux-amd64-v%s.tar.gz" % VERSION)
         self.installer = os.path.join(here, "install-hhfab.py")
+        self.probe = os.path.join(here, "component_prerequisites.py")
 
 
 def need(condition, reason):
@@ -217,6 +218,50 @@ def smoke(cfg):
     need(VERSION_RE.fullmatch(done.stdout) is not None, "cli-version")
 
 
+PROBE_SCHEMA = "labapp-component-prerequisites-v1"
+PROBE_PHASES = ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown")
+PROBE_CHECKS = ["installer", "kvm", "systemd"]
+PROBE_SECONDS = 240         # above the probe's own 210s alarm plus its bounded child cleanup
+
+
+def probe_failure(text):
+    """Strictly parse the probe's fixed failure JSON; any deviation is `prereq-invalid`."""
+    try:
+        value = json.loads(text.decode("ascii"))
+    except (UnicodeError, ValueError):
+        return "prereq-invalid"
+    if (not isinstance(value, dict) or set(value) != {"schema", "outcome", "reason", "phase"}
+            or value["schema"] != PROBE_SCHEMA or value["outcome"] != "failed"
+            or not isinstance(value["reason"], str) or value["phase"] not in PROBE_PHASES):
+        return "prereq-invalid"
+    return "prereq-" + value["phase"]
+
+
+def probe_success(text):
+    try:
+        value = json.loads(text.decode("ascii"))
+    except (UnicodeError, ValueError):
+        return False
+    return (isinstance(value, dict) and value.get("schema") == PROBE_SCHEMA and "outcome" not in value
+            and isinstance(value.get("checks"), dict) and sorted(value["checks"]) == PROBE_CHECKS)
+
+
+def prereq(cfg, uid, archive):
+    """Run the component probe through the bounded helper and map only its allowlisted failure
+    phase to a fixed `prereq-*` token (<= 32 chars). Probe exit/stdout are never echoed.
+    Plain `-B` (not `-I`): the probe imports its sibling hhfab_release.py from its own directory."""
+    argv = ["/usr/bin/python3", "-B", cfg.probe, "--owner-uid", uid, "--archive", archive]
+    try:
+        done = command(cfg, argv, PROBE_SECONDS, "prereq-timeout", {"PATH": SAFE_PATH})
+    except Check as exc:
+        raise Check("prereq-invalid" if str(exc) == "output-bound" else str(exc)) from None
+    if done.returncode == 0:
+        need(probe_success(done.stdout), "prereq-invalid")
+        return
+    need(done.returncode == 1, "prereq-invalid")
+    raise Check(probe_failure(done.stdout))
+
+
 PHASES = {"baseline": baseline, "snapshot": snapshot, "verify": verify,
           "negatives": negatives, "smoke": smoke}
 
@@ -236,11 +281,18 @@ def report(cfg, token):
 
 
 def run(argv, cfg=None):
-    if len(argv) != 1 or argv[0] not in PHASES:
+    if argv[:1] == ["prereq"]:
+        # prereq <owner-uid> <absolute-archive>: the exact probe argv of the plan step.
+        if len(argv) != 3 or not re.fullmatch(r"[1-9][0-9]{0,9}", argv[1]) or not argv[2].startswith("/"):
+            return 2
+        action = lambda c: prereq(c, argv[1], argv[2])
+    elif len(argv) == 1 and argv[0] in PHASES:
+        action = PHASES[argv[0]]
+    else:
         return 2
     cfg = cfg or Config(os.path.dirname(os.path.abspath(__file__)))
     try:
-        PHASES[argv[0]](cfg)
+        action(cfg)
     except Check as exc:
         report(cfg, str(exc))
         return 1

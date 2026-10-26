@@ -372,6 +372,14 @@ that ceiling must not replace the cloud lease. Only fixed sanitized JSON is
 printed; child output, paths, journal, credentials and arbitrary exceptions are
 never exported. A failed check exits1 and gives no overall passing claim.
 
+The failure JSON also carries a fixed `phase` naming the action that failed:
+`preflight`, `installer`, `systemd`, `kvm`, `cleanup` or `unknown`. A failing
+cleanup (unit stop/reset/absence or workspace removal) replaces the original error
+and is reported as `cleanup`; a successful cleanup keeps the original phase. The
+phase is metadata only: it never repairs or retries anything and does not change
+the success output, exit codes, deadlines or child cleanup. A missing KVM device
+is not assumed; only a failure while the `kvm` action runs reports `kvm`.
+
 Run the offline suite (also required by existing hhfab install CI):
 
 ```bash

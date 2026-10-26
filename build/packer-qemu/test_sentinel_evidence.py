@@ -268,6 +268,80 @@ class FixtureAssertionTests(unittest.TestCase):
         self.install()
         self.run_phase("snapshot")
 
+    def probe_output(self, code, payload):
+        """Run the prereq phase with the bounded helper replaced by a canned probe result."""
+        data = payload if isinstance(payload, bytes) else json.dumps(payload, sort_keys=True).encode()
+        with mock.patch.object(af, "command", return_value=subprocess.CompletedProcess([], code, data)) as run:
+            result = af.run(["prereq", "1000", "/in/archive.tar.gz"], self.cfg)
+        return result, run
+
+    def failure(self, phase="kvm", **extra):
+        value = {"schema": af.PROBE_SCHEMA, "outcome": "failed", "reason": "prerequisite command failed",
+                 "phase": phase}
+        value.update(extra)
+        return value
+
+    def test_prereq_maps_every_allowed_phase_to_a_short_fixed_token(self):
+        for phase in ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown"):
+            result, run = self.probe_output(1, self.failure(phase))
+            self.assertEqual(result, 1)
+            token = self.reason()
+            self.assertEqual(token, "prereq-" + phase)
+            self.assertLessEqual(len(token), 32)
+            self.assertRegex(token, af.REASON_RE)
+            os.unlink(self.cfg.reason)
+        argv = run.call_args.args[1]
+        self.assertEqual(argv, ["/usr/bin/python3", "-B", self.cfg.probe, "--owner-uid", "1000",
+                                "--archive", "/in/archive.tar.gz"])
+
+    def test_prereq_success_requires_the_exact_schema_and_checks(self):
+        good = {"schema": af.PROBE_SCHEMA, "caller_uid": 0, "python": "3.12.3",
+                "checks": {"installer": {}, "systemd": {}, "kvm": {}}}
+        result, _ = self.probe_output(0, good)
+        self.assertEqual((result, self.reason()), (0, None))
+        for bad in (dict(good, checks={"installer": {}}), dict(good, outcome="failed"),
+                    dict(good, schema="other"), b"not json", b"[]"):
+            result, _ = self.probe_output(0, bad)
+            self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_rejects_malformed_inconsistent_or_unexpected_output(self):
+        cases = [(1, b"{"), (1, b"\xff"), (1, b"[]"), (1, self.failure("network")),
+                 (1, self.failure(phase=["kvm"])), (1, self.failure(outcome="passed")),
+                 (1, self.failure(schema="x")), (1, self.failure(extra="SECRET")),
+                 (1, self.failure(reason=7)), (2, self.failure()), (0, self.failure()),
+                 (-9, self.failure()), (1, {"schema": af.PROBE_SCHEMA, "outcome": "failed"})]
+        for code, payload in cases:
+            with self.subTest(code=code, payload=payload):
+                result, _ = self.probe_output(code, payload)
+                self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                os.unlink(self.cfg.reason)
+
+    def test_prereq_overflow_and_deadline_use_fixed_classifications_without_peer_text(self):
+        # `command` maps the helper's Refusal to these Check tokens (existing behavior).
+        for token, expected in (("output-bound", "prereq-invalid"), ("prereq-timeout", "prereq-timeout")):
+            with mock.patch.object(af, "command", side_effect=af.Check(token)):
+                self.assertEqual(af.run(["prereq", "1000", "/in/a"], self.cfg), 1)
+            self.assertEqual(self.reason(), expected)
+            os.unlink(self.cfg.reason)
+
+    def test_real_output_cap_applies_to_the_probe_capture(self):
+        script = os.path.join(self.root, "loud.py")
+        self.write(script, b"print('X' * 10000)\n", 0o600)
+        self.cfg.probe = script
+        self.cfg.installer = str(PROVISION / "install-hhfab.py")
+        if not os.path.exists("/usr/bin/python3"):
+            self.skipTest("no /usr/bin/python3")
+        self.assertEqual(af.run(["prereq", "1000", "/in/a"], self.cfg), 1)
+        self.assertEqual(self.reason(), "prereq-invalid")
+
+    def test_prereq_arguments_are_strict(self):
+        for argv in (["prereq"], ["prereq", "0", "/a"], ["prereq", "1000", "relative"],
+                     ["prereq", "1000", "/a", "extra"], ["prereq", "1; id", "/a"]):
+            with mock.patch.object(af, "command") as run:
+                self.assertEqual(af.run(argv, self.cfg), 2, argv)
+            run.assert_not_called()
+
     def test_pins_and_version_match_the_unchanged_installer_and_stager(self):
         import stage_tools
         archive_size, archive_sha, member_size, member_sha = release.PINS["0.50.4"]
