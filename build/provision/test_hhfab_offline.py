@@ -90,7 +90,8 @@ class NoSwitchSmokeTests(unittest.TestCase):
     """Exercise real command bindings; the bounded spy never executes a CLI."""
     FABRIC = b"kind: Fabricator\nmetadata: {name: default}\n---\nkind: ControlNode\nmetadata: {name: control-1}\n"
     NAMESPACES = (b"kind: VLANNamespace\nmetadata: {name: default}\nspec: {ranges: [{from: 1000, to: 2999}]}\n---\n"
-                  b"kind: IPv4Namespace\nmetadata: {name: default}\nspec: {subnets: [10.0.0.0/16]}\n")
+                  b"kind: IPv4Namespace\nmetadata: {name: default}\nspec: {subnets: [10.0.0.0/16]}\n---\n"
+                  b"kind: SwitchGroup\nmetadata: {name: empty}\nspec: {}\n")
 
     def run_smoke(self, generated=None, fabric=None, codes=None, extra=None, mutate=False):
         from unittest.mock import patch
@@ -157,7 +158,7 @@ class NoSwitchSmokeTests(unittest.TestCase):
             [str(binary), "validate", *tail, "--hydrate-mode", "if-not-present"]])
         self.assertTrue(all(seconds == 15 and child_env is env for _, seconds, child_env in calls))
         self.assertEqual(result["node_kinds"], ["ControlNode", "Fabricator"])
-        self.assertEqual(result["wiring_kinds"], ["IPv4Namespace", "VLANNamespace"])
+        self.assertEqual(result["wiring_kinds"], ["IPv4Namespace", "SwitchGroup", "VLANNamespace"])
         self.assertEqual(set(result), {"node_kinds", "wiring_kinds", "tree_sha256"})
 
     def test_canonical_init_retains_exact_wiring_argv_and_byte_identity(self):
@@ -203,6 +204,16 @@ class NoSwitchSmokeTests(unittest.TestCase):
                       b"kind: Fabricator\nmetadata: {name: default}\n"):
             with self.subTest(fabric=value):
                 self.assertIsInstance(self.run_smoke(fabric=value)[0], subject.Refusal)
+
+    def test_empty_switch_group_marker_requires_exact_identity_and_spec(self):
+        marker = b"---\nkind: SwitchGroup\nmetadata: {name: empty}\nspec: {}\n"
+        for value in (self.NAMESPACES.replace(marker, b""), self.NAMESPACES + marker,
+                      self.NAMESPACES.replace(b"name: empty", b"name: other"),
+                      self.NAMESPACES.replace(b"spec: {}", b"spec: {unexpected: true}"),
+                      self.NAMESPACES.replace(b"spec: {}", b"spec: null"),
+                      self.NAMESPACES.replace(b"spec: {}\n", b"")):
+            with self.subTest(generated=value):
+                self.assertIsInstance(self.run_smoke(generated=value)[0], subject.Refusal)
 
     def test_extra_outputs_symlink_and_mutating_rerun_refused(self):
         for extra in ("include", "top", "result", "symlink"):

@@ -94,11 +94,12 @@ def check_zero_topology(generated, fabric):
                 and isinstance(doc.get("metadata"), dict)
                 and isinstance(doc["metadata"].get("name"), str), "zero-topology object malformed")
     identities = lambda docs: sorted((d["kind"], d["metadata"]["name"]) for d in docs)
-    require(identities(wiring) == [("IPv4Namespace", "default"), ("VLANNamespace", "default")],
+    require(identities(wiring) == [("IPv4Namespace", "default"), ("SwitchGroup", "empty"), ("VLANNamespace", "default")],
             "generated wiring identities mismatch")
     require(identities(nodes) == [("ControlNode", "control-1"), ("Fabricator", "default")],
             "generated nodes are not exactly the expected control")
     kinds = {d["kind"]: d for d in wiring}
+    require(kinds["SwitchGroup"].get("spec") == {}, "generated empty switch group mismatch")
     require(kinds["VLANNamespace"].get("spec") == {"ranges": [{"from": 1000, "to": 2999}]},
             "generated VLAN namespace mismatch")
     require(kinds["IPv4Namespace"].get("spec") == {"subnets": ["10.0.0.0/16"]},

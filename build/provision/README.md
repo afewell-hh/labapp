@@ -227,15 +227,19 @@ with control 6/6144/100, switch 4/5120/50, server 2/768/10, gateway 8/6144/50 an
 external 4/5120/50 (CPU cores/RAM MB/disk GB). It does not request gateway/external
 VMs. `hhfab validate` ignores `vlab/config.yaml`; no `vlab up` runs.
 
-Each lane also runs a no-switch smoke fixture (UNRUN until the contained CI
-proof): fresh `init` without `--wiring`, official `vlab generate --no-switches`
+Each lane also runs a no-switch smoke fixture: fresh `init` without `--wiring`, official `vlab generate --no-switches`
 (writes `include/vlab.generated.yaml`), then `validate`, which must succeed.
 Assertions: exactly `Fabricator/default` and `ControlNode/control-1` (no
 `FabNode`) in `fab.yaml`, and exactly the default VLAN/IPv4 namespace identities
-with ranges 1000–2999 and subnet 10.0.0.0/16; no Switch/Server/Connection/
-Gateway/External. Native rejection fails the lane; no workaround. The report
+with ranges 1000–2999 and subnet 10.0.0.0/16, plus exactly `SwitchGroup/empty`
+with empty spec; no Switch/Server/Connection/Gateway/External. Both pinned
+builders create that group unconditionally. It is a marker grouping switches,
+not a switch or another device; namespace-only expectations omit generated data. Native rejection fails the lane; no workaround. The report
 holds kinds and file hashes only. Canonical wiring checks are unchanged.
 Both fixtures share the existing 120-second lane deadline and isolation bounds.
+The first native validate precedes structural inspection; it must pass, followed
+by all identity/spec assertions and an unchanged successful native rerun before
+the lane passes. A later assertion failure does not establish the rerun.
 Synthetic tests exercise the actual bounded argv/environment bindings, negative
 objects/output, native refusal propagation and rerun preservation. These tests
 prove neither systemd/Docker/KVM,
@@ -252,6 +256,10 @@ No-switch sources, accessed 2026-10-26: exact
 [0.43.1 generator](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/cmdvlab.go),
 [builder](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabbuilder.go),
 and [0.50.4 builder](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/hhfab/vlabbuilder.go).
+The corresponding fabric dependency schemas
+[0.96.2](https://github.com/githedgehog/fabric/blob/v0.96.2/api/wiring/v1beta1/switchgroup_types.go)
+and [0.133.0](https://github.com/githedgehog/fabric/blob/v0.133.0/api/wiring/v1beta1/switchgroup_types.go)
+define `SwitchGroupSpec` as an empty struct.
 
 ## Pinned hhfab installer
 
