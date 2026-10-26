@@ -2,6 +2,7 @@
 
 Fixed probe, HCL and non-VM runtime checks require separately scoped lead execution.
 The sentinel and sentinel-expiry VM modes remain gated on separately accepted execution identities.
+Only `qemu-fixture` gets ordinary outbound Docker bridge networking; every other mode stays `--network=none`.
 Docker is reached only through `Backend`; tests substitute a fake. The CLI refuses
 to contact Docker unless `--execute` is given (otherwise it prints the plan).
 Python 3.10+ stdlib. See README.md "Bounded container probe" for unmet gates.
@@ -42,10 +43,17 @@ PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d
 # sentinel-expiry: 300 s work INCLUDING staging + 120 s cleanup, no renewal. A failure-only
 # proof: a paused KVM guest must outlive >=60 s until THIS container's own timer ends it.
 PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30),
-            "sentinel-expiry": (300, 120), "fixture": (1800, 900)}
+            "sentinel-expiry": (300, 120), "fixture": (1800, 900), "qemu-fixture": (1800, 900)}
+# qemu-fixture: the same 30 min work INCLUDING staging + 15 min cleanup as fixture, no renewal. It covers
+# staging, two network installer runs and the KVM witness (unmeasured; an actual failure may identify #281).
 MODES = tuple(PROFILES)
-VM_MODES = ("sentinel", "sentinel-expiry", "fixture")      # the only modes that receive /dev/kvm
-STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry", "fixture")
+VM_MODES = ("sentinel", "sentinel-expiry", "fixture", "qemu-fixture")      # the only modes that receive /dev/kvm
+STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry", "fixture", "qemu-fixture")
+# Observer-recorded success modes (the sentinel build step and receipt); only qemu-fixture adds a witness.
+SUCCESS_MODES = ("sentinel", "fixture", "qemu-fixture")
+# The ONLY mode whose outer container is not `--network=none`: ordinary outbound reachability for the fixed
+# public package plan through Docker's default bridge. It is not hostname-allowlisted egress.
+NETWORKED_MODES = ("qemu-fixture",)
 SOURCE_KEYS = {"core", "plugin", "base"}
 FIXTURE_SOURCE_KEYS = SOURCE_KEYS | {"archive"}       # fixture adds the pinned hhfab archive
 # Proposed explicit bounds, not measured requirements. The sentinel guest is 4 vCPU /
@@ -54,7 +62,7 @@ LIMITS = {"runtime-check": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "
           "probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128"),
           "sentinel": ("--memory=10g", "--memory-swap=10g", "--cpus=5", "--pids-limit=512")}
-LIMITS["sentinel-expiry"] = LIMITS["fixture"] = LIMITS["sentinel"]
+LIMITS["sentinel-expiry"] = LIMITS["fixture"] = LIMITS["qemu-fixture"] = LIMITS["sentinel"]
 # Preparation artifact accepted in #266 comment 6406373578. Bound to original source
 # 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
 # comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
@@ -88,6 +96,14 @@ SENTINEL_MIN_VERIFY = 300
 KVM_DEVICE = "/dev/kvm"
 RESULT_CAP = 4096
 SENTINEL_KEYS = {"nonce", "inputs", "shutdown", "receipt", "cloud_init"}
+QEMU_KEYS = SENTINEL_KEYS | {"qemu_witness"}
+QEMU_WITNESS_KEYS = {"accelerator", "exit", "uid", "nonce_equal", "backing_unchanged", "workspace_removed",
+                     "install1", "install2", "witness_seconds", "network"}
+QEMU_NETWORK_KEYS = {"default_route", "ca_bundle", "resolver"}
+QEMU_SECONDS_CAP = 999
+# What a passing qemu-fixture does and does not establish; retained in evidence verbatim.
+QEMU_CLAIMS = {"caller_uid": 0, "student_readiness": False, "full_vlab": False, "reboot": False,
+               "other_platforms": False, "egress": "ordinary-docker-bridge-not-allowlisted"}
 STEP_CAP = 2 * 1024 * 1024    # matches `ulimit -f 2048` in HCL_SCRIPT
 EXCERPT = 2048
 STEPS_EXPECTED = "version 0\nsyntax 0\nfull 0\n"
@@ -443,10 +459,11 @@ def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot
     sentinel adds exactly /dev/kvm and its numeric group; nothing else widens."""
     kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode in VM_MODES else []
     script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT,
-              "sentinel-expiry": SENTINEL_SCRIPT, "fixture": SENTINEL_SCRIPT,
+              "sentinel-expiry": SENTINEL_SCRIPT, "fixture": SENTINEL_SCRIPT, "qemu-fixture": SENTINEL_SCRIPT,
               "runtime-check": RUNTIME_SCRIPT}[mode]
+    network = "--network=bridge" if mode in NETWORKED_MODES else "--network=none"
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
-            "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
+            "--restart=no", network, "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
             *LIMITS[mode], *kvm, "--log-driver=none", *mounts(mode, workspace),
             "--entrypoint=/bin/bash", image_id, "-c", ENTRY, "bash", str(deadline), boot_id, script]
@@ -588,7 +605,7 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     uid, gid = (os.getuid() if uid is None else uid), (os.getgid() if gid is None else gid)
     if mode not in MODES:
         raise ValueError("unknown mode")
-    keys = FIXTURE_SOURCE_KEYS if mode == "fixture" else SOURCE_KEYS
+    keys = FIXTURE_SOURCE_KEYS if mode in ("fixture", "qemu-fixture") else SOURCE_KEYS
     if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == keys):
         raise ValueError(f"{mode} needs exactly the {', '.join(sorted(keys))} input files")
     if mode in VM_MODES:
@@ -678,7 +695,7 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     if own["mode"] in STAGED_MODES:
         # Staging starts after admission and spends the same absolute budget.
         extra = {}
-        if own["mode"] in ("sentinel", "fixture"):
+        if own["mode"] in SUCCESS_MODES:
             def verify_budget():
                 left = int(budget.work_left()) - SENTINEL_RESERVE
                 if left < SENTINEL_MIN_VERIFY:
@@ -754,7 +771,7 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     if own["mode"] == "hcl-check":
         _accept_hcl(own, result, budget, clock, oom, code)
         return
-    if own["mode"] in ("sentinel", "fixture"):
+    if own["mode"] in SUCCESS_MODES:
         _accept_sentinel(own, result, budget, clock, oom, code)
         return
     if own["mode"] == "sentinel-expiry":
@@ -899,14 +916,48 @@ def _strict_pairs(pairs):
     return dict(pairs)
 
 
-def receipt_matches(raw, staged):
-    """verified.json is untrusted container output: exactly the sentinel observer's five keys, bound to
-    THIS run's nonce and to SHA256(cd/MANIFEST) (not the overall input identity)."""
+def _exact(value, expected):
+    """Same type and value (so True is not 1 and 33.0 is not 33)."""
+    return type(value) is type(expected) and value == expected
+
+
+def _seconds(value):
+    return type(value) is int and 0 <= value <= QEMU_SECONDS_CAP
+
+
+def qemu_witness_valid(value):
+    """The observer's closed qemu_witness object, revalidated as untrusted container output: exact
+    keys and types, KVM, exit 33, root caller, nonce equality, unchanged backing, removed workspace,
+    install 1 changed / install 2 unchanged, bounded integer seconds and boolean network flags."""
+    try:
+        install1, install2, network = value["install1"], value["install2"], value["network"]
+        return (isinstance(value, dict) and set(value) == QEMU_WITNESS_KEYS
+                and _exact(value["accelerator"], "kvm") and _exact(value["exit"], 33)
+                and _exact(value["uid"], 0) and _exact(value["nonce_equal"], True)
+                and _exact(value["backing_unchanged"], True) and _exact(value["workspace_removed"], True)
+                and isinstance(install1, dict) and set(install1) == {"changed", "seconds"}
+                and _exact(install1["changed"], True) and _seconds(install1["seconds"])
+                and isinstance(install2, dict) and set(install2) == {"changed", "seconds"}
+                and _exact(install2["changed"], False) and _seconds(install2["seconds"])
+                and _seconds(value["witness_seconds"])
+                and isinstance(network, dict) and set(network) == QEMU_NETWORK_KEYS
+                and all(type(flag) is bool for flag in network.values()))
+    except (KeyError, TypeError):
+        return False
+
+
+def receipt_matches(raw, staged, qemu=False):
+    """verified.json is untrusted container output: exactly the sentinel observer's five keys (six with
+    the strict qemu_witness for qemu-fixture, and then required), bound to THIS run's nonce and to
+    SHA256(cd/MANIFEST) (not the overall input identity)."""
     try:
         body = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
-    return (isinstance(body, dict) and set(body) == SENTINEL_KEYS
+    if qemu and not (isinstance(body, dict) and set(body) == QEMU_KEYS
+                     and qemu_witness_valid(body["qemu_witness"])):
+        return False
+    return (isinstance(body, dict) and set(body) == (QEMU_KEYS if qemu else SENTINEL_KEYS)
             and body["nonce"] == staged["nonce"] and body["inputs"] == staged["guest_receipt"]
             and body["shutdown"] == "guest-shutdown" and body["receipt"] == "ok"
             and body["cloud_init"] == {"status": "done", "errors": 0, "recoverable_errors": 0}
@@ -930,9 +981,14 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
                 "plugin_member_sha256": staged["plugin_member_sha256"], "exit_code": code,
                 "command": "packer build -var-file=sentinel.pkrvars.hcl labapp.pkr.hcl",
                 "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
-    if own["mode"] == "fixture":
+    if own["mode"] in ("fixture", "qemu-fixture"):
         evidence["task"] = "fixture"
         evidence["hhfab_archive_sha256"] = staged["hhfab_archive_sha256"]
+    qemu = own["mode"] == "qemu-fixture"
+    if qemu:
+        evidence["task"] = "qemu-fixture"
+        evidence["network"] = "docker-bridge-outbound"
+        evidence["claims"] = dict(QEMU_CLAIMS)
     result["evidence"] = evidence
     raw = {n: read_step(out, n) for n in ("steps", "build.out", "build.err")}
     raw["verified.json"] = read_step(os.path.join(out, "work"), "verified.json", RESULT_CAP)
@@ -956,11 +1012,15 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
     if raw["steps"].decode("ascii", "replace") != SENTINEL_STEPS:
         result["reason"] = "build_failed"
         return
-    if not receipt_matches(raw["verified.json"], staged):
+    if not receipt_matches(raw["verified.json"], staged, qemu):
+        # For qemu-fixture this includes a missing, extra, forged or out-of-contract qemu_witness.
         result["reason"] = "stale_or_malformed_receipt"
         return
     # Retain only the validated closed summary, never arbitrary peer result text.
-    evidence["cloud_init"] = json.loads(raw["verified.json"])["cloud_init"]
+    body = json.loads(raw["verified.json"])
+    evidence["cloud_init"] = body["cloud_init"]
+    if qemu:
+        evidence["qemu_witness"] = body["qemu_witness"]
     artifact = os.path.join(out, *ARTIFACT)
     try:
         sha, _ = stage_tools.hash_file(artifact, limit=stage_tools.ARTIFACT_LIMIT,
@@ -1210,7 +1270,7 @@ def parse(argv):
     p.add_argument("--mode", choices=MODES, default="probe", help="fixed task (default: probe)")
     for key in ("core", "plugin", "base"):
         p.add_argument(f"--{key}-file", help=f"hcl-check: pinned {key} input file (absolute path)")
-    p.add_argument("--archive-file", help="fixture only: caller-supplied pinned hhfab release archive (absolute path)")
+    p.add_argument("--archive-file", help="fixture/qemu-fixture: caller-supplied pinned hhfab release archive (absolute path)")
     return p.parse_args(argv)
 
 
@@ -1221,17 +1281,18 @@ def main(argv=None):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
-    if args.mode == "fixture":
+    if args.mode in ("fixture", "qemu-fixture"):
         files["archive"] = args.archive_file
     elif args.archive_file is not None:
-        print("--archive-file is only for --mode fixture", file=sys.stderr)
+        print("--archive-file is only for --mode fixture or qemu-fixture", file=sys.stderr)
         return EXIT["usage"]
     if args.mode not in STAGED_MODES and any(files.values()):
-        print("input files are only for --mode hcl-check, sentinel, sentinel-expiry or fixture", file=sys.stderr)
+        print("input files are only for --mode hcl-check, sentinel, sentinel-expiry, fixture or qemu-fixture",
+              file=sys.stderr)
         return EXIT["usage"]
     if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
         print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file"
-              + (" and --archive-file" if args.mode == "fixture" else ""), file=sys.stderr)
+              + (" and --archive-file" if args.mode in ("fixture", "qemu-fixture") else ""), file=sys.stderr)
         return EXIT["usage"]
     if args.mode in VM_MODES and args.execute:
         try:
@@ -1247,6 +1308,7 @@ def main(argv=None):
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",
                            mode=args.mode)
         print(json.dumps({"mode": args.mode, "executed": False, "image": image, "create": plan,
+                          "network": "bridge" if args.mode in NETWORKED_MODES else "none",
                           "runtime_accepted": (EXPIRY_RUNTIME if args.mode == "sentinel-expiry"
                                                else SENTINEL_RUNTIME) is not None if args.mode in VM_MODES else None}))
         return 0

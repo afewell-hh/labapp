@@ -25,6 +25,7 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `container_runner.py`, `stage_tools.py` | Fixed Docker `probe`, `hcl-check` and `runtime-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode pins its runtime identity and requires separate lead scope |
 | `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Separately gated runtime preparation recipe; guest assertions run by the sentinel plan |
 | `guest/assert-fixture.py` | Fixed hhfab `fixture` assertions between two runs of the unchanged installer (see "Fixed `fixture` task") |
+| `guest/assert-qemu.py` | Fixed `qemu-fixture` adapter around the unchanged QEMU installer (twice) and KVM witness (see "Fixed `qemu-fixture` task") |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing
@@ -531,6 +532,66 @@ ownership, retention and disposition stay outside this repository until the lead
 * Proves, if run: the unchanged installer's offline `--archive` path installs and reruns as root in a fresh accelerated
   guest and the binary starts as `ubuntu`. Not proven: network download, APT/dpkg, services, reboot or seal, nested VLAB,
   other platforms, the release attestation (GitHub's immutable-release digest is not a verified publisher signature).
+
+### Fixed `qemu-fixture` task (networked guest QEMU install twice + KVM witness; source only)
+
+`--mode qemu-fixture` (#292, decision #291) is a fixed extension of `fixture` for ONE coherent guest slice:
+the UNCHANGED `build/provision/install-qemu.py` network installer runs twice in a fresh accelerated guest
+and the UNCHANGED `qemu_witness.py` then runs a real KVM-only L2 execution. It retains all four fixture inputs,
+`--core-file/--plugin-file/--base-file/--archive-file` (the pinned hhfab archive; no capture, bundle or proxy). It
+reuses the sentinel runtime identity, `/dev/kvm` access, ledger, `SENTINEL_RESERVE`, 1800 s work INCLUDING
+staging + 900 s cleanup (no renewal, unmeasured), 10 GiB / 5 CPU / 512 PID caps and exact cleanup. **Source
+activation does not authorize execution:** every actual trial needs separately scoped lead authorization,
+independent exact-head review, runtime-identity preflight and reconciled shared-ledger admission.
+
+* Network: `qemu-fixture` is the ONLY mode whose outer container uses `--network=bridge` (Docker's default
+  bridge, ordinary outbound reachability) instead of `--network=none`. This is NOT hostname-allowlisted
+  egress. The fixed local Unix daemon, no host network, no published port, communicator `none`, no
+  `hostfwd`, nonroot caller, `--cap-drop=ALL`, `no-new-privileges`, read-only root, caps and exact `/dev/kvm`
+  are unchanged, and every other mode (`NETWORKED_MODES`) stays `--network=none` (tested for all modes).
+  The plan, pins, signed dated Canonical snapshot and installer deadlines are the installer's own; no cloud
+  metadata, API, credential, mount, SSH or arbitrary command is added.
+* HCL is unchanged. The pinned plugin v1.1.7 generates a user-mode NIC with `net_bridge = ""` and
+  `communicator = "none"` adds no `hostfwd`; no `-nic`/`-netdev` override or cloud-init `network-config` is added
+  (not blindly: NoCloud DHCP/DNS/CA behavior is reported, not repaired; see `net=` below).
+* Retains the unchanged ten-step hhfab fixture plan prefix and all its inputs/modes, including the
+  archive and public `0444` installer pair for the nonroot component probe. Additional CD inputs
+  (covered by MANIFEST/receipt identity, `0400`, root-only) are byte-identical
+  `install-qemu.py`, `qemu_offline.py`, `qemu_witness.py` and `guest/assert-qemu.py`.
+  Steps 11-14 append `assert-qemu.py baseline`, `install 1`, `install 2`, `witness`.
+* `assert-qemu.py` only runs and observes: `/usr/bin/python3 -B install-qemu.py` with NO argument under `env -i`
+  (240 s wrapper above the installer's own 235 s alarm; its 210 s/180 s APT caps are untouched) and
+  `qemu_witness.py` (45 s above its 40 s alarm), through the unchanged `hhfab_release.bounded` helper
+  (1 MiB installer report, 4 KiB witness, 256 KiB native query/audit combined output caps, process-group cleanup). Run 1 must report `changed: true`, run 2 `changed: false`
+  (stable package/artifact state; the online rerun still authenticates APT indexes, simulates and runs install/check); the installer's one-line report is parsed
+  strictly (exact keys, pins consistent with `resolved_installed`). Independent native checks read
+  `dpkg-query` for exactly the pinned packages and versions, a clean `dpkg --audit` and the identity
+  (inode, size, mtime, ctime, SHA256) of the four regular payloads plus the required `socat -> socat1` link identity, which must be identical after the rerun. The
+  witness report must be KVM, exit 33, nonce equal, unchanged backing, removed scratch, uid 0 and the same pins.
+  No fallback, retry, permission repair, module load or TCG exists anywhere; a nonzero step is a failure.
+* Failure reasons stay inside the existing `LABAPP-DIAG` token: `inst<N>-refused-sNNN`, `inst<N>-exit-sNNN`
+  (bounded wall seconds, #281), `inst<N>-timeout`, `inst<N>-output`, `inst1-unchanged`, `inst2-changed`,
+  `native-pins`, `native-audit`, `rerun-state`, `witness-{nokvm,mismatch,artifact,pins,backing,timeout,deadline,
+  failed,output,invalid}` (fixed messages of the unchanged witness only), `state-missing`, `identity`,
+  `emit-failed`, `not-root`, `staging-input`, `internal`. No APT, dpkg, installer or peer text is exported.
+* Retained witness: on success the adapter writes one `LABAPP-QEMU v1 nonce=H inputs=H accel=kvm exit=33 uid=0
+  equal=1 backing=1 removed=1 i1=1:S i2=0:S w=S net=RCD` line on the serial console (`S` is 1-3 digits of
+  whole seconds capped at 999; `R`/`C`/`D` are 0/1 for a default IPv4 route, a nonempty CA bundle and a
+  nameserver line (including the two known systemd-resolved resolver symlink targets), reported never repaired). `host_verify.py` (still with only `require_sentinel_evidence`) accepts
+  at most one such line, bound to this run's nonce and `inputs`, inside the existing serial byte/line limits, and
+  keeps the closed object `qemu_witness` in `verified.json`; malformed, wrong-value, extra-field, duplicate,
+  stale or oversize lines fail. Other modes ignore the line and a `qemu_witness` key makes their receipt invalid.
+  The runner independently revalidates exact keys/types (`True` is not 1, `33.0` is not 33) and requires the key
+  for this mode: no witness can never pass.
+* Success also needs the sentinel gates (exit 0, `build 0`, five receipt keys bound to nonce and
+  `guest_receipt`, normal guest shutdown, cloud-init summary, bounded artifact hashed then deleted, unchanged
+  staged bytes, verified cleanup). Evidence adds `task`, `network: docker-bridge-outbound`, the witness and
+  `claims` (caller uid 0; student readiness, full VLAB, reboot and other platforms all `false`). Root-only
+  execution is not student readiness, and nothing here proves nested VLAB, Docker, reboot or another platform.
+* Not integrated: held PR #282 diagnostics, offline capture/bundles, proxies, a generic controller. A guest
+  without outbound reachability, DNS or CA bundle simply fails the first installer run with its token.
+* Offline tests: `test_qemu_fixture.py` covers synthetic staging, observer, runner and adapter failures.
+  Actual guest networking, installation and KVM execution require separately scoped live evidence.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
