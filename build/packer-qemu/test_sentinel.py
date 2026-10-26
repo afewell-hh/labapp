@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 import container_runner as cr
+import runtime_prepare as rp
 import stage_tools as st
 import supervise
 import test_container_runner as tc
@@ -451,11 +452,13 @@ class RuntimeSourceTests(unittest.TestCase):
     def test_context_is_the_dockerfile_alone(self):
         self.assertEqual(os.listdir(os.path.join(HERE, "runtime")), ["Dockerfile"])
 
-    def test_base_is_the_full_accepted_digest_and_nothing_else_is_copied_in(self):
+    def test_base_is_the_full_accepted_digest_with_only_pinned_external_ca_data_copy(self):
         froms = re.findall(r"(?m)^FROM (\S+)$", self.code)
         self.assertEqual(froms, [cr.PINNED_IMAGE])
         self.assertRegex(froms[0], r"@sha256:[0-9a-f]{64}$")
-        for word in ("COPY ", "ADD ", "curl", "wget", "apt-key", "trusted=yes", "allow-insecure",
+        copies = re.findall(r"(?m)^COPY (.+)$", self.code)
+        self.assertEqual(copies, [f"--from={rp.BUILDKIT_IMAGE} {rp.BOOTSTRAP_CA_SOURCE} {rp.BOOTSTRAP_CA_PATH}"])
+        for word in ("ADD ", "curl", "wget", "apt-key", "trusted=yes", "allow-insecure",
                      "allow-unauthenticated", "AllowUnauthenticated", "Check-Valid-Until", "--force-yes"):
             self.assertNotIn(word, self.code)
 
@@ -470,12 +473,13 @@ class RuntimeSourceTests(unittest.TestCase):
     def test_explicit_exact_roots_without_recommends_and_qemu_matches_the_guest_pins(self):
         self.assertIn("--no-install-recommends", self.code)
         roots = dict(re.findall(r"^\s+([a-z0-9.+-]+)=(\S+?)(?: \\)?$", self.code, re.M))
-        self.assertEqual(sorted(roots), ["python3", "python3.12", "qemu-system-x86", "qemu-utils", "seabios",
+        self.assertEqual(sorted(roots), ["ca-certificates", "python3", "python3.12", "qemu-system-x86", "qemu-utils", "seabios",
                                          "xorriso"])
         with open(os.path.join(HERE, "..", "provision", "install-qemu.py")) as handle:
             pins = dict(re.findall(r'"([a-z0-9-]+)": "([^"]+)"', handle.read().split("PINS = ")[1].split("}")[0]))
         for name in ("qemu-system-x86", "qemu-utils", "seabios"):
             self.assertEqual(roots[name], pins[name])
+        self.assertEqual(roots["ca-certificates"], "20240203")
         self.assertNotIn("socat", self.code)
         self.assertNotIn("genisoimage", self.code)
 

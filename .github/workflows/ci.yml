@@ -44,10 +44,15 @@ jobs:
           test -f build/packer-qemu/test_stage_tools.py
           test -f build/packer-qemu/test_sentinel.py
           test -f build/packer-qemu/test_sentinel_evidence.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          test -f build/packer-qemu/test_runtime_prepare.py
+          test_home=$(mktemp -d /tmp/labapp-portable-tests.XXXXXX)
+          env -i HOME="$test_home" PATH=/usr/bin:/bin python3 -I -B - <<'PY'
+          import os
+          import sys
           import unittest
+          sys.path.insert(0, os.path.abspath('build/packer-qemu'))
           loader = unittest.TestLoader()
-          for pattern in ('test_supervise.py', 'test_host_verify.py', 'test_container_runner.py', 'test_stage_tools.py', 'test_sentinel.py', 'test_sentinel_evidence.py'):
+          for pattern in ('test_supervise.py', 'test_host_verify.py', 'test_container_runner.py', 'test_stage_tools.py', 'test_sentinel.py', 'test_sentinel_evidence.py', 'test_runtime_prepare.py'):
               required = loader.discover('build/packer-qemu', pattern=pattern)
               if required.countTestCases() == 0:
                   raise SystemExit(f'Required suite {pattern} discovered no tests')

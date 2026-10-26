@@ -27,7 +27,8 @@ def install():
                 source = Path(next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist=')))
                 source.write_text(source.read_text().replace('/usr/share/keyrings/ubuntu-archive-keyring.gpg', str(key)))
                 code, output = bounded(args, seconds, env=module['ENV'])
-                assert code != 0 and b'NO_PUBKEY' in output
+                assert code != 0 and b'NO_PUBKEY' in output, (
+                    f'signature-refusal check failed: code={code!r} output_tail={output[-4096:]!r}')
                 raise Refusal('actual signature refusal')
             return original_call(args, seconds)
         globals_['call'] = rejected_trust
@@ -58,7 +59,7 @@ def install():
         code, output = bounded(['/usr/bin/python3', '/suite/install-qemu.py'], 240,
                                env={'PATH': '/usr/bin:/bin', 'LANG': 'C'})
         if code:
-            raise Refusal('unchanged installer CLI failed')
+            raise Refusal(f'unchanged installer CLI failed: code={code!r} output_tail={output[-4096:]!r}')
         print(json.dumps(json.loads(output)), flush=True)
     assert {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()} == apt_before
     # Real held-state preflight refuses before an APT transaction.

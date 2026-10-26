@@ -1,0 +1,65 @@
+---
+name: Sentinel runtime preparation
+"on":
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: labapp-sentinel-runtime
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUNTIME_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Create private client directories
+        run: |
+          umask 077
+          mkdir -m 0700 "$RUNNER_TEMP/runtime-docker-config" "$RUNNER_TEMP/runtime-home"
+          printf 'DOCKER_CONFIG=%s/runtime-docker-config\nHOME=%s/runtime-home\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # Pinned CLI installer only. docker driver skips create; use:false avoids
+      # selecting an implicit builder. No daemon work belongs to this action.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.38.1
+          driver: docker
+          name: default
+          use: false
+          cache-binary: false
+          cleanup: true
+      - name: Build and collect fixed candidate
+        id: build
+        timeout-minutes: 17
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$HOME" DOCKER_CONFIG="$DOCKER_CONFIG" \
+            RUNNER_TEMP="$RUNNER_TEMP" RUNTIME_RUN="$RUNTIME_RUN" \
+            GITHUB_REF="$GITHUB_REF" GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_SHA="$GITHUB_SHA" \
+            bash build/packer-qemu/runtime-prepare.sh
+      - name: Verify owned cleanup
+        if: always()
+        timeout-minutes: 3
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$HOME" DOCKER_CONFIG="$DOCKER_CONFIG" \
+            RUNNER_TEMP="$RUNNER_TEMP" python3 -I -B build/packer-qemu/runtime_prepare.py cleanup
+      - name: Seal complete evidence after cleanup
+        if: success() && steps.build.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$HOME" DOCKER_CONFIG="$DOCKER_CONFIG" \
+            RUNNER_TEMP="$RUNNER_TEMP" RUNTIME_JOB_STATUS="${{ job.status }}" \
+            RUNTIME_BUILD_OUTCOME="${{ steps.build.outcome }}" \
+            python3 -I -B build/packer-qemu/runtime_prepare.py seal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: success() && steps.build.outcome == 'success'
+        with:
+          name: sentinel-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/labapp-runtime/out
+          retention-days: 14
+          if-no-files-found: error

@@ -288,6 +288,12 @@ until verified, retain the CI/lead fallback and report denials exactly.
 - While an authorized session is active and jobs or reviews are pending, the
   lead checks roughly every 2 minutes and routes results and next work without
   waiting for the owner to ask for status.
+- Consult actual commit-specific review/completion receipts as well as summary
+  badges; summaries can lag completed code or security reviews. Resolve a mismatch
+  against the exact reviewed commit and actual receipt before acceptance.
+- Independent reviews and qualifying test runs use a clean, frozen checkout of
+  the exact commit. A new head invalidates affected prior results; finish edits
+  before freezing and rerun the affected checks against that head.
 - Bring product, scope and budget choices, blockers and meaningful milestones
   to the owner.
 - After a turn or session ends, continuous monitoring requires a separately
