@@ -429,7 +429,7 @@ after successful absence queries, in a private config, then bootstrapped explici
 The hooks resolve builder name/driver/node/endpoint, full container ID, pinned
 BuildKit image and actual image ID, exact cache mount and inspected local volume
 identity before removal through `buildx rm`. Successful list queries must prove
-absence afterwards. Buildx `ls --format=json` is parsed using its pinned source
+absence afterwards, including a successful empty full-container-ID query. Buildx `ls --format=json` is parsed using its pinned source
 schema, including embedded builder/node errors that can accompany exit status 0;
 `inspect --format` is unsupported and is not used. Failed queries/removal, identity changes, unexplained vanished
 resources and partial creation leaving only an unattributable volume are HOLD;

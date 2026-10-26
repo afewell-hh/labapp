@@ -54,7 +54,7 @@ RUN apt-get update \
  && cp /etc/apt/sources.list.d/labapp-snapshot.sources /usr/share/labapp-runtime/sources.txt \
  && apt-cache policy > /usr/share/labapp-runtime/policy.txt \
  && cp /var/lib/apt/lists/*InRelease /usr/share/labapp-runtime/ \
- && (cd /var/lib/apt/lists && sha256sum *) \
+ && (cd /var/lib/apt/lists && find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 -r sha256sum) \
     > /usr/share/labapp-runtime/indexes.sha256 \
  && (cd /usr/share/labapp-runtime && sha256sum *InRelease) \
     > /usr/share/labapp-runtime/inrelease.sha256 \

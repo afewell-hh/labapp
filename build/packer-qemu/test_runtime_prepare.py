@@ -91,7 +91,7 @@ class Ownership(unittest.TestCase):
         self.assertEqual(record['cleanup'], 'verified')
         removal = fake.calls.index(['buildx', 'rm', '--force', NAME])
         self.assertTrue(any(x[:2] == ['container', 'inspect'] for x in fake.calls[:removal]))
-        self.assertEqual(fake.calls[-1][:2], ['volume', 'ls'])
+        self.assertEqual(fake.calls[-1], ['container', 'ls', '-aq', '--no-trunc', '--filter', 'id=' + ID])
         self.assertEqual(record['identity']['container'], ID)
 
     def test_query_errors_are_never_absence(self):
@@ -169,6 +169,20 @@ class Ownership(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             prep.cleanup(call, record)
         self.assertNotIn('cleanup', record)
+
+    def test_full_id_query_failure_or_remaining_id_blocks_publication(self):
+        for fault in ['failure', 'remaining']:
+            with self.subTest(fault=fault):
+                fake, record = Fake(), state()
+                def call(args):
+                    if args[-1] == 'id=' + ID:
+                        if fault == 'failure':
+                            raise subprocess.CalledProcessError(1, args)
+                        return ID
+                    return fake(args)
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    prep.cleanup(call, record)
+                self.assertNotIn('cleanup', record)
 
     def test_cancel_or_timeout_is_not_absence(self):
         for error in [KeyboardInterrupt(), subprocess.TimeoutExpired('docker', 30)]:
@@ -300,6 +314,24 @@ class Export(unittest.TestCase):
             (out / 'image.tar').write_bytes(b'changed')
             with self.assertRaisesRegex(ValueError, 'changed'):
                 prep.seal(out, record, 'success', 'success')
+
+    def test_exact_dockerfile_index_hash_command_ignores_apt_directories(self):
+        dockerfile = Path(prep.__file__).with_name('runtime') / 'Dockerfile'
+        line, = [x for x in dockerfile.read_text().splitlines() if '(cd /var/lib/apt/lists && find ' in x]
+        command = line.split('(cd /var/lib/apt/lists && ', 1)[1].split(')', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'partial').mkdir()
+            (root / 'auxfiles').mkdir()
+            for name in ['test_InRelease', 'test_Packages.lz4']:
+                (root / name).write_text('synthetic index')
+            result = subprocess.run(['/bin/bash', '-o', 'pipefail', '-c', command], cwd=root,
+                env={'PATH': '/usr/bin:/bin'}, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            rows = result.stdout.decode().splitlines()
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                expected, name = row.split('  ')
+                self.assertEqual(prep.digest(root / name), expected)
 
     def test_no_extraction_or_runtime_execution_in_helper(self):
         source = Path(prep.__file__).read_text()

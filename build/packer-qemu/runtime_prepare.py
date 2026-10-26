@@ -110,6 +110,10 @@ def cleanup(call, state):
     if exists:
         call(['buildx', 'rm', '--force', state['name']])
     require(census(call, state['name']) == (False, [], []), 'cleanup incomplete')
+    if 'identity' in state:
+        remaining = call(['container', 'ls', '-aq', '--no-trunc', '--filter',
+                          'id=' + state['identity']['container']])
+        require(not remaining, 'owned container ID remains')
     state['cleanup'] = 'verified'
 
 
