@@ -165,6 +165,38 @@ class TunTests(unittest.TestCase):
         self.assertEqual(len(self.ioctl.call_args.args[2]), 4)
         self.close.assert_called_once_with(17)
 
+    def test_tap_open_uses_trusted_device_identity_without_issuing_ioctl(self):
+        ops = aq.TapOps()
+        self.assertEqual(ops.open(), 17)
+        self.ioctl.assert_not_called()
+        self.open.assert_called_once_with("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.close.assert_not_called()
+        ops.close(17)
+        self.close.assert_called_once_with(17)
+
+    def test_tap_open_refuses_untrusted_device_and_closes_on_identity_error_or_cancellation(self):
+        ops = aq.TapOps()
+        good = copy.copy(self.device)
+        for field, value in (("st_mode", stat.S_IFLNK | 0o777), ("st_uid", 1000),
+                             ("st_rdev", os.makedev(10, 232))):
+            self.device = copy.copy(good)
+            setattr(self.device, field, value)
+            self.assertRaises(aq.Check, ops.open)
+            self.open.assert_not_called()
+        self.device = good
+        for error in (OSError(), KeyboardInterrupt(), SystemExit(143)):
+            self.close.reset_mock()
+            self.fstat.side_effect = error
+            self.assertRaises(aq.Check if isinstance(error, OSError) else type(error), ops.open)
+            self.close.assert_called_once_with(17)
+        self.fstat.side_effect = None
+        changed = copy.copy(good)
+        changed.st_ino += 1
+        self.fstat.return_value = changed
+        self.close.reset_mock()
+        self.assertRaises(aq.Check, ops.open)
+        self.close.assert_called_once_with(17)
+
     def test_wrong_device_symlink_untrusted_parent_and_absence_never_open(self):
         for mode, rdev in ((stat.S_IFREG | 0o666, 0), (stat.S_IFLNK | 0o777, 0),
                            (stat.S_IFCHR | 0o666, os.makedev(10, 232))):

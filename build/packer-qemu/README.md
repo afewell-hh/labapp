@@ -587,18 +587,41 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
 * Root's TUN query validates trusted real `/dev/net` parents and nonsymlink character device10:200,
   opens `/dev/net/tun` with no-follow/nonblocking/close-on-exec flags, verifies descriptor identity, issues
   only `TUNGETFEATURES` and requires the TAP flag, then closes the descriptor on success or failure.
-  It does not attach an interface, issue `TUNSETIFF`, test CAP_NET_ADMIN/LSM network authorization, create
-  TAPs/bridges or run official helpers. Device/API success therefore explicitly retains `tap_create=unrun`.
+  The query itself attaches no interface and tests no CAP_NET_ADMIN/LSM network authorization.
+* Finite TAP witness (#310, SOURCE ONLY; UNRUN in any guest): right after the query the adapter performs ONE
+  FD-owned nonpersistent TAP operation on the fixed name `labapp-tap0`, inside the guest (guest root's own
+  namespace, not the host's; no outer capability is enlarged). It (1) refuses a preexisting interface of that
+  name before any mutation and never deletes or repairs one; (2) opens `/dev/net/tun` with the same trusted-parent,
+  10:200 and descriptor-identity checks; (3) issues `TUNSETIFF` with `IFF_TAP|IFF_NO_PI|IFF_TUN_EXCL` and never
+  `TUNSETPERSIST`, keeping the owning descriptor; (4) while open verifies the interface exists, is `ARPHRD_ETHER`
+  and its `tun_flags` show exactly TAP+NO_PI with no TUN/persist bit; (5) always closes the descriptor (also on
+  failure, `KeyboardInterrupt`/`SystemExit` or error) and requires the interface absent afterwards, with no retry or
+  delete. Exclusive creation refuses a name collision racing the initial absence query, without attaching
+  an unowned TAP. Absence uses a successful interface inventory; query errors never mean absent.
+  A 10 s main-thread `ITIMER_REAL` alarm interrupts the operation; SIGTERM/SIGINT become fixed cancellation
+  failures so close and final absence observation still run. Prior signal handlers are restored and an existing
+  timer refuses before observation. Monotonic checks also refuse late results. Uninterruptible kernel stalls
+  still depend on the unchanged external guest/controller deadline and disposal, never a success claim. It adds no
+  bridge, IP, route or official-helper operation, no mode/profile/HCL/budget/network/permission change, and
+  keeps the plan's four `assert-qemu.py` steps (the operation is part of `witness`). Fixed tokens:
+  `tap-{collision,query,open,create,missing,inspect,type,close,after-present,deadline,cancelled}`; leaked interface outranks
+  a close error, which outranks an earlier failure. Mocked tests cannot prove kernel authorization; a separately
+  authorized one-VM trial must show the real operation, normal completion and independent exact owned cleanup.
 * Failure reasons stay inside the existing `LABAPP-DIAG` token: `inst<N>-refused-sNNN`, `inst<N>-exit-sNNN`
   (bounded wall seconds, #281), `inst<N>-timeout`, `inst<N>-output`, `inst1-unchanged`, `inst2-changed`,
   `native-pins`, `native-audit`, `rerun-state`, `witness-{nokvm,mismatch,artifact,pins,backing,timeout,deadline,
   failed,output,invalid}` (fixed messages of the unchanged witness only), `state-missing`, `identity`,
   `emit-failed`, `not-root`, `staging-input`, `internal`, `host-{query,path,owner,drift,timeout,output}`,
-  `sudo-{owner,identity,timeout,output}` and `tun-{path,device,identity,api,features}`.
+  `sudo-{owner,identity,timeout,output}`, `tun-{path,device,identity,api,features}` and the `tap-*` tokens above.
   No APT, dpkg, installer or peer text is exported.
-* Retained witness: on success the adapter writes one `LABAPP-QEMU v2 nonce=H inputs=H accel=kvm exit=33 uid=0
+* Retained witness: on success the adapter writes one `LABAPP-QEMU v3 nonce=H inputs=H accel=kvm exit=33 uid=0
   equal=1 backing=1 removed=1 i1=1:S i2=0:S w=S net=RCD sudo=V:H ssh=V:H less=V:H caller=1000 sudo_uid=0
-  arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun` line on the serial console (`V` is a
+  arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=passed tap_before=absent tap_owned=present
+  tap_after=absent tap_s=T` line (`T` is a whole second count from 0 through 10) on the serial console.
+  `v2` (same fields ending `tap_create=unrun`) keeps its historical meaning in the observer/summary validator;
+  it cannot satisfy the new source's required success receipt, and the adapter no longer emits it.
+  v3 adds the closed `host_contract.tap` object (`before`/`owned`/`after`/`seconds`) and the runner
+  requires `tap` exactly when `tap_create` is `passed` and refuses `unrun` with it (`V` is a
   bounded native package version, `H` a SHA256; `S` is 1-3 digits of
   whole seconds capped at 999; `R`/`C`/`D` are 0/1 for a default IPv4 route, a nonempty CA bundle and a
   nameserver line (including the two known systemd-resolved resolver symlink targets), reported never repaired). `host_verify.py` (still with only `require_sentinel_evidence`) accepts
@@ -630,7 +653,12 @@ list the six required commands and launch QEMU/helpers through sudo. Their
 [50 helper](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/hhfab/cmdhelpers.go) mutate TAPs/bridges;
 these are not called here. Linux6.8's [TUN implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c)
 returns valid flags for an unattached fd's GETFEATURES query; the
-[UAPI](https://github.com/torvalds/linux/blob/v6.8/include/uapi/linux/if_tun.h) defines the query and TAP bit.
+[UAPI](https://github.com/torvalds/linux/blob/v6.8/include/uapi/linux/if_tun.h) defines the query, TAP bit,
+exclusive-create flag and read-only persistence flag (`0x0800`). In that same v6.8 source,
+`tun_set_iff` rejects existing names with `IFF_TUN_EXCL`; `tun_chr_close` detaches the descriptor, and
+`__tun_detach` unregisters an interface with no queues when persistence is unset. This is source evidence,
+not execution proof of Ubuntu's running kernel. [CPython3.12.3](https://github.com/python/cpython/blob/v3.12.3/Modules/socketmodule.c)
+discards errno for `if_nametoindex` failures; the witness therefore uses successful `if_nameindex` inventory.
 The [Noble20261017 manifest](https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.manifest)
 lists the three packages but does not establish their actual guest installed state. No release selection,
 VLAB startup, privileged network mutation, full topology or student acceptance follows from this probe.

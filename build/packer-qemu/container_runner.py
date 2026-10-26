@@ -105,6 +105,9 @@ QEMU_WITNESS_KEYS = {"accelerator", "exit", "uid", "nonce_equal", "backing_uncha
                      "install1", "install2", "witness_seconds", "network", "host_contract"}
 QEMU_NETWORK_KEYS = {"default_route", "ca_bundle", "resolver"}
 HOST_KEYS = {"native", "caller_uid", "sudo_uid", "tun_open", "tun_api", "tap_flag", "tap_create"}
+# v3 successor schema: tap_create=passed plus exactly this closed observation (v2 stays `unrun`, no `tap`).
+HOST_TAP_KEYS = HOST_KEYS | {"tap"}
+TAP_SECONDS_CAP = 10
 HOST_PACKAGES = {"sudo", "openssh-client", "less"}
 HOST_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.+:~\-]{0,63}\Z")
 QEMU_SECONDS_CAP = 999
@@ -1235,7 +1238,17 @@ def _seconds(value):
 
 def host_contract_valid(value):
     """Fixed native observations and the narrow sudo/TUN claims, independently revalidated."""
-    if not isinstance(value, dict) or set(value) != HOST_KEYS:
+    if not isinstance(value, dict) or set(value) not in (HOST_KEYS, HOST_TAP_KEYS):
+        return False
+    if "tap" in value:      # v3 only; tap_create=passed is invalid without it and `unrun` with it
+        tap = value["tap"]
+        if not (_exact(value["tap_create"], "passed") and isinstance(tap, dict)
+                and set(tap) == {"before", "owned", "after", "seconds"}
+                and _exact(tap["before"], "absent") and _exact(tap["owned"], "present")
+                and _exact(tap["after"], "absent") and type(tap["seconds"]) is int
+                and 0 <= tap["seconds"] <= TAP_SECONDS_CAP):
+            return False
+    elif not _exact(value["tap_create"], "unrun"):
         return False
     native = value["native"]
     return (isinstance(native, dict) and set(native) == HOST_PACKAGES
@@ -1245,8 +1258,7 @@ def host_contract_valid(value):
                     and re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
                     for row in native.values())
             and _exact(value["caller_uid"], 1000) and _exact(value["sudo_uid"], 0)
-            and all(_exact(value[k], True) for k in ("tun_open", "tun_api", "tap_flag"))
-            and _exact(value["tap_create"], "unrun"))
+            and all(_exact(value[k], True) for k in ("tun_open", "tun_api", "tap_flag")))
 
 
 def qemu_witness_valid(value):
@@ -1280,7 +1292,8 @@ def receipt_matches(raw, staged, qemu=False):
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
     if qemu and not (isinstance(body, dict) and set(body) == QEMU_KEYS
-                     and qemu_witness_valid(body["qemu_witness"])):
+                     and qemu_witness_valid(body["qemu_witness"])
+                     and body["qemu_witness"]["host_contract"]["tap_create"] == "passed"):
         return False
     return (isinstance(body, dict) and set(body) == (QEMU_KEYS if qemu else SENTINEL_KEYS)
             and body["nonce"] == staged["nonce"] and body["inputs"] == staged["guest_receipt"]
