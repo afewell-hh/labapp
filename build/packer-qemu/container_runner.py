@@ -605,7 +605,7 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     uid, gid = (os.getuid() if uid is None else uid), (os.getgid() if gid is None else gid)
     if mode not in MODES:
         raise ValueError("unknown mode")
-    keys = FIXTURE_SOURCE_KEYS if mode == "fixture" else SOURCE_KEYS
+    keys = FIXTURE_SOURCE_KEYS if mode in ("fixture", "qemu-fixture") else SOURCE_KEYS
     if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == keys):
         raise ValueError(f"{mode} needs exactly the {', '.join(sorted(keys))} input files")
     if mode in VM_MODES:
@@ -981,7 +981,7 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
                 "plugin_member_sha256": staged["plugin_member_sha256"], "exit_code": code,
                 "command": "packer build -var-file=sentinel.pkrvars.hcl labapp.pkr.hcl",
                 "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
-    if own["mode"] == "fixture":
+    if own["mode"] in ("fixture", "qemu-fixture"):
         evidence["task"] = "fixture"
         evidence["hhfab_archive_sha256"] = staged["hhfab_archive_sha256"]
     qemu = own["mode"] == "qemu-fixture"
@@ -1270,7 +1270,7 @@ def parse(argv):
     p.add_argument("--mode", choices=MODES, default="probe", help="fixed task (default: probe)")
     for key in ("core", "plugin", "base"):
         p.add_argument(f"--{key}-file", help=f"hcl-check: pinned {key} input file (absolute path)")
-    p.add_argument("--archive-file", help="fixture only: caller-supplied pinned hhfab release archive (absolute path)")
+    p.add_argument("--archive-file", help="fixture/qemu-fixture: caller-supplied pinned hhfab release archive (absolute path)")
     return p.parse_args(argv)
 
 
@@ -1281,10 +1281,10 @@ def main(argv=None):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
-    if args.mode == "fixture":
+    if args.mode in ("fixture", "qemu-fixture"):
         files["archive"] = args.archive_file
     elif args.archive_file is not None:
-        print("--archive-file is only for --mode fixture", file=sys.stderr)
+        print("--archive-file is only for --mode fixture or qemu-fixture", file=sys.stderr)
         return EXIT["usage"]
     if args.mode not in STAGED_MODES and any(files.values()):
         print("input files are only for --mode hcl-check, sentinel, sentinel-expiry, fixture or qemu-fixture",
@@ -1292,7 +1292,7 @@ def main(argv=None):
         return EXIT["usage"]
     if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
         print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file"
-              + (" and --archive-file" if args.mode == "fixture" else ""), file=sys.stderr)
+              + (" and --archive-file" if args.mode in ("fixture", "qemu-fixture") else ""), file=sys.stderr)
         return EXIT["usage"]
     if args.mode in VM_MODES and args.execute:
         try:

@@ -49,16 +49,21 @@ def qemu_line(nonce=thv.NONCE, inputs=thv.INPUTS, **more):
 
 
 class StagingTests(ts.StageCase):
+    def setUp(self):
+        super().setUp()
+        self.sources, self.pins = tsn.with_archive(self.sources, self.pins, self.inputs)
+
     def stage_qemu(self, **kw):
         return self.stage(task="qemu-fixture", verify_seconds=kw.pop("seconds", 600), **kw)
 
-    def test_cd_has_the_unchanged_modules_the_adapter_and_the_fixed_plan_but_no_archive(self):
+    def test_cd_has_the_unchanged_modules_the_adapter_and_the_fixed_plan_with_archive(self):
         staged = self.stage_qemu()
         names = sorted(os.listdir(os.path.join(self.ws, "cd")))
         self.assertEqual(names, sorted(["MANIFEST", "assert-sentinel.sh", "assert-qemu.py", "guest-build.sh",
                                         "hhfab_release.py", "install-qemu.py", "qemu_offline.py", "qemu_witness.py",
-                                        "meta-data", "nonce", "plan.txt", "sentinel-evidence.py", "user-data"]))
-        for name in st.QEMU_PROVISION_FILES:          # byte-identical copies of the existing modules
+                                        "meta-data", "nonce", "plan.txt", "sentinel-evidence.py", "user-data",
+                                        "install-hhfab.py", "assert-fixture.py", "component_prerequisites.py", st.ARCHIVE_NAME]))
+        for name in set(st.QEMU_PROVISION_FILES + st.PROVISION_FILES + (st.PROBE_FILE,)):  # unchanged modules
             with open(os.path.join(PROVISION, name), "rb") as handle:
                 self.assertEqual(self.read("cd", name), handle.read(), name)
         with open(os.path.join(HERE, "guest", st.QEMU_ASSERT), "rb") as handle:
@@ -67,7 +72,7 @@ class StagingTests(ts.StageCase):
         for name in (*st.QEMU_PROVISION_FILES, st.QEMU_ASSERT, "plan.txt"):
             self.assertRegex(manifest, r"(?m)^[0-9a-f]{64}  " + re.escape(name) + "$")
         self.assertEqual(staged["guest_receipt"], hashlib.sha256(self.read("cd", "MANIFEST")).hexdigest())
-        self.assertNotIn("hhfab_archive_sha256", staged)
+        self.assertEqual(staged["hhfab_archive_sha256"], self.pins["hhfab"]["sha256"])
         self.assertTrue(st.verify_staged(self.ws, staged))
 
     def test_qemu_files_are_root_only_and_exact_under_a_restrictive_umask(self):
@@ -79,14 +84,16 @@ class StagingTests(ts.StageCase):
         modes = {n: stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", n)).st_mode)
                  for n in os.listdir(os.path.join(self.ws, "cd"))}
         for name in (*st.QEMU_PROVISION_FILES, st.QEMU_ASSERT, "plan.txt", "MANIFEST", "nonce"):
-            self.assertEqual(modes[name], 0o400, name)     # no nonroot reader exists in this task
+            self.assertEqual(modes[name], 0o444 if name == "hhfab_release.py" else 0o400, name)     # shared helper remains public for the old prefix
         self.assertEqual(modes["assert-sentinel.sh"], 0o444)
+        for name in (*st.PROVISION_FILES, st.ARCHIVE_NAME):
+            self.assertEqual(modes[name], 0o444, name)
+        self.assertEqual(modes[st.PROBE_FILE], 0o400)
 
-    def test_plan_is_the_sentinel_pair_then_baseline_two_installs_and_the_witness(self):
+    def test_plan_retains_all_ten_fixture_steps_then_appends_qemu(self):
         self.stage_qemu()
         check = "root /usr/bin/python3 -I -B @IN@/assert-qemu.py "
-        self.assertEqual(self.read("cd", "plan.txt").decode().splitlines(), [
-            "root /bin/bash @IN@/assert-sentinel.sh root", "ubuntu /bin/bash @IN@/assert-sentinel.sh ubuntu",
+        self.assertEqual(self.read("cd", "plan.txt").decode().splitlines(), st.FIXTURE_PLAN.decode().splitlines() + [
             check + "baseline", check + "install 1", check + "install 2", check + "witness"])
         plan = st.QEMU_PLAN.decode()
         for word in ("curl", "wget", "--offline", "--capture-state", "--receipt-sha256", "--base-id", "-S"):
@@ -112,7 +119,7 @@ class StagingTests(ts.StageCase):
             handle.write(b"#")
         self.assertFalse(st.verify_staged(self.ws, staged))
         self.setUp()
-        self.stage(task="sentinel", verify_seconds=600)
+        self.stage(task="sentinel", verify_seconds=600, sources={k: v for k, v in self.sources.items() if k != "archive"})
         listed = os.listdir(os.path.join(self.ws, "cd"))
         for name in (*st.QEMU_PROVISION_FILES, st.QEMU_ASSERT):
             self.assertNotIn(name, listed)
@@ -198,11 +205,13 @@ VARIANTS = {
 
 
 class QemuRunnerCase(tsn.SentinelCase):
+    setUp = tsn.FixtureRunnerTests.setUp
+
     def run_qemu(self, daemon=None, delay=0.0, mode="qemu-fixture", **kw):
         daemon = daemon or QemuDaemon(self.clock)
         result = cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock,
                               sleep=self.clock.sleep, admitted_at=self.clock() - delay, uid=os.getuid() or 1000,
-                              mode=mode, sources=self.sources, **kw)
+                              mode=mode, sources=(self.sources if mode == "qemu-fixture" else {k: v for k, v in self.sources.items() if k != "archive"}), **kw)
         return result, daemon
 
 
@@ -284,9 +293,9 @@ class DeadlineAndAdmissionTests(QemuRunnerCase):
         self.assertEqual(daemon.calls, [])
         self.assertEqual(os.listdir(self.root), [])
 
-    def test_exactly_the_three_pinned_sources_are_required(self):
+    def test_exactly_the_four_pinned_sources_are_required(self):
         daemon = QemuDaemon(self.clock)
-        for sources in ({k: v for k, v in self.sources.items() if k != "base"}, dict(self.sources, archive="/x")):
+        for sources in ({k: v for k, v in self.sources.items() if k != "base"}, {k: v for k, v in self.sources.items() if k != "archive"}):
             with self.subTest(keys=sorted(sources)), self.assertRaises(ValueError):
                 cr.run_probe(RUNTIME["image_id"], self.root, self.ledger, daemon, clock=self.clock,
                              uid=os.getuid() or 1000, mode="qemu-fixture", sources=sources)
@@ -369,7 +378,7 @@ class AcceptanceTests(QemuRunnerCase):
 
 class CliTests(QemuRunnerCase):
     BASE = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "qemu-fixture",
-            "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c"]
+            "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c", "--archive-file", "/d"]
 
     def test_plan_shows_the_bridge_and_never_contacts_docker(self):
         with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
@@ -381,13 +390,13 @@ class CliTests(QemuRunnerCase):
         self.assertIn("--network=bridge", plan["create"])
         self.assertIn("--device=/dev/kvm", plan["create"])
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(cr.main(self.BASE[:5] + ["sentinel"] + self.BASE[6:]), 0)
+            self.assertEqual(cr.main(self.BASE[:5] + ["sentinel"] + self.BASE[6:-2]), 0)
         self.assertEqual(json.loads(out.getvalue())["network"], "none")
 
-    def test_inputs_are_required_and_the_archive_option_stays_fixture_only(self):
+    def test_inputs_and_the_archive_are_required(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cr.main(self.BASE[:8]), 2)
-            self.assertEqual(cr.main(self.BASE + ["--archive-file", "/d"]), 2)
+            self.assertEqual(cr.main(self.BASE[:-2]), 2)
             self.assertEqual(cr.main(self.BASE[:8] + ["--core-file", "relative", "--plugin-file", "/b",
                                                       "--base-file", "/c"]), 2)
             for option in ("--image", "--command", "--network", "--proxy"):
@@ -402,16 +411,16 @@ class CliTests(QemuRunnerCase):
             self.assertEqual(cr.main(self.BASE + ["--execute"]), 2)
         self.assertIn("not accepted", err.getvalue())
 
-    def test_execute_passes_the_fixed_mode_and_the_three_sources_only(self):
+    def test_execute_passes_the_fixed_mode_and_the_four_sources_only(self):
         argv = ["--workspace-root", self.root, "--ledger-dir", self.ledger, "--mode", "qemu-fixture",
-                "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c", "--execute"]
+                "--core-file", "/a", "--plugin-file", "/b", "--base-file", "/c", "--archive-file", "/d", "--execute"]
         with mock.patch.object(cr, "Backend", return_value=object()), \
                 mock.patch.object(cr, "run_probe", return_value={"outcome": "accepted"}) as run, \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cr.main(argv), 0)
         self.assertEqual(run.call_args.args[0], RUNTIME["image_id"])
         self.assertEqual(run.call_args.kwargs["mode"], "qemu-fixture")
-        self.assertEqual(run.call_args.kwargs["sources"], {"core": "/a", "plugin": "/b", "base": "/c"})
+        self.assertEqual(run.call_args.kwargs["sources"], {"core": "/a", "plugin": "/b", "base": "/c", "archive": "/d"})
 
 
 # ---------------------------------------------------------------- observer
@@ -476,7 +485,7 @@ PINS = {"qemu-system-x86": "1:8.2.2+ds-0ubuntu1.18", "qemu-utils": "1:8.2.2+ds-0
 NONCE_VALUE = "c3" * 32
 WITNESS_JSON = {"accelerator": "KVM", "exit": 33, "nonce_equal": True, "fixture_sha256": "d" * 64,
                 "backing_unchanged": True, "owned_workspace_removed": True,
-                "artifacts": {"/usr/bin/qemu-system-x86_64": "a" * 64}, "pins": PINS, "uid": 0, "gid": 0,
+                "artifacts": aq.EXPECTED_ARTIFACTS, "pins": PINS, "uid": 0, "gid": 0,
                 "groups": [0], "device": {"character": True, "uid": 0, "gid": 994, "mode": "0o660",
                                           "major": 10, "minor": 232}, "seconds": 1.2}
 
@@ -506,7 +515,7 @@ class GuestCase(unittest.TestCase):
         for name in aq.MODULES:
             with open(os.path.join(self.here, name), "wb") as handle:
                 handle.write(b"# synthetic, never executed\n")
-            os.chmod(os.path.join(self.here, name), 0o400)
+            os.chmod(os.path.join(self.here, name), 0o444 if name == "hhfab_release.py" else 0o400)
         with open(os.path.join(self.here, "nonce"), "w") as handle:
             handle.write(NONCE_VALUE + "\n")
         with open(os.path.join(self.here, "MANIFEST"), "wb") as handle:
@@ -576,6 +585,43 @@ class GuestCase(unittest.TestCase):
 
 
 class GuestSuccessTests(GuestCase):
+    def test_real_socat_filetree_preserves_link_and_payload_and_refuses_retarget(self):
+        cfg = self.cfg()
+        directory = os.path.dirname(self.files["a1"])
+        payload = os.path.join(directory, "socat1")
+        link = os.path.join(directory, "socat")
+        with open(payload, "wb") as handle:
+            handle.write(b"synthetic package payload")
+        os.symlink("socat1", link)
+        cfg.artifacts = (payload,)
+        before = aq.native_state(cfg, set(PINS))
+        self.assertEqual(before, aq.native_state(cfg, set(PINS)))
+        self.assertEqual(before["artifacts"][payload][-1], hashlib.sha256(b"synthetic package payload").hexdigest())
+        os.unlink(link)
+        os.symlink("a1", link)
+        with self.assertRaisesRegex(aq.Check, "native-artifact"):
+            aq.native_state(cfg, set(PINS))
+
+    def test_known_resolver_symlink_observes_target_without_repair(self):
+        target = "/run/systemd/resolve/stub-resolv.conf"
+        os.unlink(self.files["resolver"])
+        os.symlink(target, self.files["resolver"])
+        original = aq.read_small
+        with mock.patch.object(aq, "read_small", side_effect=lambda path: b"nameserver 127.0.0.53\n" if path == target else original(path)):
+            self.assertTrue(aq.network_facts(self.cfg())["resolver"])
+        self.assertEqual(os.readlink(self.files["resolver"]), target)
+
+    def test_expected_contract_tracks_unchanged_modules(self):
+        import ast
+        for filename, constants in (("install-qemu.py", {"SNAPSHOT": aq.EXPECTED_SNAPSHOT, "PINS": aq.EXPECTED_PINS}),
+                                    ("qemu_witness.py", {"ARTIFACTS": aq.EXPECTED_ARTIFACTS})):
+            with open(os.path.join(PROVISION, filename)) as handle:
+                tree = ast.parse(handle.read())
+            actual = {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                      and node.targets[0].id in constants}
+            self.assertEqual(actual, constants)
+
     def test_full_sequence_emits_exactly_one_run_bound_line_the_observer_and_runner_accept(self):
         self.assertEqual(self.sequence(), [0, 0, 0, 0])
         self.assertIsNone(self.token())
@@ -673,7 +719,9 @@ class GuestFailureTests(GuestCase):
                json.dumps({**good, "pins": {**PINS, "socat": 1}}).encode(),
                json.dumps({**good, "resolved_installed": {}}).encode(),
                json.dumps({**good, "downloaded_archives": "x"}).encode(),
-               b"\xff"]
+               b"\xff", b" " * (aq.INSTALL_OUTPUT_CAP + 1),
+               install_json(True, snapshot="wrong"), install_json(True, seconds=True),
+               install_json(True, seconds=float("nan")), install_json(True, downloaded_archives=[{}])]
         for raw in bad:
             with self.subTest(raw=raw[:40]):
                 self.setUp()
@@ -732,13 +780,14 @@ class GuestFailureTests(GuestCase):
                     {"uid": 1000}, {"nonce_equal": False}, {"backing_unchanged": False},
                     {"owned_workspace_removed": False}, {"pins": {**PINS, "socat": "9"}},
                     {"device": {"character": False}}, {"device": None}, {"fixture_sha256": "zz"},
-                    {"extra": 1}]
+                    {"extra": 1}, {"seconds": True}, {"gid": False}, {"groups": [True]},
+                    {"artifacts": {}}]
         for change in variants:
             with self.subTest(change=change):
                 self.setUp()
                 self.witness_result = (0, json.dumps({**WITNESS_JSON, **change}).encode())
                 self.fails([("baseline",), ("install", "1"), ("install", "2")], ("witness",), "^witness-invalid$")
-        for raw in (b"", b'{"a":1,"a":2}', b"Infinity"):
+        for raw in (b"", b'{"a":1,"a":2}', b"Infinity", b" " * (aq.WITNESS_OUTPUT_CAP + 1)):
             self.setUp()
             self.witness_result = (0, raw)
             self.fails([("baseline",), ("install", "1"), ("install", "2")], ("witness",), "^witness-output$")

@@ -3,12 +3,12 @@
 Staged on the CD by stage_tools.py and run by guest-build.sh's plan as
 `root /usr/bin/python3 -I -B @IN@/assert-qemu.py <phase>` under `env -i`, cwd `/`, stdin /dev/null,
 next to the UNCHANGED build/provision modules install-qemu.py, qemu_offline.py, hhfab_release.py and
-qemu_witness.py (staged byte-for-byte, root-only). Python 3.10+ stdlib only. It adds no installer
+qemu_witness.py (staged byte-for-byte, with shared hhfab_release.py public 0444 for the existing nonroot probe). Python 3.10+ stdlib only. It adds no installer
 option, repair, retry, NIC or network configuration: it only RUNS the existing modules and OBSERVES.
 
 Phases: baseline (root, identities, bounded network facts), `install 1` / `install 2` (the unchanged
 `python3 -B install-qemu.py`, no arguments, ordinary network mode: run 1 must change the guest, run 2 must be
-the documented no-op, and native dpkg/artifact state must match the pins and stay identical), witness (the
+a package/artifact no-change rerun (APT still authenticates and executes), and native dpkg/artifact state must match the pins and stay identical), witness (the
 unchanged `qemu_witness.py`: real `-accel kvm -cpu host`, nonce, exit 33, unchanged backing, removed scratch;
 then ONE strict run-bound `LABAPP-QEMU v1` line on the serial console).
 
@@ -36,7 +36,9 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 MODULES = ("install-qemu.py", "qemu_offline.py", "hhfab_release.py", "qemu_witness.py")
 INSTALL_SECONDS = 240      # above install-qemu.py's own 235 s alarm; its limits are unchanged
 WITNESS_SECONDS = 45       # above qemu_witness.py's own 40 s alarm
-OUTPUT_CAP = 1 << 18       # combined stdout/stderr, never exported
+INSTALL_OUTPUT_CAP = 1 << 20  # installer report; same bound as its internal command helper
+WITNESS_OUTPUT_CAP = 4096    # small fixed witness report, never exported
+NATIVE_OUTPUT_CAP = 1 << 18  # unchanged bounded native query/audit
 SECONDS_CAP = 999
 STATUS_CAP = 65536
 INSTALL_KEYS = {"snapshot", "pins", "resolved_installed", "downloaded_archives", "changed", "seconds"}
@@ -50,7 +52,7 @@ WITNESS_REFUSALS = {"KVM character device absent; no fallback": "witness-nokvm",
                     "backing fixture changed": "witness-backing",
                     "command timeout": "witness-timeout",
                     "overall deadline exceeded": "witness-deadline"}
-PACKAGE_ARTIFACTS = ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
+PACKAGE_ARTIFACTS = ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat1",
                      "/usr/share/seabios/bios-256k.bin")
 
 
@@ -79,7 +81,9 @@ class Config:
         release = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(release)
         try:
-            return release.bounded(["/usr/bin/env", "-C", "/", *argv], seconds, limit=OUTPUT_CAP, env=ENV)
+            limit = (INSTALL_OUTPUT_CAP if argv[-1] == self.path("install-qemu.py") else
+                     WITNESS_OUTPUT_CAP if argv[-1] == self.path("qemu_witness.py") else NATIVE_OUTPUT_CAP)
+            return release.bounded(["/usr/bin/env", "-C", "/", *argv], seconds, limit=limit, env=ENV)
         except release.Refusal as exc:
             raise Timeout("output" if str(exc) == "command output overflow" else "timeout") from None
 
@@ -157,8 +161,14 @@ def network_facts(cfg):
     route = any(len(row.split()) >= 8 and row.split()[1] == b"00000000" and row.split()[7] == b"00000000"
                 for row in table.splitlines()[1:])
     bundle = read_small(cfg.ca)
+    resolver_path = cfg.resolver
+    if os.path.islink(resolver_path):
+        # Ubuntu systemd-resolved's two documented local resolver files only.
+        target = os.path.normpath(os.path.join(os.path.dirname(resolver_path), os.readlink(resolver_path)))
+        resolver_path = target if target in ("/run/systemd/resolve/stub-resolv.conf",
+                                             "/run/systemd/resolve/resolv.conf") else ""
     resolver = any(row.split()[:1] == [b"nameserver"] and len(row.split()) >= 2
-                   for row in (read_small(cfg.resolver) or b"").splitlines())
+                   for row in (read_small(resolver_path) or b"").splitlines())
     return {"default_route": route, "ca_bundle": bool(bundle), "resolver": resolver}
 
 
@@ -167,7 +177,7 @@ def baseline(cfg):
     for name in MODULES:
         info = os.lstat(cfg.path(name))
         need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == cfg.owner
-             and stat.S_IMODE(info.st_mode) == 0o400, "staging-input")
+             and stat.S_IMODE(info.st_mode) == (0o444 if name == "hhfab_release.py" else 0o400), "staging-input")
     os.makedirs(cfg.state, mode=0o700)
     write_state(cfg, "baseline.json", {"network": network_facts(cfg)})
 
@@ -187,13 +197,34 @@ def native_state(cfg, names):
     for path in cfg.artifacts:
         info = os.lstat(path)
         need(stat.S_ISREG(info.st_mode), "native-artifact")
-        artifacts[path] = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+        artifacts[path] = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, sha256(path)]
+        if os.path.basename(path) == "socat1":
+            link = os.path.join(os.path.dirname(path), "socat")
+            meta = os.lstat(link)
+            need(stat.S_ISLNK(meta.st_mode) and os.readlink(link) == "socat1", "native-artifact")
+            artifacts[link] = [meta.st_dev, meta.st_ino, meta.st_size, meta.st_mtime_ns,
+                               meta.st_ctime_ns, os.readlink(link)]
     return {"packages": packages, "artifacts": artifacts}
+
+
+EXPECTED_SNAPSHOT = "20261024T000000Z"
+EXPECTED_PINS = {"qemu-system-x86": "1:8.2.2+ds-0ubuntu1.18", "qemu-utils": "1:8.2.2+ds-0ubuntu1.18",
+                 "socat": "1.8.0.0-4ubuntu0.1", "seabios": "1.16.3-2"}
+
+
+EXPECTED_ARTIFACTS = {
+    "/usr/bin/qemu-system-x86_64": "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854",
+    "/usr/share/seabios/bios-256k.bin": "1a9ea4f17bcfb27bda5728e2c21d9fa074cf7947b9b4910bb28213a735c96735"}
+
+
+def finite_seconds(value):
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= SECONDS_CAP
 
 
 def install_report(text, number):
     """Validate the unchanged installer's one-line JSON report; return it."""
     try:
+        need(len(text) <= INSTALL_OUTPUT_CAP, "inst%d-output" % number)
         report = strict_json(text)
     except (UnicodeError, ValueError, RecursionError):
         raise Check("inst%d-output" % number) from None
@@ -203,7 +234,12 @@ def install_report(text, number):
           and isinstance(report["resolved_installed"], dict)
           and all(report["resolved_installed"].get(k) == v for k, v in pins.items())
           and isinstance(report["downloaded_archives"], list)
-          and type(report["changed"]) is bool and isinstance(report["snapshot"], str))
+          and type(report["changed"]) is bool and report["snapshot"] == EXPECTED_SNAPSHOT
+          and pins == EXPECTED_PINS and finite_seconds(report["seconds"])
+          and all(isinstance(row, dict) and set(row) == {"name", "bytes", "sha256"}
+                  and isinstance(row["name"], str) and type(row["bytes"]) is int and row["bytes"] >= 0
+                  and isinstance(row["sha256"], str) and HEX64_RE.fullmatch(row["sha256"])
+                  for row in report["downloaded_archives"]))
     need(ok, "inst%d-output" % number)
     return report
 
@@ -234,14 +270,24 @@ def install(cfg, number):
 
 def sha256(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_size <= 1 << 28, "native-artifact")
+        total = 0
         for block in iter(lambda: handle.read(1 << 20), b""):
+            total += len(block)
+            need(total <= info.st_size, "native-artifact")
             digest.update(block)
+        after = os.fstat(handle.fileno())
+        need(total == info.st_size and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+             == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "native-artifact")
     return digest.hexdigest()
 
 
 def witness_report(text, pins):
     try:
+        need(len(text) <= WITNESS_OUTPUT_CAP, "witness-output")
         report = strict_json(text)
     except (UnicodeError, ValueError, RecursionError):
         raise Check("witness-output") from None
@@ -252,6 +298,10 @@ def witness_report(text, pins):
           and report["owned_workspace_removed"] is True
           and type(report["uid"]) is int and report["uid"] == 0
           and isinstance(report["fixture_sha256"], str) and HEX64_RE.fullmatch(report["fixture_sha256"])
+          and type(report["gid"]) is int and report["gid"] >= 0
+          and isinstance(report["groups"], list) and all(type(g) is int and g >= 0 for g in report["groups"])
+          and isinstance(report["artifacts"], dict) and report["artifacts"] == EXPECTED_ARTIFACTS
+          and finite_seconds(report["seconds"])
           and report["pins"] == pins and isinstance(device, dict) and device.get("character") is True)
     need(ok, "witness-invalid")
     return report

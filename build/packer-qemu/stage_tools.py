@@ -48,13 +48,11 @@ PROBE_FILE = "component_prerequisites.py"
 OWNER_UID = 1000          # the cloud image's dedicated `ubuntu` user; baseline asserts the mapping
 FIXTURE_ASSERT = "assert-fixture.py"
 # Fixed networked QEMU fixture: the UNCHANGED build/provision network installer (install-qemu.py with its
-# siblings) runs twice and the UNCHANGED KVM witness once; guest/assert-qemu.py only observes. Every file is
-# root-run only (0400, no nonroot reader), so nothing here widens the sentinel/fixture access.
+# siblings) runs twice and the UNCHANGED KVM witness once; guest/assert-qemu.py only observes. The original fixture prefix and
+# its public installer pair/archive remain intact; additional QEMU files are root-only.
 QEMU_PROVISION_FILES = ("install-qemu.py", "qemu_offline.py", "hhfab_release.py", "qemu_witness.py")
 QEMU_ASSERT = "assert-qemu.py"
 _QEMU_STEP = f"root /usr/bin/python3 -I -B @IN@/{QEMU_ASSERT} "
-QEMU_PLAN = (SENTINEL_PLAN.decode() + _QEMU_STEP + "baseline\n" + _QEMU_STEP + "install 1\n"
-             + _QEMU_STEP + "install 2\n" + _QEMU_STEP + "witness\n").encode()
 HHFAB_VERSION = "0.50.4"
 ARCHIVE_NAME = f"hhfab-linux-amd64-v{HHFAB_VERSION}.tar.gz"
 _INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VERSION} "
@@ -63,6 +61,9 @@ _ASSERT = f"root /usr/bin/python3 -I -B @IN@/{FIXTURE_ASSERT} "
 FIXTURE_PLAN = (SENTINEL_PLAN.decode() + _ASSERT + "baseline\n" + _INSTALL + _ASSERT + "snapshot\n"
                 + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n"
                 + _ASSERT + f"prereq {OWNER_UID} @IN@/{ARCHIVE_NAME}\n").encode()
+
+QEMU_PLAN = (FIXTURE_PLAN.decode() + _QEMU_STEP + "baseline\n" + _QEMU_STEP + "install 1\n"
+             + _QEMU_STEP + "install 2\n" + _QEMU_STEP + "witness\n").encode()
 
 # members: name -> (unix permission bits, uncompressed size, CRC32) from the #262 listing
 PINS = {
@@ -307,11 +308,11 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
     fixture stages the sentinel inputs plus the fixed hhfab plan, assert-fixture.py, the
     byte-identical install-hhfab.py/hhfab_release.py and the pinned archive (`sources["archive"]`)
     on the CD, so all of them are covered by the MANIFEST/receipt identity.
-    qemu-fixture stages the sentinel inputs plus the byte-identical install-qemu.py, qemu_offline.py,
-    hhfab_release.py and qemu_witness.py, `guest/assert-qemu.py` and the fixed QEMU plan (no archive)."""
+    qemu-fixture retains all fixture inputs/archive and its ten-step prefix, then stages the byte-identical install-qemu.py, qemu_offline.py,
+    hhfab_release.py and qemu_witness.py, `guest/assert-qemu.py` and the fixed appended QEMU plan."""
     if task not in TASKS:
         raise StageError("unknown staging task")
-    if task == "fixture" and "archive" not in sources:
+    if task in ("fixture", "qemu-fixture") and "archive" not in sources:
         raise StageError("fixture needs the pinned hhfab archive")
     if not HEX64_RE.match(nonce):
         raise StageError("nonce must be 64 lowercase hex characters")
@@ -352,7 +353,7 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         for name in (ASSERT_NAME, "sentinel-evidence.py"):
             write_new(os.path.join(cd, name),
                       read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o444)
-    if task == "fixture":
+    if task in ("fixture", "qemu-fixture"):
         # Root-only inputs (every fixture step beyond the sentinel pair runs as root). The two
         # provisioning modules are copied byte-for-byte; the archive is pinned and bounded.
         write_new(os.path.join(cd, FIXTURE_ASSERT),
@@ -369,9 +370,11 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
                      check, 0o444) != archive_pin["sha256"]:
             raise StageError("hhfab archive differs from its pin")
     if task == "qemu-fixture":
-        # Four byte-identical provisioning modules plus the observer-only adapter; no archive,
-        # download list or capture exists here: the guest installer reaches the pinned snapshot itself.
+        # Additional byte-identical QEMU modules and observer adapter. The guest QEMU installer
+        # reaches the pinned snapshot itself; the hhfab archive remains in the fixture prefix.
         for name in QEMU_PROVISION_FILES:
+            if name in PROVISION_FILES:  # shared public helper already staged for the nonroot probe
+                continue
             write_new(os.path.join(cd, name),
                       read_file(os.path.join(provision_dir, name), TEXT_LIMIT, check), 0o400)
         write_new(os.path.join(cd, QEMU_ASSERT),
@@ -400,7 +403,7 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + flag
         vars_name = SENTINEL_VARS_NAME
         extra = {"guest_receipt": guest_receipt, "verify_seconds": seconds}
-        if task == "fixture":
+        if task in ("fixture", "qemu-fixture"):
             extra["hhfab_archive_sha256"] = pins["hhfab"]["sha256"]
     else:
         var_bytes, vars_name = vars_text(nonce, inputs, base_sha), VARS_NAME

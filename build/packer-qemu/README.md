@@ -535,10 +535,10 @@ ownership, retention and disposition stay outside this repository until the lead
 
 ### Fixed `qemu-fixture` task (networked guest QEMU install twice + KVM witness; source only)
 
-`--mode qemu-fixture` (#292, decision #291) is a fixed variant of `sentinel` for ONE coherent guest slice:
+`--mode qemu-fixture` (#292, decision #291) is a fixed extension of `fixture` for ONE coherent guest slice:
 the UNCHANGED `build/provision/install-qemu.py` network installer runs twice in a fresh accelerated guest
-and the UNCHANGED `qemu_witness.py` then runs a real KVM-only L2 execution. It needs the same three
-`--core-file/--plugin-file/--base-file` inputs as `sentinel` (no archive, capture, bundle or proxy). It
+and the UNCHANGED `qemu_witness.py` then runs a real KVM-only L2 execution. It retains all four fixture inputs,
+`--core-file/--plugin-file/--base-file/--archive-file` (the pinned hhfab archive; no capture, bundle or proxy). It
 reuses the sentinel runtime identity, `/dev/kvm` access, ledger, `SENTINEL_RESERVE`, 1800 s work INCLUDING
 staging + 900 s cleanup (no renewal, unmeasured), 10 GiB / 5 CPU / 512 PID caps and exact cleanup. **Source
 activation does not authorize execution:** every actual trial needs separately scoped lead authorization,
@@ -554,18 +554,19 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
 * HCL is unchanged. The pinned plugin v1.1.7 generates a user-mode NIC with `net_bridge = ""` and
   `communicator = "none"` adds no `hostfwd`; no `-nic`/`-netdev` override or cloud-init `network-config` is added
   (not blindly: NoCloud DHCP/DNS/CA behavior is reported, not repaired; see `net=` below).
-* Staged on the CD (covered by the MANIFEST/receipt identity, all `0400`, root-only): byte-identical
-  `install-qemu.py`, `qemu_offline.py`, `hhfab_release.py`, `qemu_witness.py` and `guest/assert-qemu.py`, plus
-  the sentinel files. Plan: 1-2 the sentinel root/`ubuntu`/cloud-init assertions; 3 `assert-qemu.py baseline`;
-  4 `install 1`; 5 `install 2`; 6 `witness`.
+* Retains the unchanged ten-step hhfab fixture plan prefix and all its inputs/modes, including the
+  archive and public `0444` installer pair for the nonroot component probe. Additional CD inputs
+  (covered by MANIFEST/receipt identity, `0400`, root-only) are byte-identical
+  `install-qemu.py`, `qemu_offline.py`, `qemu_witness.py` and `guest/assert-qemu.py`.
+  Steps 11-14 append `assert-qemu.py baseline`, `install 1`, `install 2`, `witness`.
 * `assert-qemu.py` only runs and observes: `/usr/bin/python3 -B install-qemu.py` with NO argument under `env -i`
   (240 s wrapper above the installer's own 235 s alarm; its 210 s/180 s APT caps are untouched) and
   `qemu_witness.py` (45 s above its 40 s alarm), through the unchanged `hhfab_release.bounded` helper
-  (256 KiB combined cap, process-group cleanup). Run 1 must report `changed: true`, run 2 `changed: false`
-  (the documented idempotent path, not a demanded output shape); the installer's one-line report is parsed
+  (1 MiB installer report, 4 KiB witness, 256 KiB native query/audit combined output caps, process-group cleanup). Run 1 must report `changed: true`, run 2 `changed: false`
+  (stable package/artifact state; the online rerun still authenticates APT indexes, simulates and runs install/check); the installer's one-line report is parsed
   strictly (exact keys, pins consistent with `resolved_installed`). Independent native checks read
   `dpkg-query` for exactly the pinned packages and versions, a clean `dpkg --audit` and the identity
-  (inode, size, mtime, ctime) of the four pinned artifacts, which must be identical after the rerun. The
+  (inode, size, mtime, ctime, SHA256) of the four regular payloads plus the required `socat -> socat1` link identity, which must be identical after the rerun. The
   witness report must be KVM, exit 33, nonce equal, unchanged backing, removed scratch, uid 0 and the same pins.
   No fallback, retry, permission repair, module load or TCG exists anywhere; a nonzero step is a failure.
 * Failure reasons stay inside the existing `LABAPP-DIAG` token: `inst<N>-refused-sNNN`, `inst<N>-exit-sNNN`
@@ -576,7 +577,7 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
 * Retained witness: on success the adapter writes one `LABAPP-QEMU v1 nonce=H inputs=H accel=kvm exit=33 uid=0
   equal=1 backing=1 removed=1 i1=1:S i2=0:S w=S net=RCD` line on the serial console (`S` is 1-3 digits of
   whole seconds capped at 999; `R`/`C`/`D` are 0/1 for a default IPv4 route, a nonempty CA bundle and a
-  nameserver line, reported never repaired). `host_verify.py` (still with only `require_sentinel_evidence`) accepts
+  nameserver line (including the two known systemd-resolved resolver symlink targets), reported never repaired). `host_verify.py` (still with only `require_sentinel_evidence`) accepts
   at most one such line, bound to this run's nonce and `inputs`, inside the existing serial byte/line limits, and
   keeps the closed object `qemu_witness` in `verified.json`; malformed, wrong-value, extra-field, duplicate,
   stale or oversize lines fail. Other modes ignore the line and a `qemu_witness` key makes their receipt invalid.
@@ -589,7 +590,8 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   execution is not student readiness, and nothing here proves nested VLAB, Docker, reboot or another platform.
 * Not integrated: held PR #282 diagnostics, offline capture/bundles, proxies, a generic controller. A guest
   without outbound reachability, DNS or CA bundle simply fails the first installer run with its token.
-* Offline tests: `test_qemu_fixture.py` (all offline; nothing was executed by the author of this change).
+* Offline tests: `test_qemu_fixture.py` covers synthetic staging, observer, runner and adapter failures.
+  Actual guest networking, installation and KVM execution require separately scoped live evidence.
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
