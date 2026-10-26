@@ -1,8 +1,7 @@
-"""Fixed non-VM containment probe in one owned Docker container.
+"""Fixed bounded tasks in one owned Docker container.
 
-Not a general runner: one mode (`probe`) runs a fixed command in the one trusted,
-pre-acquired Ubuntu digest pinned in this repo, so the lead can later validate the
-containment premise before any VM mode is scoped. No Packer/QEMU path exists here.
+Fixed probe, HCL and non-VM runtime checks require separately scoped lead execution.
+The sentinel VM mode remains gated on a separate accepted execution identity.
 Docker is reached only through `Backend`; tests substitute a fake. The CLI refuses
 to contact Docker unless `--execute` is given (otherwise it prints the plan).
 Python 3.10+ stdlib. See README.md "Bounded container probe" for unmet gates.
@@ -20,6 +19,7 @@ import os
 import re
 import select
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -29,27 +29,35 @@ import uuid
 
 import stage_tools
 
-# The only image this probe accepts: the Ubuntu digest already pinned across
+# The probe/HCL image: the Ubuntu digest already pinned across
 # build/provision (qemu_offline.py BASE, CI K3D_TEST_IMAGE). Never pulled.
 PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac"
 # probe: 30 s work + 20 s cleanup, measured from one admission time, no renewal.
 # The proposed sentinel (15+5 min) and fixture (30+15 min) profiles are VM-mode
 # allocations and are intentionally not accepted here.
 # hcl-check: 120 s work INCLUDING all staging from admission + 30 s cleanup, no renewal.
+# runtime-check: 90 s work + 30 s cleanup, no staging or renewal.
 # sentinel: 15 min work INCLUDING staging from admission + 5 min cleanup, no renewal.
-PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300)}
+PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30)}
 MODES = tuple(PROFILES)
 STAGED_MODES = ("hcl-check", "sentinel")
 # Proposed explicit bounds, not measured requirements. The sentinel guest is 4 vCPU /
 # 8 GiB (labapp.pkr.hcl); the container adds headroom for QEMU, Packer and the observer.
-LIMITS = {"probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
+LIMITS = {"runtime-check": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
+          "probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128"),
           "sentinel": ("--memory=10g", "--memory-swap=10g", "--cpus=5", "--pids-limit=512")}
-# The only accepted sentinel runtime: a locally prepared derived image (runtime/Dockerfile).
-# None until the lead separately accepts a concrete prepared image; sentinel execution
-# then fails closed BEFORE Docker, staging, ledger or workspace. Never invent a value:
-# {"image_id": "sha256:<64 hex>", "diffids": ["sha256:<64 hex>", ...]} from the accepted
-# preparation record. No CLI, environment or caller option can supply or override it.
+# Preparation artifact accepted in #266 comment 6406373578. Bound to original source
+# 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
+# comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
+# requires separate lead authorization; this identity enables only runtime-check.
+PREPARED_RUNTIME = {'image_id': 'sha256:64584cc2aac727f22d8cdbf5c7d8cd77c457089ec069f6c5fae08b1f3199b284',
+ 'diffids': ['sha256:32ab39660fd51c6dc3aae486b42d42bbe8fe4c1db78eaf57bb9c21198de48a16',
+             'sha256:172d9fc216fc879d123ffe1f5300064d15678f43aab3947e295981a546981d9d',
+             'sha256:24bfc479ac939d1a9ddad8b376ab4bb1d04e9f29dca3c73e7ed324bdd6dfb819',
+             'sha256:faae59f53ff65efdcce8a5776891be45764c44942c0eaea1a31c08e69374bd82']}
+# A separate VM execution gate: preparation/tool acceptance does not set this.
+# No CLI, environment or caller option can supply or override either identity.
 SENTINEL_RUNTIME = None
 # Proposed, unmeasured reservation inside the ORIGINAL work window for Docker calls, Packer
 # start, ISO creation, disk conversion, rehash and result reads. The pinned plugin's
@@ -121,6 +129,73 @@ SENTINEL_SCRIPT = ("ulimit -f 8388608 || exit 125; umask 077; "
                    'echo "build $?" >> /out/steps; exit 0')
 SENTINEL_STEPS = "build 0\n"
 ARTIFACT = ("work", "out", "labapp.qcow2")
+
+
+# Fixed inert input represents SDK StepCreateCD filenames, including a nested long name.
+RUNTIME_PATH = "nested-directory/representative-provision-module-with-long-name.txt"
+RUNTIME_BYTES = b"labapp non-VM ISO tool check v1\n"
+RUNTIME_ISO_CAP = 8 * 1024 * 1024
+RUNTIME_VERSIONS = {"qemu": "QEMU emulator version 8.2.2", "qemu_img": "qemu-img version 8.2.2",
+                    "python": "Python 3.12.3", "xorriso": "xorriso 1.5.6"}
+RUNTIME_FIRMWARE = ("/usr/share/seabios/bios-256k.bin", "/usr/share/seabios/vgabios-stdvga.bin",
+                    "/usr/lib/ipxe/qemu/efi-virtio.rom")
+# The SDK v0.6.11 xorriso argv is copied exactly (label/source/dest fixed here).
+# This program never boots QEMU or opens any device. Every child inherits env -i,
+# a 90-second outer timer, no capabilities/network, and an 8 MiB per-file limit.
+RUNTIME_PROGRAM = r'''
+import hashlib, json, os, pathlib, subprocess, sys
+os.umask(0o077)
+os.chdir('/out')
+env = {'PATH': '/usr/bin:/bin', 'HOME': '/out', 'TMPDIR': '/out', 'LC_ALL': 'C'}
+def run(name, argv):
+    with open(name + '.log', 'xb') as log:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                       env=env, check=True)
+    raw = pathlib.Path(name + '.log').read_bytes()
+    if len(raw) > 16384:
+        raise ValueError('tool output exceeds cap')
+    return raw.decode('ascii')
+versions = {}
+for name, argv, expected in (
+    ('qemu', ['/usr/bin/qemu-system-x86_64', '--version'], 'QEMU emulator version 8.2.2'),
+    ('qemu_img', ['/usr/bin/qemu-img', '--version'], 'qemu-img version 8.2.2'),
+    ('python', ['/usr/bin/python3', '--version'], 'Python 3.12.3'),
+    ('xorriso', ['/usr/bin/xorriso', '-version'], 'xorriso 1.5.6')):
+    text = run(name, argv)
+    if not any(line == expected or line.startswith(expected + ' (') or
+               line.startswith(expected + ' :') for line in text.splitlines()):
+        raise ValueError('wrong tool version')
+    versions[name] = expected
+firmware = ['/usr/share/seabios/bios-256k.bin', '/usr/share/seabios/vgabios-stdvga.bin',
+            '/usr/lib/ipxe/qemu/efi-virtio.rom']
+for path in firmware:
+    if not pathlib.Path(path).is_file() or not os.access(path, os.R_OK) or os.stat(path).st_size == 0:
+        raise ValueError('firmware missing')
+name = 'nested-directory/representative-provision-module-with-long-name.txt'
+fixed = b'labapp non-VM ISO tool check v1\n'
+source = pathlib.Path('source') / name
+source.parent.mkdir(parents=True)
+source.write_bytes(fixed)
+run('create', ['/usr/bin/xorriso', '-as', 'genisoimage', '-rock', '-joliet', '-volid',
+               'cidata', '-output', '/out/check.iso', '/out/source'])
+iso = pathlib.Path('check.iso').read_bytes()
+if not 32768 < len(iso) <= 8388608 or iso[32768:32775] != b'\x01CD001\x01' or iso[32808:32840] != b'cidata'.ljust(32):
+    raise ValueError('invalid ISO volume')
+run('extract', ['/usr/bin/xorriso', '-abort_on', 'FAILURE', '-osirrox', 'on', '-indev',
+                '/out/check.iso', '-extract', '/' + name, '/out/readback'])
+if pathlib.Path('readback').read_bytes() != fixed or source.read_bytes() != fixed:
+    raise ValueError('ISO readback mismatch')
+report = {'schema': 1, 'versions': versions, 'firmware': firmware,
+          'input_sha256': hashlib.sha256(fixed).hexdigest(),
+          'iso_sha256': hashlib.sha256(iso).hexdigest(), 'iso_bytes': len(iso),
+          'readback_sha256': hashlib.sha256(fixed).hexdigest(), 'volume': 'cidata'}
+with open('runtime.json', 'x') as out:
+    json.dump(report, out, sort_keys=True)
+'''
+RUNTIME_SCRIPT = ("ulimit -f 8192 || exit 125; umask 077; "
+                  "/usr/bin/env -i HOME=/out TMPDIR=/out PATH=/usr/bin:/bin LC_ALL=C "
+                  "/usr/bin/python3 -I -B -c " + shlex.quote(RUNTIME_PROGRAM) +
+                  " > /out/runtime.log 2>&1 < /dev/null")
 
 
 def boot_clock():
@@ -281,7 +356,8 @@ def check_private_dir(path, uid, what):
 def released_record(record):
     """Only our complete terminal records permit reuse; malformed state holds."""
     try:
-        return (record["state"] == "released" and record["image"] == PINNED_IMAGE
+        return (record["state"] == "released" and record["image"] == (PREPARED_RUNTIME["image_id"]
+                    if record.get("mode") == "runtime-check" else PINNED_IMAGE)
                 and re.fullmatch(r"labapp-probe-[a-zA-Z0-9-]+", record["name"])
                 and record["label"] == "labapp.probe.run=" + record["name"][13:]
                 and (record["id"] is None or CONTAINER_ID_RE.fullmatch(record["id"]))
@@ -322,10 +398,10 @@ def unresolved_records(directory):
 
 
 def mounts(mode, workspace):
-    """Fixed mounts. probe: the workspace is the only (writable) mount. hcl-check:
+    """Fixed mounts. probe/runtime-check: only the writable workspace. hcl-check:
     staged inputs (including the base snapshot) and CD files read-only, and only
     the fresh `out` tree writable."""
-    if mode == "probe":
+    if mode in ("probe", "runtime-check"):
         return [f"--mount=type=bind,src={workspace},dst=/out"]
     return [f"--mount=type=bind,src={workspace}/in,dst=/in,readonly",
             f"--mount=type=bind,src={workspace}/out,dst=/out",
@@ -337,7 +413,8 @@ def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot
     """Exact, fixed creation argv: no init, no restart, no pull, healthcheck off.
     sentinel adds exactly /dev/kvm and its numeric group; nothing else widens."""
     kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode == "sentinel" else []
-    script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT}[mode]
+    script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT,
+              "runtime-check": RUNTIME_SCRIPT}[mode]
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
@@ -487,8 +564,11 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
         require_runtime()
     w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
-    if image != PINNED_IMAGE:
-        raise ValueError("image must be the pinned Ubuntu digest of this repo")
+    expected_image = PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else PINNED_IMAGE
+    if image != expected_image:
+        raise ValueError("image must be the fixed identity for this task")
+    if mode == "runtime-check" and sources is not None:
+        raise ValueError("runtime-check accepts no staged inputs")
     if uid == 0:
         raise ValueError("refusing to run as root")
     check_private_dir(ledger_dir, uid, "ledger dir")
@@ -579,8 +659,8 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         _checkpoint(own, budget, clock)
     backend.call(["version", "--format", "{{.Server.Version}}"], budget.seconds(CALL_CAP, budget.work_deadline))
     _checkpoint(own, budget, clock)
-    if own["mode"] == "sentinel":
-        runtime = require_runtime()
+    if own["mode"] in ("sentinel", "runtime-check"):
+        runtime = require_runtime() if own["mode"] == "sentinel" else PREPARED_RUNTIME
         image_id = check_runtime(backend.call(["image", "inspect", "--format", IMAGE_FORMAT,
                                                runtime["image_id"]],
                                               budget.seconds(CALL_CAP, budget.work_deadline)), runtime)
@@ -627,6 +707,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
             return
         sleep(min(POLL, max(budget.work_left(), 0)))
     own["exit_seen_at"] = clock()
+    if own["mode"] == "runtime-check":
+        _accept_runtime(own, result, budget, clock, oom, code)
+        return
     if own["mode"] == "hcl-check":
         _accept_hcl(own, result, budget, clock, oom, code)
         return
@@ -657,6 +740,60 @@ def read_step(out_dir, name, cap=STEP_CAP):
         return stage_tools.read_file(os.path.join(out_dir, name), cap)
     except (OSError, stage_tools.StageError):
         return None
+
+
+def _accept_runtime(own, result, budget, clock, oom, code):
+    """Accept only bounded fixed tool/ISO evidence; final acceptance also needs exact
+    container and workspace cleanup in _finish. No provisioner inputs are staged."""
+    workspace = own["workspace"]
+    evidence = {"image_id": own["image_id"], "runtime_diffids": PREPARED_RUNTIME["diffids"],
+                "exit_code": code, "oom_killed": oom, "logs": {},
+                "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    result["evidence"] = evidence
+    # Diagnostics survive verified workspace cleanup even when the program stops
+    # before writing its success report. Reject invalid files, never truncate them.
+    invalid = []
+    for name in ("qemu", "qemu_img", "python", "xorriso", "create", "extract", "runtime"):
+        raw_log = read_step(workspace, name + ".log", 16384)
+        if raw_log is None:
+            invalid.append(name + ".log")
+        else:
+            evidence["logs"][name] = {"bytes": len(raw_log), "sha256": hashlib.sha256(raw_log).hexdigest(),
+                                      "excerpt": raw_log[:EXCERPT].decode("ascii", "replace")}
+    if invalid:
+        evidence["invalid_files"] = sorted(invalid)
+    if oom or code != 0:
+        result["reason"] = "unexpected_exit"
+        return
+    if invalid:
+        result["reason"] = "invalid_runtime_evidence"
+        return
+    try:
+        raw = read_step(workspace, "runtime.json", RESULT_CAP)
+        report = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs,
+                            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        keys = {"schema", "versions", "firmware", "input_sha256", "iso_sha256", "iso_bytes",
+                "readback_sha256", "volume"}
+        fixed_sha = hashlib.sha256(RUNTIME_BYTES).hexdigest()
+        if (not isinstance(report, dict) or set(report) != keys or type(report["schema"]) is not int
+                or report["schema"] != 1 or report["versions"] != RUNTIME_VERSIONS
+                or report["firmware"] != list(RUNTIME_FIRMWARE) or report["volume"] != "cidata"
+                or report["input_sha256"] != fixed_sha or report["readback_sha256"] != fixed_sha
+                or type(report["iso_bytes"]) is not int or not 32768 < report["iso_bytes"] <= RUNTIME_ISO_CAP):
+            raise ValueError("invalid runtime report")
+        iso = read_step(workspace, "check.iso", RUNTIME_ISO_CAP)
+        if (iso is None or len(iso) != report["iso_bytes"]
+                or hashlib.sha256(iso).hexdigest() != report["iso_sha256"]
+                or iso[32768:32775] != b'\x01CD001\x01' or iso[32808:32840] != b'cidata'.ljust(32)
+                or read_step(workspace, "readback", len(RUNTIME_BYTES)) != RUNTIME_BYTES
+                or read_step(os.path.join(workspace, "source"), RUNTIME_PATH, len(RUNTIME_BYTES)) != RUNTIME_BYTES):
+            raise ValueError("ISO evidence mismatch")
+        _checkpoint(own, budget, clock)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        result["reason"] = "invalid_runtime_evidence"
+        return
+    evidence["report"] = report
+    result["outcome"], result["reason"], result["exit_code"] = "accepted", None, code
 
 
 def _accept_hcl(own, result, budget, clock, oom, code):
@@ -908,7 +1045,7 @@ def main(argv=None):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
-    if args.mode == "probe" and any(files.values()):
+    if args.mode not in STAGED_MODES and any(files.values()):
         print("input files are only for --mode hcl-check or sentinel", file=sys.stderr)
         return EXIT["usage"]
     if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
@@ -920,11 +1057,12 @@ def main(argv=None):
         except ValueError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return EXIT["usage"]
+    image = PREPARED_RUNTIME["image_id"] if args.mode == "runtime-check" else PINNED_IMAGE
     if not args.execute:
         plan = create_args("labapp-probe-<uuid>", "labapp.probe.run=<uuid>", "<image id>",
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",
                            mode=args.mode)
-        print(json.dumps({"mode": args.mode, "executed": False, "image": PINNED_IMAGE, "create": plan,
+        print(json.dumps({"mode": args.mode, "executed": False, "image": image, "create": plan,
                           "runtime_accepted": SENTINEL_RUNTIME is not None if args.mode == "sentinel" else None}))
         return 0
     try:
@@ -935,7 +1073,7 @@ def main(argv=None):
         with os.scandir(config) as entries:
             if next(entries, None) is not None:
                 raise ValueError("Docker config must be empty")
-        result = run_probe(PINNED_IMAGE, args.workspace_root, args.ledger_dir,
+        result = run_probe(image, args.workspace_root, args.ledger_dir,
                            Backend(host=args.docker_host, config=config), handle_signals=True,
                            mode=args.mode, sources=files if args.mode in STAGED_MODES else None)
     except (ValueError, OSError) as exc:
