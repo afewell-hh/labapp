@@ -26,6 +26,46 @@ ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
        "DEBIAN_FRONTEND": "noninteractive", "HOME": "/root"}
 
 
+class PhaseRefusal(Refusal):
+    """Refusal annotated with a fixed phase id, class and elapsed/allocated seconds.
+
+    The suffix is built only from fixed vocabulary and numbers; the original
+    message (cause) is kept verbatim as the prefix and as the chained exception.
+    """
+
+    def __init__(self, cause, phase, elapsed, allocated):
+        self.cause = str(cause)
+        self.phase = phase
+        self.kind = classify(self.cause)
+        self.elapsed = elapsed
+        self.allocated = allocated
+        super().__init__(f"{self.cause} [phase={phase} class={self.kind} "
+                         f"elapsed={elapsed:.1f}s allocated={allocated:.1f}s]")
+
+
+def classify(cause):
+    if cause == "command timeout":
+        return "timeout"
+    if cause == "command output overflow":
+        return "overflow"
+    if cause == "installation deadline exceeded":
+        return "budget"
+    if cause.startswith("command failed: "):
+        return "nonzero"
+    return "refusal"
+
+
+def phased(phase, allocated, action):
+    """Run action(); label a Refusal with its phase. Never alters success paths."""
+    started = time.monotonic()
+    try:
+        return action()
+    except PhaseRefusal:
+        raise
+    except Refusal as exc:
+        raise PhaseRefusal(exc, phase, time.monotonic() - started, allocated) from exc
+
+
 def call(args, seconds=10):
     code, out = bounded(args, seconds, env=ENV)
     if code:
@@ -83,13 +123,15 @@ def preflight(network=True):
         if actual is not None and actual != version:
             raise Refusal("installed pinned package drift: " + name)
     if all(before.get(name) == version for name, version in PINS.items()):
-        verify_tools()
+        phased("package-verification", 10, verify_tools)
     return before
 
 
 def install(bundle=None, receipt_sha=None, base=None):
     started = time.monotonic()
-    before = preflight() if bundle is None else preflight(network=False)
+    # allocated=10 is the per-query limit; elapsed covers the whole preflight.
+    before = phased("preflight", 10, (lambda: preflight()) if bundle is None
+                    else (lambda: preflight(network=False)))
     # Lists/cache/sources/preferences isolated. The real dpkg database stays real;
     # APT acquires its normal dpkg locks. No ambient APT_CONFIG or proxy variables.
     with tempfile.TemporaryDirectory(prefix="labapp-qemu-", dir="/var/tmp") as temporary:
@@ -106,14 +148,16 @@ def install(bundle=None, receipt_sha=None, base=None):
 
 
 def _transaction(root, apt, started, before, bundle, receipt_sha, base):
-    def run(args):
-        remaining = 210 - (time.monotonic() - started)
-        if remaining <= 0:
-            raise Refusal("installation deadline exceeded")
-        return call(args, min(180, remaining))
+    def run(phase, args):
+        allocated = min(180, 210 - (time.monotonic() - started))
+        def action():
+            if allocated <= 0:
+                raise Refusal("installation deadline exceeded")
+            return call(args, allocated)
+        return phased(phase, max(allocated, 0.0), action)
     expected_state = None
     if bundle is None:
-        run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
+        run("apt-update", [*apt, "-o", "APT::Update::Error-Mode=any", "update"])
     else:
         expected_state = offline.receive(Path(bundle), receipt_sha, root, base, SNAPSHOT, PINS, call)
         apt = [*apt, '--no-download']
@@ -127,11 +171,11 @@ def _transaction(root, apt, started, before, bundle, receipt_sha, base):
                 ENV['APT_CONFIG'] = saved_config
     # dpkg audit can be clean despite configured-but-unsatisfied dependency
     # relations. Refuse that base before install can implicitly repair it.
-    run([*apt, "check"])
+    run("apt-check-before", [*apt, "check"])
     selected = [name + "=" + version for name, version in PINS.items()]
     # --no-remove and no downgrade/hold override remain active for simulation
     # and actual transaction. Standard signed Release/index/deb verification.
-    run([*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
+    run("apt-simulate", [*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
     if bundle is None or not all(before.get(name) == version for name, version in PINS.items()):
         if expected_state is not None:
             saved_config = ENV.pop('APT_CONFIG')
@@ -140,20 +184,23 @@ def _transaction(root, apt, started, before, bundle, receipt_sha, base):
                     raise Refusal('target state drift immediately before transaction')
             finally:
                 ENV['APT_CONFIG'] = saved_config
-        run([*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
-    run([*apt, "check"])
+        run("apt-install", [*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
+    run("apt-check-after", [*apt, "check"])
     archives = [{"name": p.name, "bytes": p.stat().st_size, "sha256": digest(p)}
                 for p in sorted((root / "archives").glob("*.deb"))]
-    after = installed()
-    if any(after.get(name) != version for name, version in PINS.items()):
-        raise Refusal("installed version mismatch")
-    if call(["/usr/bin/dpkg", "--audit"]).strip():
-        raise Refusal("post-install dpkg audit failed")
-    verify_tools()
-    for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
-                 "/usr/share/seabios/bios-256k.bin"):
-        if not Path(path).is_file():
-            raise Refusal("installed artifact missing")
+    def verify():
+        found = installed()
+        if any(found.get(name) != version for name, version in PINS.items()):
+            raise Refusal("installed version mismatch")
+        if call(["/usr/bin/dpkg", "--audit"]).strip():
+            raise Refusal("post-install dpkg audit failed")
+        verify_tools()
+        for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
+                     "/usr/share/seabios/bios-256k.bin"):
+            if not Path(path).is_file():
+                raise Refusal("installed artifact missing")
+        return found
+    after = phased("package-verification", 10, verify)
     print(json.dumps({"snapshot": SNAPSHOT, "pins": PINS, "resolved_installed": after,
                       "downloaded_archives": archives, "changed": before != after,
                       "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))

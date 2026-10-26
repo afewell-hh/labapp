@@ -2,12 +2,36 @@
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import sys
 import tempfile
 
 from hhfab_release import Refusal, bounded, digest
 import qemu_witness
+
+
+UNAVAILABLE_PIN = ('qemu-system-x86', '999:0.invalid')
+
+
+def require_signature_refusal(exc):
+    """The injected refusal must come from the authenticated update phase."""
+    if not (getattr(exc, 'phase', None) == 'apt-update' and exc.cause == 'actual signature refusal'):
+        raise AssertionError(f'signature negative not at apt-update: {exc}')
+
+
+def require_unavailable_version(exc):
+    """Accept only a nonzero apt-simulate result naming the unavailable version.
+
+    Timeout, authentication, keyring, update/check or any other Refusal fails.
+    The pattern is APT's fixed C-locale "Version 'V' for 'P' was not found".
+    """
+    package, version = UNAVAILABLE_PIN
+    marker = re.compile(r"Version \\?'" + re.escape(version) + r"\\?' for \\?'" +
+                        re.escape(package) + r"\\?' was not found")
+    if not (getattr(exc, 'phase', None) == 'apt-simulate' and exc.kind == 'nonzero'
+            and marker.search(exc.cause)):
+        raise AssertionError(f'unavailable-pin negative is not a resolution refusal: {exc}')
 
 
 def install():
@@ -35,31 +59,35 @@ def install():
         try:
             module['install']()
         except Refusal as exc:
-            assert str(exc) == 'actual signature refusal'
+            require_signature_refusal(exc)
         else:
             raise AssertionError('untrusted signature accepted')
         finally:
             globals_['call'] = original_call
     assert module['installed']() == packages_before
     # Unavailable explicit pin must fail at resolution, without package changes.
-    original_pin = module['PINS']['qemu-system-x86']
-    module['PINS']['qemu-system-x86'] = '999:0.invalid'
+    original_pin = module['PINS'][UNAVAILABLE_PIN[0]]
+    module['PINS'][UNAVAILABLE_PIN[0]] = UNAVAILABLE_PIN[1]
+    unavailable_phase = None
     try:
         module['install']()
-    except Refusal:
-        pass
+    except Refusal as exc:
+        require_unavailable_version(exc)
+        unavailable_phase = exc.phase
     else:
         raise AssertionError('unavailable pin accepted')
     finally:
-        module['PINS']['qemu-system-x86'] = original_pin
+        module['PINS'][UNAVAILABLE_PIN[0]] = original_pin
     assert module['installed']() == packages_before
     print(json.dumps({'actual_signature_refusal': True, 'actual_unavailable_pin_refusal': True,
-                      'preinstall_failure_packages_unchanged': True}))
-    for _ in range(2):
+                      'unavailable_pin_phase': unavailable_phase,
+                      'preinstall_failure_packages_unchanged': True}), flush=True)
+    for label in ('initial', 'rerun'):
+        print(json.dumps({'unchanged_installer_cli': label, 'state': 'start'}), flush=True)
         code, output = bounded(['/usr/bin/python3', '/suite/install-qemu.py'], 240,
                                env={'PATH': '/usr/bin:/bin', 'LANG': 'C'})
         if code:
-            raise Refusal(f'unchanged installer CLI failed: code={code!r} output_tail={output[-4096:]!r}')
+            raise Refusal(f'unchanged installer CLI {label} failed: code={code!r} output_tail={output[-4096:]!r}')
         print(json.dumps(json.loads(output)), flush=True)
     assert {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()} == apt_before
     # Real held-state preflight refuses before an APT transaction.

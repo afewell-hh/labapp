@@ -420,6 +420,24 @@ provides an independent invocation ceiling; the CLI also arms a235second alarm. 
 state: fail and discard that disposable guest; there is no atomic rollback or
 automatic repair. A correct rerun reauthenticates the snapshot and verifies exact
 versions, mandatory tool/firmware verification against dpkg md5sums, dependency consistency and dpkg audit again.
+Failures carry fixed phase evidence (issue #281). A `Refusal` raised in
+`preflight`, `apt-update`, `apt-check-before`, `apt-simulate`, `apt-install`,
+`apt-check-after` or `package-verification` keeps its original message and gets
+the suffix ` [phase=ID class=KIND elapsed=Ns allocated=Ns]`, where KIND is one of
+`timeout`, `overflow`, `budget` (shared 210-second budget already spent),
+`nonzero` or `refusal`. `allocated` is the child limit actually granted
+(`min(180, remaining)` for APT phases; the 10-second per-query limit for
+`preflight`/`package-verification`, whose `elapsed` covers the whole phase). The
+suffix has no arguments, URLs or subprocess output; the original exception is
+chained. The shared `bounded()` supervisor, deadlines, pins, authentication and
+state checks are unchanged, and nothing runs after the failing phase. Offline
+receive/capture refusals are not phase-labelled. A timeout still cannot say
+whether the child or a descendant holding its pipe caused it.
+
+Because `qemu_offline.identity()` hashes `install-qemu.py`, any previously
+captured state file, offline bundle or receipt made with earlier installer bytes
+is invalid and must be recaptured/reacquired; do not reuse it.
+
 The pinned socat package provides the exact `socat -> socat1` link; its regular
 `socat1` payload and that fixed link target are both verified. Minimal-image
 documentation exclusions do not bypass verification of the required tools.
@@ -527,7 +545,12 @@ timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 
 The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
 containers, then runs the unchanged QEMU module twice in each and checks actual
-signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. Base manifest digest is
+signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. The
+signature negative must be the `apt-update` phase with `NO_PUBKEY`; the unavailable-pin
+negative must be a nonzero `apt-simulate` result containing APT's C-locale
+`Version '999:0.invalid' for 'qemu-system-x86' was not found` (that exact text has not yet been
+observed in this repo's CI); timeout, authentication or any other refusal fails it.
+The harness flushes its negative line and labels the two CLI runs `initial`/`rerun`. Base manifest digest is
 `68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`;
 Python pins are `3.12.3-0ubuntu2.1`/`3.12.3-1ubuntu0.17`, CA certificates
 `20240203`. Bootstrap transitive inputs come from current official mirrors and
