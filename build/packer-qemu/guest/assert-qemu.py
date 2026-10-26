@@ -355,7 +355,7 @@ class TapOps:
         """TUNSETIFF IFF_TAP|IFF_NO_PI only; the descriptor owns the interface (no TUNSETPERSIST)."""
         request = bytearray(struct.pack("16sH22x", name.encode("ascii"), IFF_TAP | IFF_NO_PI | IFF_TUN_EXCL))
         try:
-            fcntl.ioctl(fd, TUNSETIFF, request, True)
+            need(fcntl.ioctl(fd, TUNSETIFF, request, True) == 0, "tap-create")
         except OSError:
             raise Check("tap-create") from None
         need(bytes(request[:16]).split(b"\0", 1)[0] == name.encode("ascii"), "tap-create")

@@ -172,7 +172,7 @@ class QemuDaemon(tsn.SentinelDaemon):
                 body = json.load(handle)
             except ValueError:
                 return
-        witness = copy.deepcopy(GOOD_WITNESS)
+        witness = copy.deepcopy(TAP_WITNESS)
         VARIANTS[self.variant](body, witness)
         with open(path, "w") as handle:
             json.dump(body, handle)
@@ -220,7 +220,7 @@ def _tap(change=None):
 
 
 VARIANTS = {
-    "old_unrun": lambda body, witness: body.update(qemu_witness=witness),
+    "old_unrun": lambda body, witness: body.update(qemu_witness=copy.deepcopy(GOOD_WITNESS)),
     "tap_good": _tap(),
     "tap_after_present": _tap(lambda h: h["tap"].update(after="present")),
     "tap_missing_observation": _tap(lambda h: h.pop("tap")),
@@ -1101,6 +1101,7 @@ class GuestTapTests(GuestCase):
         for change, token in ((dict(silent_create=True), "tap-missing"),
                               (dict(kind=65534), "tap-type"), (dict(flags=aq.IFF_TUN | aq.IFF_NO_PI), "tap-type"),
                               (dict(flags=aq.IFF_TAP), "tap-type"),
+                              (dict(flags=aq.IFF_TAP | aq.IFF_NO_PI | 0x4000), "tap-type"),
                               (dict(flags=aq.IFF_TAP | aq.IFF_NO_PI | aq.IFF_PERSIST), "tap-type")):
             with self.subTest(change=change):
                 self.setUp()
@@ -1196,6 +1197,8 @@ class GuestTapTests(GuestCase):
         self.assertEqual(arg[:16].rstrip(b"\0"), aq.TAP_NAME.encode())
         self.assertEqual(int.from_bytes(arg[16:18], "little"), 0x9002)
         with mock.patch.object(aq.fcntl, "ioctl", side_effect=OSError):
+            self.assertRaises(aq.Check, ops.create, 9, aq.TAP_NAME)
+        with mock.patch.object(aq.fcntl, "ioctl", return_value=1):
             self.assertRaises(aq.Check, ops.create, 9, aq.TAP_NAME)
         # Linux returns EBUSY for an interface racing the absence observation;
         # EXCL forbids attaching it, and this boundary never deletes or repairs it.
