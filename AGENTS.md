@@ -40,11 +40,12 @@ Codex does not document an import mechanism, so this file uses plain links;
 - `cloud-config.yaml`, `gcp_vm_launch_command.txt`: base system setup and historical VM launch recipes
 - `build/gcp/`: access bootstrap, fixed lifecycle runner and offline collector ([README](build/gcp/README.md))
 - `build/provision/`: Packer-ready modules and tests ([README](build/provision/README.md))
-- `build/packer-qemu/`: stock Packer/QEMU VM experiment with VM execution disabled;
+- `build/packer-qemu/`: stock Packer/QEMU VM experiment with separately scoped VM execution;
   fixed non-VM Docker `probe`, `hcl-check` and `runtime-check` tasks require separately
   scoped lead execution ([README](build/packer-qemu/README.md)). The fixed `sentinel`
-  VM mode refuses until the lead separately accepts its runtime execution identity (#266). Runtime preparation
-  artifacts and tool checks do not enable VM execution. `runtime/Dockerfile`
+  VM mode pins an accepted runtime identity (#266); each actual trial still requires
+  separate lead scope and reconciled shared-ledger admission. Runtime preparation
+  artifacts and tool checks alone do not authorize VM execution. `runtime/Dockerfile`
   describes the separately gated preparation recipe. Fixed hosted preparation hooks
   (`runtime-prepare.sh`, `runtime_prepare.py`) build no VM and require separately
   scoped lead execution. The fixed `sentinel-expiry` failure-only VM proof has a concrete pinned

@@ -1194,7 +1194,6 @@ class RuntimeCheckTests(RunnerCase):
             result, daemon = self.run_runtime()
         self.assertEqual(result["outcome"], "accepted", result)
         self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
-        self.assertIsNone(cr.SENTINEL_RUNTIME)
         args = next(a for a, _ in daemon.calls if a[0] == "create")
         for flag in ("--pull=never", "--network=none", "--cap-drop=ALL", "--read-only",
                      "--security-opt=no-new-privileges", "--memory=256m", "--cpus=1", "--pids-limit=64"):

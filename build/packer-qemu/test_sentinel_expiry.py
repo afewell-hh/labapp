@@ -109,9 +109,10 @@ class ExpiryCase(tc.RunnerCase):
         src = os.path.join(os.path.dirname(self.root), "src")
         os.mkdir(src, 0o700)
         self.sources, pins = ts.make_inputs(src)
-        # Only EXPIRY_RUNTIME is set: the success runtime gate stays closed throughout.
+        # Explicitly close the independent success gate for these expiry-only tests.
         for patcher in (mock.patch.object(cr.stage_tools, "PINS", pins),
                         mock.patch.object(cr, "EXPIRY_RUNTIME", RUNTIME),
+                        mock.patch.object(cr, "SENTINEL_RUNTIME", None),
                         mock.patch.object(cr, "kvm_preflight", return_value=KVM_GID)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -144,11 +145,11 @@ class GateAndArgvTests(ExpiryCase):
             with self.assertRaises(ValueError):      # success runtime does not enable the expiry proof
                 cr.require_runtime("sentinel-expiry")
 
-    def test_shipped_expiry_identity_is_concrete_and_success_unset(self):
+    def test_shipped_expiry_and_success_identities_are_concrete(self):
         with open(os.path.join(HERE, "container_runner.py")) as handle:
             text = handle.read()
         self.assertEqual(re.findall(r"(?m)^EXPIRY_RUNTIME = (.*)$", text), ["PREPARED_RUNTIME"])
-        self.assertEqual(re.findall(r"(?m)^SENTINEL_RUNTIME = (.*)$", text), ["None"])
+        self.assertEqual(re.findall(r"(?m)^SENTINEL_RUNTIME = (.*)$", text), ["PREPARED_RUNTIME"])
 
     def test_cli_execute_refused_and_plan_contacts_nothing(self):
         argv = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "sentinel-expiry",
