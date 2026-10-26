@@ -10,21 +10,27 @@ Phases: baseline (root, identities, bounded network facts), `install 1` / `insta
 `python3 -B install-qemu.py`, no arguments, ordinary network mode: run 1 must change the guest, run 2 must be
 a package/artifact no-change rerun (APT still authenticates and executes), and native dpkg/artifact state must match the pins and stay identical), witness (the
 unchanged `qemu_witness.py`: real `-accel kvm -cpu host`, nonce, exit 33, unchanged backing, removed scratch;
-then ONE strict run-bound `LABAPP-QEMU v1` line on the serial console).
+then ONE strict run-bound `LABAPP-QEMU v2` line on the serial console). The same four phases also observe
+native sudo/ssh/less packages and trusted executable identities before/after installation. Witness additionally
+checks only ubuntu's fixed noninteractive sudo root identity command and root's nonmutating TUNGETFEATURES
+query. TAP creation and bridge operations remain unrun; no official VLAB binary/helper is invoked.
 
 A failing phase writes ONE fixed reason token to /run/labapp-reason (read and validated by guest-build.sh,
 which adds the plan step and exit code to its bounded diagnostic line) and exits 1. Tokens never contain
 peer or tool text: installer failures are `inst<N>-<kind>[-s<seconds>]` with a fixed kind, so the observer
 reports the failing installer run and its bounded wall time (the evidence #281 needs). No raw APT, dpkg,
-installer or witness output is ever echoed. Root is the only caller here: the line records uid 0 and does not
-imply a student or nonroot capability. UNRUN in a guest.
+installer or witness output is ever echoed. KVM/witness caller remains root; the additional sudo identity
+check starts as ubuntu UID1000. Neither proves student readiness. These new checks are UNRUN in a guest.
 """
+import fcntl
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import pwd
 import re
+import shutil
 import stat
 import sys
 import time
@@ -54,6 +60,10 @@ WITNESS_REFUSALS = {"KVM character device absent; no fallback": "witness-nokvm",
                     "overall deadline exceeded": "witness-deadline"}
 PACKAGE_ARTIFACTS = ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat1",
                      "/usr/share/seabios/bios-256k.bin")
+REMAINING = (("sudo", "sudo", 0o4755), ("openssh-client", "ssh", 0o755), ("less", "less", 0o755))
+VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.+:~\-]{0,63}\Z")
+HOST_OUTPUT_CAP = 4096
+TUNGETFEATURES = 0x800454cf  # Linux amd64 _IOR('T', 207, unsigned int); query only
 
 
 class Check(Exception):
@@ -63,13 +73,17 @@ class Check(Exception):
 class Config:
     def __init__(self, here, state="/run/labapp-qemufixture", reason="/run/labapp-reason", tty="/dev/ttyS0",
                  route="/proc/net/route", resolver="/etc/resolv.conf", ca="/etc/ssl/certs/ca-certificates.crt",
-                 euid=os.geteuid, run=None, clock=time.monotonic, owner=0, artifacts=PACKAGE_ARTIFACTS):
+                 euid=os.geteuid, run=None, clock=time.monotonic, owner=0, artifacts=PACKAGE_ARTIFACTS,
+                 inventory=None, tun=None, lookup=pwd.getpwnam):
         self.here, self.state, self.reason, self.tty = here, state, reason, tty
         self.route, self.resolver, self.ca = route, resolver, ca
         self.euid, self.clock = euid, clock
         self.owner = owner              # production root; synthetic metadata tests use their caller
         self.artifacts = artifacts
         self.run = run or self.bounded      # tests substitute a fake with the same contract
+        self.inventory = inventory or (lambda: remaining_inventory(self))
+        self.tun = tun or tun_query
+        self.lookup = lookup
 
     def path(self, name):
         return os.path.join(self.here, name)
@@ -172,6 +186,119 @@ def network_facts(cfg):
     return {"default_route": route, "ca_bundle": bool(bundle), "resolver": resolver}
 
 
+def trusted_parents(path, reason):
+    """Only real root-owned directories; fixed canonical paths have no symlink ancestors."""
+    part = os.path.dirname(path)
+    while True:
+        info = os.lstat(part)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+             and info.st_mode & 0o111 == 0o111, reason)
+        if part == "/":
+            break
+        part = os.path.dirname(part)
+
+
+def file_identity(info):
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def remaining_inventory(cfg):
+    """Native installed-state observations, not new pins or package integrity certification.
+
+    Canonical package files are regular and root-owned. Sudo legitimately has its setuid bit;
+    hardlinks are permitted. Only the documented merged-usr /bin alias can resolve to these files.
+    No binary is executed for inventory, and native text never leaves the guest.
+    """
+    try:
+        code, raw = cfg.run(["/usr/bin/dpkg-query", "-W",
+                             "-f=${Package}\t${Architecture}\t${Version}\t${db:Status-Status}\\n",
+                             "sudo", "openssh-client", "less"], 20)
+        need(code == 0 and len(raw) <= HOST_OUTPUT_CAP, "host-query")
+        packages = {}
+        for row in raw.decode("ascii").splitlines():
+            fields = row.split("\t")
+            need(len(fields) == 4, "host-query")
+            package, arch, version, status = fields
+            need(package in {p for p, _, _ in REMAINING} and package not in packages
+                 and arch == "amd64" and status == "installed" and VERSION_RE.fullmatch(version), "host-query")
+            packages[package] = {"version": version, "architecture": arch}
+        need(set(packages) == {p for p, _, _ in REMAINING}, "host-query")
+        for package, name, mode in REMAINING:
+            path = "/usr/bin/" + name
+            resolved = shutil.which(name, path=SAFE_PATH)
+            if resolved == "/bin/" + name:
+                alias = os.lstat("/bin")
+                need(stat.S_ISLNK(alias.st_mode) and alias.st_uid == 0
+                     and os.readlink("/bin") in ("usr/bin", "/usr/bin"), "host-path")
+            else:
+                need(resolved == path, "host-path")
+            trusted_parents(path, "host-path")
+            before = os.lstat(path)
+            need(stat.S_ISREG(before.st_mode) and before.st_uid == 0 and before.st_gid == 0
+                 and stat.S_IMODE(before.st_mode) == mode and before.st_nlink >= 1
+                 and not os.statvfs(path).f_flag & os.ST_NOEXEC, "host-path")
+            code, raw = cfg.run(["/usr/bin/dpkg-query", "-S", path], 20)
+            need(code == 0 and len(raw) <= HOST_OUTPUT_CAP and raw in (
+                (package + ": " + path + "\n").encode("ascii"),
+                (package + ":amd64: " + path + "\n").encode("ascii")), "host-owner")
+            digest = sha256(path)
+            need(file_identity(before) == file_identity(os.lstat(path)), "host-drift")
+            packages[package].update(sha256=digest, identity=file_identity(before))
+        return packages
+    except Timeout as exc:
+        raise Check("host-" + exc.kind) from None
+    except (OSError, UnicodeError):
+        raise Check("host-query") from None
+
+
+def sudo_identity(cfg):
+    """One necessary noninteractive sudo identity command, not arbitrary sudo policy proof.
+
+    runuser establishes the actual ubuntu caller with its normal groups. -n refuses prompts;
+    -k with a command ignores cached authentication and does not update that cache.
+    The shared bounded helper fixes cwd=/, closed stdin, clean environment and process cleanup.
+    """
+    try:
+        owner = cfg.lookup("ubuntu")
+        need(owner.pw_uid == 1000 and owner.pw_gid > 0, "sudo-owner")
+        code, raw = cfg.run(["/usr/sbin/runuser", "-u", "ubuntu", "--", "/usr/bin/env", "-i",
+                             "PATH=" + SAFE_PATH, "HOME=/home/ubuntu", "LC_ALL=C.UTF-8",
+                             "/usr/bin/sudo", "-n", "-k", "--", "/usr/bin/id", "-u"], 10)
+        need(code == 0 and raw == b"0\n", "sudo-identity")
+    except Timeout as exc:
+        raise Check("sudo-" + exc.kind) from None
+    except (OSError, KeyError):
+        raise Check("sudo-owner") from None
+
+
+def tun_query():
+    """Open/query/close only. GETFEATURES reports valid flags even without an interface.
+
+    This does not test CAP_NET_ADMIN, TAP creation, bridges, LSM authorization or official helpers.
+    No interface is attached and no persistent device or network configuration is created.
+    """
+    try:
+        path = "/dev/net/tun"
+        trusted_parents(path, "tun-path")
+        before = os.lstat(path)
+        need(stat.S_ISCHR(before.st_mode) and before.st_uid == 0
+             and (os.major(before.st_rdev), os.minor(before.st_rdev)) == (10, 200), "tun-device")
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(fd)
+            need((before.st_dev, before.st_ino, before.st_rdev, before.st_mode, before.st_uid, before.st_gid)
+                 == (opened.st_dev, opened.st_ino, opened.st_rdev, opened.st_mode, opened.st_uid, opened.st_gid),
+                 "tun-identity")
+            flags = bytearray(4)
+            need(fcntl.ioctl(fd, TUNGETFEATURES, flags, True) == 0, "tun-api")
+            need(int.from_bytes(flags, "little") & 0x0002 != 0, "tun-features")
+        finally:
+            os.close(fd)
+    except OSError:
+        raise Check("tun-api") from None
+
+
 def baseline(cfg):
     need(cfg.euid() == 0, "not-root")
     for name in MODULES:
@@ -179,7 +306,7 @@ def baseline(cfg):
         need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == cfg.owner
              and stat.S_IMODE(info.st_mode) == (0o444 if name == "hhfab_release.py" else 0o400), "staging-input")
     os.makedirs(cfg.state, mode=0o700)
-    write_state(cfg, "baseline.json", {"network": network_facts(cfg)})
+    write_state(cfg, "baseline.json", {"network": network_facts(cfg), "remaining": cfg.inventory()})
 
 
 def native_state(cfg, names):
@@ -260,12 +387,14 @@ def install(cfg, number):
     need(report["changed"] is first, "inst1-unchanged" if first else "inst2-changed")
     native = native_state(cfg, set(report["pins"]))
     need(native["packages"] == report["pins"], "native-pins")
+    remaining = cfg.inventory()
+    need(remaining == prior["remaining"], "host-drift")
     if not first:
         need(report["pins"] == prior["pins"], "rerun-pins")
         need(native == prior["native"], "rerun-state")
     write_state(cfg, "install%d.json" % number,
                 {"pins": report["pins"], "native": native, "seconds": spent, "changed": report["changed"],
-                 "network": prior["network"]})
+                 "network": prior["network"], "remaining": remaining})
 
 
 def sha256(path):
@@ -344,6 +473,9 @@ def witness(cfg):
         need(code == 1 and text.startswith(prefix), "witness-failed")
         raise Check(WITNESS_REFUSALS.get(text[len(prefix):].decode("ascii", "replace"), "witness-failed"))
     witness_report(out, one["pins"])
+    need(cfg.inventory() == two["remaining"] == one["remaining"] == base["remaining"], "host-drift")
+    sudo_identity(cfg)
+    cfg.tun()
     nonce = read_small(cfg.path("nonce"))
     manifest = read_small(cfg.path("MANIFEST"))
     need(nonce is not None and manifest is not None, "identity")
@@ -351,8 +483,13 @@ def witness(cfg):
     inputs = hashlib.sha256(manifest).hexdigest()
     need(HEX64_RE.fullmatch(nonce) is not None, "identity")
     flags = "".join("1" if base["network"][key] else "0" for key in ("default_route", "ca_bundle", "resolver"))
-    line = ("\nLABAPP-QEMU v1 nonce=%s inputs=%s accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
-            "i1=1:%d i2=0:%d w=%d net=%s\n" % (nonce, inputs, one["seconds"], two["seconds"], spent, flags))
+    inventory = " ".join("%s=%s:%s" % (name, base["remaining"][package]["version"],
+                                        base["remaining"][package]["sha256"])
+                         for package, name, _ in REMAINING)
+    line = ("\nLABAPP-QEMU v2 nonce=%s inputs=%s accel=kvm exit=33 uid=0 equal=1 backing=1 removed=1 "
+            "i1=1:%d i2=0:%d w=%d net=%s %s caller=1000 sudo_uid=0 arch=amd64 "
+            "tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun\n" %
+            (nonce, inputs, one["seconds"], two["seconds"], spent, flags, inventory))
     emit_line(cfg, line.encode("ascii"))
 
 

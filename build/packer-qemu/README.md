@@ -569,14 +569,37 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   `dpkg-query` for exactly the pinned packages and versions, a clean `dpkg --audit` and the identity
   (inode, size, mtime, ctime, SHA256) of the four regular payloads plus the required `socat -> socat1` link identity, which must be identical after the rerun. The
   witness report must be KVM, exit 33, nonce equal, unchanged backing, removed scratch, uid 0 and the same pins.
-  No fallback, retry, permission repair, module load or TCG exists anywhere; a nonzero step is a failure.
+  The adapter adds no retry, fallback, permission repair, module load or TCG. The unchanged shared installer
+  retains its one native APT transport retry within the same 210 s/180 s bounds; a nonzero step is a failure.
+* Remaining host contract (#295), within those same fourteen actions: baseline inventories native `sudo`,
+  `openssh-client` and `less` using fixed `dpkg-query` package/status/architecture/version and file-owner
+  queries. The commands must resolve under the fixed PATH to canonical `/usr/bin/sudo`, `ssh` and `less`,
+  with real trusted root-owned parents, executable filesystem, root:root regular files and modes `04755`
+  for sudo, `0755` for ssh/less. Hardlinks and the root-owned merged-usr `/bin -> usr/bin` alias are valid;
+  arbitrary executable symlinks, shadowed commands and writable parents/files refuse. Bounded hashes and
+  metadata must stay unchanged after both QEMU installs and before the witness summary. Versions are native
+  observations, not newly selected pins; absent packages refuse instead of installing or repairing them.
+* The witness also uses the existing bounded helper to run exactly `runuser -u ubuntu -- env -i`
+  with fixed PATH/HOME/locale followed by `/usr/bin/sudo -n -k -- /usr/bin/id -u` (10 s, stdin closed,
+  cwd `/`). `ubuntu` must map to UID1000 and nonroot primary GID; only exit0 and exactly `0\n` pass.
+  This proves that fixed command's noninteractive root identity, not arbitrary command-specific sudoers
+  authorization. The KVM execution remains root-only; direct nonroot KVM group access is not required.
+* Root's TUN query validates trusted real `/dev/net` parents and nonsymlink character device10:200,
+  opens `/dev/net/tun` with no-follow/nonblocking/close-on-exec flags, verifies descriptor identity, issues
+  only `TUNGETFEATURES` and requires the TAP flag, then closes the descriptor on success or failure.
+  It does not attach an interface, issue `TUNSETIFF`, test CAP_NET_ADMIN/LSM network authorization, create
+  TAPs/bridges or run official helpers. Device/API success therefore explicitly retains `tap_create=unrun`.
 * Failure reasons stay inside the existing `LABAPP-DIAG` token: `inst<N>-refused-sNNN`, `inst<N>-exit-sNNN`
   (bounded wall seconds, #281), `inst<N>-timeout`, `inst<N>-output`, `inst1-unchanged`, `inst2-changed`,
   `native-pins`, `native-audit`, `rerun-state`, `witness-{nokvm,mismatch,artifact,pins,backing,timeout,deadline,
   failed,output,invalid}` (fixed messages of the unchanged witness only), `state-missing`, `identity`,
-  `emit-failed`, `not-root`, `staging-input`, `internal`. No APT, dpkg, installer or peer text is exported.
-* Retained witness: on success the adapter writes one `LABAPP-QEMU v1 nonce=H inputs=H accel=kvm exit=33 uid=0
-  equal=1 backing=1 removed=1 i1=1:S i2=0:S w=S net=RCD` line on the serial console (`S` is 1-3 digits of
+  `emit-failed`, `not-root`, `staging-input`, `internal`, `host-{query,path,owner,drift,timeout,output}`,
+  `sudo-{owner,identity,timeout,output}` and `tun-{path,device,identity,api,features}`.
+  No APT, dpkg, installer or peer text is exported.
+* Retained witness: on success the adapter writes one `LABAPP-QEMU v2 nonce=H inputs=H accel=kvm exit=33 uid=0
+  equal=1 backing=1 removed=1 i1=1:S i2=0:S w=S net=RCD sudo=V:H ssh=V:H less=V:H caller=1000 sudo_uid=0
+  arch=amd64 tun_open=1 tun_api=1 tap_flag=1 tap_create=unrun` line on the serial console (`V` is a
+  bounded native package version, `H` a SHA256; `S` is 1-3 digits of
   whole seconds capped at 999; `R`/`C`/`D` are 0/1 for a default IPv4 route, a nonempty CA bundle and a
   nameserver line (including the two known systemd-resolved resolver symlink targets), reported never repaired). `host_verify.py` (still with only `require_sentinel_evidence`) accepts
   at most one such line, bound to this run's nonce and `inputs`, inside the existing serial byte/line limits, and
@@ -584,6 +607,9 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   stale or oversize lines fail. Other modes ignore the line and a `qemu_witness` key makes their receipt invalid.
   The runner independently revalidates exact keys/types (`True` is not 1, `33.0` is not 33) and requires the key
   for this mode: no witness can never pass.
+  Its closed `host_contract` object keeps exactly those three native versions/architectures/hashes and
+  the fixed caller/sudo/TUN claims; no paths, raw command output, account configuration or journal is retained.
+  Previous v1 summaries cannot satisfy the new source contract; historical evidence remains historical.
 * Success also needs the sentinel gates (exit 0, `build 0`, five receipt keys bound to nonce and
   `guest_receipt`, normal guest shutdown, cloud-init summary, bounded artifact hashed then deleted, unchanged
   staged bytes, verified cleanup). Evidence adds `task`, `network: docker-bridge-outbound`, the witness and
@@ -591,8 +617,23 @@ independent exact-head review, runtime-identity preflight and reconciled shared-
   execution is not student readiness, and nothing here proves nested VLAB, Docker, reboot or another platform.
 * Not integrated: held PR #282 diagnostics, offline capture/bundles, proxies, a generic controller. A guest
   without outbound reachability, DNS or CA bundle simply fails the first installer run with its token.
-* Offline tests: `test_qemu_fixture.py` covers synthetic staging, observer, runner and adapter failures.
+* Offline tests: `test_qemu_fixture.py` covers synthetic staging, observer, runner and adapter failures;
+  `test_native_host.py` covers native filesystem/package shapes, sudo refusals and TUN descriptor/API cleanup
+  with injected observations only. It never runs host root, native package queries or device operations.
   Actual guest networking, installation and KVM execution require separately scoped live evidence.
+
+Remaining-host sources read 2026-10-26: exact Fabricator
+[v0.43.1 runner](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabrunner.go) and
+[v0.50.4 runner](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/hhfab/vlabrunner.go)
+list the six required commands and launch QEMU/helpers through sudo. Their
+[43 helper](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/cmdhelpers.go) and
+[50 helper](https://github.com/githedgehog/fabricator/blob/v0.50.4/pkg/hhfab/cmdhelpers.go) mutate TAPs/bridges;
+these are not called here. Linux6.8's [TUN implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c)
+returns valid flags for an unattached fd's GETFEATURES query; the
+[UAPI](https://github.com/torvalds/linux/blob/v6.8/include/uapi/linux/if_tun.h) defines the query and TAP bit.
+The [Noble20261017 manifest](https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.manifest)
+lists the three packages but does not establish their actual guest installed state. No release selection,
+VLAB startup, privileged network mutation, full topology or student acceptance follows from this probe.
 
 ### Fixed `control-build` task (non-VM official control-installer build measurement; source only)
 
