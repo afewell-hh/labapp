@@ -43,7 +43,7 @@ jobs:
             GITHUB_REF="$GITHUB_REF" GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_SHA="$GITHUB_SHA" \
             bash build/packer-qemu/runtime-prepare.sh
       - name: Verify owned cleanup
-        if: always()
+        if: always() && steps.build.outcome != '' && steps.build.outcome != 'skipped'
         timeout-minutes: 3
         run: |
           env -i PATH=/usr/bin:/bin HOME="$HOME" DOCKER_CONFIG="$DOCKER_CONFIG" \
