@@ -23,6 +23,10 @@ class Fake:
         self.builder = self.container = self.volume = True
         self.calls = []
         self.fail = None
+        self.builder_info = {'Name': NAME, 'Driver': 'docker-container',
+            'Nodes': [{'Name': NAME + '0', 'Endpoint': prep.HOST,
+                       'DriverOpts': {'image': prep.BUILDKIT_IMAGE, 'restart-policy': 'no',
+                                      'provenance-add-gha': 'false'}}]}
         self.item = {'Id': ID, 'Name': '/buildx_buildkit_' + NAME + '0',
                      'Image': IMAGE, 'Config': {'Image': prep.BUILDKIT_IMAGE},
                      'HostConfig': {'RestartPolicy': {'Name': 'no'}},
@@ -34,14 +38,11 @@ class Fake:
         if key == self.fail:
             raise subprocess.CalledProcessError(1, args)
         if key == ('buildx', 'ls'):
-            return json.dumps({'Name': NAME}) if self.builder else ''
+            return json.dumps(self.builder_info) if self.builder else ''
         if key == ('container', 'ls'):
             return ID if self.container else ''
         if key == ('volume', 'ls'):
             return VOLUME['Name'] if self.volume else ''
-        if key == ('buildx', 'inspect'):
-            return json.dumps({'Name': NAME, 'Driver': 'docker-container',
-                               'Nodes': [{'Name': NAME + '0', 'Endpoint': prep.HOST}]})
         if key == ('container', 'inspect'):
             return json.dumps([self.item])
         if key == ('volume', 'inspect'):
@@ -95,7 +96,7 @@ class Ownership(unittest.TestCase):
 
     def test_query_errors_are_never_absence(self):
         for key in [('buildx', 'ls'), ('container', 'ls'), ('volume', 'ls'),
-                    ('buildx', 'inspect'), ('container', 'inspect'), ('volume', 'inspect')]:
+                    ('container', 'inspect'), ('volume', 'inspect')]:
             with self.subTest(key=key):
                 fake, record = Fake(), state()
                 fake.fail = key
@@ -103,6 +104,22 @@ class Ownership(unittest.TestCase):
                     prep.cleanup(fake, record)
                 self.assertNotIn('cleanup', record)
                 self.assertFalse(any(x[:2] == ['buildx', 'rm'] for x in fake.calls))
+
+    def test_successful_json_with_embedded_node_or_builder_error_is_hold(self):
+        for node in [False, True]:
+            with self.subTest(node=node):
+                fake, record = Fake(), state()
+                target = fake.builder_info['Nodes'][0] if node else fake.builder_info
+                target['Err'] = 'synthetic daemon error'
+                with self.assertRaisesRegex(ValueError, 'query error'):
+                    prep.cleanup(fake, record)
+                self.assertFalse(any(x[:2] == ['buildx', 'rm'] for x in fake.calls))
+
+    def test_real_cli_schema_uses_ls_json_not_unsupported_inspect_format(self):
+        fake, record = Fake(), state()
+        prep.cleanup(fake, record)
+        self.assertIn(['buildx', 'ls', '--format=json'], fake.calls)
+        self.assertFalse(any(x[:2] == ['buildx', 'inspect'] for x in fake.calls))
 
     def test_failed_remove_is_hold(self):
         fake, record = Fake(), state()

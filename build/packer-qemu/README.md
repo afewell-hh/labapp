@@ -429,7 +429,9 @@ after successful absence queries, in a private config, then bootstrapped explici
 The hooks resolve builder name/driver/node/endpoint, full container ID, pinned
 BuildKit image and actual image ID, exact cache mount and inspected local volume
 identity before removal through `buildx rm`. Successful list queries must prove
-absence afterwards. Failed queries/removal, identity changes, unexplained vanished
+absence afterwards. Buildx `ls --format=json` is parsed using its pinned source
+schema, including embedded builder/node errors that can accompany exit status 0;
+`inspect --format` is unsupported and is not used. Failed queries/removal, identity changes, unexplained vanished
 resources and partial creation leaving only an unattributable volume are HOLD;
 no global prune or deletion of preexisting images is allowed. Pulled base/BuildKit
 images are immutable dependency cache, retained until fresh-host disposal. Only
@@ -481,6 +483,7 @@ path to `sys.path` before unittest discovery. No suite may be silently absent.
 
 Primary sources read 2026-10-26 (upstream current docs; no runtime execution):
 [Buildx docker-container driver and defaults](https://docs.docker.com/build/builders/drivers/docker-container/),
+[pinned v0.38.1 JSON listing schema](https://github.com/docker/buildx/blob/v0.38.1/commands/ls.go),
 [pinned v0.38.1 driver source, including privileged bootstrap and removal](https://github.com/docker/buildx/blob/v0.38.1/driver/docker-container/driver.go),
 [Docker exporter / metadata / pull behavior](https://docs.docker.com/reference/cli/docker/buildx/build/),
 [pinned setup action source](https://github.com/docker/setup-buildx-action/blob/8d2750c68a42422c14e847fe6c8ac0403b4cbd6f/src/main.ts),

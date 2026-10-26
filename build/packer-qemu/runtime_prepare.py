@@ -49,26 +49,39 @@ def docker(args):
     return result.stdout.decode('utf-8').strip()
 
 
+def builders(call):
+    # Buildx v0.38.1 `ls` reports node errors in JSON even with exit 0.
+    rows = [json.loads(line) for line in call(['buildx', 'ls', '--format=json']).splitlines()]
+    require(len(rows) <= 128 and len({x['Name'] for x in rows}) == len(rows), 'ambiguous builders')
+    require(all(not x.get('Err') and all(not n.get('Err') and n.get('Status') != 'error'
+                for n in x['Nodes']) for x in rows), 'builder query error')
+    return rows
+
+
 def census(call, name):
     # Successful empty LIST responses establish absence. Inspect errors never do.
-    builders = [json.loads(line)['Name'].rstrip('*') for line in
-                call(['buildx', 'ls', '--format', '{{json .}}']).splitlines()]
+    names = [x['Name'] for x in builders(call)]
     containers = call(['container', 'ls', '-aq', '--no-trunc', '--filter',
                        f'name=^/buildx_buildkit_{name}0$']).splitlines()
     volumes = call(['volume', 'ls', '-q', '--filter', f'name=^buildx_buildkit_{name}0_state$']).splitlines()
     require(len(containers) <= 1 and len(volumes) <= 1, 'ambiguous ownership')
-    return name in builders, containers, volumes
+    return name in names, containers, volumes
 
 
 def bind(call, state):
     name = state['name']
     exists, containers, volumes = census(call, name)
     if exists:
-        builder = json.loads(call(['buildx', 'inspect', name, '--format', '{{json .}}']))
+        matches = [x for x in builders(call) if x['Name'] == name]
+        require(len(matches) == 1, 'builder disappeared')
+        builder, = matches
         require(builder['Name'] == name and builder['Driver'] == 'docker-container', 'builder mismatch')
         nodes = builder['Nodes']
         require(len(nodes) == 1 and nodes[0]['Name'] == name + '0' and
                 nodes[0]['Endpoint'] == HOST, 'builder endpoint mismatch')
+        require(nodes[0].get('DriverOpts') == {'image': BUILDKIT_IMAGE, 'restart-policy': 'no',
+                'provenance-add-gha': 'false'} and not nodes[0].get('Files') and
+                not nodes[0].get('ProxyConfig'), 'builder configuration mismatch')
     if containers:
         require(exists and CID.fullmatch(containers[0]), 'orphan container')
         item, = json.loads(call(['container', 'inspect', containers[0]]))
