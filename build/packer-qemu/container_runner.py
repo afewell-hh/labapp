@@ -2,7 +2,7 @@
 
 Fixed probe, HCL and non-VM runtime checks require separately scoped lead execution.
 The sentinel and sentinel-expiry VM modes remain gated on separately accepted execution identities.
-Only `qemu-fixture` gets ordinary outbound Docker bridge networking; every other mode stays `--network=none`.
+Only `qemu-fixture` and `control-build` get ordinary outbound Docker bridge networking; every other mode stays `--network=none`.
 Docker is reached only through `Backend`; tests substitute a fake. The CLI refuses
 to contact Docker unless `--execute` is given (otherwise it prints the plan).
 Python 3.10+ stdlib. See README.md "Bounded container probe" for unmet gates.
@@ -43,7 +43,10 @@ PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d
 # sentinel-expiry: 300 s work INCLUDING staging + 120 s cleanup, no renewal. A failure-only
 # proof: a paused KVM guest must outlive >=60 s until THIS container's own timer ends it.
 PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30),
-            "sentinel-expiry": (300, 120), "fixture": (1800, 900), "qemu-fixture": (1800, 900)}
+            "sentinel-expiry": (300, 120), "fixture": (1800, 900), "qemu-fixture": (1800, 900),
+            "control-build": (1800, 900)}
+# control-build: the same 30 min work INCLUDING staging + 15 min cleanup, no renewal. It covers staging and the
+# unchanged official hhfab init/validate/build sequence (cold, no-op, fresh-workspace warm) with no /dev/kvm. Unmeasured.
 # qemu-fixture: the same 30 min work INCLUDING staging + 15 min cleanup as fixture, no renewal. It covers
 # staging, two network installer runs and the KVM witness (unmeasured; an actual failure may identify #281).
 MODES = tuple(PROFILES)
@@ -51,10 +54,11 @@ VM_MODES = ("sentinel", "sentinel-expiry", "fixture", "qemu-fixture")      # the
 STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry", "fixture", "qemu-fixture")
 # Observer-recorded success modes (the sentinel build step and receipt); only qemu-fixture adds a witness.
 SUCCESS_MODES = ("sentinel", "fixture", "qemu-fixture")
-# The ONLY mode whose outer container is not `--network=none`: ordinary outbound reachability for the fixed
+# The ONLY modes whose outer container is not `--network=none`: ordinary outbound reachability for the fixed
 # public package plan through Docker's default bridge. It is not hostname-allowlisted egress.
-NETWORKED_MODES = ("qemu-fixture",)
+NETWORKED_MODES = ("qemu-fixture", "control-build")
 SOURCE_KEYS = {"core", "plugin", "base"}
+CONTROL_SOURCE_KEYS = {"archive"}      # control-build stages only the pinned hhfab archive; the wiring is fixed in-repo
 FIXTURE_SOURCE_KEYS = SOURCE_KEYS | {"archive"}       # fixture adds the pinned hhfab archive
 # Proposed explicit bounds, not measured requirements. The sentinel guest is 4 vCPU /
 # 8 GiB (labapp.pkr.hcl); the container adds headroom for QEMU, Packer and the observer.
@@ -62,7 +66,7 @@ LIMITS = {"runtime-check": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "
           "probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128"),
           "sentinel": ("--memory=10g", "--memory-swap=10g", "--cpus=5", "--pids-limit=512")}
-LIMITS["sentinel-expiry"] = LIMITS["fixture"] = LIMITS["qemu-fixture"] = LIMITS["sentinel"]
+LIMITS["sentinel-expiry"] = LIMITS["fixture"] = LIMITS["qemu-fixture"] = LIMITS["control-build"] = LIMITS["sentinel"]
 # Preparation artifact accepted in #266 comment 6406373578. Bound to original source
 # 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
 # comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
@@ -242,6 +246,141 @@ RUNTIME_SCRIPT = ("ulimit -f 8192 || exit 125; umask 077; "
                   " > /out/runtime.log 2>&1 < /dev/null")
 
 
+# --- control-build: the unchanged official `hhfab build --build-controls=true --build-gateways=false --build-mode=iso`.
+# Facts read from fabricator v0.50.4 source (nothing executed): init writes fab.yaml/.registry.yaml/include/result into
+# --workdir; `--import-host-upstream` (hidden unless HHFAB_PREVIEW) reads only DOCKER_CONFIG/config.json and, for an
+# empty store, yields an anonymous upstream stanza; `build` has no --force/--clean option; recipe.buildInstall skips when
+# `<type>--<name>--install.inhash` matches AND `<type>--<name>--install-usb.iso` exists, otherwise removes and rebuilds.
+CONTROL_STEPS = ("init1", "validate1", "assert1", "cold", "noop", "init2", "validate2", "assert2", "warm")
+CONTROL_ENV = ("/usr/bin/env -i HOME=/out/home TMPDIR=/out/tmp PATH=/usr/bin:/bin LC_ALL=C "
+               "DOCKER_CONFIG=/in/docker HHFAB_PREVIEW=true")
+CONTROL_INIT = ("init --fabric-mode spine-leaf --dev --gateway=false --import-host-upstream "
+                "--registry-repo ghcr.io --registry-prefix githedgehog --wiring /in/wiringd.yaml")
+CONTROL_VALIDATE = "validate --hydrate-mode if-not-present"
+CONTROL_BUILD = "build --hydrate-mode if-not-present --build-controls=true --build-gateways=false --build-mode=iso"
+# The generated upstream stanza is checked from bounded text before any build; only the exit status is kept.
+ASSERT_PROGRAM = r'''
+import sys
+raw = open(sys.argv[1], 'rb').read(1048577)
+if len(raw) > 1048576:
+    sys.exit(3)
+# Check only the exact generated spec.config.registry subtree. Other generated
+# user passwords and join tokens are unrelated and must never be exported.
+lines = raw.decode('utf-8').splitlines()
+path = []
+registry = []
+for line in lines:
+    text = line.strip()
+    if text == '---':
+        break
+    if not text or text.startswith('#'):
+        continue
+    indent = len(line) - len(line.lstrip(' '))
+    while path and path[-1][0] >= indent:
+        path.pop()
+    if ':' not in text:
+        if [entry[1] for entry in path][:3] == ['spec', 'config', 'registry']:
+            sys.exit(4)
+        continue
+    key, value = text.split(':', 1)
+    keys = [entry[1] for entry in path] + [key]
+    if keys[:3] == ['spec', 'config', 'registry']:
+        registry.append((keys[3:], value.strip()))
+    path.append((indent, key))
+want = [([], ''), (['mode'], 'upstream'), (['upstream'], ''),
+        (['upstream', 'repo'], 'ghcr.io'), (['upstream', 'prefix'], 'githedgehog'),
+        (['upstream', 'noTLSVerify'], 'false'), (['upstream', 'username'], ''),
+        (['upstream', 'password'], '')]
+# Official init emits empty scalars; accept their explicit quoted/null forms too.
+empty = ('', '\"\"', "''", 'null')
+normalized = [(keys, '' if keys in (['upstream', 'username'], ['upstream', 'password'])
+               and value in empty else value) for keys, value in registry]
+ok = normalized == want
+sys.exit(0 if ok else 4)
+'''
+# Exact v0.50.4 recipe creates 9 GiB + 500 MiB + 2*(33*512) + 1 MiB =
+# 10,189,046,784 logical bytes before ISO finalization. 12 GiB leaves ~2.51 GiB
+# per-file headroom. Lead-approved experiment thresholds, not measured fit.
+CONTROL_RECIPE_DISK_BYTES = 9 * (1 << 30) + 501 * (1 << 20) + 2 * 33 * 512
+CONTROL_FILE_KIB = 12 * 1024 * 1024  # per-file ulimit, NOT a directory quota
+CONTROL_OWNED_CAP = 32 << 30   # sampled allocated-bytes ceiling for /out (proposed, unmeasured); NOT a quota
+CONTROL_MIN_FREE = 40 << 30    # host free-space precondition before the workspace exists (proposed, unmeasured)
+CONTROL_SAMPLE = 5             # seconds between host samples of the owned tree
+CONTROL_ENTRY_CAP = 200000
+CONTROL_MS_CAP = 1800000
+CONTROL_ISO_RE = re.compile(r"^[a-z]+--[A-Za-z0-9._-]+--install-usb\.iso$")
+CONTROL_STEP_RE = re.compile(r"^([a-z0-9]+) (\d{1,3}) (\d{1,8})$")
+CONTROL_SIZE_RE = re.compile(r"^(cache_cold|w1_cold|cache_warm|w2_warm) (\d{1,12}) (\d{1,12})$")
+CONTROL_STAT_RE = re.compile(r"^(cold|noop) (\d{1,13}) (\d{1,12}) (\d{1,12})$")
+# What a passing control-build does and does not establish; retained in evidence verbatim.
+CONTROL_CLAIMS = {"measures": "inner official control-installer build only", "release_pin": False,
+                  "outer_labapp_image": False, "full_vlab": False, "student_readiness": False,
+                  "disk_quota": False, "peak": "sampled-lower-bound", "signatures_verified": False,
+                  "egress": "ordinary-docker-bridge-not-allowlisted"}
+
+
+def _control_step(name, command, workdir):
+    return f"step {name} {CONTROL_ENV} /in/hhfab {command} --workdir {workdir} --cache-dir /out/cache"
+
+
+CONTROL_SCRIPT = (
+    f"ulimit -f {CONTROL_FILE_KIB} || exit 125; umask 077; "
+    'now() { t=${EPOCHREALTIME/./}; echo $((t/1000)); }; '
+    'step() { n=$1; shift; s=$(now); "$@" > "/out/$n.out" 2> "/out/$n.err" < /dev/null; c=$?; e=$(now); '
+    'echo "$n $c $((e-s))" >> /out/steps; return $c; }; '
+    'size() { a=$(/usr/bin/du -sk --apparent-size "$2") || return 1; b=$(/usr/bin/du -sk "$2") || return 1; '
+    'echo "$1 ${a%%[[:space:]]*} ${b%%[[:space:]]*}" >> /out/sizes; }; '
+    'isostat() { /usr/bin/stat -c "$1 %s %i %Y" /out/$2/result/*--install-usb.iso >> /out/isostat; }; '
+    "asserted() { step $1 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B -c "
+    f"{shlex.quote(ASSERT_PROGRAM)} /out/$2/fab.yaml; }}; "
+    f"{_control_step('init1', CONTROL_INIT, '/out/w1')} && "
+    f"{_control_step('validate1', CONTROL_VALIDATE, '/out/w1')} && asserted assert1 w1 && "
+    f"{_control_step('cold', CONTROL_BUILD, '/out/w1')} && size cache_cold /out/cache && size w1_cold /out/w1 && "
+    "isostat cold w1 && "
+    f"{_control_step('noop', CONTROL_BUILD, '/out/w1')} && isostat noop w1 && "
+    f"{_control_step('init2', CONTROL_INIT, '/out/w2')} && "
+    f"{_control_step('validate2', CONTROL_VALIDATE, '/out/w2')} && asserted assert2 w2 && "
+    f"{_control_step('warm', CONTROL_BUILD, '/out/w2')} && size cache_warm /out/cache && size w2_warm /out/w2; exit 0")
+
+
+class OutputBound(Exception):
+    """Sampled owned-tree allocation or entry count crossed its bound (not a filesystem quota)."""
+
+
+class DiskHeadroom(Exception):
+    """Host free space is below the control-build precondition; no workspace was created."""
+
+
+def free_bytes(path):
+    info = os.statvfs(path)
+    return info.f_bavail * info.f_frsize
+
+
+def measure_tree(path, limit=CONTROL_ENTRY_CAP):
+    """lstat-only walk (never follows symlinks): (logical bytes, allocated bytes, entries). Hard links are
+    counted per name, so this is an upper bound; entries that vanish mid-walk are skipped."""
+    logical = allocated = entries = 0
+    stack = [path]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as items:
+                for item in items:
+                    entries += 1
+                    if entries > limit:
+                        raise OutputBound("entry limit")
+                    try:
+                        info = item.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    logical += info.st_size
+                    allocated += info.st_blocks * 512
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(item.path)
+        except FileNotFoundError:
+            continue
+    return logical, allocated, entries
+
+
 def boot_clock():
     return time.clock_gettime(time.CLOCK_BOOTTIME)
 
@@ -404,7 +543,7 @@ def released_record(record):
         if mode not in MODES:
             return False
         expected_image = (require_runtime(mode)["image_id"] if mode in VM_MODES else
-                          PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else PINNED_IMAGE)
+                          PREPARED_RUNTIME["image_id"] if mode in ("runtime-check", "control-build") else PINNED_IMAGE)
         return (record["state"] == "released" and record["image"] == expected_image
                 and re.fullmatch(r"labapp-probe-[a-zA-Z0-9-]+", record["name"])
                 and record["label"] == "labapp.probe.run=" + record["name"][13:]
@@ -451,6 +590,9 @@ def mounts(mode, workspace):
     the fresh `out` tree writable."""
     if mode in ("probe", "runtime-check"):
         return [f"--mount=type=bind,src={workspace},dst=/out"]
+    if mode == "control-build":      # no CD tree: inputs read-only, only `out` writable
+        return [f"--mount=type=bind,src={workspace}/in,dst=/in,readonly",
+                f"--mount=type=bind,src={workspace}/out,dst=/out"]
     return [f"--mount=type=bind,src={workspace}/in,dst=/in,readonly",
             f"--mount=type=bind,src={workspace}/out,dst=/out",
             f"--mount=type=bind,src={workspace}/cd,dst=/out/work/cd,readonly"]
@@ -463,7 +605,7 @@ def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot
     kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode in VM_MODES else []
     script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT,
               "sentinel-expiry": SENTINEL_SCRIPT, "fixture": SENTINEL_SCRIPT, "qemu-fixture": SENTINEL_SCRIPT,
-              "runtime-check": RUNTIME_SCRIPT}[mode]
+              "runtime-check": RUNTIME_SCRIPT, "control-build": CONTROL_SCRIPT}[mode]
     network = "--network=bridge" if mode in NETWORKED_MODES else "--network=none"
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", network, "--cap-drop=ALL", "--no-healthcheck",
@@ -608,14 +750,15 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
     uid, gid = (os.getuid() if uid is None else uid), (os.getgid() if gid is None else gid)
     if mode not in MODES:
         raise ValueError("unknown mode")
-    keys = FIXTURE_SOURCE_KEYS if mode in ("fixture", "qemu-fixture") else SOURCE_KEYS
-    if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == keys):
+    keys = (FIXTURE_SOURCE_KEYS if mode in ("fixture", "qemu-fixture") else
+            CONTROL_SOURCE_KEYS if mode == "control-build" else SOURCE_KEYS)
+    if (mode in STAGED_MODES or mode == "control-build") and not (isinstance(sources, dict) and set(sources) == keys):
         raise ValueError(f"{mode} needs exactly the {', '.join(sorted(keys))} input files")
     if mode in VM_MODES:
         require_runtime(mode)
     w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
-    expected_image = (PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else
+    expected_image = (PREPARED_RUNTIME["image_id"] if mode in ("runtime-check", "control-build") else
                       require_runtime(mode)["image_id"] if mode in VM_MODES else PINNED_IMAGE)
     if image != expected_image:
         raise ValueError("image must be the fixed identity for this task")
@@ -674,7 +817,8 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
 
 
 def _reason(exc):
-    return {Expired: "budget_exhausted", DockerError: "daemon_error", OSError: "ledger_or_fs_error",
+    return {OutputBound: "output_bound_exceeded", DiskHeadroom: "insufficient_disk_headroom",
+            Expired: "budget_exhausted", DockerError: "daemon_error", OSError: "ledger_or_fs_error",
             DockerTimeout: "daemon_timeout", ValueError: "invalid_input",
             stage_tools.StageError: "staging_rejected", HardwareMissing: "kvm_unavailable"}.get(type(exc), "error")
 
@@ -692,9 +836,15 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     kvm_gid = None
     if own["mode"] in VM_MODES:
         kvm_gid = kvm_preflight()      # metadata only; no TCG fallback exists
+    if own["mode"] == "control-build" and free_bytes(root) < CONTROL_MIN_FREE:
+        raise DiskHeadroom()       # before any workspace or Docker mutation
     # Preparation consumes the same budget as everything else.
     own["workspace"] = make_workspace(root, own["ident"], uid)
     ledger.write("workspace_made", workspace=own["workspace"])
+    if own["mode"] == "control-build":
+        own["staged"] = stage_tools.stage_control(own["workspace"], own["sources"],
+                                                  lambda: _checkpoint(own, budget, clock))
+        _checkpoint(own, budget, clock)
     if own["mode"] in STAGED_MODES:
         # Staging starts after admission and spends the same absolute budget.
         extra = {}
@@ -717,8 +867,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         _checkpoint(own, budget, clock)
     backend.call(["version", "--format", "{{.Server.Version}}"], budget.seconds(CALL_CAP, budget.work_deadline))
     _checkpoint(own, budget, clock)
-    if own["mode"] in VM_MODES + ("runtime-check",):
-        runtime = PREPARED_RUNTIME if own["mode"] == "runtime-check" else require_runtime(own["mode"])
+    if own["mode"] in VM_MODES + ("runtime-check", "control-build"):
+        runtime = (PREPARED_RUNTIME if own["mode"] in ("runtime-check", "control-build")
+                   else require_runtime(own["mode"]))
         image_id = check_runtime(backend.call(["image", "inspect", "--format", IMAGE_FORMAT,
                                                runtime["image_id"]],
                                               budget.seconds(CALL_CAP, budget.work_deadline)), runtime)
@@ -760,6 +911,8 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         status, code, oom = match.group(1), int(match.group(2)), match.group(3) == "true"
         if status in ("exited", "dead"):
             break
+        if own["mode"] == "control-build":
+            _sample_control(own, clock)
         if budget.work_left() <= 0:
             if own["mode"] == "sentinel-expiry":
                 own["exit_seen_at"] = clock()
@@ -770,6 +923,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     own["exit_seen_at"] = clock()
     if own["mode"] == "runtime-check":
         _accept_runtime(own, result, budget, clock, oom, code)
+        return
+    if own["mode"] == "control-build":
+        _accept_control(own, result, budget, clock, oom, code)
         return
     if own["mode"] == "hcl-check":
         _accept_hcl(own, result, budget, clock, oom, code)
@@ -857,6 +1013,155 @@ def _accept_runtime(own, result, budget, clock, oom, code):
         result["reason"] = "invalid_runtime_evidence"
         return
     evidence["report"] = report
+    result["outcome"], result["reason"], result["exit_code"] = "accepted", None, code
+
+
+def _sample_control(own, clock):
+    """Periodic lstat walk of the owned `out` tree. This is SAMPLING: growth between samples can overshoot the
+    bound, and the recorded peak is a lower bound. No filesystem quota exists or is claimed."""
+    now = clock()
+    if now - own.get("sampled_at", -CONTROL_SAMPLE) < CONTROL_SAMPLE:
+        return
+    own["sampled_at"] = now
+    logical, allocated, _ = measure_tree(os.path.join(own["workspace"], "out"))
+    peak = own.setdefault("peak", {"logical": 0, "allocated": 0, "samples": 0})
+    peak["samples"] += 1
+    peak["logical"], peak["allocated"] = max(peak["logical"], logical), max(peak["allocated"], allocated)
+    if allocated > CONTROL_OWNED_CAP:
+        raise OutputBound("owned allocation over bound")
+
+
+def _control_lines(raw, pattern):
+    """Closed parse of a small container-written file: every line must match, else None."""
+    if raw is None:
+        return None
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    rows = [pattern.fullmatch(line) for line in lines]
+    return None if not rows or any(row is None for row in rows) else [row.groups() for row in rows]
+
+
+def _control_iso(out, name):
+    """The single `<type>--<name>--install-usb.iso` in out/<name>/result, or None."""
+    try:
+        with os.scandir(os.path.join(out, name, "result")) as items:
+            found = [item for item in items if CONTROL_ISO_RE.fullmatch(item.name)]
+    except OSError:
+        return None
+    return found[0].path if len(found) == 1 and found[0].name == "control--control-1--install-usb.iso" else None
+
+
+def _accept_control(own, result, budget, clock, oom, code):
+    """Success needs exit 0, all nine recorded steps exiting 0 in order (init/validate/upstream assertion/cold
+    build/no-op build/fresh init/validate/assertion/warm build), one bounded ISO in each workspace, a no-op
+    labelled from metadata without claiming an internal hash skip, unchanged staged bytes and
+    (checked in _finish) verified removal of the container and the whole owned workspace."""
+    out = os.path.join(own["workspace"], "out")
+    staged = own["staged"]
+    evidence = {"image_id": own["image_id"], "runtime_diffids": PREPARED_RUNTIME["diffids"], "task": "control-build",
+                "staged_inputs_verification": "not_run", "cache_audit": {"status": "not_run"},
+                "inputs": staged, "exit_code": code, "oom_killed": oom, "claims": dict(CONTROL_CLAIMS),
+                "network": "docker-bridge-outbound", "commands": {
+                    "init": "hhfab " + CONTROL_INIT, "validate": "hhfab " + CONTROL_VALIDATE,
+                    "build": "hhfab " + CONTROL_BUILD},
+                "limits": {"file_kib": CONTROL_FILE_KIB, "owned_allocated_sample_cap": CONTROL_OWNED_CAP,
+                           "min_free": CONTROL_MIN_FREE, "quota": False},
+                "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    result["evidence"] = evidence
+    raw = {n: read_step(out, n, RESULT_CAP) for n in ("steps", "sizes", "isostat")}
+    steps = _control_lines(raw["steps"], CONTROL_STEP_RE)
+    if steps is not None and (len(steps) > len(CONTROL_STEPS) or any(s[0] not in CONTROL_STEPS for s in steps)):
+        steps = None
+    if steps is not None:
+        evidence["steps"] = [[n, int(c), int(ms)] for n, c, ms in steps]
+    for step in CONTROL_STEPS:
+        for suffix in ("out", "err"):
+            data = read_step(out, f"{step}.{suffix}")
+            if data is not None:
+                evidence.setdefault("logs", {})[f"{step}.{suffix}"] = {
+                    "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    failed = next((s for s in (steps or []) if s[1] != "0"), None)
+    if failed is not None:
+        evidence["failed_step"] = {"name": failed[0], "exit": int(failed[1])}
+    try:
+        logical, allocated, entries = measure_tree(out)
+    except (OSError, OutputBound):
+        result["reason"] = "output_bound_exceeded"
+        return
+    peak = own.setdefault("peak", {"logical": 0, "allocated": 0, "samples": 0})
+    evidence["owned_bytes"] = {
+        "at_exit": {"logical": logical, "allocated": allocated, "entries": entries},
+        "peak_sampled": {"logical": max(peak["logical"], logical), "allocated": max(peak["allocated"], allocated),
+                         "samples": peak["samples"]}}
+    if allocated > CONTROL_OWNED_CAP:
+        result["reason"] = "output_bound_exceeded"
+        return
+    if oom or code != 0:
+        result["reason"] = "unexpected_exit"
+        return
+    if steps is None or [s[0] for s in steps] != list(CONTROL_STEPS) or any(
+            s[1] != "0" or int(s[2]) > CONTROL_MS_CAP for s in steps):
+        result["reason"] = "build_failed"
+        return
+    if len(evidence.get("logs", {})) != 2 * len(CONTROL_STEPS):
+        result["reason"] = "invalid_step_evidence"
+        return
+    sizes, stats = _control_lines(raw["sizes"], CONTROL_SIZE_RE), _control_lines(raw["isostat"], CONTROL_STAT_RE)
+    if (sizes is None or [s[0] for s in sizes] != ["cache_cold", "w1_cold", "cache_warm", "w2_warm"]
+            or stats is None or [s[0] for s in stats] != ["cold", "noop"]):
+        result["reason"] = "invalid_step_evidence"
+        return
+    kib = {label: {"apparent_kib": int(a), "allocated_kib": int(b)} for label, a, b in sizes}
+    cold, noop = tuple(stats[0][1:]), tuple(stats[1][1:])
+    seconds = {n: int(ms) / 1000 for n, _, ms in steps}
+    evidence["timing_seconds"] = seconds
+    evidence["cache_kib"] = {"after_cold": kib["cache_cold"], "after_warm": kib["cache_warm"]}
+    evidence["workspace_kib"] = {"w1_after_cold": kib["w1_cold"], "w2_after_warm": kib["w2_warm"]}
+    # Matching metadata alone cannot prove unchanged bytes or an internal hash skip.
+    # `warm` is the fresh-workdir build sharing the cache; transfer is unobserved.
+    evidence["noop"] = "unchanged_metadata_noop_candidate" if cold == noop else "rebuilt_in_place"
+    evidence["warm_cache_growth_apparent_kib"] = (kib["cache_warm"]["apparent_kib"]
+                                                  - kib["cache_cold"]["apparent_kib"])
+    check = lambda: _checkpoint(own, budget, clock)
+    evidence["staged_inputs_verification"] = "incomplete"
+    try:
+        intact = stage_tools.verify_control(own["workspace"], staged, check)
+    except (OSError, stage_tools.StageError):
+        intact = False
+    evidence["staged_inputs_verification"] = "passed" if intact else "failed"
+    if not intact:
+        result["reason"] = "staged_inputs_changed"
+        return
+    isos = {}
+    for name in ("w1", "w2"):
+        path = _control_iso(out, name)
+        try:
+            if path is None:
+                raise stage_tools.StageError("no single ISO")
+            sha, _ = stage_tools.hash_file(path, limit=CONTROL_FILE_KIB * 1024, check=check)
+            isos[name] = {"sha256": sha, "bytes": os.lstat(path).st_size, "name": os.path.basename(path)}
+        except (OSError, stage_tools.StageError):
+            result["reason"] = "iso_missing_or_invalid"
+            return
+    if isos["w1"]["bytes"] != int(noop[0]) or isos["w1"]["bytes"] <= 0 or isos["w2"]["bytes"] <= 0:
+        result["reason"] = "iso_missing_or_invalid"
+        return
+    evidence["iso"] = isos
+    evidence["iso_equal"] = isos["w1"]["sha256"] == isos["w2"]["sha256"]
+    evidence["cache_audit"] = {"status": "incomplete"}
+    try:
+        evidence["cache_identity"] = stage_tools.verify_control_cache(os.path.join(out, "cache"), check)
+    except stage_tools.CacheAuditRefusal as exc:
+        evidence["cache_audit"] = exc.receipt
+        result["reason"] = "cache_identity_mismatch"
+        return
+    except (OSError, stage_tools.StageError):
+        evidence["cache_audit"] = {"status": "refused", "stage": "unknown", "reason": "unclassified"}
+        result["reason"] = "cache_identity_mismatch"
+        return
+    evidence["cache_audit"] = {"status": "passed"}
     result["outcome"], result["reason"], result["exit_code"] = "accepted", None, code
 
 
@@ -1301,18 +1606,25 @@ def main(argv=None):
         print("invalid docker, host or path argument", file=sys.stderr)
         return EXIT["usage"]
     files = {key: getattr(args, f"{key}_file") for key in ("core", "plugin", "base")}
-    if args.mode in ("fixture", "qemu-fixture"):
+    control = args.mode == "control-build"
+    if control and any(files.values()):
+        print("control-build takes only --archive-file", file=sys.stderr)
+        return EXIT["usage"]
+    if control:
+        files = {}
+    if args.mode in ("fixture", "qemu-fixture", "control-build"):
         files["archive"] = args.archive_file
     elif args.archive_file is not None:
-        print("--archive-file is only for --mode fixture or qemu-fixture", file=sys.stderr)
+        print("--archive-file is only for --mode fixture, qemu-fixture or control-build", file=sys.stderr)
         return EXIT["usage"]
-    if args.mode not in STAGED_MODES and any(files.values()):
+    if args.mode not in STAGED_MODES and not control and any(files.values()):
         print("input files are only for --mode hcl-check, sentinel, sentinel-expiry, fixture or qemu-fixture",
               file=sys.stderr)
         return EXIT["usage"]
-    if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
-        print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file"
-              + (" and --archive-file" if args.mode in ("fixture", "qemu-fixture") else ""), file=sys.stderr)
+    if (args.mode in STAGED_MODES or control) and not all(f and PATH_RE.match(f) for f in files.values()):
+        print(f"{args.mode} requires "
+              + ("safe absolute --archive-file" if control else "safe absolute --core-file, --plugin-file and --base-file"
+                 + (" and --archive-file" if args.mode in ("fixture", "qemu-fixture") else "")), file=sys.stderr)
         return EXIT["usage"]
     if args.mode in VM_MODES and args.execute:
         try:
@@ -1320,7 +1632,7 @@ def main(argv=None):
         except ValueError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return EXIT["usage"]
-    image = (PREPARED_RUNTIME["image_id"] if args.mode == "runtime-check" else
+    image = (PREPARED_RUNTIME["image_id"] if args.mode in ("runtime-check", "control-build") else
              ((EXPIRY_RUNTIME if args.mode == "sentinel-expiry" else SENTINEL_RUNTIME)
               or PREPARED_RUNTIME)["image_id"] if args.mode in VM_MODES else PINNED_IMAGE)
     if not args.execute:
@@ -1342,7 +1654,7 @@ def main(argv=None):
                 raise ValueError("Docker config must be empty")
         result = run_probe(image, args.workspace_root, args.ledger_dir,
                            Backend(host=args.docker_host, config=config), handle_signals=True,
-                           mode=args.mode, sources=files if args.mode in STAGED_MODES else None)
+                           mode=args.mode, sources=files if args.mode in STAGED_MODES or control else None)
     except (ValueError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT["usage"]
