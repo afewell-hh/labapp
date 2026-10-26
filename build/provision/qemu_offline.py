@@ -143,7 +143,7 @@ def setup(root, snapshot):
         'Dir::State::lists': str(root / 'lists'), 'Dir::Cache::archives': str(root / 'archives'),
         'Dir::Cache::pkgcache': '', 'Dir::Cache::srcpkgcache': '',
         'APT::Architecture': 'amd64', 'APT::Architectures::': 'amd64',
-        'Acquire::Retries': '0', 'Acquire::https::Timeout': '15', 'Acquire::GzipIndexes': 'true',
+        'Acquire::Retries': '1', 'Acquire::https::Timeout': '15', 'Acquire::GzipIndexes': 'true',
         'DPkg::Lock::Timeout': '10', 'APT::Get::AllowUnauthenticated': 'false',
         'Acquire::AllowInsecureRepositories': 'false', 'Acquire::AllowWeakRepositories': 'false',
         'Acquire::AllowDowngradeToInsecureRepositories': 'false', 'Acquire::Check-Valid-Until': 'true',

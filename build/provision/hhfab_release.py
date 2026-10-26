@@ -26,13 +26,17 @@ def digest(path):
     return result.hexdigest()
 
 
-def bounded(args, seconds, limit=1024 * 1024, env=None):
+def bounded(args, seconds, limit=1024 * 1024, env=None, on_start=None):
     """Combined pipes capped in memory; kill/reap process group on every failure."""
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=env, start_new_session=True)
     output = bytearray()
     deadline = time.monotonic() + seconds
     try:
+        # Keep observation inside the cleanup boundary: a failing observer must
+        # never strand the child just launched above. Existing callers unchanged.
+        if on_start is not None:
+            on_start(proc.pid)
         with selectors.DefaultSelector() as select:
             select.register(proc.stdout, selectors.EVENT_READ)
             while select.get_map():
