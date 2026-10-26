@@ -300,16 +300,88 @@ class FixtureAssertionTests(unittest.TestCase):
         self.assertEqual(argv, ["/usr/bin/python3", "-B", self.cfg.probe, "--owner-uid", "1000",
                                 "--archive", "/in/archive.tar.gz"])
 
+    def good_probe(self):
+        return {"schema": af.PROBE_SCHEMA, "caller_uid": 0, "python": "3.12.3",
+                "checks": {"installer": {"version": af.VERSION, "sha256": af.MEMBER_SHA256,
+                    "mode": "0755", "uid": 1000, "gid": 1000, "supplementary_groups": [],
+                    "rerun": "unchanged", "cli": "passed"},
+                    "systemd": {"pid1": "systemd", "result": "success", "exec_main_status": 0,
+                        "marker": "matched", "cleanup": "verified-absent"},
+                    "kvm": {"uid": 0, "api_version": 12, "create_vm": "passed",
+                        "scope": "root-device-api-only", "l2_execution": "unproven"}}}
+
     def test_prereq_success_requires_the_exact_schema_and_checks(self):
-        good = {"schema": af.PROBE_SCHEMA, "caller_uid": 0, "python": "3.12.3",
-                "checks": {"installer": {}, "systemd": {}, "kvm": {}}}
+        good = self.good_probe()
         result, _ = self.probe_output(0, good)
         self.assertEqual((result, self.reason()), (0, None))
-        for bad in (dict(good, checks={"installer": {}}), dict(good, outcome="failed"),
-                    dict(good, schema="other"), b"not json", b"[]"):
+        # Every required success field, including all nested values, is enforced.
+        paths = [(key,) for key in good]
+        paths += [("checks", name) for name in good["checks"]]
+        paths += [("checks", name, key) for name, check in good["checks"].items() for key in check]
+        for path in paths:
+            for mutation in ("missing", "malformed"):
+                bad = json.loads(json.dumps(good))
+                target = bad
+                for part in path[:-1]:
+                    target = target[part]
+                if mutation == "missing":
+                    del target[path[-1]]
+                else:
+                    target[path[-1]] = None
+                with self.subTest(path=path, mutation=mutation):
+                    result, _ = self.probe_output(0, bad)
+                    self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                    os.unlink(self.cfg.reason)
+        for bad in (dict(good, outcome="failed"), dict(good, phase="kvm"),
+                    dict(good, caller_uid=False), dict(good, caller_uid=1),
+                    dict(good, python="3.9.1"), dict(good, python="SECRET"), b"not json", b"[]"):
             result, _ = self.probe_output(0, bad)
             self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
             os.unlink(self.cfg.reason)
+
+    def test_prereq_inconsistent_nested_success_values_and_types_are_refused(self):
+        changes = [("installer", "uid", 1001), ("installer", "gid", 0),
+                   ("installer", "uid", 1000.0), ("installer", "gid", True),
+                   ("installer", "supplementary_groups", [1000]), ("installer", "rerun", "installed"),
+                   ("installer", "sha256", "0" * 64), ("installer", "cli", "failed"),
+                   ("installer", "mode", "0777"), ("installer", "version", "9.9.9"),
+                   ("systemd", "exec_main_status", False), ("systemd", "cleanup", "uncertain"),
+                   ("systemd", "result", "failed"), ("systemd", "marker", "wrong"),
+                   ("kvm", "uid", False), ("kvm", "api_version", 11),
+                   ("kvm", "create_vm", "failed"), ("kvm", "l2_execution", "proven")]
+        for check, key, value in changes:
+            bad = self.good_probe()
+            bad["checks"][check][key] = value
+            with self.subTest(check=check, key=key, value=value):
+                result, _ = self.probe_output(0, bad)
+                self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+                os.unlink(self.cfg.reason)
+
+    def test_prereq_duplicate_keys_nonfinite_and_failure_missing_fields_are_invalid(self):
+        good = json.dumps(self.good_probe()).encode()
+        failure = json.dumps(self.failure()).encode()
+        cases = [(0, b"[" * 1500 + b"0" + b"]" * 1500),
+                 (1, b"[" * 1500 + b"0" + b"]" * 1500),
+                 (0, good[:-1] + b',"caller_uid":0}'),
+                 (0, good.replace(b'"api_version": 12', b'"api_version":12,"api_version":12')),
+                 (1, failure[:-1] + b',"phase":"kvm"}'),
+                 (1, failure.replace(b'"reason": "prerequisite command failed"', b'"reason":NaN'))]
+        for key in self.failure():
+            bad = self.failure()
+            del bad[key]
+            cases.append((1, bad))
+        for code, payload in cases:
+            result, _ = self.probe_output(code, payload)
+            self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_external_cutoff_reserves_unit_cleanup_but_does_not_extend_service(self):
+        # 210 work + 40 cleanup + three 2s reaps fits under300; final helper reap2.
+        self.assertEqual(af.PROBE_SECONDS, 300)
+        self.assertGreaterEqual(af.PROBE_SECONDS - (210 + 15 + 10 + 15 + 3 * 2), 44)
+        self.assertLess(af.PROBE_SECONDS + 2, 1500)
+        _, run = self.probe_output(0, self.good_probe())
+        self.assertEqual(run.call_args.args[2], 300)
 
     def test_prereq_rejects_malformed_inconsistent_or_unexpected_output(self):
         cases = [(1, b"{"), (1, b"\xff"), (1, b"[]"), (1, self.failure("network")),

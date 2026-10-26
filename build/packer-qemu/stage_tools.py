@@ -42,7 +42,7 @@ SENTINEL_PLAN = (f"root /bin/bash @IN@/{ASSERT_NAME} root\n"
 # The sentinel root+ubuntu/cloud-init steps come first and supply the pre-seal evidence line.
 PROVISION_DIR = os.path.normpath(os.path.join(HERE, "..", "provision"))
 PROVISION_FILES = ("install-hhfab.py", "hhfab_release.py")
-# Unchanged prerequisite probe, staged 0400 (run by root only). Its nonroot child reads the
+# Shared prerequisite probe, staged 0400 (run by root only). Its nonroot child reads the
 # installer pair and the archive, so exactly those are staged 0444.
 PROBE_FILE = "component_prerequisites.py"
 OWNER_UID = 1000          # the cloud image's dedicated `ubuntu` user; baseline asserts the mapping
@@ -54,8 +54,7 @@ _INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VE
 _ASSERT = f"root /usr/bin/python3 -I -B @IN@/{FIXTURE_ASSERT} "
 FIXTURE_PLAN = (SENTINEL_PLAN.decode() + _ASSERT + "baseline\n" + _INSTALL + _ASSERT + "snapshot\n"
                 + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n"
-                + f"root /usr/bin/python3 -B @IN@/{PROBE_FILE} --owner-uid {OWNER_UID} "
-                  f"--archive @IN@/{ARCHIVE_NAME}\n").encode()
+                + _ASSERT + f"prereq {OWNER_UID} @IN@/{ARCHIVE_NAME}\n").encode()
 
 # members: name -> (unix permission bits, uncompressed size, CRC32) from the #262 listing
 PINS = {

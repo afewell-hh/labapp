@@ -309,7 +309,7 @@ def probe_failure(text):
     """Strict failure shape; export only its fixed allowlisted phase."""
     try:
         value = strict_probe_json(text)
-    except (UnicodeError, ValueError):
+    except (UnicodeError, ValueError, RecursionError):
         return "prereq-invalid"
     if (not isinstance(value, dict) or set(value) != {"schema", "outcome", "reason", "phase"}
             or value["schema"] != PROBE_SCHEMA or value["outcome"] != "failed"
@@ -323,7 +323,7 @@ def probe_success(text, owner_uid=1000):
     """Require the unchanged original success fields and exact check contracts."""
     try:
         value = strict_probe_json(text)
-    except (UnicodeError, ValueError):
+    except (UnicodeError, ValueError, RecursionError):
         return False
     if (not isinstance(value, dict) or set(value) != {"schema", "caller_uid", "python", "checks"}
             or value["schema"] != PROBE_SCHEMA or type(value["caller_uid"]) is not int

@@ -547,8 +547,7 @@ class FixtureStagingTests(ts.StageCase):
             "root /bin/bash @IN@/assert-sentinel.sh root", "ubuntu /bin/bash @IN@/assert-sentinel.sh ubuntu",
             check + "baseline", install, check + "snapshot", install, check + "verify",
             check + "negatives", check + "smoke",
-            "root /usr/bin/python3 -B @IN@/component_prerequisites.py --owner-uid 1000 "
-            "--archive @IN@/hhfab-linux-amd64-v0.50.4.tar.gz"])
+            check + "prereq 1000 @IN@/hhfab-linux-amd64-v0.50.4.tar.gz"])
         self.assertEqual(st.OWNER_UID, 1000)       # explicit dedicated owner, never root's 0
         self.assertEqual(st.FIXTURE_PLAN.decode().count("install-hhfab.py"), 2)
         self.assertNotIn("--install-dir", st.FIXTURE_PLAN.decode())      # the default /usr/local/bin

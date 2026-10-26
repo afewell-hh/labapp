@@ -460,7 +460,7 @@ ownership, retention and disposition stay outside this repository until the lead
   4 `/usr/bin/python3 -B install-hhfab.py --version 0.50.4 --archive ...` as root, cwd `/`, sanitized environment, default
   `/usr/local/bin`; 5 `snapshot` (exact member hash, regular/single-link/0755/owner, unrelated entries untouched, no
   `.hhfab-stage-*`, inode/size/mtime/ctime recorded); 6 the identical installer argv again; 7 `verify` (rerun left the same inode and times, so it
-  answered `unchanged`, and nothing else changed); 8 `negatives`; 9 `smoke`; 10 the unchanged
+  answered `unchanged`, and nothing else changed); 8 `negatives`; 9 `smoke`; 10 the fixed `assert-fixture.py prereq 1000 <archive>` wrapper invokes the shared
   `build/provision/component_prerequisites.py` as root with `--owner-uid 1000 --archive ...` (last, so steps 1-9 keep their
   numbers). `baseline` also requires `ubuntu` to be uid 1000 with a nonzero primary group (token `owner-map`), so the probe never
   runs against root or an unintended user. The probe checks PID1/systemd transient-unit start/result/cleanup, a stripped-groups
@@ -486,9 +486,6 @@ ownership, retention and disposition stay outside this repository until the lead
   source file can become `0600` under umask `077` before ISO creation. Source hash/mode tests
   and direct xorriso checks therefore cannot establish the final guest copy's accessibility.
   Guest normalization and actual early nonroot read/import/privacy assertions cover that boundary.
-* Probe diagnostics: step 10 failure reports only `step=10 exit=N reason=plan-step`. The unchanged probe's JSON reason is
-  deliberately not exported and it exits 1 for installer, systemd and KVM failures alike, so a missing guest `/dev/kvm` cannot be told
-  from an earlier probe failure without changing the probe or adding a wrapper step; neither is done here.
 * `negatives` run the unchanged installer against ISOLATED owned directories under `/run`, never `/usr/local/bin`: a
   same-size corrupted copy of the archive against nonmatching prior bytes (never executed) and against an absent
   target must exit 1 with exactly the archive checksum/size refusal and leave those bytes, mode and times and the directory
@@ -501,11 +498,16 @@ ownership, retention and disposition stay outside this repository until the lead
   (`owner-map`, `dir-state`, `target-present`, `stage-leftover`, `install-state`, `dir-preserved`, `rerun-state`, `archive-integrity`, `bad-version`,
   `neg-state`, `negative-timeout`, `state-missing`, `cli-run`, `cli-version`, `cli-timeout`, `output-bound`, `internal`) or `plan-step`. The observer validates it against the run's nonce and
   inputs and appends only those fields to its failure reason. The `prereq <owner-uid> <archive>` assertion phase runs
-  `/usr/bin/python3 -B component_prerequisites.py --owner-uid U --archive A` through the same bounded helper (4 KiB, 240 s
+  `/usr/bin/python3 -B component_prerequisites.py --owner-uid U --archive A` through the same bounded helper (4 KiB, 300 s
   wrapper deadline above the probe's 210 s alarm), strictly parses the fixed schema/outcome/phase/exit, and maps only an
   allowed phase to `prereq-preflight|installer|systemd|kvm|cleanup|unknown`; malformed, inconsistent, overlong or
-  unexpected-exit output is `prereq-invalid` and a deadline is `prereq-timeout`. It is for the step-10 probe invocation
-  of the stacked fixture; this branch has no step 10, so the plan is unchanged here. The runner keeps that bounded text as
+  unexpected-exit output is `prereq-invalid` and a deadline is `prereq-timeout`.
+  The external 300s cutoff covers the internal210s plus unit cleanup15+10+15s
+  and three2s reap allowances, leaving44s scheduling/filesystem margin. Cleanup
+  completion is not guaranteed by this cutoff; the existing helper adds at most2s
+  final group reap. Existing service1500s/work1800s deadlines stay unchanged. Success JSON must match the
+  original complete root-caller, Python and installer/systemd/KVM check contracts; duplicate JSON keys are refused.
+  The runner keeps that bounded text as
   `evidence.observer_failure` beyond the 2 KiB excerpt. No guest stdout/stderr is exported.
 * Budget: 1800 s work INCLUDING staging from admission + 900 s cleanup, no renewal (proposed, unmeasured).
   The staged 60 MB CD file and the two extractions are unmeasured; large-ISO readback is a separate offline-checkable
