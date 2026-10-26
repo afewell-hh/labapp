@@ -1,7 +1,7 @@
 """Fixed bounded tasks in one owned Docker container.
 
 Fixed probe, HCL and non-VM runtime checks require separately scoped lead execution.
-The sentinel VM mode remains gated on a separate accepted execution identity.
+The sentinel and sentinel-expiry VM modes remain gated on separately accepted execution identities.
 Docker is reached only through `Backend`; tests substitute a fake. The CLI refuses
 to contact Docker unless `--execute` is given (otherwise it prints the plan).
 Python 3.10+ stdlib. See README.md "Bounded container probe" for unmet gates.
@@ -38,15 +38,20 @@ PINNED_IMAGE = "ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d
 # hcl-check: 120 s work INCLUDING all staging from admission + 30 s cleanup, no renewal.
 # runtime-check: 90 s work + 30 s cleanup, no staging or renewal.
 # sentinel: 15 min work INCLUDING staging from admission + 5 min cleanup, no renewal.
-PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30)}
+# sentinel-expiry: 300 s work INCLUDING staging + 120 s cleanup, no renewal. A failure-only
+# proof: a paused KVM guest must outlive >=60 s until THIS container's own timer ends it.
+PROFILES = {"probe": (30, 20), "hcl-check": (120, 30), "sentinel": (900, 300), "runtime-check": (90, 30),
+            "sentinel-expiry": (300, 120)}
 MODES = tuple(PROFILES)
-STAGED_MODES = ("hcl-check", "sentinel")
+VM_MODES = ("sentinel", "sentinel-expiry")      # the only modes that receive /dev/kvm
+STAGED_MODES = ("hcl-check", "sentinel", "sentinel-expiry")
 # Proposed explicit bounds, not measured requirements. The sentinel guest is 4 vCPU /
 # 8 GiB (labapp.pkr.hcl); the container adds headroom for QEMU, Packer and the observer.
 LIMITS = {"runtime-check": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "probe": ("--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=64"),
           "hcl-check": ("--memory=1g", "--memory-swap=1g", "--cpus=1", "--pids-limit=128"),
           "sentinel": ("--memory=10g", "--memory-swap=10g", "--cpus=5", "--pids-limit=512")}
+LIMITS["sentinel-expiry"] = LIMITS["sentinel"]
 # Preparation artifact accepted in #266 comment 6406373578. Bound to original source
 # 6b920067 / Dockerfile SHA256 63988869315f1df724e01647c6a334901f28edd689f1039c35080812e7e9e1ef;
 # comment changes to that recipe do not mean this artifact was rebuilt. Tool execution
@@ -59,7 +64,17 @@ PREPARED_RUNTIME = {'image_id': 'sha256:64584cc2aac727f22d8cdbf5c7d8cd77c457089e
 # A separate VM execution gate: preparation/tool acceptance does not set this.
 # No CLI, environment or caller option can supply or override either identity.
 SENTINEL_RUNTIME = None
-# Proposed, unmeasured reservation inside the ORIGINAL work window for Docker calls, Packer
+# Failure-only identity for the fixed sentinel-expiry proof; a separate gate so the success
+# runtime stays unset. Activation (setting it to PREPARED_RUNTIME) needs separate lead review.
+EXPIRY_RUNTIME = None
+# The observer must outlive the container timer (<= 300 s), so its own and the shell-local
+# secondary timeouts are set far above the work window and can never fire first.
+EXPIRY_VERIFY_SECONDS = 3600
+EXPIRY_MIN_REMAINING = 150     # work left after staging for startup, paused dwell and exit
+EXPIRY_MIN_DWELL = 60          # armed witness must precede the container timer by this much
+ARMED_KEYS = {"kind", "armed", "armed_at", "nonce", "inputs"}
+ARMED_KIND = "labapp-expiry-armed v1"
+START_WITNESS_RE = re.compile(r"^start (\d{1,12}) (\d{1,4})\n$")# Proposed, unmeasured reservation inside the ORIGINAL work window for Docker calls, Packer
 # start, ISO creation, disk conversion, rehash and result reads. The pinned plugin's
 # 5 min shutdown_timeout is NOT subtracted: with communicator=none the observer returns
 # only after guest shutdown, and a later shutdown wait returns at once.
@@ -412,9 +427,9 @@ def create_args(name, label, image_id, user, workspace, deadline, boot_id="<boot
                 mode="probe", kvm_gid="<kvm-gid>"):
     """Exact, fixed creation argv: no init, no restart, no pull, healthcheck off.
     sentinel adds exactly /dev/kvm and its numeric group; nothing else widens."""
-    kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode == "sentinel" else []
+    kvm = [f"--device={KVM_DEVICE}", f"--group-add={kvm_gid}"] if mode in VM_MODES else []
     script = {"probe": PROBE_SCRIPT, "hcl-check": HCL_SCRIPT, "sentinel": SENTINEL_SCRIPT,
-              "runtime-check": RUNTIME_SCRIPT}[mode]
+              "sentinel-expiry": SENTINEL_SCRIPT, "runtime-check": RUNTIME_SCRIPT}[mode]
     return ["create", "--pull=never", f"--name={name}", f"--label={label}",
             "--restart=no", "--network=none", "--cap-drop=ALL", "--no-healthcheck",
             "--security-opt=no-new-privileges", "--read-only", f"--user={user}",
@@ -426,9 +441,9 @@ class HardwareMissing(Exception):
     """/dev/kvm is absent or unusable by the nonroot runner; never replaced by TCG."""
 
 
-def require_runtime():
-    """Fail closed unless the lead-accepted concrete sentinel runtime identity is set."""
-    runtime = SENTINEL_RUNTIME
+def require_runtime(mode="sentinel"):
+    """Fail closed unless the lead-accepted concrete runtime identity for this VM mode is set."""
+    runtime = EXPIRY_RUNTIME if mode == "sentinel-expiry" else SENTINEL_RUNTIME
     ok = (isinstance(runtime, dict) and set(runtime) == {"image_id", "diffids"}
           and isinstance(runtime["image_id"], str) and IMAGE_ID_RE.fullmatch(runtime["image_id"])
           and isinstance(runtime["diffids"], list) and runtime["diffids"]
@@ -531,8 +546,8 @@ def read_witness(path, deadline, started_after):
 def run_probe(image, root, ledger_dir, backend, **kwargs):
     # Nonblocking admission: one host ledger authority must be used for this
     # endpoint. Hold this lock through scan, reservation, cleanup and publication.
-    if kwargs.get("mode") == "sentinel":
-        require_runtime()      # before the lock, ledger, workspace, staging or any Docker call
+    if kwargs.get("mode") in VM_MODES:
+        require_runtime(kwargs["mode"])      # before the lock, ledger, workspace, staging or any Docker call
     check_private_dir(ledger_dir, kwargs.get("uid") or os.getuid(), "ledger dir")
     kwargs.setdefault("admitted_at", kwargs.get("clock", boot_clock)())
     try:
@@ -560,8 +575,8 @@ def _run_probe_locked(image, root, ledger_dir, backend, *, clock=boot_clock, sle
         raise ValueError("unknown mode")
     if mode in STAGED_MODES and not (isinstance(sources, dict) and set(sources) == {"core", "plugin", "base"}):
         raise ValueError(f"{mode} needs exactly the core, plugin and base input files")
-    if mode == "sentinel":
-        require_runtime()
+    if mode in VM_MODES:
+        require_runtime(mode)
     w, c = PROFILES[mode]
     budget = Budget(w if work is None else work, c if cleanup is None else cleanup, clock, admitted_at)
     expected_image = PREPARED_RUNTIME["image_id"] if mode == "runtime-check" else PINNED_IMAGE
@@ -638,7 +653,7 @@ def _checkpoint(own, budget, clock):
 def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
     ledger = own["ledger"]
     kvm_gid = None
-    if own["mode"] == "sentinel":
+    if own["mode"] in VM_MODES:
         kvm_gid = kvm_preflight()      # metadata only; no TCG fallback exists
     # Preparation consumes the same budget as everything else.
     own["workspace"] = make_workspace(root, own["ident"], uid)
@@ -653,14 +668,20 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
                     raise Expired()
                 return left
             extra = {"task": "sentinel", "verify_seconds": verify_budget}
+        elif own["mode"] == "sentinel-expiry":
+            def expiry_budget():
+                if budget.work_left() < EXPIRY_MIN_REMAINING:
+                    raise Expired()      # staging consumed too much of the original 300 s
+                return EXPIRY_VERIFY_SECONDS
+            extra = {"task": "sentinel-expiry", "verify_seconds": expiry_budget}
         own["staged"] = stage_tools.stage(own["workspace"], own["sources"], os.urandom(32).hex(),
                                           lambda: _checkpoint(own, budget, clock), pins=stage_tools.PINS,
                                           **extra)
         _checkpoint(own, budget, clock)
     backend.call(["version", "--format", "{{.Server.Version}}"], budget.seconds(CALL_CAP, budget.work_deadline))
     _checkpoint(own, budget, clock)
-    if own["mode"] in ("sentinel", "runtime-check"):
-        runtime = require_runtime() if own["mode"] == "sentinel" else PREPARED_RUNTIME
+    if own["mode"] in VM_MODES + ("runtime-check",):
+        runtime = PREPARED_RUNTIME if own["mode"] == "runtime-check" else require_runtime(own["mode"])
         image_id = check_runtime(backend.call(["image", "inspect", "--format", IMAGE_FORMAT,
                                                runtime["image_id"]],
                                               budget.seconds(CALL_CAP, budget.work_deadline)), runtime)
@@ -715,6 +736,9 @@ def _run(image, root, backend, budget, own, result, sleep, uid, gid, clock):
         return
     if own["mode"] == "sentinel":
         _accept_sentinel(own, result, budget, clock, oom, code)
+        return
+    if own["mode"] == "sentinel-expiry":
+        _accept_expiry(own, result, budget, clock, oom, code)
         return
     if oom or code not in EXPECTED_EXIT:
         result["reason"] = "unexpected_exit"
@@ -935,6 +959,102 @@ def _accept_sentinel(own, result, budget, clock, oom, code):
     result["exit_code"] = code
 
 
+def _armed_valid(raw, staged, n, t):
+    """The observer's armed witness is untrusted container output: exactly the five fixed keys,
+    this run's nonce and guest-receipt identity, and a paused-state time that leaves at least
+    EXPIRY_MIN_DWELL seconds before the container timer (start n, t seconds) fires."""
+    try:
+        body = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs,
+                          parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return False
+    return (isinstance(body, dict) and set(body) == ARMED_KEYS and body["kind"] == ARMED_KIND
+            and body["armed"] == "paused" and body["nonce"] == staged["nonce"]
+            and body["inputs"] == staged["guest_receipt"]
+            and type(body["armed_at"]) is int and n <= body["armed_at"]
+            and (n + t) - body["armed_at"] >= EXPIRY_MIN_DWELL)
+
+
+def _accept_expiry(own, result, budget, clock, oom, code):
+    """Accept a FAILURE-ONLY proof: the guest was paused by the sole observer (running, stop,
+    paused all answered) and the container's own PID 1 timer ended Packer/QEMU at least
+    EXPIRY_MIN_DWELL seconds later. It is never a successful guest or build: a completed build
+    step, a success marker, an early or OOM exit, or a missing/malformed witness all fail.
+    Bounded diagnostics and hashes are retained BEFORE any decision; cleanup is in _finish."""
+    out = os.path.join(own["workspace"], "out")
+    staged = own["staged"]
+    evidence = {"image_id": own["image_id"], "runtime_diffids": EXPIRY_RUNTIME["diffids"],
+                "proof": "expected_expiry", "build_success": False,
+                "inputs": staged["inputs"], "guest_receipt": staged["guest_receipt"],
+                "nonce_sha256": hashlib.sha256(staged["nonce"].encode()).hexdigest(),
+                "verify_seconds": staged["verify_seconds"], "vars_sha256": staged["vars_sha256"],
+                "hcl_sha256": staged["hcl_sha256"], "base_sha256": staged["base_sha256"],
+                "core_member_sha256": staged["core_member_sha256"],
+                "plugin_member_sha256": staged["plugin_member_sha256"], "exit_code": code,
+                "oom_killed": oom, "command": "packer build -var-file=sentinel.pkrvars.hcl labapp.pkr.hcl",
+                "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    result["evidence"] = evidence
+    work = os.path.join(out, "work")
+    raw = {"build.out": read_step(out, "build.out"), "build.err": read_step(out, "build.err"),
+           "witness": read_step(out, "witness", 256), "steps": read_step(out, "steps"),
+           "armed.json": read_step(work, "armed.json", RESULT_CAP),
+           "verified.json": read_step(work, "verified.json", RESULT_CAP)}
+    for name, data in raw.items():
+        if data is not None:
+            evidence[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            if name in ("build.out", "build.err", "steps"):
+                evidence[name]["excerpt"] = data[:EXCERPT].decode("ascii", "replace")
+    artifact = os.path.join(work, "out", "labapp.qcow2")
+    try:
+        if os.path.lexists(artifact):
+            evidence["artifact"] = {"bytes": os.lstat(artifact).st_size}      # not hashed: disposable partial
+            os.unlink(artifact)
+            if os.path.lexists(artifact):
+                raise OSError("artifact still exists")
+            evidence["artifact"]["deleted"] = True
+    except OSError:
+        result["reason"] = "artifact_invalid_or_not_deleted"
+        return
+    missing = sorted(n for n in ("build.out", "build.err", "witness") if raw[n] is None)
+    if missing:
+        evidence["invalid_files"] = missing
+        result["reason"] = "invalid_step_evidence"
+        return
+    if oom or code not in EXPECTED_EXIT:
+        result["reason"] = "unexpected_exit"
+        return
+    if raw["verified.json"] is not None:
+        result["reason"] = "unexpected_success_marker"
+        return
+    if raw["steps"] is not None:
+        result["reason"] = "build_completed_before_expiry"
+        return
+    match = START_WITNESS_RE.fullmatch(raw["witness"].decode("ascii", "replace"))
+    n, t = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+    if not match or t != own["deadline"] - n - 1 - KILL_AFTER or t < MIN_TIMER or n < int(own["started_at"]) - 1:
+        result["reason"] = "no_timer_witness"
+        return
+    if own["exit_seen_at"] - own["started_at"] < t - 1:
+        result["reason"] = "exited_before_timer"
+        return
+    if raw["armed.json"] is None:
+        result["reason"] = "missing_armed_witness"
+        return
+    if not _armed_valid(raw["armed.json"], staged, n, t):
+        result["reason"] = "invalid_or_short_armed_witness"
+        return
+    try:
+        intact = stage_tools.verify_staged(own["workspace"], staged,
+                                           lambda: _checkpoint(own, budget, clock))
+    except (OSError, stage_tools.StageError):
+        intact = False
+    if not intact:
+        result["reason"] = "staged_inputs_changed"
+        return
+    result["outcome"], result["reason"] = "accepted", None
+    result["exit_code"], result["proof"] = code, "expected_expiry"
+
+
 def _finish(backend, budget, own, result, clock):
     ledger = own["ledger"]
     if ledger is None:        # reservation never became durable: no mutation was attempted
@@ -1051,9 +1171,9 @@ def main(argv=None):
     if args.mode in STAGED_MODES and not all(f and PATH_RE.match(f) for f in files.values()):
         print(f"{args.mode} requires safe absolute --core-file, --plugin-file and --base-file", file=sys.stderr)
         return EXIT["usage"]
-    if args.mode == "sentinel" and args.execute:
+    if args.mode in VM_MODES and args.execute:
         try:
-            require_runtime()       # before Docker config, staging or any daemon contact
+            require_runtime(args.mode)     # before Docker config, staging or any daemon contact
         except ValueError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return EXIT["usage"]
@@ -1063,7 +1183,8 @@ def main(argv=None):
                            "<uid>:<gid>", args.workspace_root + "/labapp-probe-<uuid>", "<deadline boottime>",
                            mode=args.mode)
         print(json.dumps({"mode": args.mode, "executed": False, "image": image, "create": plan,
-                          "runtime_accepted": SENTINEL_RUNTIME is not None if args.mode == "sentinel" else None}))
+                          "runtime_accepted": (EXPIRY_RUNTIME if args.mode == "sentinel-expiry"
+                                               else SENTINEL_RUNTIME) is not None if args.mode in VM_MODES else None}))
         return 0
     try:
         config = os.path.join(args.ledger_dir, "docker-config")     # empty: no helpers/credentials
