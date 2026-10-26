@@ -652,6 +652,15 @@ to the public registry, and independent exact-head review.
   descriptor mappings **in memory only**, so on-disk cache auditing cannot establish selected root manifests or
   four packed-directory descriptor correspondences. Those remain explicitly **unverified**, as do signatures;
   this is component measurement scope, not reproducible artifact acceptance. No new query/downloader is added.
+  Inside the exclusively owned cache only, names follow POSIX component semantics: NUL and separators cannot
+  occur inside a component, and paths must be absolute, normalized (no empty/dot/dotdot traversal components)
+  and structurally beneath the exact owned-cache root. Spaces, plus signs, brackets, quotes, colons, Unicode and
+  literal control characters/newlines are valid filename bytes; they never enter a shell or retained raw text.
+  Anchored directory descriptors still require `O_DIRECTORY|O_NOFOLLOW` for every parent and `O_NOFOLLOW` plus
+  regular-file/stable-identity checks for each file. Symlinks and special entries remain refused. The generic
+  staged-input path policy is unchanged. Public bash-completion
+  [2.16.0 source fixtures](https://github.com/scop/bash-completion/tree/2.16.0/test/fixtures/_filedir)
+  include bracket, space and apostrophe filename classes; those are not evidence of a disposed trial's exact name.
 * Independent staged-input rehash runs after valid phase evidence and before ISO hashing/cache audit. Its
   `staged_inputs_verification` is `not_run`, `incomplete`, `passed` or `failed`; a failure refuses the task and
   prevents the cache audit. `cache_audit.status` likewise distinguishes `not_run`, `incomplete`, `passed` and

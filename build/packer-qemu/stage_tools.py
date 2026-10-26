@@ -552,11 +552,21 @@ CONTROL_CACHE_REFERENCES = (('fabricator_k3s-airgap@v1.36.3-k3s1.oras',
     391744600,
     '50b390c0bad46bf33cbce5e9afd1a557f96d56a8e1298e7920730e53e7c49efb',
     False))))
-CONTROL_CACHE_PATH_RE = re.compile(r"^/[A-Za-z0-9_@./-]+$")
+# Cache names are POSIX components, never shell arguments or receipt text.
+# NUL and separators cannot occur inside a component; normalization/confinement
+# below rejects empty/dot/dotdot components without guessing upstream characters.
+CONTROL_CACHE_PATH_RE = re.compile(r"\A/(?:[^/\x00]+/)*[^/\x00]+\Z")
 CONTROL_CACHE_ENTRY_CAP = 200000
 CONTROL_CACHE_BYTE_CAP = 32 << 30
 CONTROL_CACHE_FINGERPRINT = hashlib.sha256(json.dumps(
     CONTROL_CACHE_REFERENCES, separators=(',', ':')).encode('ascii')).hexdigest()
+
+
+def _control_cache_path_confined(path, owned_cache):
+    """Lexical boundary only; anchored no-follow descriptors enforce filesystem confinement."""
+    return bool(CONTROL_CACHE_PATH_RE.fullmatch(owned_cache) and os.path.normpath(owned_cache) == owned_cache
+                and CONTROL_CACHE_PATH_RE.fullmatch(path) and os.path.normpath(path) == path
+                and os.path.commonpath((owned_cache, path)) == owned_cache)
 
 
 class CacheAuditRefusal(StageError):
@@ -591,6 +601,7 @@ def verify_control_cache(cache, check=_noop):
     """
     count = total = files = directories = 0
     stage, indices = 'version', {}
+    owned_cache = cache
 
     def refuse(reason, **counts):
         raise CacheAuditRefusal(stage, reason, **indices, entries_scanned=count,
@@ -599,6 +610,8 @@ def verify_control_cache(cache, check=_noop):
 
     def children(directory):
         nonlocal count
+        if not _control_cache_path_confined(directory, owned_cache):
+            refuse('path_policy')
         fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             for part in directory.split('/')[1:]:
@@ -623,7 +636,7 @@ def verify_control_cache(cache, check=_noop):
                    missing_count=len(set(expected) - set(observed)), extra_count=len(set(observed) - set(expected)))
 
     def checked_hash(path, info, size=None):
-        if not CONTROL_CACHE_PATH_RE.fullmatch(path) or os.path.normpath(path) != path:
+        if not _control_cache_path_confined(path, owned_cache):
             refuse('path_policy')
         if not stat.S_ISREG(info.st_mode):
             refuse('entry_type')

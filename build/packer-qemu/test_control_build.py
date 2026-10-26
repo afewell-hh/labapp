@@ -230,7 +230,7 @@ class CacheFailureReceiptTests(unittest.TestCase):
         self.assertEqual(receipt['payload_bytes_hashed'], 2 * len(MEMBER))
         self.assertEqual(receipt['regular_payloads_verified'], 1)
 
-    def test_alias_empty_unpacked_tree_and_unsafe_name_remain_refused(self):
+    def test_alias_and_empty_unpacked_tree_remain_refused(self):
         target = self.path(6, 0)
         leaf = os.path.join(target, 'synthetic-file')
         os.unlink(leaf)
@@ -238,10 +238,6 @@ class CacheFailureReceiptTests(unittest.TestCase):
         self.assertEqual((receipt['root_index'], receipt['payload_index']), (6, 0))
         os.symlink('/etc/passwd', leaf)
         self.refused('unpacked', 'entry_type')
-        os.unlink(leaf)
-        with open(os.path.join(target, self.SECRET + ' unsafe'), 'wb') as handle:
-            handle.write(b'synthetic')
-        self.refused('unpacked', 'path_policy')
 
     def test_helper_filesystem_and_unknown_errors_never_export_messages(self):
         for error, reason in ((OSError(self.SECRET), 'filesystem'),
@@ -281,6 +277,124 @@ class CacheFailureReceiptTests(unittest.TestCase):
 
     def test_expiry_during_hash_is_not_reclassified_as_a_cache_refusal(self):
         with mock.patch.object(st, 'hash_file', side_effect=cr.Expired()):
+            with self.assertRaises(cr.Expired):
+                st.verify_control_cache(self.cache)
+
+
+class CacheComponentPathTests(unittest.TestCase):
+    # First three are filename classes in the official bash-completion2.16.0
+    # source tree, not identified names in either disposed trial artifact.
+    NAMES = ('[x]', 'a b', "a'b", 'g++', 'a:b', '"quoted"', 'unicode-é-中',
+             'line\nbreak', 'tab\tname', 'escape\x1bname', 'back\\slash', '$(must-not-run)')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = os.path.realpath(self.tmp.name)
+        self.references = synthetic_cache_references()
+        patcher = mock.patch.object(st, 'CONTROL_CACHE_REFERENCES', self.references)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        write_cache(self.cache, self.references)
+        self.subtree = os.path.join(self.cache, 'v1', self.references[6][0], 'bash-completion')
+
+    def test_posix_component_classes_are_hashed_without_shell_or_raw_name_export(self):
+        parent = os.path.join(self.subtree, 'directory with +[x]')
+        os.mkdir(parent)
+        for name in self.NAMES + (os.fsdecode(b'nonutf8-\xff'),):
+            with open(os.path.join(parent, name), 'wb') as handle:
+                handle.write(MEMBER)
+        with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected child')):
+            receipt = st.verify_control_cache(self.cache)
+        self.assertEqual((receipt['regular_payloads_verified'], receipt['unpacked_directories']), (15, 4))
+        serialized = json.dumps(receipt)
+        for name in self.NAMES + (os.path.basename(parent),):
+            self.assertNotIn(json.dumps(name), serialized)
+        before = receipt['unpacked_content']
+        os.rename(os.path.join(parent, '[x]'), os.path.join(parent, '[different]'))
+        self.assertNotEqual(st.verify_control_cache(self.cache)['unpacked_content'], before)
+
+    def test_confinement_rejects_traversal_absolute_escape_sibling_prefix_and_nul(self):
+        allowed = self.subtree + '/g++\n[x]'
+        self.assertTrue(st._control_cache_path_confined(allowed, self.cache))
+        for path in (self.cache + '/./file', self.cache + '/../outside', self.cache + '//file',
+                     self.cache + '-sibling/file', '/etc/passwd', 'relative/file',
+                     self.cache + '/nul\x00name', self.cache + '/trailing/', '//' + self.cache.lstrip('/')):
+            with self.subTest(path=repr(path)):
+                self.assertFalse(st._control_cache_path_confined(path, self.cache))
+        self.assertFalse(st._control_cache_path_confined(allowed, self.cache + '/..'))
+        with self.assertRaises(st.CacheAuditRefusal) as raised:
+            st.verify_control_cache(self.cache + '/v1/..')
+        self.assertEqual(raised.exception.receipt['reason'], 'path_policy')
+
+    def test_generic_staging_path_policy_remains_unchanged(self):
+        path = os.path.join(self.cache, 'generic+name')
+        with open(path, 'wb') as handle:
+            handle.write(MEMBER)
+        self.assertFalse(st.PATH_RE.fullmatch(path))
+        with self.assertRaises(st.StageError):
+            st.hash_file(path)
+
+    def test_symlink_and_fifo_in_newly_allowed_directory_still_refuse_without_open(self):
+        directory = os.path.join(self.subtree, 'directory +[x]')
+        os.mkdir(directory)
+        for scenario in ('symlink', 'fifo'):
+            leaf = os.path.join(directory, 'name with spaces')
+            if scenario == 'symlink':
+                os.symlink('/etc/passwd', leaf)
+            else:
+                os.mkfifo(leaf, 0o600)
+            with self.subTest(scenario=scenario), mock.patch.object(st, 'open_regular', wraps=st.open_regular) as opened:
+                with self.assertRaises(st.CacheAuditRefusal) as raised:
+                    st.verify_control_cache(self.cache)
+                self.assertEqual(raised.exception.receipt['reason'], 'entry_type')
+                self.assertFalse(any(call.args[0] == leaf for call in opened.call_args_list))
+            os.unlink(leaf)
+
+    def test_parent_or_leaf_swap_cannot_follow_an_outside_alias(self):
+        original = st.hash_file
+        directory = os.path.join(self.subtree, 'swappable +[x]')
+        os.mkdir(directory)
+        target = os.path.join(directory, 'leaf with spaces')
+        with tempfile.TemporaryDirectory() as outside:
+            outside_leaf = os.path.join(outside, 'leaf with spaces')
+            with open(outside_leaf, 'wb') as handle:
+                handle.write(b'synthetic outside secret')
+            for scenario in ('parent', 'leaf'):
+                with open(target, 'wb') as handle:
+                    handle.write(MEMBER)
+                def swapped(path, *args, **kwargs):
+                    if path == target:
+                        if scenario == 'parent':
+                            os.rename(directory, directory + '-moved')
+                            os.symlink(outside, directory)
+                        else:
+                            os.unlink(target)
+                            os.symlink(outside_leaf, target)
+                    return original(path, *args, **kwargs)
+                with self.subTest(scenario=scenario), mock.patch.object(st, 'hash_file', side_effect=swapped):
+                    with self.assertRaises(st.CacheAuditRefusal) as raised:
+                        st.verify_control_cache(self.cache)
+                    self.assertEqual(raised.exception.receipt['reason'], 'filesystem')
+                    self.assertNotIn('outside secret', json.dumps(raised.exception.receipt))
+                if scenario == 'parent':
+                    os.unlink(directory)
+                    os.rename(directory + '-moved', directory)
+                else:
+                    os.unlink(target)
+                with open(outside_leaf, 'rb') as handle:
+                    self.assertEqual(handle.read(), b'synthetic outside secret')
+
+    def test_expiry_on_allowed_filename_is_not_reclassified(self):
+        target = os.path.join(self.subtree, 'g++ [x]')
+        with open(target, 'wb') as handle:
+            handle.write(MEMBER)
+        original = st.hash_file
+        def expired(path, *args, **kwargs):
+            if path == target:
+                raise cr.Expired()
+            return original(path, *args, **kwargs)
+        with mock.patch.object(st, 'hash_file', side_effect=expired):
             with self.assertRaises(cr.Expired):
                 st.verify_control_cache(self.cache)
 
@@ -733,6 +847,26 @@ class FailClosedTests(ControlCase):
                 self.assertEqual(result["outcome"], "failed", result)
                 self.assertEqual(result["reason"], reason)
                 self.assert_fully_cleaned(result, daemon)
+
+    def test_allowed_filename_before_later_hash_refusal_is_private_and_fully_cleaned(self):
+        original = write_cache
+        name = 'private fixture +[x] unicode-é\nname'
+        def cache_with_names(cache, references):
+            original(cache, references)
+            tree = os.path.join(cache, 'v1', references[6][0], 'bash-completion')
+            with open(os.path.join(tree, name), 'wb') as handle:
+                handle.write(MEMBER)
+            target = os.path.join(cache, 'v1', references[9][0], references[9][2][5][0])
+            with open(target, 'wb') as handle:
+                handle.write(b'x' * len(MEMBER))
+        with mock.patch(__name__ + '.write_cache', side_effect=cache_with_names):
+            result, daemon = self.run_control()
+        self.assertEqual(result['reason'], 'cache_identity_mismatch')
+        audit = result['evidence']['cache_audit']
+        self.assertEqual((audit['reason'], audit['root_index'], audit['payload_index']), ('file_hash', 9, 5))
+        self.assertEqual(result['evidence']['staged_inputs_verification'], 'passed')
+        self.assertNotIn(json.dumps(name), json.dumps(result))
+        self.assert_fully_cleaned(result, daemon)
 
     def test_cache_refusal_retains_successful_staged_rehash_and_exact_cleanup(self):
         result, daemon = self.run_control('cache_mismatch')
