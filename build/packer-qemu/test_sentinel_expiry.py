@@ -225,6 +225,25 @@ class AcceptanceTests(ExpiryCase):
         self.assertEqual(daemon.containers, {})
         self.assertEqual((self.record()["state"], self.record()["mode"]), ("released", "sentinel-expiry"))
 
+    def test_released_expiry_record_allows_reuse_only_for_accepted_mode_identity(self):
+        result, _ = self.run_expiry()
+        self.assertEqual(result["outcome"], "accepted")
+        record = self.record()
+        self.assertEqual(record["image"], RUNTIME["image_id"])
+        self.assertTrue(cr.released_record(record))
+        self.assertEqual(cr.unresolved_records(self.ledger), [])
+        self.assertFalse(cr.released_record({**record, "image": cr.PINNED_IMAGE}))
+        self.assertFalse(cr.released_record({**record, "mode": "unknown"}))
+        self.assertFalse(cr.released_record({**record, "mode": "sentinel"}))  # success gate closed
+        for runtime in (None, {}, {"image_id": RUNTIME["image_id"], "diffids": []}):
+            with self.subTest(runtime=runtime), mock.patch.object(cr, "EXPIRY_RUNTIME", runtime):
+                self.assertFalse(cr.released_record(record))
+        with mock.patch.object(cr, "EXPIRY_RUNTIME", {**RUNTIME, "image_id": "sha256:" + "9" * 64}):
+            self.assertFalse(cr.released_record(record))
+        with mock.patch.object(cr, "SENTINEL_RUNTIME", RUNTIME):
+            self.assertTrue(cr.released_record({**record, "mode": "sentinel"}))
+            self.assertFalse(cr.released_record({**record, "mode": "sentinel", "image": cr.PINNED_IMAGE}))
+
     def test_post_expiry_rehash_uses_original_total_deadline_with_cleanup_reserve(self):
         real = st.verify_staged
         def slow(workspace, staged, check):
