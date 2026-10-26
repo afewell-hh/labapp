@@ -499,8 +499,15 @@ ownership, retention and disposition stay outside this repository until the lead
   `neg-state`, `negative-timeout`, `state-missing`, `cli-run`, `cli-version`, `cli-timeout`, `output-bound`, `internal`) or `plan-step`. The observer validates it against the run's nonce and
   inputs and appends only those fields to its failure reason. The `prereq <owner-uid> <archive>` assertion phase runs
   `/usr/bin/python3 -B component_prerequisites.py --owner-uid U --archive A` through the same bounded helper (4 KiB, 300 s
-  wrapper deadline above the probe's 210 s alarm), strictly parses the fixed schema/outcome/phase/exit, and maps only an
-  allowed phase to `prereq-preflight|installer|systemd|kvm|cleanup|unknown`; malformed, inconsistent, overlong or
+  wrapper deadline above the probe's 210 s alarm), strictly parses schema/outcome/phase/action/category/mount/exit, rejecting impossible
+  action/category combinations. It maps fixed failures to `prereq-<phase>-<category>`
+  or `prereq-inst-<action>-<category>`; installer action tokens are `none`, `mkdir`,
+  `chown`, `first`, `snap1`, `rerun`, `snap2`, `cli`. CLI tokens append `-ex`, `-nx`
+  or `-uk` for the probe's effective destination `ST_NOEXEC` observation (executable,
+  noexec or unavailable). Only CLI failures carry that observation; observing it
+  never skips the CLI or changes mounts. All tokens fit the existing 32-character
+  reason limit. Categories are fixed `timeout`, `overflow`, `nonzero`, `mismatch`,
+  `permission`, `operational`, `refusal`, `interrupted`; arbitrary text is rejected; malformed, inconsistent, overlong or
   unexpected-exit output is `prereq-invalid` and a deadline is `prereq-timeout`.
   The external 300s cutoff covers the internal210s plus unit cleanup15+10+15s
   and three2s reap allowances, leaving44s scheduling/filesystem margin. Cleanup

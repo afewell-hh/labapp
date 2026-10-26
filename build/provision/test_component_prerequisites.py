@@ -194,15 +194,15 @@ class ProbeTests(unittest.TestCase):
                 patch.object(signal, 'signal'), patch.object(signal, 'alarm'), contextlib.redirect_stdout(output):
             self.assertEqual(probe.main(), 1)
         self.assertNotIn('SECRET', output.getvalue())
-        self.assertIn('operational failure', output.getvalue())
+        self.assertIn('operational', output.getvalue())
 
 
 class PhaseTests(unittest.TestCase):
     """The failure JSON names the failing action; success and exit codes are unchanged."""
 
     def setUp(self):
-        self.addCleanup(setattr, probe, 'STAGE', 'unknown')
-        probe.STAGE = 'unknown'
+        self.addCleanup(probe.stage, 'unknown')
+        probe.stage('unknown')
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -247,7 +247,7 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(code, 1)
             data = json_loads(text)
             self.assertEqual(data, {'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
-                                    'reason': 'prerequisite command failed', 'phase': expected})
+                                    'category': 'refusal', 'phase': expected, 'action': 'none', 'execution_mount': 'none'})
             self.assertNotIn('SECRET', text)
 
     def test_unexpected_exception_and_timeout_keep_stage_phase(self):
@@ -307,6 +307,122 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(sorted(report), ['caller_uid', 'checks', 'python', 'schema'])
         self.assertEqual(sorted(report['checks']), ['installer', 'kvm', 'systemd'])
         self.assertNotIn('phase', report)
+
+
+class InstallerDiagnosticTests(unittest.TestCase):
+    setUp = PhaseTests.setUp
+    fail_main = PhaseTests.fail_main
+    # Reuse only test setup/report helper; no real installer, identity changes or privileged work.
+    def exercise(self, action, failure, mount=0):
+        owner = pwd.getpwuid(os.getuid())
+        workspace = Path(self.temporary.name)
+        calls = []
+        def chown(*_):
+            calls.append('chown')
+            if action == 'chown':
+                raise failure
+        def run(args, seconds=15, limit=4096):
+            name = ('firstinstall', 'rerun', 'cli')[sum(c in ('firstinstall', 'rerun', 'cli') for c in calls)]
+            calls.append(name)
+            if name == action:
+                if isinstance(failure, BaseException):
+                    raise failure
+                return failure
+            return 0, {'firstinstall': b'hhfab install: installed\n',
+                       'rerun': b'hhfab install: unchanged\n', 'cli': b'hhfab version v0.50.4\n'}[name]
+        def snapshot(*_):
+            name = 'snapshot-rerun' if 'snapshot-first' in calls else 'snapshot-first'
+            calls.append(name)
+            if action == name:
+                raise failure
+            return (1, 2, 3, 4, 5)
+        def operation(*_):
+            probe.stage('installer')
+            if action == 'mkdir':
+                with patch.object(Path, 'mkdir', side_effect=failure):
+                    return probe.installer_probe(owner, workspace, Path('/archive'))
+            return probe.installer_probe(owner, workspace, Path('/archive'))
+        with patch.object(probe, 'probe', operation), patch.object(probe, 'run', run), \
+                patch.object(os, 'chown', chown), patch.object(probe, 'installed_snapshot', snapshot), \
+                patch.object(os, 'statvfs', side_effect=mount if isinstance(mount, Exception) else None,
+                             return_value=type('Flags', (), {'f_flag': mount})()):
+            code, text = self.fail_main()
+        data = json_loads(text)
+        self.assertEqual(code, 1)
+        self.assertEqual((data['phase'], data['action']), ('installer', action))
+        self.assertNotIn('SECRET', text)
+        self.assertNotIn('reason', data)
+        self.assertEqual(data['execution_mount'], ('unknown' if isinstance(mount, Exception) else
+                         'noexec' if mount & os.ST_NOEXEC else 'exec') if action == 'cli' else 'none')
+        order = ['chown', 'firstinstall', 'snapshot-first', 'rerun', 'snapshot-rerun', 'cli']
+        self.assertEqual(calls, [] if action == 'mkdir' else order[:order.index(action)+1])
+        (workspace / 'install').rmdir() if (workspace / 'install').exists() else None
+        return data['category']
+
+    def test_actions_are_attributed_before_failure_and_stop_later_work(self):
+        for action in ('mkdir', 'chown', 'firstinstall', 'snapshot-first', 'rerun', 'snapshot-rerun', 'cli'):
+            for error, category in ((OSError('SECRET'), 'operational'), (PermissionError('SECRET'), 'permission'), (Refusal('SECRET'), 'refusal'),
+                                    (KeyboardInterrupt(), 'interrupted'),
+                                    (Refusal('overall work deadline exceeded'), 'timeout')):
+                with self.subTest(action=action, category=category):
+                    self.assertEqual(self.exercise(action, error), category)
+
+    def test_command_status_output_and_snapshot_mismatches_are_distinct(self):
+        for action in ('firstinstall', 'rerun', 'cli'):
+            for reply, category in (((4, b'SECRET'), 'nonzero'), ((0, b'SECRET'), 'mismatch'),
+                                     (Refusal('command timeout'), 'timeout'),
+                                     (Refusal('command output overflow'), 'overflow')):
+                with self.subTest(action=action, category=category):
+                    self.assertEqual(self.exercise(action, reply), category)
+        for action in ('snapshot-first', 'snapshot-rerun'):
+            self.assertEqual(self.exercise(action, Refusal('installed binary verification failed')), 'mismatch')
+
+    def test_real_tiny_child_helper_timeout_and_overflow_are_classified(self):
+        for script, seconds, limit, expected in (
+                ('import time; time.sleep(5)', .1, 64, 'timeout'),
+                ('import os; os.write(2,b"SECRET"*10000)', 2, 64, 'overflow')):
+            with self.subTest(expected=expected):
+                with self.assertRaises(Refusal) as caught:
+                    probe.run([sys.executable, '-I', '-B', '-c', script], seconds, limit)
+                self.assertEqual(probe.failure_category(caught.exception), expected)
+
+    def test_cli_mount_observation_is_fixed_and_failure_does_not_skip_cli(self):
+        for mount in (0, os.ST_NOEXEC, PermissionError('SECRET')):
+            self.assertEqual(self.exercise('cli', PermissionError('SECRET'), mount), 'permission')
+
+    def test_probe_cleanup_preserves_cli_metadata_or_overrides_all_of_it(self):
+        for cleanup_fails in (False, True):
+            temporary = tempfile.TemporaryDirectory(dir=self.temporary.name)
+            self.addCleanup(temporary.cleanup)
+            def installer(*_):
+                probe.stage('installer', 'cli', 'noexec')
+                raise PermissionError('SECRET')
+            with patch.object(probe.tempfile, 'TemporaryDirectory', return_value=temporary), \
+                    patch.object(probe, 'preflight', return_value=pwd.getpwuid(os.getuid())), \
+                    patch.object(probe, 'installer_probe', installer), \
+                    patch.object(probe, 'systemd_probe') as systemd, \
+                    patch.object(temporary, 'cleanup', side_effect=OSError('SECRET') if cleanup_fails else None):
+                code, text = self.fail_main()
+            data = json_loads(text)
+            self.assertEqual(code, 1)
+            expected = ('cleanup', 'none', 'none', 'operational') if cleanup_fails else \
+                       ('installer', 'cli', 'noexec', 'permission')
+            self.assertEqual(tuple(data[k] for k in ('phase', 'action', 'execution_mount', 'category')), expected)
+            systemd.assert_not_called()
+            self.assertNotIn('SECRET', text)
+
+    def test_cleanup_restores_both_phase_and_installer_action(self):
+        probe.stage('installer', 'rerun')
+        previous = probe.stage('cleanup')
+        self.assertEqual((probe.STAGE, probe.ACTION), ('cleanup', 'none'))
+        probe.stage(*previous)
+        self.assertEqual((probe.STAGE, probe.ACTION), ('installer', 'rerun'))
+        self.assertEqual(probe.EXECUTION_MOUNT, 'none')
+        probe.stage('installer', 'cli', 'noexec')
+        previous = probe.stage('cleanup')
+        self.assertEqual(probe.EXECUTION_MOUNT, 'none')
+        probe.stage(*previous)
+        self.assertEqual((probe.STAGE, probe.ACTION, probe.EXECUTION_MOUNT), ('installer', 'cli', 'noexec'))
 
 
 def json_loads(text):

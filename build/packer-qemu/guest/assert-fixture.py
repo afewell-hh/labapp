@@ -305,18 +305,40 @@ def strict_probe_json(text):
     return json.loads(text.decode("ascii"), object_pairs_hook=pairs, parse_constant=invalid)
 
 
+PROBE_CATEGORIES = ("timeout", "overflow", "nonzero", "mismatch", "operational", "refusal", "interrupted", "permission")
+PROBE_ACTIONS = {"none": "none", "mkdir": "mkdir", "chown": "chown", "firstinstall": "first",
+                 "snapshot-first": "snap1", "rerun": "rerun", "snapshot-rerun": "snap2", "cli": "cli"}
+
+
 def probe_failure(text):
-    """Strict failure shape; export only its fixed allowlisted phase."""
+    """Validate the complete fixed failure contract; export only short fixed tokens."""
     try:
         value = strict_probe_json(text)
     except (UnicodeError, ValueError, RecursionError):
         return "prereq-invalid"
-    if (not isinstance(value, dict) or set(value) != {"schema", "outcome", "reason", "phase"}
+    if (not isinstance(value, dict) or set(value) != {"schema", "outcome", "category", "phase", "action", "execution_mount"}
             or value["schema"] != PROBE_SCHEMA or value["outcome"] != "failed"
-            or not isinstance(value["reason"], str) or not value["reason"]
-            or value["phase"] not in PROBE_PHASES):
+            or value["phase"] not in PROBE_PHASES
+            or value["category"] not in PROBE_CATEGORIES
+            or not isinstance(value["action"], str) or value["action"] not in PROBE_ACTIONS):
         return "prereq-invalid"
-    return "prereq-" + value["phase"]
+    phase, action, category = value["phase"], value["action"], value["category"]
+    mount = value["execution_mount"]
+    if ((phase == "installer" and action == "cli" and mount not in ("exec", "noexec", "unknown"))
+            or ((phase != "installer" or action != "cli") and mount != "none")):
+        return "prereq-invalid"
+    if phase != "installer":
+        if (action != "none" or
+                (phase in ("preflight", "unknown") and category in ("nonzero", "overflow", "mismatch")) or
+                (phase == "cleanup" and category in ("nonzero", "mismatch"))):
+            return "prereq-invalid"
+        return "prereq-" + phase + "-" + category
+    if ((action in ("none", "mkdir", "chown") and category in ("nonzero", "overflow", "mismatch"))
+            or (action.startswith("snapshot-") and category in ("nonzero", "overflow"))):
+        return "prereq-invalid"
+    # CLI mount observation remains bounded metadata, encoded only as fixed compact tokens.
+    suffix = "-" + {"exec": "ex", "noexec": "nx", "unknown": "uk"}[mount] if action == "cli" else ""
+    return "prereq-inst-" + PROBE_ACTIONS[action] + "-" + category + suffix
 
 
 def probe_success(text, owner_uid=1000):
@@ -354,7 +376,7 @@ def probe_success(text, owner_uid=1000):
 
 def prereq(cfg, uid, archive):
     """Run the component probe through the bounded helper and map only its allowlisted failure
-    phase to a fixed `prereq-*` token (<= 32 chars). Probe exit/stdout are never echoed.
+    phase/action/category to a fixed `prereq-*` token (<= 32 chars). Probe exit/stdout are never echoed.
     Plain `-B` (not `-I`): the probe imports its sibling hhfab_release.py from its own directory."""
     argv = ["/usr/bin/python3", "-B", cfg.probe, "--owner-uid", uid, "--archive", archive]
     try:

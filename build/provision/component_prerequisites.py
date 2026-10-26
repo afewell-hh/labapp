@@ -28,6 +28,8 @@ PYTHON = "/usr/bin/python3"
 # Fixed failure-phase allowlist; STAGE names the action in progress, never child output.
 PHASES = ("preflight", "installer", "systemd", "kvm", "cleanup", "unknown")
 STAGE = "unknown"
+ACTION = "none"
+EXECUTION_MOUNT = "none"
 # This wrapper drops supplementary groups, then gid/uid before exec; no shell.
 DROP = ("import os,sys; uid=int(sys.argv[1]); gid=int(sys.argv[2]); "
         "os.setgroups([]); os.setgid(gid); os.setuid(uid); os.chdir(sys.argv[3]); "
@@ -45,10 +47,38 @@ finally:
 """
 
 
-def stage(name):
-    global STAGE
-    previous, STAGE = STAGE, name
+def stage(name, action="none", execution_mount="none"):
+    global STAGE, ACTION, EXECUTION_MOUNT
+    previous = STAGE, ACTION, EXECUTION_MOUNT
+    STAGE, ACTION, EXECUTION_MOUNT = name, action, execution_mount
     return previous
+
+
+def installer_action(name):
+    global ACTION, EXECUTION_MOUNT
+    ACTION = name
+    EXECUTION_MOUNT = "unknown" if name == "cli" else "none"
+
+
+class DiagnosticRefusal(Refusal):
+    """Local fixed category; never accepts command output as diagnostic text."""
+    def __init__(self, category, message):
+        super().__init__(message)
+        self.category = category
+
+
+def failure_category(error):
+    if isinstance(error, PermissionError):
+        return "permission"
+    if isinstance(error, DiagnosticRefusal):
+        return error.category
+    if isinstance(error, Refusal):
+        return {"command timeout": "timeout", "overall work deadline exceeded": "timeout",
+                "command output overflow": "overflow",
+                "installed binary verification failed": "mismatch",
+                "rerun changed binary": "mismatch",
+                "installed CLI version mismatch": "mismatch"}.get(str(error), "refusal")
+    return "interrupted" if isinstance(error, KeyboardInterrupt) else "operational"
 
 
 def run(args, seconds=15, limit=4096):
@@ -57,8 +87,10 @@ def run(args, seconds=15, limit=4096):
 
 def require(args, seconds=15, expected=None):
     code, output = run(args, seconds)
-    if code or (expected is not None and output != expected):
-        raise Refusal("prerequisite command failed")
+    if code:
+        raise DiagnosticRefusal("nonzero", "prerequisite command failed")
+    if expected is not None and output != expected:
+        raise DiagnosticRefusal("mismatch", "prerequisite command output mismatch")
     return output
 
 
@@ -96,17 +128,31 @@ def installed_snapshot(binary, uid):
 
 def installer_probe(owner, workspace, archive):
     destination = workspace / 'install'
+    installer_action('mkdir')
     destination.mkdir(mode=0o700)
+    installer_action('chown')
     os.chown(destination, owner.pw_uid, owner.pw_gid)
     installer = Path(__file__).resolve().with_name('install-hhfab.py')
     args = [PYTHON, str(installer), '--version', VERSION,
             '--install-dir', str(destination), '--archive', str(archive)]
+    installer_action('firstinstall')
     require(as_owner(owner, destination, args), 65, b'hhfab install: installed\n')
     binary = destination / 'hhfab'
+    installer_action('snapshot-first')
     before = installed_snapshot(binary, owner.pw_uid)
+    installer_action('rerun')
     require(as_owner(owner, destination, args), 65, b'hhfab install: unchanged\n')
+    installer_action('snapshot-rerun')
     if before != installed_snapshot(binary, owner.pw_uid):
         raise Refusal("rerun changed binary")
+    installer_action('cli')
+    # Observation only, in this process's actual mount namespace. Failure to observe
+    # must not replace or skip the original CLI action. No mount/path text is exported.
+    global EXECUTION_MOUNT
+    try:
+        EXECUTION_MOUNT = "noexec" if os.statvfs(destination).f_flag & os.ST_NOEXEC else "exec"
+    except OSError:
+        pass
     output = require(as_owner(owner, destination, [str(binary), '--version']), 20)
     if not re.fullmatch(rb'hhfab version v?0\.50\.4\n?', output):
         raise Refusal("installed CLI version mismatch")
@@ -175,7 +221,7 @@ def systemd_probe(workspace):
         previous = stage('cleanup')
         try:
             cleanup_unit(unit)
-            stage(previous)
+            stage(*previous)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
@@ -201,7 +247,7 @@ def probe(uid, archive):
     finally:
         previous = stage('cleanup')
         temporary.cleanup()
-        stage(previous)
+        stage(*previous)
     return report
 
 
@@ -222,8 +268,10 @@ def main():
     except (Exception, KeyboardInterrupt) as error:
         # Never export raw child output, exception text or paths.
         print(json.dumps({'schema': 'labapp-component-prerequisites-v1', 'outcome': 'failed',
-                          'reason': str(error) if isinstance(error, Refusal) else 'operational failure',
-                          'phase': STAGE if STAGE in PHASES else 'unknown'}))
+                          'category': failure_category(error),
+                          'phase': STAGE if STAGE in PHASES else 'unknown',
+                          'action': ACTION if STAGE == 'installer' else 'none',
+                          'execution_mount': EXECUTION_MOUNT if STAGE == 'installer' and ACTION == 'cli' else 'none'}))
         return 1
     finally:
         signal.alarm(0)

@@ -282,9 +282,11 @@ class FixtureAssertionTests(unittest.TestCase):
         return result, run
 
     def failure(self, phase="kvm", **extra):
-        value = {"schema": af.PROBE_SCHEMA, "outcome": "failed", "reason": "prerequisite command failed",
+        value = {"schema": af.PROBE_SCHEMA, "outcome": "failed", "category": "refusal", "action": "none", "execution_mount": "none",
                  "phase": phase}
         value.update(extra)
+        if value['action'] == 'cli' and 'execution_mount' not in extra:
+            value['execution_mount'] = 'unknown'
         return value
 
     def test_prereq_maps_every_allowed_phase_to_a_short_fixed_token(self):
@@ -292,7 +294,7 @@ class FixtureAssertionTests(unittest.TestCase):
             result, run = self.probe_output(1, self.failure(phase))
             self.assertEqual(result, 1)
             token = self.reason()
-            self.assertEqual(token, "prereq-" + phase)
+            self.assertEqual(token, "prereq-" + ("inst-none" if phase == "installer" else phase) + "-refusal")
             self.assertLessEqual(len(token), 32)
             self.assertRegex(token, af.REASON_RE)
             os.unlink(self.cfg.reason)
@@ -365,7 +367,7 @@ class FixtureAssertionTests(unittest.TestCase):
                  (0, good[:-1] + b',"caller_uid":0}'),
                  (0, good.replace(b'"api_version": 12', b'"api_version":12,"api_version":12')),
                  (1, failure[:-1] + b',"phase":"kvm"}'),
-                 (1, failure.replace(b'"reason": "prerequisite command failed"', b'"reason":NaN'))]
+                 (1, failure.replace(b'"category": "refusal"', b'"category":NaN'))]
         for key in self.failure():
             bad = self.failure()
             del bad[key]
@@ -373,6 +375,49 @@ class FixtureAssertionTests(unittest.TestCase):
         for code, payload in cases:
             result, _ = self.probe_output(code, payload)
             self.assertEqual((result, self.reason()), (1, "prereq-invalid"))
+            os.unlink(self.cfg.reason)
+
+    def test_prereq_installer_actions_categories_and_impossible_combinations(self):
+        for action, short in af.PROBE_ACTIONS.items():
+            for category in af.PROBE_CATEGORIES:
+                invalid = ((action in ('none', 'mkdir', 'chown') and category in ('nonzero', 'overflow', 'mismatch'))
+                           or (action.startswith('snapshot-') and category in ('nonzero', 'overflow')))
+                result, _ = self.probe_output(1, self.failure('installer', action=action, category=category))
+                token = self.reason()
+                self.assertEqual((result, token), (1, 'prereq-invalid' if invalid else
+                                                  'prereq-inst-' + short + '-' + category + ('-uk' if action == 'cli' else '')))
+                self.assertRegex(token, af.REASON_RE)
+                self.assertLessEqual(len(token), 32)
+                os.unlink(self.cfg.reason)
+        for phase in af.PROBE_PHASES:
+            if phase != 'installer':
+                for category in af.PROBE_CATEGORIES:
+                    result, _ = self.probe_output(1, self.failure(phase, category=category))
+                    invalid = ((phase in ('preflight', 'unknown') and category in ('nonzero', 'overflow', 'mismatch'))
+                               or (phase == 'cleanup' and category in ('nonzero', 'mismatch')))
+                    self.assertEqual(self.reason(), 'prereq-invalid' if invalid else 'prereq-' + phase + '-' + category)
+                    self.assertLessEqual(len(self.reason()), 32)
+                    os.unlink(self.cfg.reason)
+        for bad in (self.failure('kvm', action='cli'), self.failure('installer', action='SECRET'),
+                    self.failure(category='SECRET'), self.failure(action=[]), self.failure(category={}),
+                    self.failure('installer', action=True), self.failure('installer', action=7)):
+            self.probe_output(1, bad)
+            self.assertEqual(self.reason(), 'prereq-invalid')
+            os.unlink(self.cfg.reason)
+
+    def test_cli_mount_metadata_is_strict_and_only_fixed_tokens_are_exported(self):
+        for mount, short in (('exec', 'ex'), ('noexec', 'nx'), ('unknown', 'uk')):
+            self.probe_output(1, self.failure('installer', action='cli', category='permission', execution_mount=mount))
+            self.assertEqual(self.reason(), 'prereq-inst-cli-permission-' + short)
+            os.unlink(self.cfg.reason)
+        for mount in ('none', '', 'SECRET', True, 1, None, [], {}):
+            self.probe_output(1, self.failure('installer', action='cli', execution_mount=mount))
+            self.assertEqual(self.reason(), 'prereq-invalid')
+            os.unlink(self.cfg.reason)
+        for payload in (self.failure('installer', action='rerun', execution_mount='noexec'),
+                        self.failure('cleanup', execution_mount='exec')):
+            self.probe_output(1, payload)
+            self.assertEqual(self.reason(), 'prereq-invalid')
             os.unlink(self.cfg.reason)
 
     def test_prereq_external_cutoff_reserves_unit_cleanup_but_does_not_extend_service(self):
