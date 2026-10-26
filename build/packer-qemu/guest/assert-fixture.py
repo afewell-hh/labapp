@@ -13,6 +13,7 @@ plan step and exit code to its bounded diagnostic line) and exits 1. No peer or 
 output is ever echoed. UNRUN in a guest.
 """
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -140,17 +141,30 @@ def verify(cfg):
     need(found == shot["hhfab"], "rerun-state")
 
 
+def command(cfg, argv, seconds, timeout_reason, env):
+    """Use the unchanged sibling helper's streaming cap and group deadline/cleanup.
+
+    Load only the exact staged sibling; -I deliberately excludes cwd from imports.
+    GNU env fixes cwd without changing this assertion process's working directory.
+    stdout/stderr are combined and never exported as diagnostic text.
+    """
+    path = os.path.join(os.path.dirname(cfg.installer), "hhfab_release.py")
+    spec = importlib.util.spec_from_file_location("fixture_hhfab_release", path)
+    release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release)
+    try:
+        code, output = release.bounded(["/usr/bin/env", "-C", "/", *argv], seconds,
+                                       limit=OUTPUT_CAP, env=env)
+    except release.Refusal as exc:
+        raise Check("output-bound" if str(exc) == "command output overflow" else timeout_reason) from None
+    return subprocess.CompletedProcess(argv, code, output)
+
+
 def run_installer(cfg, directory, version, archive):
     argv = ["/usr/bin/python3", "-B", cfg.installer, "--version", version,
             "--install-dir", directory, "--archive", archive]
     env = {"PATH": SAFE_PATH, "HOME": "/root", "LC_ALL": "C.UTF-8", "DEBIAN_FRONTEND": "noninteractive"}
-    try:
-        done = subprocess.run(argv, cwd="/", env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=INSTALL_SECONDS)
-    except subprocess.TimeoutExpired:
-        raise Check("negative-timeout") from None
-    need(len(done.stdout) <= OUTPUT_CAP and len(done.stderr) <= OUTPUT_CAP, "output-bound")
-    return done
+    return command(cfg, argv, INSTALL_SECONDS, "negative-timeout", env)
 
 
 def negatives(cfg):
@@ -180,13 +194,13 @@ def negatives(cfg):
     before = identity(os.lstat(target))
     for directory in (prior, absent):
         done = run_installer(cfg, directory, VERSION, corrupt)
-        need(done.returncode == 1 and done.stderr == REFUSAL and not done.stdout, "archive-integrity")
+        need(done.returncode == 1 and done.stdout == REFUSAL, "archive-integrity")
     need(identity(os.lstat(target)) == before, "neg-state")
     with open(target, "rb") as handle:
         need(handle.read(OUTPUT_CAP) == PRIOR_BYTES, "neg-state")
     need(sorted(os.listdir(prior)) == ["hhfab"] and os.listdir(absent) == [], "neg-state")
     done = run_installer(cfg, prior, "9.9.9", cfg.archive)       # argparse refusal, exit 2
-    need(done.returncode == 2 and b"invalid choice: '9.9.9'" in done.stderr and not done.stdout,
+    need(done.returncode == 2 and b"invalid choice: '9.9.9'" in done.stdout,
          "bad-version")
     need(identity(os.lstat(target)) == before and sorted(os.listdir(prior)) == ["hhfab"], "neg-state")
     # The good installation and its directory were never an argument to any negative.
@@ -198,12 +212,7 @@ def smoke(cfg):
     argv = [*cfg.ubuntu_prefix, "env", "-i", "PATH=" + SAFE_PATH, "HOME=/home/ubuntu",
             "LC_ALL=C.UTF-8", "DEBIAN_FRONTEND=noninteractive",
             os.path.join(cfg.install_dir, "hhfab"), "--version"]
-    try:
-        done = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=SMOKE_SECONDS, env={"PATH": SAFE_PATH})
-    except subprocess.TimeoutExpired:
-        raise Check("cli-timeout") from None
-    need(len(done.stdout) <= OUTPUT_CAP, "output-bound")
+    done = command(cfg, argv, SMOKE_SECONDS, "cli-timeout", {"PATH": SAFE_PATH})
     need(done.returncode == 0, "cli-run")
     need(VERSION_RE.fullmatch(done.stdout) is not None, "cli-version")
 

@@ -11,6 +11,8 @@ import platform
 from pathlib import Path
 import re
 import tempfile
+import sys
+import time
 import unittest
 from unittest import mock
 
@@ -223,6 +225,43 @@ class FixtureAssertionTests(unittest.TestCase):
                   b"&& echo 'hhfab version v0.50.4'\n")
         with mock.patch.dict(os.environ, {"SECRET": "x"}):
             self.smoke_with(script)
+
+    def test_streaming_command_bounds_combined_output_before_capture(self):
+        start = time.monotonic()
+        with self.assertRaisesRegex(af.Check, "^output-bound$"):
+            af.command(self.cfg, [sys.executable, "-I", "-B", "-c",
+                                  "import os; os.write(2, b'x' * 10000000)"],
+                       2, "negative-timeout", {"PATH": af.SAFE_PATH})
+        self.assertLess(time.monotonic() - start, 2.5)
+
+    def test_command_deadline_kills_child_and_pipe_holding_descendant(self):
+        for fork in (False, True):
+            with self.subTest(pipe_holder=fork):
+                pidfile = os.path.join(self.root, "owned-child-pid")
+                script = ("import os,time; " + ("pid=os.fork(); " if fork else "")
+                          + "open(%r, 'w').write(str(os.getpid())); " % pidfile
+                          + ("time.sleep(30) if pid == 0 else None" if fork else "time.sleep(30)"))
+                start = time.monotonic()
+                try:
+                    with self.assertRaisesRegex(af.Check, "^cli-timeout$"):
+                        af.command(self.cfg, [sys.executable, "-I", "-B", "-c", script],
+                                   .3, "cli-timeout", {"PATH": af.SAFE_PATH})
+                    self.assertLess(time.monotonic() - start, 2.5)
+                    pid = int(Path(pidfile).read_text())
+                    status = Path("/proc/%d/stat" % pid)
+                    until = time.monotonic() + 1
+                    while status.exists() and status.read_text().split()[2] != "Z" and time.monotonic() < until:
+                        time.sleep(.01)
+                    self.assertTrue(not status.exists() or status.read_text().split()[2] == "Z")
+                finally:
+                    # Exact test-owned process only; also clean up if the assertion regresses.
+                    if os.path.exists(pidfile):
+                        pid = int(Path(pidfile).read_text())
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+                        os.unlink(pidfile)
 
     def test_reason_tokens_are_fixed_and_valid_for_the_guest_runner(self):
         source = (HERE / "guest" / "assert-fixture.py").read_text()

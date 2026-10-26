@@ -43,6 +43,7 @@ jobs:
           test -f build/packer-qemu/test_container_runner.py
           test -f build/packer-qemu/test_stage_tools.py
           test -f build/packer-qemu/test_sentinel.py
+          test -f build/packer-qemu/guest/assert-fixture.py
           test -f build/packer-qemu/test_sentinel_evidence.py
           test -f build/packer-qemu/test_runtime_prepare.py
           test -f build/packer-qemu/test_sentinel_expiry.py

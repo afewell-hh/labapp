@@ -468,6 +468,9 @@ ownership, retention and disposition stay outside this repository until the lead
   The staged 60 MB CD file and the two extractions are unmeasured; large-ISO readback is a separate offline-checkable
   and live gate. Source activation here is not execution authorization: every actual trial needs separately scoped lead
   authorization and reconciled shared-ledger admission.
+* Installer refusal checks and the CLI smoke reuse the unchanged sibling helper
+  for a combined 4 KiB streaming output cap, fixed deadline and process-group cleanup;
+  cwd is `/`, and diagnostics never export the child output.
 * Proves, if run: the unchanged installer's offline `--archive` path installs and reruns as root in a fresh accelerated
   guest and the binary starts as `ubuntu`. Not proven: network download, APT/dpkg, services, reboot or seal, nested VLAB,
   other platforms, the release attestation (GitHub's immutable-release digest is not a verified publisher signature).
