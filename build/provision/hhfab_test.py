@@ -78,6 +78,78 @@ def check_wiring(path):
     return docs
 
 
+def check_zero_topology(generated, fabric):
+    """Inspect only the bounded public no-switch fixture with distribution libyaml."""
+    import yaml
+    for path in (generated, fabric):
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 1024 * 1024,
+                "zero-topology file invalid or oversized")
+    try:
+        wiring = list(yaml.load_all(generated.read_bytes(), Loader=yaml.CSafeLoader))
+        nodes = list(yaml.load_all(fabric.read_bytes(), Loader=yaml.CSafeLoader))
+    except yaml.YAMLError:
+        raise Refusal("zero-topology config malformed") from None
+    for doc in wiring + nodes:
+        require(isinstance(doc, dict) and isinstance(doc.get("kind"), str)
+                and isinstance(doc.get("metadata"), dict)
+                and isinstance(doc["metadata"].get("name"), str), "zero-topology object malformed")
+    identities = lambda docs: sorted((d["kind"], d["metadata"]["name"]) for d in docs)
+    require(identities(wiring) == [("IPv4Namespace", "default"), ("VLANNamespace", "default")],
+            "generated wiring identities mismatch")
+    require(identities(nodes) == [("ControlNode", "control-1"), ("Fabricator", "default")],
+            "generated nodes are not exactly the expected control")
+    kinds = {d["kind"]: d for d in wiring}
+    require(kinds["VLANNamespace"].get("spec") == {"ranges": [{"from": 1000, "to": 2999}]},
+            "generated VLAN namespace mismatch")
+    require(kinds["IPv4Namespace"].get("spec") == {"subnets": ["10.0.0.0/16"]},
+            "generated IPv4 namespace mismatch")
+    return {"wiring_kinds": sorted(kinds), "node_kinds": sorted(d["kind"] for d in nodes)}
+
+
+def fixture_cli(binary, cache, env, deadline):
+    """Bind the existing fixed public commands to one lane's isolation and deadline."""
+    def cli(command, case, extra=()):
+        require(command in ("init", "validate", "versions", "vlab generate"), "unexpected fixture command")
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "lane deadline exceeded")
+        return bounded([str(binary), *command.split(), "--workdir", str(case), "--cache-dir", str(cache), *extra],
+                       min(30, remaining), env=env)
+
+    def init(case, wiring="/suite/wiringd.yaml", mode="spine-leaf"):
+        require(case.is_dir() and not case.is_symlink() and not list(case.iterdir()),
+                "init requires fresh owned empty case")
+        return cli("init", case, ["--fabric-mode", mode, "--dev", "--gateway=false",
+                                 "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog",
+                                 *(["--wiring", str(wiring)] if wiring is not None else [])])
+
+    def validate(case):
+        return cli("validate", case, ["--hydrate-mode", "if-not-present"])
+
+    return cli, init, validate
+
+
+def no_switch_smoke(cli, init, validate, case):
+    """Fresh init (no wiring) -> official vlab generate --no-switches -> validate."""
+    require(init(case, None)[0] == 0, "official init refused no-switch fixture")
+    require(not list((case / "include").iterdir()), "init left unexpected include files")
+    require(cli("vlab generate", case, ["--no-switches"])[0] == 0, "official generate --no-switches refused")
+    generated = case / "include/vlab.generated.yaml"
+    require([p.name for p in (case / "include").iterdir()] == ["vlab.generated.yaml"] and generated.is_file(),
+            "unexpected generated include outputs")
+    tree_hashes(case)
+    require(validate(case)[0] == 0, "official validate refused no-switch fixture")
+    require([p.name for p in (case / "include").iterdir()] == ["vlab.generated.yaml"],
+            "validation left unexpected include outputs")
+    require({p.name for p in case.iterdir()} == {"fab.yaml", ".registry.yaml", "include", "result"},
+            "unexpected no-switch outputs")
+    require(not list((case / "result").iterdir()), "unexpected persisted no-switch result")
+    summary = check_zero_topology(generated, case / "fab.yaml")
+    before = tree_hashes(case)
+    require(validate(case)[0] == 0 and tree_hashes(case) == before, "no-switch validation rerun changed fixture")
+    summary["tree_sha256"] = before
+    return summary
+
+
 def lane(version):
     import yaml
     require(hasattr(yaml, "CSafeLoader"), "distribution CSafeLoader unavailable")
@@ -101,21 +173,7 @@ def lane(version):
     checks = []
     summaries = []
 
-    def cli(command, case, extra=()):
-        remaining = deadline - time.monotonic()
-        require(remaining > 0, "lane deadline exceeded")
-        return bounded([str(binary), command, "--workdir", str(case), "--cache-dir", str(cache), *extra],
-                       min(30, remaining), env=env)
-
-    def init(case, wiring="/suite/wiringd.yaml", mode="spine-leaf"):
-        require(case.is_dir() and not case.is_symlink() and not list(case.iterdir()),
-                "init requires fresh owned empty case")
-        return cli("init", case, ["--fabric-mode", mode, "--dev", "--gateway=false",
-                                 "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog",
-                                 "--wiring", str(wiring)])
-
-    def validate(case):
-        return cli("validate", case, ["--hydrate-mode", "if-not-present"])
+    cli, init, validate = fixture_cli(binary, cache, env, deadline)
 
     def versions(case):
         # CLI versions can succeed with defaults even without config: guard FIRST.
@@ -184,6 +242,8 @@ def lane(version):
     else:
         raise Refusal("missing fixture allowed versions")
     checks.append("reject-missing-config-before-versions")
+    no_switch = no_switch_smoke(cli, init, validate, Path(tempfile.mkdtemp(prefix="noswitch-", dir="/work")))
+    checks.append("no-switch-smoke")
     # Test unchanged bounded executor against real isolated children (not simulated exit0).
     for name, program, seconds, limit in [
         ("timeout", "import time; time.sleep(10)", 0.1, 1024),
@@ -200,7 +260,7 @@ def lane(version):
                 for v in SIZES.values()), "invalid separate sizing fixture")
     checks.append("sizing-fixture-only")
     print(json.dumps({"schema": 1, "version": version, "status": "passed", "checks": checks,
-                      "fresh_runs": summaries, "sizing_scope": "fixture-only; not upstream VLAB validation"}, sort_keys=True))
+                      "fresh_runs": summaries, "no_switch": no_switch, "sizing_scope": "fixture-only; not upstream VLAB validation"}, sort_keys=True))
 
 
 if __name__ == "__main__":
