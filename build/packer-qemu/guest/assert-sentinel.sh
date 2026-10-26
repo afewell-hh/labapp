@@ -30,5 +30,15 @@ if [[ $want == root ]]; then
   # Read the full bounded status, validate it, and emit only a fixed summary.
   # pipefail rejects a failed cloud-init command; overlong output is never truncated
   # into an accepted record. Only root runs this before guest-build.sh seals.
+  # Both pipeline statuses are captured immediately and any nonzero one still fails; the
+  # only output is one fixed token (producer/renderer numeric statuses, 0-255) left in
+  # the reason file that guest-build.sh's LABAPP-DIAG line reads.
+  set +e
   cloud-init status --format json | python3 -I "${BASH_SOURCE[0]%/*}/sentinel-evidence.py" >/dev/ttyS0
+  st=("${PIPESTATUS[@]}")
+  set -e
+  if [[ ${st[0]} != 0 || ${st[1]} != 0 ]]; then
+    (set -o noclobber; printf 'pipe-p%d-r%d' "${st[0]}" "${st[1]}" >/run/labapp-reason) 2>/dev/null || true
+    exit 1
+  fi
 fi

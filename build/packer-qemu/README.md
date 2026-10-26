@@ -373,6 +373,16 @@ reconciled shared-ledger admission. `supervise.py` stays execution-disabled.
   `LABAPP-EVIDENCE v1 nonce=HEX64 inputs=HEX64 cloud-init=done errors=0 recoverable=0`;
   arbitrary status fields and error text are never retained or echoed. The identities
   are the checked staged nonce and CD MANIFEST digest.
+  The record is written with a direct `os.write` loop (partial writes, EINTR; no buffered
+  stdout to flush again at interpreter exit). The helper's exit status is a fixed
+  classification: 0 accepted, 1 input rejected, 3 EPIPE, 4 ENOSPC, 5 EIO, 6 other errno,
+  7 no write progress. `assert-sentinel.sh` captures both `PIPESTATUS` values at once,
+  still fails on any nonzero one, and leaves only the fixed reason token
+  `pipe-p<producer>-r<renderer>` (first reason wins) for the existing `LABAPP-DIAG` line.
+  This was added after the first fixture guest failed at root step 1 with exit 120
+  (interpreter cleanup error) before hhfab ran; the errno and which side failed there
+  remain unobserved, so the cause is inferred, not established. The next attempt's
+  `reason=` token will separate them. Offline tests: `test_sentinel_evidence.py`.
 * Observer: sentinel vars set `require_sentinel_evidence = true` (HCL default false),
   adding `--require-sentinel-evidence`. The observer requires exactly one matching
   record alongside the existing receipt, prelaunch/KVM/cont and normal-shutdown gates.
