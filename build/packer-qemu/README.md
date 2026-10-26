@@ -1,7 +1,7 @@
 # Stock Packer/QEMU portability experiment (`build/packer-qemu/`)
 
-The **VM experiment remains disabled and unproven**. Fixed non-VM Docker `probe`
-and `hcl-check` tasks are available under separately scoped lead execution. The
+The **VM experiment remains disabled and unproven**. Fixed non-VM Docker `probe`,
+`hcl-check` and `runtime-check` tasks are available under separately scoped lead execution. The
 experiment tests stock Packer core with the stock QEMU plugin,
 `communicator = "none"`, a NoCloud guest that runs the
 unchanged `build/provision/` modules, and a private host-side observer. Plain
@@ -21,8 +21,8 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `supervise.py` | Offline input staging and read-only hardware diagnostics; every execution request is rejected |
 | `host_verify.py` | Sole client of the private QMP and serial sockets; bounded parser; writes the result marker |
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
-| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe` and `hcl-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode is gated off until a runtime identity is accepted |
-| `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Unbuilt sentinel runtime recipe; guest assertions run by the sentinel plan |
+| `container_runner.py`, `stage_tools.py` | Fixed Docker `probe`, `hcl-check` and `runtime-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode is gated off until a runtime identity is accepted |
+| `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Separately gated runtime preparation recipe; guest assertions run by the sentinel plan |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing
@@ -325,7 +325,7 @@ default prints the plan only.
   not total `/out` bytes. Actual version-output, sidecar and HCL-check results
   belong in #264; they cannot establish VM readiness.
 
-### Fixed `sentinel` task (offline contracts only; UNRUN, execution refused)
+### Fixed `sentinel` task (VM execution gate)
 
 `--mode sentinel` reuses the same admission, single ledger, actual-start timer, bounded
 backend, exact name+label+ID cleanup and HOLD semantics. There is no image, command or
@@ -338,14 +338,14 @@ stays execution-disabled.
   the full accepted Ubuntu digest, deletes ambient APT sources, writes one Deb822 source
   pair for snapshot `20261024T000000Z` (Canonical's documented Noble form; the keyring
   is the base image's own, no key download or authentication/`Valid-Until` bypass) and
-  installs explicit candidate roots `qemu-system-x86`, `qemu-utils`, `seabios`
+  installs explicit pinned roots `qemu-system-x86`, `qemu-utils`, `seabios`
   (equal to `build/provision/install-qemu.py` PINS, which are untouched), `python3`,
   `python3.12`, `xorriso` and `ca-certificates` with `--no-install-recommends`; the resolved package list
   and `InRelease` hashes are recorded inside the image. The ISO tool is one the pinned
   SDK actually searches (`xorriso`, `mkisofs`, `hdiutil`, `oscdimg`); the
-  `supervise.py` diagnostic no longer accepts `genisoimage`. Versions are candidates:
-  snapshot availability, closure (for example `ipxe-qemu` option ROMs), HTTP vs CA needs
-  and `Valid-Until` behavior are **unverified** until the preparation job runs.
+  `supervise.py` diagnostic no longer accepts `genisoimage`. Snapshot availability, dependency closure (including option ROMs), transport/CA
+  requirements and `Valid-Until` behavior require reviewed preparation evidence;
+  firmware loading and ISO operation require separate execution evidence.
   A build-client or job timeout does not prove daemon-side work stopped.
 * Argv: hcl-check's boundary plus `--device=/dev/kvm` and numeric `--group-add` of its
   GID (metadata-only `lstat` preflight: character device, nonzero group, group rw; no
@@ -402,10 +402,48 @@ The required offline suites run in the `portable-builder-offline` CI job; they
 exercise preparation, observer parsing and rejection of execution without
 launching Packer, QEMU, systemd units or other build processes.
 
+## Fixed non-VM runtime tool check
+
+`container_runner.py --mode runtime-check` prints an offline plan by default;
+`--execute` requires separate concrete lead authorization. This task accepts only
+`PREPARED_RUNTIME` (the image ID and four DiffIDs from the reviewed preparation
+artifact); no CLI/environment image, command or input override is accepted. Its
+identity remains bound to the original source and Dockerfile hashes recorded in
+GitHub even when recipe comments change. Preparation/import, actual tool results
+and subsequent VM acceptance are separate gates; `SENTINEL_RUNTIME` stays unset.
+
+This mode reuses the existing admission ledger, absolute budget, cancellation and
+exact full-ID/name/label cleanup. It has 90 seconds work plus 30 seconds cleanup,
+256 MiB memory, one CPU and 64 PIDs; nonroot, read-only root, no capabilities,
+no-new-privileges, no network, no devices and only one owned writable workspace.
+It stages no core, plugin, base disk or provisioner. The fixed empty-environment
+command checks QEMU/qemu-img 8.2.2, Python 3.12.3, xorriso 1.5.6 and readable
+nonempty SeaBIOS, standard VGA and virtio network firmware. It runs QEMU only
+with `--version`; there is no boot or KVM open/ioctl.
+
+The tiny ISO uses the pinned SDK's exact xorriso recipe: `-as genisoimage -rock
+-joliet -volid cidata -output DEST SOURCE`. Fixed inert bytes have a long nested
+filename; xorriso reads it back without mounting. The check requires successful
+creation/extraction, exact bytes, unchanged source and the ISO9660 volume label.
+Files are capped at 8 MiB, logs at 16 KiB, and a strict 4 KiB JSON report binds
+versions, firmware paths and input/readback/ISO hashes. The host reader rejects
+symlinked, oversized, missing, malformed or duplicate-key evidence. Acceptance
+also requires verified container and workspace removal before publication. These
+checks prove neither firmware loading nor Packer/guest/hardware compatibility.
+Offline fake-tool/daemon tests run in the existing required `test_container_runner.py`
+CI suite; they do not execute a prepared image.
+
+Primary sources read 2026-10-26: [QEMU plugin v1.1.7 SDK pin](https://github.com/hashicorp/packer-plugin-qemu/blob/v1.1.7/go.mod),
+[its StepCreateCD use](https://github.com/hashicorp/packer-plugin-qemu/blob/v1.1.7/builder/qemu/builder.go),
+[SDK v0.6.11 ISO argv](https://github.com/hashicorp/packer-plugin-sdk/blob/v0.6.11/multistep/commonsteps/step_create_cdrom.go),
+[GNU xorriso extraction examples](https://www.gnu.org/software/xorriso/) (current manual; selected tool 1.5.6),
+[plugin machine/device defaults](https://github.com/hashicorp/packer-plugin-qemu/blob/v1.1.7/builder/qemu/config.go)
+and [QEMU command generation](https://github.com/hashicorp/packer-plugin-qemu/blob/v1.1.7/builder/qemu/step_run.go).
+
 ## Fixed hosted runtime preparation
 
 `runtime-prepare.sh` and the fixed `runtime_prepare.py` hooks are the preparation
-entrypoints. They are **not executed or enabled by this offline change**. The lead
+entrypoints. Preparation requires a separate concrete lead execution scope. The lead
 must apply/review the fixed manual workflow separately and record execution scope.
 The standard fresh GitHub-hosted Ubuntu 24.04 VM is the trust boundary: read-only
 checkout authority, no cloud/registry-write/SSH credentials or secret forwarding,

@@ -1093,5 +1093,218 @@ class HclCheckTests(RunnerCase):
                 cr.main(base + ["--mode", "build"])
 
 
+class RuntimeDaemon(FakeDaemon):
+    """Data-only stand-in for the fixed tools, not an image execution."""
+    def __init__(self, clock, fault=None, **kwargs):
+        super().__init__(clock, exit_code=0, **kwargs)
+        self.fault = fault
+
+    def image_info(self):
+        info = {"Id": cr.PREPARED_RUNTIME["image_id"],
+                "RootFS": {"Layers": list(cr.PREPARED_RUNTIME["diffids"])}, "Config": {}}
+        if self.fault == "image_id":
+            info["Id"] = IMAGE_ID
+        if self.fault == "layers":
+            info["RootFS"]["Layers"].reverse()
+        if self.fault in ("Volumes", "OnBuild"):
+            info["Config"][self.fault] = ["unexpected"]
+        return json.dumps(info)
+
+    def start(self, c):
+        ws = workspace_of(c["args"])
+        source = os.path.join(ws, "source", cr.RUNTIME_PATH)
+        os.makedirs(os.path.dirname(source))
+        with open(source, "wb") as handle:
+            handle.write(cr.RUNTIME_BYTES)
+        iso = bytearray(40 * 2048)
+        iso[32768:32775] = b'\x01CD001\x01'
+        iso[32808:32840] = b'cidata'.ljust(32)
+        report = {"schema": 1, "versions": cr.RUNTIME_VERSIONS, "firmware": list(cr.RUNTIME_FIRMWARE),
+                  "input_sha256": hashlib.sha256(cr.RUNTIME_BYTES).hexdigest(),
+                  "iso_sha256": hashlib.sha256(iso).hexdigest(), "iso_bytes": len(iso),
+                  "readback_sha256": hashlib.sha256(cr.RUNTIME_BYTES).hexdigest(), "volume": "cidata"}
+        if self.fault == "version":
+            report["versions"] = dict(report["versions"], qemu="QEMU emulator version 9.0.0")
+        if self.fault == "boolean":
+            report["schema"] = True
+        if self.fault == "firmware":
+            report["firmware"] = []
+        if self.fault == "extra":
+            report["extra"] = "ignored?"
+        if self.fault == "volume":
+            iso[32808] = 0
+            report["iso_sha256"] = hashlib.sha256(iso).hexdigest()
+        files = {"runtime.json": json.dumps(report).encode(), "check.iso": iso,
+                 "readback": cr.RUNTIME_BYTES}
+        files.update({name + ".log": b"synthetic tool log\n" for name in
+                      ("qemu", "qemu_img", "python", "xorriso", "create", "extract")})
+        if self.fault == "duplicate":
+            files["runtime.json"] = files["runtime.json"][:-1] + b', "schema": 1}'
+        if self.fault == "oversize":
+            files["runtime.json"] = b" " * (cr.RESULT_CAP + 1)
+        if self.fault == "log_cap":
+            files["create.log"] = b"x" * 16385
+        if self.fault == "readback":
+            files["readback"] = b"bad"
+        if self.fault == "iso_hash":
+            files["check.iso"][-1] = 1
+        if self.fault == "missing":
+            del files["runtime.json"]
+        for name, raw in files.items():
+            with open(os.path.join(ws, name), "wb") as handle:
+                handle.write(raw)
+        if self.fault == "symlink":
+            os.unlink(os.path.join(ws, "runtime.json"))
+            os.symlink("readback", os.path.join(ws, "runtime.json"))
+        c["state"], c["exit_at"], c["code"] = "running", self.clock.now + 1, self.exit_code
+        if self.mode == "never_exits":
+            c["exit_at"] = float("inf")
+        if self.fault == "exit":
+            c["code"] = 1
+
+
+class RuntimeCheckTests(RunnerCase):
+    def run_runtime(self, fault=None, **kwargs):
+        daemon = RuntimeDaemon(self.clock, fault, **kwargs.pop("daemon", {}))
+        result = cr.run_probe(cr.PREPARED_RUNTIME["image_id"], self.root, self.ledger, daemon,
+                              clock=self.clock, sleep=self.clock.sleep, uid=os.getuid() or 1000,
+                              mode="runtime-check", **kwargs)
+        return result, daemon
+
+    def test_fixed_non_vm_args_identity_and_no_staging(self):
+        with mock.patch.object(cr.stage_tools, "stage", side_effect=AssertionError), \
+                mock.patch.object(cr, "kvm_preflight", side_effect=AssertionError):
+            result, daemon = self.run_runtime()
+        self.assertEqual(result["outcome"], "accepted", result)
+        self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
+        self.assertIsNone(cr.SENTINEL_RUNTIME)
+        args = next(a for a, _ in daemon.calls if a[0] == "create")
+        for flag in ("--pull=never", "--network=none", "--cap-drop=ALL", "--read-only",
+                     "--security-opt=no-new-privileges", "--memory=256m", "--cpus=1", "--pids-limit=64"):
+            self.assertIn(flag, args)
+        self.assertEqual(len([a for a in args if a.startswith("--mount=")]), 1)
+        self.assertIn(cr.PREPARED_RUNTIME["image_id"], args)
+        self.assertEqual(args[-1], cr.RUNTIME_SCRIPT)
+        self.assertFalse(any(a.startswith(("--device", "--group-add", "--env", "--privileged")) for a in args))
+        self.assertEqual(self.record()["image"], cr.PREPARED_RUNTIME["image_id"])
+        self.assertTrue(cr.released_record(self.record()))
+        self.assertEqual(cr.PROFILES["runtime-check"], (90, 30))
+        self.assertEqual(result["evidence"]["runtime_diffids"], cr.PREPARED_RUNTIME["diffids"])
+
+    def test_preflight_rejects_image_and_config_mismatch_before_create(self):
+        for fault in ("image_id", "layers", "Volumes", "OnBuild"):
+            with self.subTest(fault=fault):
+                result, daemon = self.run_runtime(fault)
+                self.assertEqual(result["outcome"], "failed", result)
+                self.assertFalse(self.mutations(daemon))
+
+    def test_untrusted_report_or_iso_never_accepts_and_still_cleans(self):
+        for fault in ("version", "boolean", "firmware", "extra", "duplicate", "oversize", "log_cap",
+                      "readback", "iso_hash", "missing", "symlink", "volume", "exit"):
+            with self.subTest(fault=fault):
+                result, daemon = self.run_runtime(fault)
+                self.assertEqual(result["outcome"], "failed", result)
+                self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
+
+    def test_cleanup_ambiguity_cancellation_and_expiry_override_success(self):
+        for mode in ("rm_lost", "name_mismatch", "never_exits", "start_interrupt"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as ledger:
+                os.chmod(ledger, 0o700)
+                old = self.ledger
+                self.ledger = ledger
+                try:
+                    result, daemon = self.run_runtime(daemon={"mode": mode})
+                finally:
+                    self.ledger = old
+                self.assertNotEqual(result["outcome"], "accepted", result)
+                if mode in ("rm_lost", "name_mismatch"):
+                    self.assertEqual(result["outcome"], "hold")
+        result, daemon = self.run_runtime(admitted_at=self.clock() - 90)
+        self.assertNotEqual(result["outcome"], "accepted")
+        self.assertFalse(self.mutations(daemon))
+
+    def test_cli_no_input_or_image_override_and_plan_is_offline(self):
+        base = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "runtime-check"]
+        with mock.patch.object(cr, "Backend", side_effect=AssertionError), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cr.main(base), 0)
+        self.assertEqual(json.loads(out.getvalue())["image"], cr.PREPARED_RUNTIME["image_id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cr.main(base + ["--core-file", "/anything"]), 2)
+            with self.assertRaises(SystemExit):
+                cr.main(base + ["--image", IMAGE_ID])
+        with self.assertRaises(ValueError):
+            self.run_runtime(sources={"core": "/anything"})
+        with self.assertRaises(ValueError):
+            cr.run_probe(IMAGE, self.root, self.ledger, RuntimeDaemon(self.clock),
+                         mode="runtime-check", uid=os.getuid() or 1000)
+
+
+class RuntimeProgramTests(unittest.TestCase):
+    """Execute only the Python assertion logic with fake tools/firmware and inert files.
+    This catches command/argument, failed tool and readback errors without any image."""
+    def test_plugin_recipe_and_each_assertion_failure(self):
+        from pathlib import Path
+        for fault in (None, "version", "create", "readback", "firmware", "volume"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                calls = []
+                old_cwd = os.getcwd()
+                old_umask = os.umask(0o077)
+                os.umask(old_umask)
+                self.addCleanup(os.chdir, old_cwd)
+                real_is_file, real_access, real_stat = Path.is_file, os.access, os.stat
+                def is_file(path):
+                    if str(path) in cr.RUNTIME_FIRMWARE:
+                        return fault != "firmware"
+                    return real_is_file(path)
+                def access(path, mode):
+                    return True if path in cr.RUNTIME_FIRMWARE else real_access(path, mode)
+                def info(path, *args, **kwargs):
+                    if path in cr.RUNTIME_FIRMWARE:
+                        return type('Info', (), {'st_size': 1024})()
+                    return real_stat(path, *args, **kwargs)
+                def tool(argv, **kwargs):
+                    calls.append(argv)
+                    self.assertEqual(kwargs["env"], {'PATH': '/usr/bin:/bin', 'HOME': '/out',
+                                                     'TMPDIR': '/out', 'LC_ALL': 'C'})
+                    if argv[1] in ("--version", "-version"):
+                        key = {"qemu-system-x86_64": "qemu", "qemu-img": "qemu_img",
+                               "python3": "python", "xorriso": "xorriso"}[os.path.basename(argv[0])]
+                        kwargs["stdout"].write((('wrong' if fault == 'version' else cr.RUNTIME_VERSIONS[key]) + '\n').encode())
+                    elif argv[1] == "-as":
+                        self.assertEqual(argv, ['/usr/bin/xorriso', '-as', 'genisoimage', '-rock', '-joliet',
+                                                '-volid', 'cidata', '-output', '/out/check.iso', '/out/source'])
+                        if fault == "create":
+                            raise subprocess.CalledProcessError(1, argv)
+                        iso = bytearray(40 * 2048)
+                        iso[32768:32775] = b'\x01CD001\x01'
+                        iso[32808:32840] = (b'bad' if fault == 'volume' else b'cidata').ljust(32)
+                        Path('check.iso').write_bytes(iso)
+                    else:
+                        self.assertEqual(argv, ['/usr/bin/xorriso', '-abort_on', 'FAILURE', '-osirrox', 'on',
+                                                '-indev', '/out/check.iso', '-extract', '/' + cr.RUNTIME_PATH,
+                                                '/out/readback'])
+                        Path('readback').write_bytes(b'bad' if fault == 'readback' else cr.RUNTIME_BYTES)
+                # The embedded program is fixed; only its private /out cwd and immutable
+                # firmware metadata are substituted. No subprocess ever starts.
+                real_chdir = os.chdir
+                os.chdir(tmp)
+                try:
+                    with mock.patch('os.chdir', side_effect=lambda path: None if path == '/out' else real_chdir(path)), \
+                            mock.patch('subprocess.run', side_effect=tool), mock.patch.object(Path, 'is_file', is_file), \
+                            mock.patch('os.access', side_effect=access), mock.patch('os.stat', side_effect=info):
+                        if fault:
+                            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                                exec(compile(cr.RUNTIME_PROGRAM, '<fixed runtime assertions>', 'exec'), {})
+                            self.assertFalse(Path('runtime.json').exists())
+                        else:
+                            exec(compile(cr.RUNTIME_PROGRAM, '<fixed runtime assertions>', 'exec'), {})
+                            self.assertEqual(json.loads(Path('runtime.json').read_text())['volume'], 'cidata')
+                            self.assertEqual(len(calls), 6)
+                finally:
+                    os.chdir(old_cwd)
+                    os.umask(old_umask)
+
+
 if __name__ == "__main__":
     unittest.main()

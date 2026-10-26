@@ -1,9 +1,10 @@
 # Fixed sentinel runtime (README.md "Fixed sentinel task"). This directory is the ENTIRE
-# Docker build context; only pinned external CA data is copied in. NOT built, NOT tested, NOT accepted:
-# every package version below is a publisher-metadata CANDIDATE; availability and the
-# dependency closure in the dated snapshot are unverified until the reviewed preparation
-# workflow runs. The resulting image ID and RootFS DiffIDs, once accepted by the lead,
-# become container_runner.SENTINEL_RUNTIME. Shared guest-module pins are untouched.
+# Docker build context; only pinned external CA data is copied in. Preparation and
+# tool execution require separate lead scopes and reviewed evidence. The accepted
+# artifact remains bound to its ORIGINAL source/recipe hashes in GitHub; a recipe
+# edit does not rebuild or reidentify it. PREPARED_RUNTIME binds tool checks only;
+# SENTINEL_RUNTIME needs separate acceptance before any VM execution. Shared guest
+# module pins are untouched.
 FROM ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 
 # DATA only from the already pinned builder image; no donor executable runs.
