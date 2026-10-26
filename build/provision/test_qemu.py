@@ -6,11 +6,13 @@ import sys
 import tempfile
 import subprocess
 import json
+import re
 import test_bridge_ipv4_harness as ownership
 import unittest
 from unittest.mock import patch
 
 from hhfab_release import Refusal, bounded
+import qemu_container
 import qemu_witness as witness
 
 INSTALL = Path(__file__).with_name('install-qemu.py')
@@ -114,6 +116,142 @@ except KeyboardInterrupt:
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][-1], 'update')
         self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
+
+
+class PhaseDiagnosticTests(unittest.TestCase):
+    SEQUENCE = ['apt-update', 'apt-check-before', 'apt-simulate', 'apt-install', 'apt-check-after']
+    NONZERO = "command failed: apt-get code=100 output_tail=b'E: boom\\n'"
+
+    def setUp(self):
+        self.module = runpy.run_path(str(INSTALL))
+        self.globals = self.module['install'].__globals__
+
+    def step(self, args):
+        if args[-1] == 'update':
+            return 'apt-update'
+        if '--simulate' in args:
+            return 'apt-simulate'
+        if '--yes' in args:
+            return 'apt-install'
+        return 'apt-check'
+
+    def failing_call(self, target, message, calls):
+        def call(args, seconds=10):
+            name = self.step(args)
+            calls.append((name, seconds))
+            if name == 'apt-check':
+                name = 'apt-check-before' if sum(c[0] == 'apt-check' for c in calls) == 1 else 'apt-check-after'
+            if name == target:
+                raise Refusal(message)
+            return b''
+        return call
+
+    def test_each_transaction_phase_is_labelled_and_stops_later_work(self):
+        for target in self.SEQUENCE:
+            for message, kind in [('command timeout', 'timeout'), (self.NONZERO, 'nonzero'),
+                                  ('command output overflow', 'overflow')]:
+                calls = []
+                before = set(Path('/var/tmp').glob('labapp-qemu-*'))
+                patched = {'preflight': lambda: {}, 'call': self.failing_call(target, message, calls),
+                           'installed': lambda: self.fail('verification after failed phase')}
+                with self.subTest(target=target, kind=kind), patch.dict(self.globals, patched):
+                    with self.assertRaises(self.module['PhaseRefusal']) as caught:
+                        self.module['install']()
+                    exc = caught.exception
+                    self.assertEqual((exc.phase, exc.kind, exc.cause), (target, kind, message))
+                    self.assertRegex(str(exc), r'^' + re.escape(message) +
+                                     r' \[phase=' + target + ' class=' + kind +
+                                     r' elapsed=\d+\.\ds allocated=\d+\.\ds\]$')
+                    self.assertIsInstance(exc.__cause__, Refusal)
+                    # Nothing after the failed phase ran; workspace removed.
+                    self.assertEqual(len(calls), self.SEQUENCE.index(target) + 1)
+                    self.assertTrue(0 < exc.allocated <= 180)
+                    self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
+
+    def test_exhausted_shared_budget_is_labelled_without_running_command(self):
+        calls = []
+        ticks = iter([0.0])  # installer start; every later reading is past the 210 s budget
+        fake_time = type('T', (), {'monotonic': staticmethod(lambda: next(ticks, 211.0))})
+        with patch.dict(self.globals, {'preflight': lambda: {}, 'time': fake_time,
+                                       'call': lambda args, seconds=10: calls.append(args) or b''}):
+            with self.assertRaises(self.module['PhaseRefusal']) as caught:
+                self.module['install']()
+        self.assertEqual((caught.exception.kind, caught.exception.allocated), ('budget', 0.0))
+        self.assertEqual(calls, [])
+        self.assertEqual(caught.exception.phase, 'apt-update')
+
+    def test_preflight_and_package_verification_phases(self):
+        def refuse(args, seconds=10):
+            raise Refusal('command timeout')
+        with patch('os.geteuid', return_value=0), patch.object(Path, 'is_file', return_value=True), \
+             patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"'), \
+             patch.dict(self.globals, {'call': refuse}):
+            with self.assertRaises(self.module['PhaseRefusal']) as caught:
+                self.module['install']()
+        self.assertEqual((caught.exception.phase, caught.exception.kind, caught.exception.allocated),
+                         ('preflight', 'timeout', 10))
+        pins = dict(self.module['PINS'])
+        with patch('os.geteuid', return_value=0), patch.object(Path, 'is_file', return_value=True), \
+             patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"'), \
+             patch.dict(self.globals, {'call': lambda args, seconds=10: b'amd64\n' if '--print-architecture' in args else b'',
+                                       'installed': lambda: pins,
+                                       'verify_tools': lambda: (_ for _ in ()).throw(Refusal('command timeout'))}):
+            with self.assertRaises(self.module['PhaseRefusal']) as caught:
+                self.module['install']()
+        # The inner label wins; preflight does not relabel it.
+        self.assertEqual((caught.exception.phase, caught.exception.kind), ('package-verification', 'timeout'))
+
+    def test_post_install_verification_phase(self):
+        with patch.dict(self.globals, {'preflight': lambda: {}, 'call': lambda args, seconds=10: b'',
+                                       'installed': lambda: {}}):
+            with self.assertRaises(self.module['PhaseRefusal']) as caught:
+                self.module['install']()
+        self.assertEqual((caught.exception.phase, caught.exception.kind, caught.exception.cause),
+                         ('package-verification', 'refusal', 'installed version mismatch'))
+
+    def test_classification_and_diagnostic_text_are_fixed(self):
+        classify = self.module['classify']
+        for cause, kind in [('command timeout', 'timeout'), ('command output overflow', 'overflow'),
+                            ('installation deadline exceeded', 'budget'), (self.NONZERO, 'nonzero'),
+                            ('authentication failure', 'refusal'), ('actual signature refusal', 'refusal')]:
+            self.assertEqual(classify(cause), kind)
+        exc = self.module['PhaseRefusal']('command timeout', 'apt-update', 1.5, 180)
+        self.assertEqual(str(exc), 'command timeout [phase=apt-update class=timeout elapsed=1.5s allocated=180.0s]')
+
+
+class StrictNegativeTests(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(str(INSTALL))
+        self.make = self.module['PhaseRefusal']
+
+    def refusal(self, cause, phase):
+        return self.make(cause, phase, 1, 180)
+
+    def test_unavailable_version_only_from_nonzero_simulation(self):
+        good = "command failed: apt-get code=100 output_tail=b\"E: Version '999:0.invalid' for 'qemu-system-x86' was not found\\n\""
+        escaped = ("command failed: apt-get code=100 output_tail=b'E: Version \\'999:0.invalid\\' "
+                   "for \\'qemu-system-x86\\' was not found\\n'")
+        for accepted in (good, escaped):
+            qemu_container.require_unavailable_version(self.refusal(accepted, 'apt-simulate'))
+        for cause, phase in [
+                ('command timeout', 'apt-simulate'), ('command timeout', 'apt-update'),
+                (good, 'apt-update'), (good, 'apt-check-before'),
+                ("command failed: apt-get code=100 output_tail=b'W: GPG error NO_PUBKEY'", 'apt-simulate'),
+                ("command failed: apt-get code=100 output_tail=b'E: Unable to locate package'", 'apt-simulate'),
+                (good.replace('999:0.invalid', '1:1.0'), 'apt-simulate'),
+                (good.replace('qemu-system-x86', 'socat'), 'apt-simulate'),
+                ('authentication failure', 'apt-simulate'), ('actual signature refusal', 'apt-update')]:
+            with self.subTest(cause=cause, phase=phase), self.assertRaises(AssertionError):
+                qemu_container.require_unavailable_version(self.refusal(cause, phase))
+        with self.assertRaises(AssertionError):
+            qemu_container.require_unavailable_version(Refusal(good))
+
+    def test_signature_negative_requires_authenticated_update_phase(self):
+        qemu_container.require_signature_refusal(self.refusal('actual signature refusal', 'apt-update'))
+        for exc in (self.refusal('actual signature refusal', 'apt-simulate'),
+                    self.refusal('command timeout', 'apt-update'), Refusal('actual signature refusal')):
+            with self.assertRaises(AssertionError):
+                qemu_container.require_signature_refusal(exc)
 
 
 class WitnessTests(unittest.TestCase):
