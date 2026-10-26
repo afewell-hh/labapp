@@ -427,7 +427,13 @@ filename; xorriso reads it back without mounting. The check requires successful
 creation/extraction, exact bytes, unchanged source and the ISO9660 volume label.
 Files are capped at 8 MiB, logs at 16 KiB, and a strict 4 KiB JSON report binds
 versions, firmware paths and input/readback/ISO hashes. The host reader rejects
-symlinked, oversized, missing, malformed or duplicate-key evidence. Acceptance
+symlinked, oversized, missing, malformed or duplicate-key evidence. Before cleanup,
+fixed tool logs and the runtime program stdout/stderr log retain bounded byte
+counts, SHA256s and excerpts (at most 2 KiB each) in the result, including on
+nonzero/OOM exits. Missing or invalid diagnostics are explicitly listed; arbitrary
+paths and oversized files are never read as diagnostics. JSON serialization escapes
+control bytes in public output. Failure evidence retains candidate identity, exit
+code, OOM state and elapsed time; it cannot turn a failure into acceptance. Acceptance
 also requires verified container and workspace removal before publication. These
 checks prove neither firmware loading nor Packer/guest/hardware compatibility.
 Offline fake-tool/daemon tests run in the existing required `test_container_runner.py`

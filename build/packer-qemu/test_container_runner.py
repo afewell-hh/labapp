@@ -1137,7 +1137,7 @@ class RuntimeDaemon(FakeDaemon):
         files = {"runtime.json": json.dumps(report).encode(), "check.iso": iso,
                  "readback": cr.RUNTIME_BYTES}
         files.update({name + ".log": b"synthetic tool log\n" for name in
-                      ("qemu", "qemu_img", "python", "xorriso", "create", "extract")})
+                      ("qemu", "qemu_img", "python", "xorriso", "create", "extract", "runtime")})
         if self.fault == "duplicate":
             files["runtime.json"] = files["runtime.json"][:-1] + b', "schema": 1}'
         if self.fault == "oversize":
@@ -1185,6 +1185,7 @@ class RuntimeCheckTests(RunnerCase):
         self.assertEqual(len([a for a in args if a.startswith("--mount=")]), 1)
         self.assertIn(cr.PREPARED_RUNTIME["image_id"], args)
         self.assertEqual(args[-1], cr.RUNTIME_SCRIPT)
+        self.assertTrue(cr.RUNTIME_SCRIPT.endswith(" > /out/runtime.log 2>&1 < /dev/null"))
         self.assertFalse(any(a.startswith(("--device", "--group-add", "--env", "--privileged")) for a in args))
         self.assertEqual(self.record()["image"], cr.PREPARED_RUNTIME["image_id"])
         self.assertTrue(cr.released_record(self.record()))
@@ -1222,6 +1223,79 @@ class RuntimeCheckTests(RunnerCase):
         result, daemon = self.run_runtime(admitted_at=self.clock() - 90)
         self.assertNotEqual(result["outcome"], "accepted")
         self.assertFalse(self.mutations(daemon))
+
+    def test_failed_tool_diagnostics_survive_verified_cleanup(self):
+        class FailedXorriso(RuntimeDaemon):
+            def start(inner, c):
+                super().start(c)
+                ws = workspace_of(c["args"])
+                os.unlink(os.path.join(ws, "runtime.json"))
+                os.unlink(os.path.join(ws, "extract.log"))
+                for name, raw in (("create.log", b'xorriso: FAILURE: invalid input\n\x1b[31m' + b'x' * 4096),
+                                  ("runtime.log", b'Traceback: CalledProcessError: xorriso exited 1\n')):
+                    with open(os.path.join(ws, name), "wb") as handle:
+                        handle.write(raw)
+                c["code"] = 1
+        daemon = FailedXorriso(self.clock)
+        result = cr.run_probe(cr.PREPARED_RUNTIME["image_id"], self.root, self.ledger, daemon,
+                              clock=self.clock, sleep=self.clock.sleep, uid=os.getuid() or 1000,
+                              mode="runtime-check")
+        self.assertEqual((result["outcome"], result["reason"]), ("failed", "unexpected_exit"))
+        self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
+        self.assertFalse(os.path.exists(workspace_of(next(args for args, _ in daemon.calls if args[0] == "create"))))
+        evidence = result["evidence"]
+        self.assertEqual(evidence["exit_code"], 1)
+        self.assertEqual(evidence["image_id"], cr.PREPARED_RUNTIME["image_id"])
+        self.assertEqual(evidence["runtime_diffids"], cr.PREPARED_RUNTIME["diffids"])
+        self.assertIn("elapsed", evidence)
+        self.assertEqual(evidence["invalid_files"], ["extract.log"])
+        self.assertIn("CalledProcessError", evidence["logs"]["runtime"]["excerpt"])
+        self.assertIn("xorriso: FAILURE", evidence["logs"]["create"]["excerpt"])
+        self.assertEqual(len(evidence["logs"]["create"]["excerpt"]), cr.EXCERPT)
+        self.assertGreater(evidence["logs"]["create"]["bytes"], cr.EXCERPT)
+        self.assertNotIn('\x1b', json.dumps(result))
+        self.assertIn('\\u001b', json.dumps(result))
+
+    def test_failure_evidence_survives_oom_and_uncertain_cleanup(self):
+        for mode, outcome in (("oom", "failed"), ("rm_lost", "hold")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as ledger:
+                os.chmod(ledger, 0o700)
+                daemon = RuntimeDaemon(self.clock, fault="exit", mode=mode)
+                result = cr.run_probe(cr.PREPARED_RUNTIME["image_id"], self.root, ledger, daemon,
+                                      clock=self.clock, sleep=self.clock.sleep, uid=os.getuid() or 1000,
+                                      mode="runtime-check")
+                self.assertEqual(result["outcome"], outcome)
+                self.assertEqual(result["evidence"]["exit_code"], 1)
+                self.assertEqual(result["evidence"]["oom_killed"], mode == "oom")
+                self.assertIn("runtime", result["evidence"]["logs"])
+
+    def test_failed_diagnostic_files_are_bounded_regular_and_no_follow(self):
+        for name in ("qemu", "qemu_img", "python", "xorriso", "create", "extract", "runtime"):
+            for fault in ("missing", "symlink", "oversize", "directory", "fifo"):
+                with self.subTest(name=name, fault=fault):
+                    class BadDiagnostic(RuntimeDaemon):
+                        def start(inner, c):
+                            super().start(c)
+                            path = os.path.join(workspace_of(c["args"]), name + ".log")
+                            os.unlink(path)
+                            if fault == "symlink":
+                                os.symlink("/etc/hostname", path)
+                            elif fault == "oversize":
+                                with open(path, "wb") as handle:
+                                    handle.truncate(16385)
+                            elif fault == "directory":
+                                os.mkdir(path)
+                            elif fault == "fifo":
+                                os.mkfifo(path)
+                            c["code"] = 1
+                    daemon = BadDiagnostic(self.clock)
+                    result = cr.run_probe(cr.PREPARED_RUNTIME["image_id"], self.root, self.ledger, daemon,
+                                          clock=self.clock, sleep=self.clock.sleep, uid=os.getuid() or 1000,
+                                          mode="runtime-check")
+                    self.assertEqual((result["outcome"], result["reason"]), ("failed", "unexpected_exit"))
+                    self.assertEqual(result["evidence"]["invalid_files"], [name + ".log"])
+                    self.assertNotIn(name, result["evidence"]["logs"])
+                    self.assertEqual((result["cleanup"], result["workspace"]), ("verified", "removed"))
 
     def test_cli_no_input_or_image_override_and_plan_is_offline(self):
         base = ["--workspace-root", "/tmp/x", "--ledger-dir", "/tmp/y", "--mode", "runtime-check"]
@@ -1275,6 +1349,7 @@ class RuntimeProgramTests(unittest.TestCase):
                         self.assertEqual(argv, ['/usr/bin/xorriso', '-as', 'genisoimage', '-rock', '-joliet',
                                                 '-volid', 'cidata', '-output', '/out/check.iso', '/out/source'])
                         if fault == "create":
+                            kwargs["stdout"].write(b'xorriso: FAILURE: synthetic tool error\n')
                             raise subprocess.CalledProcessError(1, argv)
                         iso = bytearray(40 * 2048)
                         iso[32768:32775] = b'\x01CD001\x01'
@@ -1297,6 +1372,8 @@ class RuntimeProgramTests(unittest.TestCase):
                             with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                                 exec(compile(cr.RUNTIME_PROGRAM, '<fixed runtime assertions>', 'exec'), {})
                             self.assertFalse(Path('runtime.json').exists())
+                            if fault == 'create':
+                                self.assertIn(b'xorriso: FAILURE', Path('create.log').read_bytes())
                         else:
                             exec(compile(cr.RUNTIME_PROGRAM, '<fixed runtime assertions>', 'exec'), {})
                             self.assertEqual(json.loads(Path('runtime.json').read_text())['volume'], 'cidata')

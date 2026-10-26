@@ -194,7 +194,8 @@ with open('runtime.json', 'x') as out:
 '''
 RUNTIME_SCRIPT = ("ulimit -f 8192 || exit 125; umask 077; "
                   "/usr/bin/env -i HOME=/out TMPDIR=/out PATH=/usr/bin:/bin LC_ALL=C "
-                  "/usr/bin/python3 -I -B -c " + shlex.quote(RUNTIME_PROGRAM))
+                  "/usr/bin/python3 -I -B -c " + shlex.quote(RUNTIME_PROGRAM) +
+                  " > /out/runtime.log 2>&1 < /dev/null")
 
 
 def boot_clock():
@@ -744,10 +745,29 @@ def read_step(out_dir, name, cap=STEP_CAP):
 def _accept_runtime(own, result, budget, clock, oom, code):
     """Accept only bounded fixed tool/ISO evidence; final acceptance also needs exact
     container and workspace cleanup in _finish. No provisioner inputs are staged."""
+    workspace = own["workspace"]
+    evidence = {"image_id": own["image_id"], "runtime_diffids": PREPARED_RUNTIME["diffids"],
+                "exit_code": code, "oom_killed": oom, "logs": {},
+                "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    result["evidence"] = evidence
+    # Diagnostics survive verified workspace cleanup even when the program stops
+    # before writing its success report. Reject invalid files, never truncate them.
+    invalid = []
+    for name in ("qemu", "qemu_img", "python", "xorriso", "create", "extract", "runtime"):
+        raw_log = read_step(workspace, name + ".log", 16384)
+        if raw_log is None:
+            invalid.append(name + ".log")
+        else:
+            evidence["logs"][name] = {"bytes": len(raw_log), "sha256": hashlib.sha256(raw_log).hexdigest(),
+                                      "excerpt": raw_log[:EXCERPT].decode("ascii", "replace")}
+    if invalid:
+        evidence["invalid_files"] = sorted(invalid)
     if oom or code != 0:
         result["reason"] = "unexpected_exit"
         return
-    workspace = own["workspace"]
+    if invalid:
+        result["reason"] = "invalid_runtime_evidence"
+        return
     try:
         raw = read_step(workspace, "runtime.json", RESULT_CAP)
         report = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs,
@@ -768,19 +788,11 @@ def _accept_runtime(own, result, budget, clock, oom, code):
                 or read_step(workspace, "readback", len(RUNTIME_BYTES)) != RUNTIME_BYTES
                 or read_step(os.path.join(workspace, "source"), RUNTIME_PATH, len(RUNTIME_BYTES)) != RUNTIME_BYTES):
             raise ValueError("ISO evidence mismatch")
-        logs = {}
-        for name in ("qemu", "qemu_img", "python", "xorriso", "create", "extract"):
-            raw_log = read_step(workspace, name + ".log", 16384)
-            if raw_log is None:
-                raise ValueError("missing tool evidence")
-            logs[name] = {"bytes": len(raw_log), "sha256": hashlib.sha256(raw_log).hexdigest()}
         _checkpoint(own, budget, clock)
     except (ValueError, TypeError, AttributeError, RecursionError):
         result["reason"] = "invalid_runtime_evidence"
         return
-    result["evidence"] = {"image_id": own["image_id"], "runtime_diffids": PREPARED_RUNTIME["diffids"],
-                          "report": report, "logs": logs,
-                          "elapsed": round(own["exit_seen_at"] - own["started_at"], 2)}
+    evidence["report"] = report
     result["outcome"], result["reason"], result["exit_code"] = "accepted", None, code
 
 
