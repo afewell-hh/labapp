@@ -29,14 +29,27 @@ SENTINEL_VARS_NAME = "sentinel.pkrvars.hcl"
 VARS_NAMES = (VARS_NAME, SENTINEL_VARS_NAME)     # generated, excluded from the overall identity
 VERIFY_SECONDS = 30
 GUEST_FILES = ("user-data", "guest-build.sh")
-TASKS = ("hcl-check", "sentinel", "sentinel-expiry")
-VM_TASKS = ("sentinel", "sentinel-expiry")      # same guest inputs and guest-receipt identity
+TASKS = ("hcl-check", "sentinel", "sentinel-expiry", "fixture")
+VM_TASKS = ("sentinel", "sentinel-expiry", "fixture")      # same guest-receipt identity
 ARTIFACT_LIMIT = 1 << 32      # bound for hashing the disposable sentinel output
 # Sentinel guest assertions. Staged 0444 so `ubuntu` can read the copy made by user-data
 # (cp -a keeps modes; ISO Rock Ridge modes are UNVERIFIED until the tiny ISO check).
 ASSERT_NAME = "assert-sentinel.sh"
 SENTINEL_PLAN = (f"root /bin/bash @IN@/{ASSERT_NAME} root\n"
                  f"ubuntu /bin/bash @IN@/{ASSERT_NAME} ubuntu\n").encode()
+# Fixed hhfab fixture: the UNCHANGED build/provision installer pair is staged byte-for-byte and
+# run twice with the pinned --archive; assert-fixture.py only observes (see its docstring).
+# The sentinel root+ubuntu/cloud-init steps come first and supply the pre-seal evidence line.
+PROVISION_DIR = os.path.normpath(os.path.join(HERE, "..", "provision"))
+PROVISION_FILES = ("install-hhfab.py", "hhfab_release.py")
+FIXTURE_ASSERT = "assert-fixture.py"
+HHFAB_VERSION = "0.50.4"
+ARCHIVE_NAME = f"hhfab-linux-amd64-v{HHFAB_VERSION}.tar.gz"
+_INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VERSION} "
+            f"--archive @IN@/{ARCHIVE_NAME}\n")
+_ASSERT = f"root /usr/bin/python3 -I @IN@/{FIXTURE_ASSERT} "
+FIXTURE_PLAN = (SENTINEL_PLAN.decode() + _ASSERT + "baseline\n" + _INSTALL + _ASSERT + "snapshot\n"
+                + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n").encode()
 
 # members: name -> (unix permission bits, uncompressed size, CRC32) from the #262 listing
 PINS = {
@@ -54,6 +67,10 @@ PINS = {
         "members": {"LICENSE.txt": (0o644, 16757, 1201051225),
                     PLUGIN_FILE: (0o755, 49807522, 3434352986)},
     },
+    # Full release archive of the 0.50.4 compatibility candidate (not an image pin); identical to
+    # build/provision/hhfab_release.py PINS, whose unchanged guest module validates the member too.
+    "hhfab": {"file": ARCHIVE_NAME, "size": 59692810,
+              "sha256": "a8e6d1b8d0f752d7586c29201add3ff174d330c87fa25a3bdadec43f6c1376b6"},
     "base": {
         "file": "ubuntu-24.04-server-cloudimg-amd64.img", "size": 621284352,
         "sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
@@ -260,7 +277,7 @@ def vars_text(nonce, inputs, base_sha, verify_seconds=VERIFY_SECONDS):
 
 
 def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-check",
-          verify_seconds=None):
+          verify_seconds=None, provision_dir=PROVISION_DIR):
     """Create ws/in (read-only inputs), ws/cd (read-only CD files) and ws/out (the only
     writable tree, with its fixed empty subdirectories). `sources` maps core, plugin
     and base to caller-supplied files that must match the pins. Return the evidence.
@@ -271,9 +288,14 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
     observer `inputs`, keeps the overall in/+cd/ digest as `inputs` EVIDENCE, and
     takes `verify_seconds` (sentinel-expiry stages the identical guest inputs but asks the
     observer for the armed witness; its verify_seconds must exceed the work window) (an int or a callable evaluated when the var-file is
-    written, so it reflects the original budget actually left)."""
+    written, so it reflects the original budget actually left).
+    fixture stages the sentinel inputs plus the fixed hhfab plan, assert-fixture.py, the
+    byte-identical install-hhfab.py/hhfab_release.py and the pinned archive (`sources["archive"]`)
+    on the CD, so all of them are covered by the MANIFEST/receipt identity."""
     if task not in TASKS:
         raise StageError("unknown staging task")
+    if task == "fixture" and "archive" not in sources:
+        raise StageError("fixture needs the pinned hhfab archive")
     if not HEX64_RE.match(nonce):
         raise StageError("nonce must be 64 lowercase hex characters")
     for path in sources.values():
@@ -313,7 +335,20 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         for name in (ASSERT_NAME, "sentinel-evidence.py"):
             write_new(os.path.join(cd, name),
                       read_file(os.path.join(repo_dir, "guest", name), TEXT_LIMIT, check), 0o444)
-    write_new(os.path.join(cd, "plan.txt"), SENTINEL_PLAN if task in VM_TASKS else b"", 0o400)
+    if task == "fixture":
+        # Root-only inputs (every fixture step beyond the sentinel pair runs as root). The two
+        # provisioning modules are copied byte-for-byte; the archive is pinned and bounded.
+        write_new(os.path.join(cd, FIXTURE_ASSERT),
+                  read_file(os.path.join(repo_dir, "guest", FIXTURE_ASSERT), TEXT_LIMIT, check), 0o400)
+        for name in PROVISION_FILES:
+            write_new(os.path.join(cd, name),
+                      read_file(os.path.join(provision_dir, name), TEXT_LIMIT, check), 0o400)
+        archive_pin = pins["hhfab"]
+        if copy_hash(sources["archive"], os.path.join(cd, archive_pin["file"]), archive_pin["size"],
+                     check) != archive_pin["sha256"]:
+            raise StageError("hhfab archive differs from its pin")
+    write_new(os.path.join(cd, "plan.txt"),
+              FIXTURE_PLAN if task == "fixture" else SENTINEL_PLAN if task in VM_TASKS else b"", 0o400)
     write_new(os.path.join(cd, "nonce"), nonce.encode("ascii") + b"\n", 0o400)
     lines = "".join(f"{hash_file(os.path.join(cd, n), check=check)[0]}  {n}\n" for n in sorted(os.listdir(cd))
                     if n != "nonce")
@@ -335,6 +370,8 @@ def stage(ws, sources, nonce, check=_noop, pins=PINS, repo_dir=HERE, task="hcl-c
         var_bytes = vars_text(nonce, guest_receipt, base_sha, seconds) + flag
         vars_name = SENTINEL_VARS_NAME
         extra = {"guest_receipt": guest_receipt, "verify_seconds": seconds}
+        if task == "fixture":
+            extra["hhfab_archive_sha256"] = pins["hhfab"]["sha256"]
     else:
         var_bytes, vars_name = vars_text(nonce, inputs, base_sha), VARS_NAME
     write_new(os.path.join(inp, vars_name), var_bytes, 0o400)

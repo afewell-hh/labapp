@@ -64,6 +64,27 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self.target.read_bytes(), b"old binary, never execute")
                 self.assertEqual(list(self.destination.iterdir()), [self.target])
 
+    def test_matching_target_returns_unchanged_before_reading_the_archive(self):
+        # Why a corrupt-archive negative needs isolated, nonmatching prior bytes (#274):
+        # an already pinned 0755 target is answered "unchanged" before the archive is opened.
+        self.assertEqual(self.run_install(), "installed")
+        self.archive.write_bytes(b"corrupt, wrong size and digest")
+        self.assertEqual(self.run_install(), "unchanged")
+        self.assertEqual(self.target.read_bytes(), b"test")
+        self.archive.unlink()                              # not even present
+        self.assertEqual(self.run_install(), "unchanged")
+        self.archive_for()
+        self.target.write_bytes(b"old binary, never execute")      # nonmatching prior bytes
+        self.archive.write_bytes(b"corrupt, wrong size and digest")
+        with self.assertRaisesRegex(release.Refusal, "archive checksum/size mismatch"):
+            self.run_install()
+        self.assertEqual(self.target.read_bytes(), b"old binary, never execute")
+        self.assertEqual(list(self.destination.iterdir()), [self.target])
+        self.target.unlink()                               # absent target: the same refusal, nothing left
+        with self.assertRaisesRegex(release.Refusal, "archive checksum/size mismatch"):
+            self.run_install()
+        self.assertEqual(list(self.destination.iterdir()), [])
+
     def test_archive_member_safety_preserves_existing(self):
         for name, kind in [("../escape", tarfile.REGTYPE), ("hhfab-linux-amd64/hhfab", tarfile.SYMTYPE),
                            ("hhfab-linux-amd64/hhfab", tarfile.LNKTYPE)]:

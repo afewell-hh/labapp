@@ -14,7 +14,8 @@
 # Order: cloud-init success check -> staged bytes match MANIFEST exactly ->
 # plan (modules, then verification) -> seal -> sync -> receipt on the private
 # serial port -> poweroff. A failure emits a status=fail receipt and exits;
-# the host watchdog, not this script, terminates the VM.
+# a failing plan step first emits one bounded LABAPP-DIAG line (step, exit, token).
+# The host watchdog, not this script, terminates the VM.
 set -Eeuo pipefail
 
 IN=/var/lib/labapp-build/in
@@ -26,6 +27,27 @@ nonce=$ZERO
 emit() { # status
   printf '\nLABAPP-RECEIPT v1 nonce=%s inputs=%s status=%s\n' "$nonce" "$inputs" "$1" \
     >/dev/ttyS0
+}
+
+# Bounded failure diagnostic: the failing plan step (1-based) and its exit code plus ONE
+# fixed reason token a plan verifier may have left in $REASON. Nothing else from a
+# step is ever sent; a missing or malformed token becomes `plan-step`.
+REASON=/run/labapp-reason
+fail_step=0
+fail_rc=0
+diag_sent=0
+
+# shellcheck disable=SC2317  # invoked only from the ERR trap string
+emit_diag() {
+  local reason=plan-step token=
+  [[ $fail_step != 0 && $diag_sent == 0 ]] || return 0
+  diag_sent=1
+  if [[ -f $REASON && ! -L $REASON ]]; then
+    token=$(head -c 33 "$REASON" 2>/dev/null) || token=
+    [[ $token =~ ^[a-z][a-z0-9-]{0,31}$ ]] && reason=$token
+  fi
+  printf '\nLABAPP-DIAG v1 nonce=%s inputs=%s step=%d exit=%d reason=%s\n' \
+    "$nonce" "$inputs" "$fail_step" "$fail_rc" "$reason" >/dev/ttyS0 || true
 }
 
 check_cloud_init() {
@@ -71,10 +93,12 @@ check_inputs() {
 }
 
 run_plan() {
-  local user rest home
+  local user rest home rc
+  local -i step=0
   local -a words prefix
   while read -r user rest || [[ -n ${user:-} ]]; do
     [[ -z ${user:-} || $user == \#* ]] && continue
+    step+=1
     read -r -a words <<<"${rest//@IN@/$IN}"
     case $user in
       root) prefix=(); home=/root ;;
@@ -82,7 +106,12 @@ run_plan() {
       *) echo "unsupported plan user" >&2; return 1 ;;
     esac
     (cd / && "${prefix[@]}" env -i PATH="$SAFE_PATH" HOME="$home" LC_ALL=C.UTF-8 \
-      DEBIAN_FRONTEND=noninteractive "${words[@]}" </dev/null)
+      DEBIAN_FRONTEND=noninteractive "${words[@]}" </dev/null) || {
+      rc=$?
+      fail_step=$step
+      fail_rc=$rc
+      return 1
+    }
   done <"$IN/plan.txt"
 }
 
@@ -96,7 +125,7 @@ seal() {
 main() {
   nonce=$(<"$IN/nonce")
   inputs=$(sha256sum "$IN/MANIFEST" | cut -d' ' -f1)
-  trap 'emit fail' ERR
+  trap 'emit_diag; emit fail' ERR
   check_cloud_init
   check_inputs
   run_plan

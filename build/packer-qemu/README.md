@@ -24,6 +24,7 @@ or hardware compatibility. Runtime evidence and remaining gates belong in the PR
 | `guest/user-data`, `guest/guest-build.sh` | NoCloud seed; nonblocking enqueue; build service body (plan, seal, receipt, poweroff) |
 | `container_runner.py`, `stage_tools.py` | Fixed Docker `probe`, `hcl-check` and `runtime-check` tasks; pinned bounded staging (see "Bounded container probe"); `sentinel` mode pins its runtime identity and requires separate lead scope |
 | `runtime/Dockerfile`, `guest/assert-sentinel.sh` | Separately gated runtime preparation recipe; guest assertions run by the sentinel plan |
+| `guest/assert-fixture.py` | Fixed hhfab `fixture` assertions between two runs of the unchanged installer (see "Fixed `fixture` task") |
 | `test_*.py` | Offline tests: `python3 -m unittest discover -s build/packer-qemu -p 'test_*.py' -v` |
 
 ## Pins, verification, licensing
@@ -429,6 +430,47 @@ execution: each actual trial requires separately scoped lead authorization.
 * Unproven here: that a paused guest survives to the timer under the real plugin, that
   Packer/QEMU descendants vanish with the container (an independent client-loss probe
   is a separate lead step), and every UNRUN HCL attribute above.
+
+### Fixed `fixture` task (unchanged hhfab installer twice; source only)
+
+`--mode fixture --archive-file ABS` is a fixed variant of `sentinel`, not a module runner.
+It reuses the sentinel staging, run-bound receipt and pre-seal cloud-init evidence, observer
+(`require_sentinel_evidence`), SENTINEL runtime identity, `/dev/kvm` access, ledger, deadline and exact
+cleanup; there is no new HCL variable, command, module or path option. The caller supplies
+a read-only archive that must be exactly the committed pin (59,692,810 bytes, SHA256
+`a8e6d1b8d0f752d7586c29201add3ff174d330c87fa25a3bdadec43f6c1376b6`, hhfab 0.50.4, a compatibility
+candidate and not an image pin); the runner copies it through the bounded `copy_hash` helper.
+Nothing is acquired here and no archive cache is created or authorized; the caller-held file's
+ownership, retention and disposition stay outside this repository until the lead records them.
+
+* Staged on the CD and covered by the MANIFEST/receipt identity: byte-identical
+  `build/provision/install-hhfab.py` and `hhfab_release.py`, the pinned archive, `guest/assert-fixture.py`.
+* Fixed plan (steps are numbered for diagnostics): 1-2 the sentinel root/`ubuntu`/cloud-init assertions;
+  3 `baseline` (real unwritable-by-others directory chain, no `hhfab`, no stage leftover; records unrelated entries);
+  4 `/usr/bin/python3 -B install-hhfab.py --version 0.50.4 --archive ...` as root, cwd `/`, sanitized environment, default
+  `/usr/local/bin`; 5 `snapshot` (exact member hash, regular/single-link/0755/owner, unrelated entries untouched, no
+  `.hhfab-stage-*`, inode/size/mtime/ctime recorded); 6 the identical installer argv again; 7 `verify` (rerun left the same inode and times, so it
+  answered `unchanged`, and nothing else changed); 8 `negatives`; 9 `smoke`.
+* `negatives` run the unchanged installer against ISOLATED owned directories under `/run`, never `/usr/local/bin`: a
+  same-size corrupted copy of the archive against nonmatching prior bytes (never executed) and against an absent
+  target must exit 1 with exactly the archive checksum/size refusal and leave those bytes, mode and times and the directory
+  unchanged; `--version 9.9.9` must be the argparse exit 2 refusal. (An already matching installed binary returns
+  `unchanged` before reading its archive, so it cannot test a corrupt archive; `test_install_hhfab.py` records that.)
+* `smoke` runs `/usr/local/bin/hhfab --version` as `ubuntu` through `runuser`, `env -i`, cwd `/`, 20 s, 4 KiB output, and
+  requires the anchored `hhfab version v?0.50.4` (optional final newline) used by `component_prerequisites.py`.
+* Diagnostics: a failing plan step makes `guest-build.sh` send one `LABAPP-DIAG v1 ... step=N exit=N reason=token` line
+  before the failure receipt; `token` is a fixed word from `/run/labapp-reason` written by `assert-fixture.py`
+  (`dir-state`, `target-present`, `stage-leftover`, `install-state`, `dir-preserved`, `rerun-state`, `archive-integrity`, `bad-version`,
+  `neg-state`, `negative-timeout`, `state-missing`, `cli-run`, `cli-version`, `cli-timeout`, `output-bound`, `internal`) or `plan-step`. The observer validates it against the run's nonce and
+  inputs and appends only those fields to its failure reason; the runner keeps that bounded text as
+  `evidence.observer_failure` beyond the 2 KiB excerpt. No guest stdout/stderr is exported.
+* Budget: 1800 s work INCLUDING staging from admission + 900 s cleanup, no renewal (proposed, unmeasured).
+  The staged 60 MB CD file and the two extractions are unmeasured; large-ISO readback is a separate offline-checkable
+  and live gate. Source activation here is not execution authorization: every actual trial needs separately scoped lead
+  authorization and reconciled shared-ledger admission.
+* Proves, if run: the unchanged installer's offline `--archive` path installs and reruns as root in a fresh accelerated
+  guest and the binary starts as `ubuntu`. Not proven: network download, APT/dpkg, services, reboot or seal, nested VLAB,
+  other platforms, the release attestation (GitHub's immutable-release digest is not a verified publisher signature).
 
 ```bash
 # Read-only hardware diagnostics; successful exit does not enable execution.
