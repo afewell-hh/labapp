@@ -1,7 +1,7 @@
 """Fixed hhfab fixture assertions (see ../README.md "Fixed hhfab fixture task").
 
 Staged on the CD by stage_tools.py and run by guest-build.sh's plan as
-`root /usr/bin/python3 -I @IN@/assert-fixture.py <phase>` under `env -i`, cwd `/`,
+`root /usr/bin/python3 -I -B @IN@/assert-fixture.py <phase>` under `env -i`, cwd `/`,
 stdin /dev/null, between runs of the UNCHANGED build/provision/install-hhfab.py.
 Python 3.10+ stdlib only. It installs nothing into /usr/local/bin and never executes
 hhfab as root; the only execution of the installed binary is the nonroot `smoke`.

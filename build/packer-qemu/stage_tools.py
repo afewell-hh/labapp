@@ -47,7 +47,7 @@ HHFAB_VERSION = "0.50.4"
 ARCHIVE_NAME = f"hhfab-linux-amd64-v{HHFAB_VERSION}.tar.gz"
 _INSTALL = (f"root /usr/bin/python3 -B @IN@/install-hhfab.py --version {HHFAB_VERSION} "
             f"--archive @IN@/{ARCHIVE_NAME}\n")
-_ASSERT = f"root /usr/bin/python3 -I @IN@/{FIXTURE_ASSERT} "
+_ASSERT = f"root /usr/bin/python3 -I -B @IN@/{FIXTURE_ASSERT} "
 FIXTURE_PLAN = (SENTINEL_PLAN.decode() + _ASSERT + "baseline\n" + _INSTALL + _ASSERT + "snapshot\n"
                 + _INSTALL + _ASSERT + "verify\n" + _ASSERT + "negatives\n" + _ASSERT + "smoke\n").encode()
 

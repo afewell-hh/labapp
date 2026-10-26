@@ -525,7 +525,7 @@ class FixtureStagingTests(ts.StageCase):
         self.fixture()
         install = ("root /usr/bin/python3 -B @IN@/install-hhfab.py --version 0.50.4 "
                    "--archive @IN@/hhfab-linux-amd64-v0.50.4.tar.gz")
-        check = "root /usr/bin/python3 -I @IN@/assert-fixture.py "
+        check = "root /usr/bin/python3 -I -B @IN@/assert-fixture.py "
         self.assertEqual(self.read("cd", "plan.txt").decode().splitlines(), [
             "root /bin/bash @IN@/assert-sentinel.sh root", "ubuntu /bin/bash @IN@/assert-sentinel.sh ubuntu",
             check + "baseline", install, check + "snapshot", install, check + "verify",
