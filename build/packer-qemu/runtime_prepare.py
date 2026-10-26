@@ -16,6 +16,9 @@ import tarfile
 # Publisher release + Docker Hub tag metadata read 2026-10-26; README has URLs.
 BUILDKIT_IMAGE = "moby/buildkit@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c"
 BUILDX_VERSION = "v0.38.1"
+BOOTSTRAP_CA_SOURCE = "/etc/ssl/certs/ca-certificates.crt"
+BOOTSTRAP_CA_PATH = "/tmp/labapp-bootstrap-ca.pem"
+BOOTSTRAP_CA_CAP = 1024 * 1024
 HEX = re.compile(r"sha256:[0-9a-f]{64}\Z")
 CID = re.compile(r"[0-9a-f]{64}\Z")
 HOST = "unix:///var/run/docker.sock"
@@ -156,9 +159,13 @@ def evidence(out, state):
             for name, cap in [('packages.txt', 4*1024*1024), ('sources.txt', 65536),
                               ('policy.txt', 1024*1024), ('apt-config.txt', 1024*1024),
                               ('apt-lists.tar', 256*1024*1024), ('keyring.gpg', 1024*1024),
-                              ('inrelease.sha256', 65536), ('indexes.sha256', 1024*1024)]:
+                              ('inrelease.sha256', 65536), ('indexes.sha256', 1024*1024),
+                              ('bootstrap-ca.pem', BOOTSTRAP_CA_CAP)]:
                 raw = read_member(layer, 'usr/share/labapp-runtime/' + name, cap)
                 (out / name).write_bytes(raw)
+    state['bootstrap_ca'] = {'source_image': BUILDKIT_IMAGE, 'source_path': BOOTSTRAP_CA_SOURCE,
+                             'bytes': (out / 'bootstrap-ca.pem').stat().st_size,
+                             'sha256': digest(out / 'bootstrap-ca.pem')}
     state['image_id'], state['diffids'] = image_id, diffids
     require((out / 'metadata.json').is_file(), 'missing build metadata')
     require((out / 'metadata.json').stat().st_size <= 1024*1024, 'oversized metadata')
@@ -173,6 +180,7 @@ def seal(out, state, job_status='failure', build_outcome='failure'):
             'publication requires evidence and verified cleanup')
     require(digest(out / 'image.tar') == state['tar_sha256'], 'tar changed')
     require(digest(out / 'Dockerfile') == state['dockerfile_sha256'], 'Dockerfile changed')
+    require(digest(out / 'bootstrap-ca.pem') == state['bootstrap_ca']['sha256'], 'bootstrap CA changed')
     (out / 'provenance.json').write_text(json.dumps(state, sort_keys=True) + '\n')
     files = sorted(out.iterdir())
     require(all(x.is_file() and not x.is_symlink() for x in files), 'unexpected artifact member')

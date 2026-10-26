@@ -69,10 +69,12 @@ def archive_bytes(files):
     return out.getvalue()
 
 
-def candidate(out, missing=None, duplicate=None, base=False, compressed=()):
+def candidate(out, missing=None, duplicate=None, base=False, compressed=(), ca_bytes=None):
     files = ['packages.txt', 'sources.txt', 'policy.txt', 'apt-config.txt',
-             'apt-lists.tar', 'keyring.gpg', 'inrelease.sha256', 'indexes.sha256']
+             'apt-lists.tar', 'keyring.gpg', 'inrelease.sha256', 'indexes.sha256', 'bootstrap-ca.pem']
     members = [('usr/share/labapp-runtime/' + x, b'synthetic-only\n') for x in files if x != missing]
+    if ca_bytes is not None:
+        members = [(name, ca_bytes if name.endswith('/bootstrap-ca.pem') else raw) for name, raw in members]
     if duplicate:
         members += [('usr/share/labapp-runtime/' + duplicate, b'duplicate')]
     layer = archive_bytes(members)
@@ -252,6 +254,58 @@ source "$1"
                 'compression=uncompressed,force-compression=true')
             self.assertNotIn('--load', build)
             self.assertEqual([x.name for x in (root / 'labapp-runtime/context').iterdir()], ['Dockerfile'])
+
+    def test_actual_recipe_uses_only_pinned_ca_data_and_preserves_final_layer_evidence(self):
+        dockerfile = Path(prep.__file__).with_name('runtime') / 'Dockerfile'
+        text = dockerfile.read_text()
+        copy, = [shlex.split(line) for line in text.splitlines() if line.startswith('COPY ')]
+        self.assertEqual(copy, ['COPY', '--from=' + prep.BUILDKIT_IMAGE,
+                               prep.BOOTSTRAP_CA_SOURCE, prep.BOOTSTRAP_CA_PATH])
+        apt = [line for line in text.splitlines() if 'apt-get ' in line and not line.lstrip().startswith('#')]
+        self.assertEqual(len(apt), 2)
+        for line in apt:
+            self.assertIn('-o Acquire::https::CAInfo=' + prep.BOOTSTRAP_CA_PATH, line)
+        self.assertIn('ca-certificates=20240203', text)
+        self.assertIn('test -s ' + prep.BOOTSTRAP_CA_PATH, text)
+        self.assertNotIn('test -s ' + prep.BOOTSTRAP_CA_SOURCE, text)
+        final_run = text.rsplit('RUN ', 1)[1]
+        self.assertIn('cp ' + prep.BOOTSTRAP_CA_PATH + ' /usr/share/labapp-runtime/bootstrap-ca.pem', final_run)
+        recipe = '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+        for weakened in ['Verify-Peer=false', 'Verify-Host=false', 'trusted=yes', '--allow-unauthenticated',
+                         'Check-Valid-Until=false']:
+            self.assertNotIn(weakened, recipe)
+        self.assertEqual(text.count('Snapshot: 20261024T000000Z'), 2)
+        self.assertNotIn('apt-get ', text.split('RUN apt-get ', 1)[0])
+
+    def test_bootstrap_ca_bytes_are_bounded_and_bound_to_donor_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out, record = Path(directory), state()
+            raw = b'synthetic CA data, not an actual certificate\n'
+            candidate(out, ca_bytes=raw)
+            prep.evidence(out, record)
+            self.assertEqual(record['bootstrap_ca'], {'source_image': prep.BUILDKIT_IMAGE,
+                'source_path': prep.BOOTSTRAP_CA_SOURCE, 'bytes': len(raw),
+                'sha256': hashlib.sha256(raw).hexdigest()})
+            self.assertEqual((out / 'bootstrap-ca.pem').read_bytes(), raw)
+        for raw in [b'', b'x' * (prep.BOOTSTRAP_CA_CAP + 1)]:
+            with self.subTest(size=len(raw)), tempfile.TemporaryDirectory() as directory:
+                out, record = Path(directory), state()
+                candidate(out, ca_bytes=raw)
+                with self.assertRaisesRegex(ValueError, 'invalid tar member'):
+                    prep.evidence(out, record)
+                self.assertNotIn('tar_sha256', record)
+
+    def test_retained_bootstrap_ca_corruption_blocks_sealing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out, record = Path(directory), state()
+            candidate(out)
+            prep.evidence(out, record)
+            prep.cleanup(Fake(), record)
+            record['dockerfile_sha256'] = prep.digest(out / 'Dockerfile')
+            (out / 'bootstrap-ca.pem').write_bytes(b'corrupted retained data')
+            with self.assertRaisesRegex(ValueError, 'bootstrap CA changed'):
+                prep.seal(out, record, 'success', 'success')
+            self.assertFalse((out / 'SHA256SUMS').exists())
 
     def test_forced_uncompressed_two_layer_contract_preserves_diffids(self):
         with tempfile.TemporaryDirectory() as directory:

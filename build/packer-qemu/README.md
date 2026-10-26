@@ -340,7 +340,7 @@ stays execution-disabled.
   is the base image's own, no key download or authentication/`Valid-Until` bypass) and
   installs explicit candidate roots `qemu-system-x86`, `qemu-utils`, `seabios`
   (equal to `build/provision/install-qemu.py` PINS, which are untouched), `python3`,
-  `python3.12` and `xorriso` with `--no-install-recommends`; the resolved package list
+  `python3.12`, `xorriso` and `ca-certificates` with `--no-install-recommends`; the resolved package list
   and `InRelease` hashes are recorded inside the image. The ISO tool is one the pinned
   SDK actually searches (`xorriso`, `mkisofs`, `hdiutil`, `oscdimg`); the
   `supervise.py` diagnostic no longer accepts `genisoimage`. Versions are candidates:
@@ -451,13 +451,29 @@ admission. Upload occurs only after work and cleanup succeed; cancellation fails
 the GitHub `success()` condition. Failed uploads do not admit any runtime. This
 workflow is not a durable local lease authority or a reusable self-hosted runner.
 
-The base must already contain compatible APT, HTTPS transport, a CA bundle,
-archive keyring and gpgv. The Dockerfile checks these before network work and
-fails closed if they are absent. Canonical's snapshot rewriting uses HTTPS even
-for HTTP archive source entries. There is no ambient-latest bootstrap, key TOFU,
-package-authentication bypass or Valid-Until override. Candidate root availability,
-signed-snapshot dependency closure, CA/base compatibility and firmware completeness
-remain unverified until separately authorized preparation; a refusal means HOLD.
+The base must contain compatible APT, HTTPS transport, archive keyring and gpgv;
+the Dockerfile checks them before network work. The pinned Ubuntu base lacks a CA
+bundle (observed in existing CI bootstrap package logs). Snapshot rewriting and
+the dated HTTP endpoint lead to HTTPS, so HTTP archive entries do not solve that
+bootstrap requirement. A fixed data-only `COPY` obtains the CA bundle from the
+already digest-pinned BuildKit image into `/tmp/labapp-bootstrap-ca.pem`. The
+v0.34.1 source selects Alpine 3.23; Alpine's `apk-tools` requires the CA bundle
+package whose contents include `/etc/ssl/certs/ca-certificates.crt`. These are
+source/package-metadata evidence for the path, not inspection of the exact donor
+image's file bytes. A missing donor path or unusable trust corpus fails closed.
+
+Both APT update and install explicitly use that dedicated corpus through
+`Acquire::https::CAInfo`. TLS peer/host checks, Ubuntu archive signatures, package
+hashes and Valid-Until stay enabled. Native dated-snapshot resolution includes
+`ca-certificates=20240203`; no donor executable runs and no donor package is
+installed. There is no ambient-latest APT bootstrap, key TOFU or authentication
+bypass. The final RUN copies the bootstrap corpus into the final evidence layer
+before deleting the temporary path, so the fixed last-layer reader can retain its
+bounded bytes. Provenance records the exact donor digest/path and actual corpus
+size/SHA256, and sealing rechecks the retained corpus. Exact donor file content,
+TLS usability, candidate root availability, signed-snapshot dependency closure
+and firmware completeness remain unverified until separately scoped preparation.
+A refusal means HOLD; synthetic recipe/data tests establish no actual COPY/build.
 The final image layer retains complete APT list files (including signed InRelease
 and package indexes), their hashes, archive keyring, sources, APT configuration,
 policy and the complete installed package/version/architecture set before cache
@@ -505,6 +521,10 @@ Primary sources read 2026-10-26 (upstream current docs; no runtime execution):
 [pinned setup action source](https://github.com/docker/setup-buildx-action/blob/8d2750c68a42422c14e847fe6c8ac0403b4cbd6f/src/main.ts),
 [BuildKit v0.34.1 release](https://github.com/moby/buildkit/releases/tag/v0.34.1),
 [publisher Docker Hub digest metadata](https://hub.docker.com/v2/namespaces/moby/repositories/buildkit/tags/v0.34.1),
+[BuildKit v0.34.1 Alpine donor source](https://github.com/moby/buildkit/blob/v0.34.1/Dockerfile#L221),
+[Alpine 3.23 apk-tools CA dependency](https://pkgs.alpinelinux.org/package/v3.23/main/x86_64/apk-tools),
+[Noble APT explicit CAInfo and default TLS verification](https://manpages.ubuntu.com/manpages/noble/man1/apt-transport-https.1.html),
+[Alpine CA bundle file metadata](https://pkgs.alpinelinux.org/contents?arch=x86_64&branch=v3.23&name=ca-certificates-bundle&repo=main),
 [Canonical Noble snapshots](https://ubuntu.com/server/docs/how-to/software/snapshot-service/),
 [GitHub standard fresh hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 [GitHub timeout / cancellation conditions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
