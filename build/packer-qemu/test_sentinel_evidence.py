@@ -11,6 +11,7 @@ import platform
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import sys
@@ -235,6 +236,9 @@ class FixtureAssertionTests(unittest.TestCase):
         self.cfg = af.Config(here, install_dir=self.bin, state=os.path.join(self.root, "state"),
                              reason=os.path.join(self.root, "reason"), ubuntu_prefix=(), top=self.root,
                              lookup=lambda name: types.SimpleNamespace(pw_uid=1000, pw_gid=1000))
+        staging = mock.patch.object(af, "staging_access")
+        staging.start()  # legacy phase tests isolate staging; dedicated tests below exercise it
+        self.addCleanup(staging.stop)
         self.cfg.installer = str(PROVISION / "install-hhfab.py")
         self.cfg.archive = os.path.join(here, "archive.tar.gz")
         self.write(self.cfg.archive, bytes(range(256)) * 16, 0o400)
@@ -301,6 +305,11 @@ class FixtureAssertionTests(unittest.TestCase):
         self.cfg.lookup = missing
         self.run_phase("baseline", 1, "owner-map")
         self.assertFalse(os.path.exists(self.cfg.state))        # nothing recorded before the refusal
+
+    def test_baseline_staging_refusal_uses_existing_reason_before_state_creation(self):
+        with mock.patch.object(af, "staging_access", side_effect=af.Check("staging-input")):
+            self.run_phase("baseline", 1, "staging-input")
+        self.assertFalse(os.path.exists(self.cfg.state))
 
     def test_baseline_refuses_unsafe_directory_or_existing_target_without_deleting_anything(self):
         self.install()
@@ -439,6 +448,106 @@ class FixtureAssertionTests(unittest.TestCase):
         for token in tokens:
             self.assertRegex(token, af.REASON_RE)
 
+
+
+class GuestStagingTests(unittest.TestCase):
+    """Unprivileged synthetic metadata/access checks, not proof of a root-owned guest copy."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.realpath(self.tmp.name)
+        os.chmod(self.root, 0o755)
+        self.here = os.path.join(self.root, "in")
+        os.mkdir(self.here, 0o755)
+        self.cfg = af.Config(self.here, top=self.root, staging_uid=os.geteuid(), ubuntu_prefix=(),
+                             owner_uid=os.geteuid())
+        for name in ("install-hhfab.py", "hhfab_release.py"):
+            shutil.copyfile(PROVISION / name, os.path.join(self.here, name))
+            os.chmod(os.path.join(self.here, name), 0o444)
+        Path(self.cfg.archive).write_bytes(b"synthetic archive, never installed")
+        os.chmod(self.cfg.archive, 0o444)
+        self.nonce = os.path.join(self.here, "nonce")
+        Path(self.nonce).write_bytes(b"private")
+        os.chmod(self.nonce, 0o600)
+
+    def test_trusted_metadata_accepts_exact_modes_and_owner(self):
+        af.staging_metadata(self.cfg)
+        self.assertEqual(af.Config("/in").staging_uid, 0)
+
+    def test_parent_modes_owner_and_symlink_are_refused(self):
+        for mode in (0o700, 0o775, 0o777):
+            os.chmod(self.here, mode)
+            with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+                af.staging_metadata(self.cfg)
+        os.chmod(self.here, 0o755)
+        self.cfg.staging_uid = os.geteuid() + 1
+        with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+            af.staging_metadata(self.cfg)
+        self.cfg.staging_uid = os.geteuid()
+        alias = os.path.join(self.root, "alias")
+        os.symlink(self.here, alias)
+        self.cfg.here = alias
+        with self.assertRaisesRegex(af.Check, "^staging-parent$"):
+            af.staging_metadata(self.cfg)
+
+    def test_each_input_and_nonce_refuse_wrong_modes_symlinks_and_hardlinks(self):
+        for name, good in (("install-hhfab.py", 0o444), ("hhfab_release.py", 0o444),
+                           (os.path.basename(self.cfg.archive), 0o444), ("nonce", 0o600)):
+            path = os.path.join(self.here, name)
+            for mode in (0o400 if good == 0o444 else 0o644, 0o666):
+                os.chmod(path, mode)
+                with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                    af.staging_metadata(self.cfg)
+            os.chmod(path, good)
+            extra = os.path.join(self.root, "extra")
+            os.link(path, extra)
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+            os.unlink(extra)
+            os.rename(path, extra)
+            os.symlink(extra, path)
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+            os.unlink(path)
+            os.rename(extra, path)
+
+    def test_input_owner_mismatch_is_refused_independently_of_parent_owner(self):
+        original = os.lstat
+        def metadata(path):
+            info = original(path)
+            if path == self.cfg.archive:
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(af.os, "lstat", side_effect=metadata):
+            with self.assertRaisesRegex(af.Check, "^staging-input$"):
+                af.staging_metadata(self.cfg)
+
+    @unittest.skipUnless(os.geteuid() > 0 and os.path.exists("/proc/1/mem"), "nonroot Linux access check")
+    def test_same_uid_private_nonce_is_rejected_by_the_actual_data_only_child(self):
+        # A host same-UID read is intentionally NOT a successful guest privacy proof.
+        with self.assertRaisesRegex(af.Check, "^staging-access$"):
+            af.staging_access(self.cfg)
+
+    @unittest.skipUnless(os.geteuid() > 0 and os.path.exists("/proc/1/mem"), "nonroot Linux access check")
+    def test_actual_readonly_sibling_import_and_read_under_sanitized_child_environment(self):
+        # /proc/1/mem is an independently inaccessible lower-layer stand-in, not a guest nonce.
+        with self.assertRaises(PermissionError):
+            open("/proc/1/mem", "rb")
+        argv = ["/usr/bin/env", "-i", "PATH=" + af.SAFE_PATH, "HOME=/home/ubuntu", "LC_ALL=C.UTF-8",
+                "/usr/bin/python3", "-I", "-B", "-c", af.ACCESS_CHILD, self.here,
+                "/proc/1/mem", str(os.geteuid())]
+        done = af.command(self.cfg, argv, 20, "staging-timeout", {"PATH": af.SAFE_PATH})
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertEqual(sorted(os.listdir(self.here)),
+                         ["hhfab-linux-amd64-v0.50.4.tar.gz", "hhfab_release.py", "install-hhfab.py", "nonce"])
+
+    def test_access_failure_and_unexpected_output_are_bounded_fixed_refusals(self):
+        for code, output in ((1, b"private peer output"), (0, b"unexpected")):
+            with mock.patch.object(af, "command", return_value=subprocess.CompletedProcess([], code, output)):
+                with self.assertRaisesRegex(af.Check, "^staging-access$"):
+                    af.staging_access(self.cfg)
 
 if __name__ == "__main__":
     unittest.main()

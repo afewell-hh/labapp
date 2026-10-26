@@ -174,6 +174,7 @@ def copy_hash(path, dest, size, check=_noop, mode=0o400):
             raise StageError("input size differs from its pin")
         fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
         with os.fdopen(fd, "wb") as out:
+            os.fchmod(out.fileno(), mode)  # exact fresh-file contract, independent of caller umask
             digest, total = hashlib.sha256(), 0
             while True:
                 check()
@@ -209,6 +210,7 @@ def check_listing(zf, pin):
 def write_new(path, data, mode):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), mode)
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())

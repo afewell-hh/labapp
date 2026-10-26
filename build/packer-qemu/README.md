@@ -469,7 +469,12 @@ ownership, retention and disposition stay outside this repository until the lead
   provide this validation, not that the image or GCP is invalid. A nonzero exit is preserved: no TCG, permission, module or retry repair.
 * Staged modes: the installer pair and archive are `0444` (the probe's nonroot child reads and imports them; `user-data` makes
   `/var/lib/labapp-build` and `.../in` root-owned `0755`); the probe, `assert-fixture.py`, plan and MANIFEST are `0400`, and
-  the nonce is `0600` after the copy. The probe is MANIFEST/receipt covered like the other files.
+  the nonce is `0600` after the copy. Fresh-file modes are explicit even with umask `077`.
+  The copy is recursively made root-owned after `cp -a`; baseline verifies every real, trusted,
+  traversable parent and each required single-link regular file and its exact mode/owner. A bounded
+  sanitized `ubuntu` Python child actually reads the pair/archive, imports the exact sibling, verifies
+  those files are unwritable and cannot read the nonce, without executing hhfab or installer/probe work.
+  Failure uses the existing fixed `staging-*` reason path. The probe is MANIFEST/receipt covered like the other files.
 * Probe diagnostics: step 10 failure reports only `step=10 exit=N reason=plan-step`. The unchanged probe's JSON reason is
   deliberately not exported and it exits 1 for installer, systemd and KVM failures alike, so a missing guest `/dev/kvm` cannot be told
   from an earlier probe failure without changing the probe or adding a wrapper step; neither is done here.

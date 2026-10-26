@@ -43,11 +43,12 @@ class Check(Exception):
 class Config:
     def __init__(self, here, install_dir="/usr/local/bin", state="/run/labapp-fixture",
                  reason="/run/labapp-reason", ubuntu_prefix=("runuser", "-u", "ubuntu", "--"), top="/",
-                 owner_uid=1000, lookup=pwd.getpwnam):
+                 owner_uid=1000, lookup=pwd.getpwnam, staging_uid=0):
         self.here = here
         self.top = top
         self.owner_uid = owner_uid      # must equal stage_tools.OWNER_UID (a host test checks)
         self.lookup = lookup
+        self.staging_uid = staging_uid  # production root; synthetic metadata tests use their caller
         self.install_dir = install_dir
         self.state = state
         self.reason = reason
@@ -123,6 +124,58 @@ def installed_state(cfg, others):
     return identity(info)
 
 
+
+# Data-only nonroot child: read the required files, import the exact sibling, and prove the
+# private nonce is inaccessible. No installer/probe entrypoint or hhfab binary is executed.
+ACCESS_CHILD = r"""
+import importlib.util, os, sys
+here, nonce, uid = sys.argv[1:]
+assert os.geteuid() == int(uid) > 0
+for name in ("install-hhfab.py", "hhfab_release.py", "hhfab-linux-amd64-v0.50.4.tar.gz"):
+    path = os.path.join(here, name)
+    with open(path, "rb") as handle:
+        assert handle.read(1)
+    assert not os.access(path, os.W_OK)
+try:
+    with open(nonce, "rb"):
+        pass
+except PermissionError:
+    pass
+else:
+    raise AssertionError("private nonce readable")
+spec = importlib.util.spec_from_file_location("fixture_access_release", os.path.join(here, "hhfab_release.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert "0.50.4" in module.PINS
+"""
+
+
+def staging_metadata(cfg):
+    """Validate the actual post-cloud-init guest copy, not host/ISO source metadata."""
+    part = cfg.here
+    while True:
+        info = os.lstat(part)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == cfg.staging_uid
+             and not info.st_mode & 0o022 and info.st_mode & 0o001, "staging-parent")
+        if part in (cfg.top, "/"):
+            break
+        part = os.path.dirname(part)
+    for name, mode in (("install-hhfab.py", 0o444), ("hhfab_release.py", 0o444),
+                       ("hhfab-linux-amd64-v0.50.4.tar.gz", 0o444), ("nonce", 0o600)):
+        info = os.lstat(os.path.join(cfg.here, name))
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == cfg.staging_uid
+             and stat.S_IMODE(info.st_mode) == mode, "staging-input")
+
+
+def staging_access(cfg):
+    staging_metadata(cfg)
+    argv = [*cfg.ubuntu_prefix, "/usr/bin/env", "-i", "PATH=" + SAFE_PATH,
+            "HOME=/home/ubuntu", "LC_ALL=C.UTF-8", "/usr/bin/python3", "-I", "-B", "-c",
+            ACCESS_CHILD, cfg.here, os.path.join(cfg.here, "nonce"), str(cfg.owner_uid)]
+    done = command(cfg, argv, SMOKE_SECONDS, "staging-timeout", {"PATH": SAFE_PATH})
+    need(done.returncode == 0 and done.stdout == b"", "staging-access")
+
+
 def baseline(cfg):
     # The prerequisite probe is given --owner-uid explicitly: `ubuntu` must be that dedicated
     # nonroot user (nonroot primary group); never silently fall back to root.
@@ -131,6 +184,7 @@ def baseline(cfg):
     except KeyError:
         raise Check("owner-map") from None
     need(owner.pw_uid == cfg.owner_uid > 0 and owner.pw_gid > 0, "owner-map")
+    staging_access(cfg)
     real_directories(cfg.install_dir, cfg.top, "dir-state")
     now = listing(cfg.install_dir)
     need("hhfab" not in now, "target-present")

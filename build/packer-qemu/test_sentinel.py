@@ -527,6 +527,17 @@ class FixtureStagingTests(ts.StageCase):
         self.assertEqual(staged["guest_receipt"], hashlib.sha256(self.read("cd", "MANIFEST")).hexdigest())
         self.assertTrue(st.verify_staged(self.ws, staged))
 
+    def test_fixture_modes_are_exact_even_under_a_restrictive_caller_umask(self):
+        previous = os.umask(0o077)
+        try:
+            self.fixture()
+        finally:
+            os.umask(previous)
+        for name in (*st.PROVISION_FILES, st.ARCHIVE_NAME, "assert-sentinel.sh"):
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", name)).st_mode), 0o444, name)
+        for name in ("nonce", "plan.txt", "MANIFEST", st.PROBE_FILE, st.FIXTURE_ASSERT):
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(self.ws, "cd", name)).st_mode), 0o400, name)
+
     def test_plan_runs_the_installer_twice_with_identical_argv_between_fixed_assertions(self):
         self.fixture()
         install = ("root /usr/bin/python3 -B @IN@/install-hhfab.py --version 0.50.4 "
@@ -556,7 +567,9 @@ class FixtureStagingTests(ts.StageCase):
         with open(os.path.join(HERE, "guest", "user-data")) as handle:
             text = handle.read()
         self.assertIn("install -d -m 0755 -o root -g root /var/lib/labapp-build /var/lib/labapp-build/in", text)
-        self.assertLess(text.index("cp -a"), text.index("chmod 0755 /var/lib/labapp-build/in"))
+        self.assertLess(text.index("cp -a"), text.index("chown -R root:root /var/lib/labapp-build/in"))
+        self.assertLess(text.index("chown -R root:root /var/lib/labapp-build/in"),
+                        text.index("chmod 0755 /var/lib/labapp-build/in"))
         self.assertLess(text.index("chmod 0755 /var/lib/labapp-build/in"),
                         text.index("chmod 0600 /var/lib/labapp-build/in/nonce"))
 
