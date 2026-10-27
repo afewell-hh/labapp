@@ -25,7 +25,7 @@ COMMIT, TREE = "a" * 40, "b" * 40
 
 # Stand-in installer CLI with the same arguments and result shape; behavior is chosen by `mode`.
 FAKE = '''
-import json, os, subprocess, sys, time
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 here = Path(__file__).resolve().parent
 mode = (here / "mode").read_text().strip()
@@ -36,9 +36,28 @@ args = sys.argv[1:]
 dest = Path(args[args.index("--install-dir") + 1])
 target = dest / "kubectl"
 payload = (here / "payload").read_bytes()
+if mode == "overflow":
+    print("x" * 10000, flush=True)
+    time.sleep(600)
 if mode == "fail":
     print("kubectl install: official kubectl download failed", file=sys.stderr)
     sys.exit(1)
+if mode == "nested":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (here / "child_pid").write_text(str(child.pid))
+    def cancel(*args):
+        child.kill()
+        child.wait(timeout=2)
+        (here / "nested_reaped").write_text("yes")
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, cancel)
+    time.sleep(600)
+if mode == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    (here / "child_pid").write_text(str(os.getpid()))
+    time.sleep(600)
 if mode == "hang":
     (here / "child_pid").write_text(str(os.getpid()))
     time.sleep(600)
@@ -63,6 +82,8 @@ out = json.loads((here / "expect.json").read_text())
 out.update(target=str(target), target_mode="0755", status=status)
 if (here / "override.json").exists():
     out.update(json.loads((here / "override.json").read_text()))
+if mode == "drift":
+    (here / "hhfab_release.py").write_text("changed public source")
 if mode == "garbage":
     print("not json")
 else:
@@ -202,7 +223,8 @@ class ProofTests(unittest.TestCase):
         report = self.run_proof()
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["error"], "rerun changed the target identity or metadata")
-        self.assert_clean(report)
+        self.assertIn("unknown child", report["cleanup_error"])
+        self.assertTrue((self.root / "install" / "kubectl").exists())
 
     def test_timeout_kills_child_and_cleans(self):
         self.fake("hang")
@@ -225,6 +247,61 @@ class ProofTests(unittest.TestCase):
         self.assertTrue(gone(int((self.tools / "child_pid").read_text())))
         self.assertIs(signal.getsignal(signal.SIGTERM), before)
         self.assert_clean(report)
+
+    def test_nested_separate_session_child_reaped_on_timeout(self):
+        self.fake("nested")
+        with patch.object(proof, "RUN_CAP", 1):
+            report = self.run_proof()
+        self.assertEqual(report["error"], "command timeout")
+        self.assertEqual((self.tools / "nested_reaped").read_text(), "yes")
+        self.assertTrue(gone(int((self.tools / "child_pid").read_text())))
+        self.assert_clean(report)
+
+    def test_nested_separate_session_child_reaped_on_cancellation(self):
+        self.fake("nested")
+        timer = threading.Timer(1.5, os.kill, (os.getpid(), signal.SIGTERM))
+        self.addCleanup(timer.cancel)
+        timer.start()
+        report = self.run_proof()
+        self.assertEqual(report["error"], "interrupted")
+        self.assertEqual((self.tools / "nested_reaped").read_text(), "yes")
+        self.assertTrue(gone(int((self.tools / "child_pid").read_text())))
+        self.assert_clean(report)
+
+    def test_forced_escalation_keeps_nested_cleanup_unverified(self):
+        self.fake("stubborn")
+        with patch.object(proof, "RUN_CAP", 1), patch.object(proof, "TERM_GRACE", 0.1):
+            report = self.run_proof()
+        self.assertEqual(report["error"], "command timeout")
+        self.assertIn("nested process cleanup unverified", report["cleanup_error"])
+        self.assertFalse(report["cleanup"]["processes_absent"])
+        self.assertTrue(gone(int((self.tools / "child_pid").read_text())))
+        self.assertEqual(self.invocations(), 1)
+
+    def test_source_mutation_refused_without_rerun(self):
+        self.fake("drift")
+        report = self.run_proof()
+        self.assertEqual(report["error"], "installer sources changed during the proof")
+        self.assertEqual(self.invocations(), 1)
+        self.assert_clean(report)
+
+    def test_actual_child_output_overflow_is_bounded(self):
+        self.fake("overflow")
+        report = self.run_proof()
+        self.assertEqual(report["error"], "command output overflow")
+        self.assertEqual(self.invocations(), 1)
+        self.assert_clean(report)
+
+    def test_target_metadata_change_during_hash_refused(self):
+        target = self.root / "kubectl"
+        target.write_bytes(PAYLOAD)
+        target.chmod(0o755)
+        def changing(path):
+            target.chmod(0o700)
+            return PIN["sha256"]
+        with patch.object(proof, "digest", changing), self.assertRaisesRegex(
+                proof.Refusal, "installed target changed while observed"):
+            proof.observe(target)
 
     def test_work_deadline_bounds_non_child_steps(self):
         self.fake("good")
@@ -251,7 +328,8 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(report["error"], "unexpected process outlived the installer")
         self.assertTrue(gone(int((self.tools / "child_pid").read_text())))
         self.assertEqual(self.invocations(), 1)
-        self.assert_clean(report)
+        self.assertIn("unknown child", report["cleanup_error"])
+        self.assertTrue((self.root / "install" / "kubectl").exists())
 
     def test_unknown_child_is_preserved_not_deleted(self):
         self.fake("extra")
@@ -269,7 +347,7 @@ class ProofTests(unittest.TestCase):
             proof.remove_destination(state["dir"], state, [])
         self.assertTrue(state["dir"].exists())
 
-    def test_cleanup_removes_only_owned_stage_and_refuses_foreign_stage_content(self):
+    def test_cleanup_refuses_even_plausibly_named_stage(self):
         destination = self.root / "install"
         destination.mkdir()
         info = destination.stat()
@@ -277,15 +355,19 @@ class ProofTests(unittest.TestCase):
         stage = destination / ".kubectl-stage-abc"
         stage.mkdir()
         (stage / "kubectl").write_bytes(b"x")
-        (stage / "other").write_bytes(b"x")
         with self.assertRaises(proof.Refusal):
             proof.remove_destination(destination, state, [])
-        self.assertTrue((stage / "other").exists())
-        (stage / "other").unlink()
-        removed = []
-        proof.remove_destination(destination, state, removed)
-        self.assertFalse(destination.exists())
-        self.assertEqual(removed, [".kubectl-stage-abc/"])
+        self.assertTrue((stage / "kubectl").exists())
+
+    def test_cleanup_refuses_unobserved_target(self):
+        destination = self.root / "install"
+        destination.mkdir()
+        info = destination.stat()
+        (destination / "kubectl").write_bytes(PAYLOAD)
+        state = {"dir": destination, "dir_id": (info.st_dev, info.st_ino), "target_id": None}
+        with self.assertRaises(proof.Refusal):
+            proof.remove_destination(destination, state, [])
+        self.assertTrue((destination / "kubectl").exists())
 
     def test_cleanup_refuses_target_with_unrecorded_inode(self):
         destination = self.root / "install"

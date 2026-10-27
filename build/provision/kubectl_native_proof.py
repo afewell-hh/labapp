@@ -5,7 +5,7 @@ curl); never runs kubectl and never touches /usr/local/bin. Invoke
 python3 -B /absolute/kubectl_native_proof.py --root /absolute/private --commit SHA --tree SHA
 [--runner-image TEXT] with a cleared environment. --root must be a caller-owned 0700 directory
 containing empty caller-owned 0700 `home` and `tmp` directories; the harness creates, verifies
-and removes `root/install` (the only destination) and prints one JSON report. Keep the sibling
+and removes `root/install` (the only destination), printing preflight and final JSON lines. Keep the sibling
 install-kubectl.py and hhfab_release.py alongside this file. Work is bounded by WORK seconds and
 a separate CLEANUP; a failed run is never retried or repaired. Only owned, expected artifacts are
 removed; any unknown child is left in place and reported.
@@ -19,6 +19,8 @@ from pathlib import Path
 import platform
 import re
 import signal
+import selectors
+import subprocess
 import stat
 import sys
 import time
@@ -35,6 +37,7 @@ PIN = {
 # Initial finite limits, not measured fit: whole work phase, separate cleanup phase, and one
 # installer invocation (its own 180s alarm plus grace). The installer's limits are unchanged.
 WORK, CLEANUP, RUN_CAP = 600, 60, 185
+TERM_GRACE = 5
 PYTHON = "/usr/bin/python3"
 CURL = "/usr/bin/curl"
 OS_RELEASE = Path("/etc/os-release")
@@ -80,7 +83,7 @@ def observe_host():
             or (release.get("ID"), release.get("VERSION_ID")) != ("ubuntu", "24.04")
             or sys.version_info[:2] != (3, 12)):
         raise Refusal("host is not Ubuntu 24.04 x86_64 with Python 3.12")
-    code, output = bounded([CURL, "--version"], 10, limit=8192, env=dict(CHILD_ENV))
+    code, output = bounded([CURL, "--disable", "--version"], 10, limit=8192, env=dict(CHILD_ENV))
     if code:
         raise Refusal("curl version unavailable")
     lines = output.decode("ascii", "replace").splitlines() or [""]
@@ -91,6 +94,59 @@ def observe_host():
 def command(installer, destination):
     return [PYTHON, "-B", str(installer), "--version", VERSION, "--platform", PLATFORM,
             "--install-dir", str(destination)]
+
+
+def run_installer(args, seconds, env, state):
+    """Supervise this one CLI; graceful cancellation lets its own helper reap curl."""
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    state["pids"].append(proc.pid)
+    deadline = time.monotonic() + seconds
+    output = bytearray()
+    try:
+        with selectors.DefaultSelector() as selected:
+            selected.register(proc.stdout, selectors.EVENT_READ)
+            while selected.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Refusal("command timeout")
+                for key, _ in selected.select(min(remaining, 0.1)):
+                    block = os.read(key.fileobj.fileno(), 8192)
+                    if not block:
+                        selected.unregister(key.fileobj)
+                    elif len(output) + len(block) > 8192:
+                        raise Refusal("command output overflow")
+                    else:
+                        output.extend(block)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("command timeout")
+        return proc.wait(timeout=remaining), bytes(output)
+    except BaseException:
+        # Preserve the original error. Grace is finite and charged to work/cleanup;
+        # suppress repeated interruption while the unchanged installer reaps its child.
+        saved = {n: signal.getsignal(n) for n in (signal.SIGALRM, signal.SIGINT, signal.SIGTERM)}
+        signal.alarm(0)
+        for number in saved:
+            signal.signal(number, signal.SIG_IGN)
+        try:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=TERM_GRACE)
+                except subprocess.TimeoutExpired:
+                    state["forced"] = True
+                    proc.kill()
+                    proc.wait(timeout=2)
+        finally:
+            for number, handler in saved.items():
+                signal.signal(number, handler)
+            # Do not renew the absolute work deadline after a per-call failure.
+            remaining = state["deadline"] - time.monotonic()
+            signal.alarm(max(1, math.ceil(remaining)))
+        raise
+    finally:
+        proc.stdout.close()
 
 
 def session_members(sid):
@@ -134,8 +190,9 @@ def observe(target):
     seen = {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size, "mode": "0755",
             "uid": info.st_uid, "nlink": info.st_nlink, "mtime_ns": info.st_mtime_ns,
             "ctime_ns": info.st_ctime_ns, "sha256": sha}
-    if (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) != (info.st_ino, info.st_mtime_ns,
-                                                                  info.st_ctime_ns):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size",
+              "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(after, key) != getattr(info, key) for key in fields):
         raise Refusal("installed target changed while observed")
     if sha != PIN["sha256"]:
         raise Refusal("installed target checksum mismatch")
@@ -191,6 +248,9 @@ def work(root, installer, report, state, environ):
     target = destination / "kubectl"
     if os.path.lexists(target) or any(destination.iterdir()):
         raise Refusal("target must be absent before the first invocation")
+    report["private_modes"] = {name: oct(stat.S_IMODE(path.lstat().st_mode))
+                               for name, path in (("root", root), ("home", home),
+                                                  ("tmp", tmp), ("install", destination))}
     report["target_absent_before_first"] = True
     print(json.dumps({"preflight": report}, sort_keys=True), flush=True)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(tmp), "LC_ALL": "C",
@@ -201,15 +261,18 @@ def work(root, installer, report, state, environ):
         if remaining <= 0:
             raise Refusal("work deadline exceeded")
         begun = time.monotonic()
-        code, output = bounded(command(installer, destination), min(RUN_CAP, remaining),
-                               limit=8192, env=dict(env), on_start=state["pids"].append)
+        code, output = run_installer(command(installer, destination), min(RUN_CAP, remaining),
+                                     dict(env), state)
         elapsed = time.monotonic() - begun
         reap_session(state["pids"][-1])
+        if code == 0:
+            seen = observe(target)
+            if state["target_id"] is None:
+                state["target_id"] = (seen["dev"], seen["ino"])
         outcome = verify_outcome(code, output, status, sources, target)
         if (digest(installer), digest(helper)) != (sources["installer_sha256"],
                                                    sources["helper_sha256"]):
             raise Refusal("installer sources changed during the proof")
-        seen = observe(target)
         if first is None:
             first = seen
             state["target_id"] = (seen["dev"], seen["ino"])
@@ -220,24 +283,6 @@ def work(root, installer, report, state, environ):
         if not math.isfinite(elapsed):
             raise Refusal("non-finite timing")
         report[label] = {"outcome": outcome, "target": seen, "seconds": round(elapsed, 3)}
-
-
-def remove_stage(child, info, removed):
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        return False
-    stage = Path(child.path)
-    with os.scandir(stage) as entries:
-        inner = list(entries)
-    for entry in inner:
-        item = entry.stat(follow_symlinks=False)
-        if (entry.name != "kubectl" or not stat.S_ISREG(item.st_mode)
-                or item.st_uid != os.geteuid() or item.st_nlink != 1):
-            return False
-    for entry in inner:
-        os.unlink(entry.path)
-    os.rmdir(stage)
-    removed.append(child.name + "/")
-    return True
 
 
 def remove_destination(destination, state, removed):
@@ -251,10 +296,10 @@ def remove_destination(destination, state, removed):
         item = child.stat(follow_symlinks=False)
         if (child.name == "kubectl" and stat.S_ISREG(item.st_mode) and item.st_nlink == 1
                 and item.st_uid == os.geteuid()
-                and state["target_id"] in (None, (item.st_dev, item.st_ino))):
+                and state["target_id"] == (item.st_dev, item.st_ino)):
             os.unlink(child.path)
             removed.append("kubectl")
-        elif not (child.name.startswith(".kubectl-stage-") and remove_stage(child, item, removed)):
+        else:
             unknown += 1
     if unknown:
         raise Refusal(str(unknown) + " unknown child entries retained in the install directory")
@@ -268,7 +313,10 @@ def clean(root, state, info):
             reap_session(pid)
         except Refusal as error:
             problems.append(str(error))
-    info["processes_absent"] = not any(session_members(pid) for pid in state["pids"])
+    info["processes_absent"] = (not state.get("forced", False)
+                                and not any(session_members(pid) for pid in state["pids"]))
+    if state.get("forced", False):
+        problems.append("forced installer termination: nested process cleanup unverified")
     destination = state["dir"]
     if destination is not None:
         try:
@@ -308,7 +356,7 @@ def prove(root, installer, commit, tree, runner_image="", environ=None):
     report = {"proof": "kubectl-native-install-rerun", "status": "failed", "commit": commit,
               "tree": tree, "runner_image_claimed": runner_image,
               "limits": {"work": WORK, "cleanup": CLEANUP, "run_cap": RUN_CAP}}
-    state = {"dir": None, "dir_id": None, "target_id": None, "pids": [], "deadline": None}
+    state = {"dir": None, "dir_id": None, "target_id": None, "pids": [], "deadline": None, "forced": False}
     saved = {number: signal.getsignal(number)
              for number in (signal.SIGALRM, signal.SIGINT, signal.SIGTERM)}
     primary = cleanup_error = None
@@ -329,7 +377,11 @@ def prove(root, installer, commit, tree, runner_image="", environ=None):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGALRM, _cleanup_expired)
-        signal.alarm(CLEANUP)
+        # Cancellation grace consumes the fixed overall work+cleanup envelope.
+        remaining = begun + WORK + CLEANUP - time.monotonic()
+        if remaining <= 0:
+            raise CleanupExpired
+        signal.alarm(max(1, math.ceil(min(CLEANUP, remaining))))
         info = report["cleanup"] = {"removed": []}
         clean(root, state, info)
     except BaseException as error:  # noqa: BLE001

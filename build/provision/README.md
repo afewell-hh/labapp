@@ -390,7 +390,7 @@ are refused before mutation; an over-budget final report refuses after publicati
 behavior, installation-time fit and equivalence to the baseline image's kubectl path,
 owner and mode are not verified (`not_verified`; cosign is outside this slice).
 
-### Native kubectl install and rerun proof (source only)
+### Native kubectl install and rerun proof
 
 `kubectl_native_proof.py` runs the unchanged `install-kubectl.py` CLI twice
 (`--version 1.35.0 --platform linux/amd64 --install-dir <private>/install`, network mode) against
@@ -398,8 +398,8 @@ one private, harness-created destination, for a manual-only workflow on a fresh 
 Ubuntu 24.04 runner (Python 3.12 stdlib and curl; no APT, container or VM). It proves only that
 the unchanged CLI can acquire, byte-install and idempotently rerun in a caller-owned directory.
 It does not prove root or `/usr/local/bin` installation, a pinned-container base, image/VM
-integration or kubectl runtime; kubectl is never executed. No native run has happened yet; the
-first real download and timing will be measured only by one separately authorized dispatch.
+integration or kubectl runtime; kubectl is never executed. Real download and timing evidence
+requires a separately authorized manual dispatch.
 
 ```bash
 # Cleared environment; ROOT is a caller-owned 0700 directory with empty 0700 home/ and tmp/.
@@ -409,10 +409,10 @@ env -i PATH=/usr/bin:/bin HOME=$ROOT/home TMPDIR=$ROOT/tmp LC_ALL=C PYTHONDONTWR
 python3 -m unittest discover -s build/provision -p test_kubectl_native_proof.py -v
 ```
 
-One JSON report is printed (a `preflight` line first, then the final report) and the exit status is
+Up to two JSON lines are printed (`preflight` when reached, then the final report) and the exit status is
 0 only if both invocations and cleanup passed. Before the first call the harness records the
 commit/tree it was given, SHA256 of itself, the installer and `hhfab_release.py`, the observed OS,
-Python, UID and curl version, and that `install/kubectl` is absent. After each call it verifies
+Python, UID and curl version, private directory modes, and that `install/kubectl` is absent. After each call it verifies
 independently of the installer: exit status, a single-line JSON result whose tool, version,
 platform, URL, pin, module/helper hashes, target path, mode, status (`installed`, then
 `unchanged`) and `executed: false` match; the target's bytes, size, 0755 mode, owner and link
@@ -421,15 +421,21 @@ session. The rerun must leave the target's inode, mtime and ctime unchanged. Per
 reported (finite assumptions, not measured fit).
 
 Limits are initial assumptions: 600s total work (alarm), a separate 60s cleanup (alarm), and
-185s per call around the installer's own unchanged 120/125/180s limits; no renewal, widening,
+185s per call plus at most 5s graceful cancellation around the installer's own unchanged 120/125/180s limits; no renewal, widening,
 retry or repair. Any failure, including timeout, stays failed and preserves the primary error;
 cleanup errors are reported separately. Cleanup removes only the recorded install-directory
-inode, a `kubectl` file matching the recorded inode, and `.kubectl-stage-*` directories holding
-only an owned single-link `kubectl`; any other child (or non-empty `home`/`tmp`) is left in place
-and reported as a cleanup failure. A hard runner cancellation (SIGKILL) gives no cleanup
+inode and a successfully observed, pinned `kubectl` matching its recorded inode. Unobserved
+outputs, leftover stages and other unknown children (or non-empty `home`/`tmp`) are retained
+and reported as cleanup failures. The installer owns its normal stage cleanup; the harness
+never infers stage ownership from a name prefix or shape. A hard runner cancellation (SIGKILL) gives no cleanup
 receipt, and later runner disposal is not one. Trusted: the interpreter, `/usr/bin/curl`, the
 module directory, the runner and the destination; this is not a defense against a hostile
-concurrent writer or a descendant that leaves the installer's session.
+concurrent writer or an arbitrary descendant that leaves the installer's session. Cancellation
+sends installer SIGTERM and waits up to 5s so its unchanged helper can kill/reap curl in its
+separate session. Forced escalation leaves nested-process cleanup explicitly unverified.
+The manual workflow fixes a 700s outer bound with 30s kill grace and a 13-minute job bound;
+these enclose the 600s work plus 60s cleanup envelope without renewing it. Cancellation
+grace consumes that same fixed envelope; cleanup receives at most 60s of its remainder.
 
 ## Offline-delivered guest prerequisite probe
 
