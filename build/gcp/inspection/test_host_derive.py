@@ -243,6 +243,9 @@ class TypedYamlTests(unittest.TestCase):
         with self.assertRaises(d.yaml.YAMLError):
             d.yaml.safe_load(pure)  # pure SafeLoader refuses it; libyaml accepts it
         self.assertEqual(d.YamlReader().read(pure), [{'ip': 'dhcp'}])
+        plain = d.yaml.compose('1', Loader=d.safe_loader())
+        self.assertEqual(plain.style, '')  # CParser's plain style, not None.
+        self.assertIs(type(d.YamlReader().convert(plain, 0)), int)
         result = d.YamlReader().read('a:\t1\nb:\ttrue\nc:\t"1"\nd:\tnull\n')[0]
         self.assertEqual([type(result[k]) for k in 'abcd'], [int, bool, str, type(None)])
         for body in ('ip:\t&x dhcp', 'ip:\t*x', 'ip:\t!!str dhcp', 'ip:\t{<<: x}', 'ip:\tdhcp\nip:\tdhcp',

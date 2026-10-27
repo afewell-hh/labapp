@@ -194,7 +194,10 @@ class YamlReader:
         tag, value = node.tag.removeprefix('tag:yaml.org,2002:'), node.value
         if tag == 'str':
             return value
-        require(node.style is None)
+        # CParser's plain-node style is '', unlike the Python composer's None
+        # (PyYAML 6.0.1 yaml/_yaml.pyx:_compose_scalar_node). Quoted and block
+        # styles must never satisfy a typed non-string scalar.
+        require(node.style == '')
         if tag == 'int':
             require(re.fullmatch(r'0|[1-9][0-9]*|-[1-9][0-9]*', value) is not None and len(value) <= 32)
             return int(value)
