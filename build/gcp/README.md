@@ -208,7 +208,12 @@ code. Both new command entrypoints turn SIGTERM into bounded owned cleanup;
 a cancelled derivation removes its exclusive partial candidate and prints only
 the fixed refusal. YAML event preflight rejects tags, anchors/aliases, nonstring/duplicate/
 merge keys, ambiguous scalar forms, unsupported scalar types and resource
-excesses; only SafeLoader nodes are composed, without object constructors.
+excesses; only CSafeLoader nodes are composed, without object constructors.
+The distribution libyaml-backed `yaml.CSafeLoader` is required (PyYAML >=6.0
+with libyaml; otherwise fixed refusal, no pure-Python or other fallback) because
+the public official hhfab 0.43.1 template has a tab in `ip:<tab>dhcp` that pure
+SafeLoader refuses. An earlier `invalid_yaml` gap shows only that this parser
+refused, not that the source was malformed; its actual cause remains unverified.
 CRLF is normalized for parsing; lone CR/control characters refuse. Limits are
 depth32, scalar4096UTF-8 bytes,64documents/file,256documents and100,000events
 aggregate. Integer/bool/string/null types remain distinct; quoted values never
