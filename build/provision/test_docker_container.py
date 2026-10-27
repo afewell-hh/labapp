@@ -483,10 +483,21 @@ elif a[0] == 'inspect':
             save()
             sys.exit(1)
         rows = ['0' if 'swap_drift' in modes else '1073741824',
-                'bridge' if 'network_drift' in modes else 'default',
+                'host' if 'network_drift' in modes else 'bridge',
                 '["no-new-privileges=true"]' if 'security_drift' in modes else '["no-new-privileges"]',
-                '["ALL"]' if 'cap_drift' in modes else '["NET_RAW"]',
+                '["ALL"]' if 'cap_drift' in modes else '["CAP_NET_RAW"]',
                 '["foreign"]' if 'device_drift' in modes else '[]']
+        network_cases = {'network_none': 'none', 'network_foreign': 'foreign-network',
+                         'network_default': 'default', 'network_late': 'bridge' + ' ' * 128 + 'foreign'}
+        cap_cases = {'cap_absent': 'null', 'cap_empty': '[]', 'cap_wrong': '["CAP_NET_ADMIN"]',
+                     'cap_alias': '["NET_RAW"]', 'cap_extra': '["CAP_NET_RAW","CAP_NET_ADMIN"]',
+                     'cap_late': '["CAP_NET_RAW"' + ' ' * 128 + ',"CAP_NET_ADMIN"]'}
+        for mode, value in network_cases.items():
+            if mode in modes:
+                rows[1] = value
+        for mode, value in cap_cases.items():
+            if mode in modes:
+                rows[3] = value
         if 'escaped' in modes:
             rows[4] = '[]' + '\x1b\a\r' + 'x' * 1000
         if 'late_drift' in modes:
@@ -556,9 +567,11 @@ class HostLauncherTests(unittest.TestCase):
         create = state['create']
         text = ' '.join(create)
         for required in ('--platform=linux/amd64', '--init', '--memory=1g', '--memory-swap=1g', '--cpus=2', '--pids-limit=128',
-                         '--security-opt=no-new-privileges', '--cap-drop=NET_RAW', '--label'):
+                         '--security-opt=no-new-privileges', '--network=bridge', '--cap-drop=CAP_NET_RAW', '--label'):
             self.assertIn(required, create)
-        for flag in ('--privileged', '--network', '--net', '--pid', '--ipc', '--uts', '--userns', '--device',
+        self.assertEqual([arg for arg in create if arg.startswith('--network=')], ['--network=bridge'])
+        self.assertEqual([arg for arg in create if arg.startswith('--cap-drop=')], ['--cap-drop=CAP_NET_RAW'])
+        for flag in ('--privileged', '--net', '--pid', '--ipc', '--uts', '--userns', '--device',
                      '--volumes-from', '--env-file', '--add-host', '--cap-add', '--pull'):
             self.assertFalse([arg for arg in create if arg == flag or arg.startswith(flag + '=')], flag)
         for forbidden in ('docker.sock', 'host-secret', 'hello-world'):
@@ -576,6 +589,27 @@ class HostLauncherTests(unittest.TestCase):
         diagnostics = [line for line in result.stdout.splitlines() if ' field=' in line]
         self.assertEqual(len(diagnostics), 10)
         self.assertTrue(all(line.endswith('match=true') for line in diagnostics))
+
+    def test_network_and_cap_drop_require_exact_canonical_values_without_start(self):
+        cases = [('network_drift', 'network'), ('network_none', 'network'),
+                 ('network_foreign', 'network'), ('network_default', 'network'), ('network_late', 'network'),
+                 ('cap_absent', 'cap_drop'), ('cap_empty', 'cap_drop'), ('cap_wrong', 'cap_drop'),
+                 ('cap_alias', 'cap_drop'), ('cap_extra', 'cap_drop'), ('cap_late', 'cap_drop')]
+        for mode, field in cases:
+            with self.subTest(mode=mode):
+                self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
+                result, state = self.launch(mode, merged=True)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                diagnostics = [line for line in result.stdout.splitlines() if ' field=' in line]
+                self.assertEqual(len(diagnostics), 10)
+                row = next(line for line in diagnostics if 'isolation field=%s ' % field in line)
+                self.assertTrue(row.endswith('match=false'), row)
+                if mode.endswith('_late'):
+                    self.assertIn('truncated=true', row)
+                self.assertLess(result.stdout.index(row), result.stdout.index('applied containment differs'))
+                self.assertFalse(any(call[0] == 'start' for call in state['calls']))
+                self.assert_owned_gone(state)
+                self.assertFalse(Path(state['config']).parent.exists())
 
     def test_each_fixed_field_drift_is_diagnosed_before_refusal_without_start(self):
         for mode, group, field in (

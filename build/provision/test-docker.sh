@@ -182,7 +182,7 @@ exec python3 /suite/docker_container.py run --base "$LABAPP_BASE_REF" --budget "
 GUEST
 target_id="$(work_timeout 90 docker create --platform=linux/amd64 --init --name "$target" --label "$run_label" \
   --memory=1g --memory-swap=1g --cpus=2 --pids-limit=128 --security-opt=no-new-privileges \
-  --cap-drop=NET_RAW -v "$workdir/suite:/suite:ro" \
+  --network=bridge --cap-drop=CAP_NET_RAW -v "$workdir/suite:/suite:ro" \
   --env PYTHONDONTWRITEBYTECODE=1 --env "LABAPP_BASE_REF=$base" \
   "$base" timeout --kill-after=5s 570s bash -ceu "$guest")"
 [[ "$target_id" =~ ^[a-f0-9]{64}$ ]]
@@ -202,7 +202,7 @@ isolation="$(work_timeout 5 docker inspect --format \
 {{json .HostConfig.SecurityOpt}}
 {{json .HostConfig.CapDrop}}
 {{json .HostConfig.Devices}}' "$target_id")" || isolation_status=$?
-expected_isolation=$'1073741824\ndefault\n["no-new-privileges"]\n["NET_RAW"]\n[]'
+expected_isolation=$'1073741824\nbridge\n["no-new-privileges"]\n["CAP_NET_RAW"]\n[]'
 diagnose applied "$applied_status" "$applied" "$expected"
 diagnose isolation "$isolation_status" "$isolation" "$expected_isolation"
 ((applied_status == 0)) || exit "$applied_status"

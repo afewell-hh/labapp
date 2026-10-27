@@ -825,8 +825,10 @@ preserves any primary failure exit status. A preexisting trusted regular service
 disposable fixture data and deleted with the target.
 
 Containment (assumptions to measure, not demonstrated fit): `--init`, 2 CPUs, 1 GiB
-(swap equal), 128 PIDs, `no-new-privileges`, `NET_RAW` dropped, default bridge
-network, no privileged mode, host socket, devices, host network or credentials.
+(swap equal), 128 PIDs, `no-new-privileges`, explicit `--network=bridge` and
+`--cap-drop=CAP_NET_RAW`, no privileged mode, host socket, devices, host network or credentials.
+Inspect must report exactly `bridge` and `["CAP_NET_RAW"]`; aliases, missing or
+additional capability drops and other network modes are refused before start.
 The docker client uses an empty private `DOCKER_CONFIG`; only a read-only copy of
 the three public files is mounted. Total work, including acquisition and
 preparation, is 600s (guest wrapper 570s, installer runs refused when the
