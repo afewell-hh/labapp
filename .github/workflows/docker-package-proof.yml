@@ -47,11 +47,30 @@ jobs:
           # an observed exact container-cleanup receipt.
           cleanup_host() {
             local result=$?
+            local path failed=0
             trap - EXIT
-            rmdir -- "$private/home" "$private/tmp" "$private/docker-config" "$private" || {
+            if [[ -L "$private" || ( -e "$private" && ! -d "$private" ) ]]; then
+              printf 'docker proof: private host directory cleanup failed; preserved path=%q\n' "$private" >&2
+              [[ "$result" -ne 0 ]] || result=1
+              exit "$result"
+            fi
+            for path in "$private/home" "$private/tmp" "$private/docker-config" "$private"; do
+              if [[ -d "$path" && ! -L "$path" ]]; then
+                rmdir -- "$path" 2>/dev/null || failed=1
+              elif [[ -e "$path" || -L "$path" ]]; then
+                failed=1
+              fi
+              if [[ -e "$path" || -L "$path" ]]; then
+                failed=1
+                printf 'docker proof: private host path preserved path=%q\n' "$path" >&2
+              else
+                printf 'docker proof: private host checked exact owned absence path=%q\n' "$path"
+              fi
+            done
+            if ((failed)); then
               echo 'docker proof: private host directory cleanup failed' >&2
               [[ "$result" -ne 0 ]] || result=1
-            }
+            fi
             exit "$result"
           }
           trap cleanup_host EXIT

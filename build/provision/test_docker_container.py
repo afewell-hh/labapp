@@ -396,7 +396,7 @@ class SystemProbeTests(unittest.TestCase):
             self.assertEqual(json.loads(out.getvalue()), {'result': 'x'})
 
 
-FAKE_DOCKER = r'''#!/usr/bin/python3
+FAKE_DOCKER = r'''#!/usr/bin/python3 -I
 import hashlib, json, os, sys, time
 from pathlib import Path
 
@@ -406,6 +406,11 @@ a = sys.argv[1:]
 modes = set(os.environ['FAKE_DOCKER_MODE'].split('+'))
 s['calls'].append(a)
 s.setdefault('config', os.environ.get('DOCKER_CONFIG'))
+config = Path(s['config'])
+if 'unknown_child' in modes:
+    (config / 'foreign-child').write_text('preserve')
+if 'dangling_child' in modes and not (config / 'foreign-link').is_symlink():
+    (config / 'foreign-link').symlink_to('missing')
 
 def save():
     path.write_text(json.dumps(s))
@@ -440,6 +445,10 @@ elif a[0] == 'start':
         time.sleep(60)
     if 'timeout' in modes:
         sys.exit(124)
+    if 'interrupt' in modes:
+        sys.exit(130)
+    if 'terminated' in modes:
+        sys.exit(143)
     ok = 'guest_fail' not in modes
     print(json.dumps({'result': 'pass' if ok else 'fail'}))
     sys.exit(0 if ok else 1)
@@ -449,14 +458,44 @@ elif a[0] == 'inspect':
     if 'State.ExitCode' in fmt:
         print('1' if 'guest_fail' in modes else '124' if 'timeout' in modes else '0')
     elif 'OOMKilled' in fmt:
+        if 'output_link' in modes:
+            out = config.parent / 'out'
+            out.unlink()
+            foreign = path.parent / 'foreign-output'
+            foreign.write_text('FOREIGN_OUTPUT_MUST_NOT_PRINT')
+            out.symlink_to(foreign)
         print('true' if 'oom' in modes else 'false')
     elif 'HostConfig.Privileged' in fmt:
+        if 'applied_unavailable' in modes:
+            save()
+            sys.exit(124)
         bind = create[create.index('-v') + 1]
-        print('privileged=%s memory=%d nano_cpus=%d pids=%s binds=%s' % (
-            'true' if 'privileged' in modes else 'false', 1 << 30, 2 * 10 ** 9,
-            [x for x in create if x.startswith('--pids-limit=')][0].split('=')[1], json.dumps([bind])))
+        if 'bind_drift' in modes:
+            bind = bind.replace(':/suite:ro', ':/suite:rw')
+        print('%s\n%d\n%d\n%s\n%s' % (
+            'true' if 'privileged' in modes else 'false',
+            1 if 'memory_drift' in modes else 1 << 30,
+            1 if 'cpu_drift' in modes else 2 * 10 ** 9,
+            '0' if 'pid_drift' in modes else [x for x in create if x.startswith('--pids-limit=')][0].split('=')[1],
+            json.dumps([bind])))
     else:
-        print('swap=%s network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' % ('0' if 'swap_drift' in modes else '1073741824'))
+        if 'isolation_unavailable' in modes:
+            save()
+            sys.exit(1)
+        rows = ['0' if 'swap_drift' in modes else '1073741824',
+                'bridge' if 'network_drift' in modes else 'default',
+                '["no-new-privileges=true"]' if 'security_drift' in modes else '["no-new-privileges"]',
+                '["ALL"]' if 'cap_drift' in modes else '["NET_RAW"]',
+                '["foreign"]' if 'device_drift' in modes else '[]']
+        if 'escaped' in modes:
+            rows[4] = '[]' + '\x1b\a\r' + 'x' * 1000
+        if 'late_drift' in modes:
+            rows[4] = '[]' + ' ' * 1000 + 'foreign'
+        if 'missing_field' in modes:
+            rows.pop()
+        if 'extra_field' in modes:
+            rows.append('UNLISTED_SECRET_MUST_NOT_PRINT')
+        print('\n'.join(rows))
 elif a[:2] == ['container', 'ls']:
     if 'daemon_down' in modes:
         save()
@@ -494,9 +533,10 @@ class HostLauncherTests(unittest.TestCase):
                     FAKE_DOCKER_STATE=str(self.state), FAKE_DOCKER_MODE=mode, FAKE_DOCKER_MARK=str(self.mark),
                     AWS_SECRET_ACCESS_KEY='host-secret')
 
-    def launch(self, mode, *args):
+    def launch(self, mode, *args, merged=False):
         result = subprocess.run(['bash', str(RUNNER), *args], env=self.environment(mode),
-                                capture_output=True, text=True, timeout=30)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merged else subprocess.PIPE,
+                                text=True, timeout=30)
         return result, json.loads(self.state.read_text())
 
     def assert_owned_gone(self, state):
@@ -532,6 +572,94 @@ class HostLauncherTests(unittest.TestCase):
         self.assertLessEqual({c[0] for c in state['calls']}, {'version', 'create', 'image', 'start', 'inspect', 'container', 'rm'})
         self.assertIn('docker-config', state['config'])
         self.assertFalse(os.path.exists(state['config']), 'private config/workdir must be removed')
+        self.assertIn('host temp cleanup checked exact owned absence workdir=', result.stdout)
+        diagnostics = [line for line in result.stdout.splitlines() if ' field=' in line]
+        self.assertEqual(len(diagnostics), 10)
+        self.assertTrue(all(line.endswith('match=true') for line in diagnostics))
+
+    def test_each_fixed_field_drift_is_diagnosed_before_refusal_without_start(self):
+        for mode, group, field in (
+                ('privileged', 'applied', 'privileged'), ('memory_drift', 'applied', 'memory'),
+                ('cpu_drift', 'applied', 'nano_cpus'), ('pid_drift', 'applied', 'pids'),
+                ('bind_drift', 'applied', 'binds'), ('swap_drift', 'isolation', 'swap'),
+                ('network_drift', 'isolation', 'network'), ('security_drift', 'isolation', 'security'),
+                ('cap_drift', 'isolation', 'cap_drop'), ('device_drift', 'isolation', 'devices')):
+            with self.subTest(mode=mode):
+                self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
+                result, state = self.launch(mode, merged=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                rows = result.stdout.splitlines()
+                self.assertEqual(len([r for r in rows if ' field=' in r]), 10)
+                row = next(r for r in rows if '%s field=%s ' % (group, field) in r)
+                self.assertTrue(row.endswith('match=false'), row)
+                self.assertIn('requested=', row)
+                self.assertIn('observed=', row)
+                rejection = result.stdout.index('docker test: applied containment differs from request')
+                self.assertLess(result.stdout.index('isolation field=devices '), rejection)
+                self.assertLess(result.stdout.index('applied field=binds '), rejection)
+                self.assertFalse(any(c[0] == 'start' for c in state['calls']))
+                self.assert_owned_gone(state)
+
+    def test_diagnostics_distinguish_unavailable_missing_extra_and_truncated(self):
+        cases = [('applied_unavailable', 124, 'applied inspect_status=124', '<inspect-unavailable>'),
+                 ('isolation_unavailable', 1, 'isolation inspect_status=1', '<inspect-unavailable>'),
+                 ('missing_field', 1, 'isolation inspect_status=0 fields=4', '<missing>'),
+                 ('extra_field', 1, 'extra_fields=1 values=omitted', 'match=true'),
+                 ('escaped', 1, 'truncated=true', 'match=false'),
+                 ('late_drift', 1, 'truncated=true', 'match=false')]
+        for mode, code, first, second in cases:
+            with self.subTest(mode=mode):
+                self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
+                result, state = self.launch(mode)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(first, result.stdout)
+                self.assertIn(second, result.stdout)
+                self.assertNotIn('UNLISTED_SECRET_MUST_NOT_PRINT', result.stdout)
+                self.assertNotIn('\x1b', result.stdout)
+                self.assertNotIn('\a', result.stdout)
+                self.assertNotIn('\r', result.stdout)
+                rows = [r for r in result.stdout.splitlines() if ' field=' in r]
+                self.assertEqual(len(rows), 10)
+                self.assertLess(max(map(len, rows)), 1200)
+                if mode == 'escaped':
+                    self.assertIn('\\E', result.stdout)
+                self.assertFalse(any(c[0] == 'start' for c in state['calls']))
+                self.assert_owned_gone(state)
+
+    def test_host_unknown_children_are_preserved_and_prevent_absence_receipt(self):
+        for mode in ('unknown_child', 'dangling_child'):
+            for primary, code in (('success', 1), ('timeout', 124), ('interrupt', 130), ('terminated', 143)):
+                with self.subTest(mode=mode, primary=primary):
+                    self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
+                    result, state = self.launch(mode + '+' + primary)
+                    config = Path(state['config'])
+                    try:
+                        self.assertEqual(result.returncode, code, result.stderr)
+                        self.assertIn('host temp cleanup failed preserved workdir=', result.stdout)
+                        self.assertNotIn('host temp cleanup checked exact owned absence', result.stdout)
+                        child = config / ('foreign-child' if mode == 'unknown_child' else 'foreign-link')
+                        self.assertTrue(child.exists() or child.is_symlink())
+                        self.assert_owned_gone(state)
+                    finally:
+                        (config / ('foreign-child' if mode == 'unknown_child' else 'foreign-link')).unlink()
+                        config.rmdir()
+                        config.parent.rmdir()
+
+    def test_replaced_output_symlink_is_preserved_without_reading_foreign_data(self):
+        result, state = self.launch('output_link')
+        workdir = Path(state['config']).parent
+        out = workdir / 'out'
+        try:
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(out.is_symlink())
+            self.assertEqual(out.read_text(), 'FOREIGN_OUTPUT_MUST_NOT_PRINT')
+            self.assertNotIn('FOREIGN_OUTPUT_MUST_NOT_PRINT', result.stdout)
+            self.assertNotIn('host temp cleanup checked exact owned absence', result.stdout)
+            self.assertIn('host temp cleanup failed preserved workdir=', result.stdout)
+            self.assert_owned_gone(state)
+        finally:
+            out.unlink()
+            workdir.rmdir()
 
     def test_guest_failure_keeps_primary_result_and_cleans_up(self):
         result, state = self.launch('guest_fail')
@@ -577,7 +705,7 @@ class HostLauncherTests(unittest.TestCase):
         result, state = self.launch('renamed')
         self.assertEqual(result.returncode, 1)
         self.assertIn('owned cleanup failed', result.stderr)
-        self.assertNotIn('cleanup checked exact owned absence', result.stdout)
+        self.assertNotIn('docker test: cleanup checked exact owned absence', result.stdout)
         self.assertFalse(any(c[0] == 'rm' for c in state['calls']))
         self.assertTrue(any(obj['name'].endswith('-renamed') for obj in state['containers'].values()))
 
@@ -588,7 +716,7 @@ class HostLauncherTests(unittest.TestCase):
                 result, _ = self.launch(mode)
                 self.assertEqual(result.returncode, code)
                 self.assertIn('owned cleanup failed', result.stderr)
-                self.assertNotIn('cleanup checked exact owned absence', result.stdout)
+                self.assertNotIn('docker test: cleanup checked exact owned absence', result.stdout)
 
     def test_exact_name_with_foreign_label_is_never_removed(self):
         result, state = self.launch('name_collision')
@@ -630,6 +758,62 @@ class HostLauncherTests(unittest.TestCase):
             self.assertIn(expected, text)
         for forbidden in ('gcloud', 'docker run', 'docker pull', 'hello-world', '--privileged', 'docker.sock'):
             self.assertNotIn(forbidden, text)
+
+
+class WorkflowCleanupTests(unittest.TestCase):
+    """Execute the maintained workflow cleanup function, never its Docker calls."""
+    def test_actual_workflow_cleanup_receipts_and_primary_codes(self):
+        workflow = RUNNER.parents[2] / '.github/workflows/docker-package-proof.yml'
+        text = workflow.read_text()
+        start = text.index('          cleanup_host() {\n')
+        end = text.index('          trap cleanup_host EXIT\n', start)
+        function = '\n'.join(line[10:] for line in text[start:end].splitlines())
+        self.assertTrue(function.endswith('}'))
+        for kind in ('empty', 'unknown', 'dangling', 'replaced', 'parent_link'):
+            for primary in (0, 124, 130, 143):
+                with self.subTest(kind=kind, primary=primary), tempfile.TemporaryDirectory() as directory:
+                    private = Path(directory) / 'private'
+                    private.mkdir(mode=0o700)
+                    for name in ('home', 'tmp', 'docker-config'):
+                        (private / name).mkdir(mode=0o700)
+                    child = private / 'tmp' / 'foreign'
+                    if kind == 'unknown':
+                        child.write_text('preserve')
+                    elif kind == 'dangling':
+                        child.symlink_to('absent')
+                    elif kind == 'replaced':
+                        (private / 'tmp').rmdir()
+                        (private / 'tmp').symlink_to('absent')
+                    elif kind == 'parent_link':
+                        for name in ('home', 'tmp', 'docker-config'):
+                            (private / name).rmdir()
+                        private.rmdir()
+                        private.symlink_to('absent')
+                    script = 'set -euo pipefail\nprivate=$1\n' + function + '\ntrap cleanup_host EXIT\nexit "$2"\n'
+                    result = subprocess.run(['bash', '-c', script, 'cleanup-fixture', str(private), str(primary)],
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, primary or (0 if kind == 'empty' else 1), result.stderr)
+                    parent_receipt = 'checked exact owned absence path=' + str(private) + '\n'
+                    if kind == 'empty':
+                        self.assertFalse(private.exists() or private.is_symlink())
+                        self.assertIn(parent_receipt, result.stdout)
+                        self.assertEqual(result.stdout.count('checked exact owned absence'), 4)
+                    else:
+                        self.assertTrue(private.exists() or private.is_symlink())
+                        self.assertIn('directory cleanup failed', result.stderr)
+                        self.assertNotIn(parent_receipt, result.stdout)
+                        if kind == 'parent_link':
+                            self.assertTrue(private.is_symlink())
+                            private.unlink()
+                        elif kind == 'replaced':
+                            self.assertTrue((private / 'tmp').is_symlink())
+                            (private / 'tmp').unlink()
+                        else:
+                            self.assertTrue(child.exists() or child.is_symlink())
+                            child.unlink()
+                            child.parent.rmdir()
+                        if kind != 'parent_link':
+                            private.rmdir()
 
 
 if __name__ == '__main__':
