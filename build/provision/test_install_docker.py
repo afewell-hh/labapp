@@ -4,6 +4,9 @@ import hashlib
 import os
 from pathlib import Path
 import runpy
+import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -23,6 +26,8 @@ class DockerTests(unittest.TestCase):
     def setUp(self):
         self.module = runpy.run_path(str(INSTALL))
         self.g = self.module['install'].__globals__
+        # Synthetic installer workspaces stay inside the harness's private TMPDIR.
+        self.g['WORKDIR'] = tempfile.gettempdir()
 
     def test_exact_pins_sources_key_and_budget(self):
         m = self.module
@@ -53,6 +58,8 @@ class DockerTests(unittest.TestCase):
                       release='ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble', exists=lambda p: False):
         def call(args, seconds=10, env=None):
             if args[0].endswith('dpkg'):
+                if '--get-selections' in args:
+                    return b'docker-ce\thold\n' if holds else b'dpkg\tinstall\n'
                 if '--print-foreign-architectures' in args:
                     return foreign
                 return arch if '--print-architecture' in args else audit
@@ -61,11 +68,13 @@ class DockerTests(unittest.TestCase):
             self.fail('unexpected command')
         stack = contextlib.ExitStack()
         stack.enter_context(patch('os.geteuid', return_value=0))
+        # Target behavior is mocked explicitly; local tests may run on 3.10+.
+        stack.enter_context(patch.object(sys, 'version_info', (3, 12)))
         stack.enter_context(patch.object(Path, 'read_text', return_value=release))
         stack.enter_context(patch.object(Path, 'is_file', return_value=True))
         stack.enter_context(patch('os.path.lexists', side_effect=exists))
         stack.enter_context(patch.dict(self.g, {'call': call, 'installed': lambda: packages or {},
-                                                'system_paths': lambda: None}))
+                                                'system_paths': lambda: None, 'safe_tree': lambda *a, **k: None}))
         return stack
 
     def test_platform_and_state_refusals(self):
@@ -86,6 +95,12 @@ class DockerTests(unittest.TestCase):
     def test_nonroot_refused_before_any_command(self):
         with patch('os.geteuid', return_value=1000), patch.dict(self.g, {'call': lambda *a, **k: self.fail('cmd')}):
             with self.assertRaisesRegex(Refusal, 'root'):
+                self.module['preflight']()
+
+    def test_python_version_refused_before_native_command(self):
+        with patch('os.geteuid', return_value=0), patch.object(sys, 'version_info', (3, 10)), \
+             patch.dict(self.g, {'call': lambda *a, **k: self.fail('native command')}):
+            with self.assertRaisesRegex(Refusal, 'Python 3.12'):
                 self.module['preflight']()
 
     def test_unsafe_trees_refused(self):
@@ -165,9 +180,14 @@ class DockerTests(unittest.TestCase):
 
         def fetch_key(run, key):
             run(['/usr/bin/curl', 'x'], plain=True)
+        def archives(root, reviewed, run):
+            if not digest_ok:
+                raise Refusal('trio archive digest mismatch')
+            return []
         patches = {'call': call, 'preflight': lambda: next(installed_iter), 'installed': lambda: dict(self.module['PINS'] if after is None else after),
                    'health': lambda: None, 'verify_payloads': payloads, 'fetch_key': fetch_key,
-                   'safe_tree': lambda *a, **k: None, 'digest': digest, 'apt_uid': lambda: 0}
+                   'safe_tree': lambda *a, **k: None, 'digest': digest, 'apt_uid': lambda: 0,
+                   'verify_archives': archives}
         return log, patches
 
     def run_install(self, before, **kw):
@@ -191,7 +211,7 @@ class DockerTests(unittest.TestCase):
         log, printed = self.run_install({})
         words = ('update', 'check', '--simulate', '--download-only', '--no-download')
         verbs = ['curl' if a[0].endswith('curl') else next(w for w in words if w in a) for a, _, _ in log]
-        self.assertEqual(verbs, ['curl', 'update', 'check', '--simulate', '--download-only', '--no-download', 'check'])
+        self.assertEqual(verbs, ['curl', 'update', 'check', '--simulate', '--download-only', '--simulate', '--no-download', 'check'])
         for args, seconds, env in log:
             self.assertLessEqual(seconds, 180)
             self.assertEqual(env['PATH'], '/usr/sbin:/usr/bin:/sbin:/bin')
@@ -230,12 +250,117 @@ class DockerTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, 'version mismatch'):
             self.run_install({}, after={'docker-ce': 'wrong'})
 
-    def test_rerun_verifies_without_network_or_install(self):
+    def test_post_install_audit_failure_is_not_success(self):
+        log, patches = self.transaction([{}])
+        patches['health'] = lambda: (_ for _ in ()).throw(Refusal('post audit failure'))
+        with patch.dict(self.g, patches), self.assertRaisesRegex(Refusal, 'post audit'):
+            self.module['install']()
+        self.assertTrue(any('--yes' in a and '--no-download' in a for a, _, _ in log))
+
+    def test_plan_change_stops_mutation(self):
+        log, patches = self.transaction([{}])
+        inner = patches['call']
+        def call(args, seconds=10, env=None):
+            answer = inner(args, seconds, env)
+            return (GOOD_PLAN + 'Inst extra (1 Ubuntu [amd64])\n').encode() if '--simulate' in args and '--no-download' in args else answer
+        patches['call'] = call
+        with patch.dict(self.g, patches), self.assertRaisesRegex(Refusal, 'simulation changed'):
+            self.module['install']()
+        self.assertFalse(any('--yes' in a and '--no-download' in a for a, _, _ in log))
+
+    def test_archives_encoded_epoch_metadata_and_closure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'archives').mkdir()
+            archive = root / 'archives/docker-ce_5%3a29.1.3_amd64.deb'
+            archive.write_bytes(b'synthetic archive; never executed')
+            sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+            calls = []
+            def native(args, plain=False):
+                calls.append(args)
+                return f'Package: docker-ce\nVersion: {V}\nArchitecture: amd64\n'.encode()
+            with patch.dict(self.g, {'ARCHIVES': {'docker-ce': sha}, 'safe_tree': lambda *a, **k: None}):
+                report = self.module['verify_archives'](root, {'docker-ce': V}, native)
+                self.assertEqual(report[0]['sha256'], sha)
+                self.assertEqual(calls[0][0], '/usr/bin/dpkg-deb')
+                with self.assertRaisesRegex(Refusal, 'cover'):
+                    self.module['verify_archives'](root, {'docker-ce': V, 'dep': '1'}, native)
+                with self.assertRaisesRegex(Refusal, 'reviewed simulation'):
+                    self.module['verify_archives'](root, {'docker-ce': 'wrong'}, native)
+            calls.clear()
+            with patch.dict(self.g, {'safe_tree': lambda *a, **k: None}), self.assertRaisesRegex(Refusal, 'digest'):
+                self.module['verify_archives'](root, {'docker-ce': V}, native)
+            self.assertEqual(calls, [])  # reject wrong pinned bytes before dpkg-deb
+
+    def test_payload_integrity_and_link_refusal(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            artifact = root / 'usr/bin/docker'
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b'synthetic payload')
+            expected = hashlib.md5(artifact.read_bytes()).hexdigest()
+            patches = {'PAYLOADS': {'docker-ce-cli': 'usr/bin/docker', 'containerd.io': 'usr/bin/docker'},
+                       'EXTRA_PAYLOADS': (), 'call': lambda *a, **k: f'{expected}  usr/bin/docker\n'.encode()}
+            with patch.dict(self.g, patches):
+                self.assertEqual(set(self.module['verify_payloads'](root)), {'usr/bin/docker'})
+                artifact.write_bytes(b'corrupt')
+                with self.assertRaisesRegex(Refusal, 'drift'):
+                    self.module['verify_payloads'](root)
+                artifact.unlink()
+                artifact.symlink_to('missing')
+                with self.assertRaisesRegex(Refusal, 'link'):
+                    self.module['verify_payloads'](root)
+
+    def test_receipt_parent_refused_before_any_transaction(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            link = root / 'link'
+            link.symlink_to(root, target_is_directory=True)
+            with patch.dict(self.g, {'preflight': lambda: {}, 'call': lambda *a, **k: self.fail('native')}):
+                with self.assertRaisesRegex(Refusal, 'parent'):
+                    self.module['install'](link / 'receipt')
+
+    def test_bounded_failures_propagate_and_cleanup(self):
+        for failure in (Refusal('timeout'), Refusal('output overflow'), KeyboardInterrupt()):
+            log, patches = self.transaction([{}])
+            patches['call'] = lambda *a, failure=failure, **k: (_ for _ in ()).throw(failure)
+            with tempfile.TemporaryDirectory() as d:
+                real_tmp = tempfile.TemporaryDirectory
+                class Tmp(real_tmp):
+                    def __init__(inner, *a, **k):
+                        super().__init__(prefix='owned-', dir=d)
+                with patch.dict(self.g, patches), patch('tempfile.TemporaryDirectory', Tmp):
+                    with self.assertRaises(type(failure)):
+                        self.module['install']()
+                self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_cli_sigterm_reaps_python_child(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pidfile = root / 'pid'
+            child = "import os,signal,time;from pathlib import Path;Path(" + repr(str(pidfile)) + ").write_text(str(os.getpid()));os.kill(os.getppid(),signal.SIGTERM);time.sleep(10)"
+            program = '''
+import runpy,sys
+sys.path.insert(0, sys.argv[1])
+from hhfab_release import bounded
+m=runpy.run_path(sys.argv[2]);main=m['main']
+child=sys.argv[3]
+main.__globals__['install']=lambda receipt: bounded([sys.executable,'-I','-B','-c',child],5)
+sys.argv=['install-docker.py']
+try:main()
+except KeyboardInterrupt:sys.exit(130)
+'''
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', program, str(INSTALL.parent), str(INSTALL), child], capture_output=True, timeout=8)
+            self.assertEqual(result.returncode, 130, result.stderr)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pidfile.read_text()), 0)
+
+    def test_rerun_reauthenticates_without_install(self):
         full = dict(self.module['PINS'])
         log, _ = self.run_install(full)
-        mutating = [a for a, _, _ in log if '-y' in a or '--yes' in a or 'update' in a or a[0].endswith('curl')]
+        mutating = [a for a, _, _ in log if '-y' in a or '--yes' in a or 'install' in a]
         self.assertEqual(mutating, [])
-        self.assertEqual(len(log), 1)  # only apt-get check
+        self.assertEqual(len(log), 4)  # key, authenticated update and health checks
         with self.assertRaisesRegex(Refusal, 'drift'):
             self.run_install(full, md5_ok=False)
 
@@ -249,7 +374,7 @@ class DockerTests(unittest.TestCase):
                 self.module['persist'](path, {'a': 2})
             link = Path(d) / 'link.json'
             os.symlink(path, link)
-            with self.assertRaisesRegex(Refusal, 'unsafe receipt'):
+            with self.assertRaisesRegex(Refusal, 'link'):
                 self.module['persist'](link, receipt)
             self.assertEqual([p.name for p in Path(d).iterdir() if p.name.startswith('.docker')], [])
 

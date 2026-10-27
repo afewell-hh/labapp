@@ -39,7 +39,7 @@ KEY_MAX = 16 * 1024
 UBUNTU_KEY = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 # Packages that collide with the reviewed trio (Docker's documented removal list).
 CONFLICTS = ("docker.io", "docker-doc", "docker-compose", "docker-compose-v2",
-             "podman-docker", "containerd", "runc")
+             "docker", "docker-engine", "docker-buildx", "podman-docker", "containerd", "runc")
 # Payloads: package -> package-relative path verified against dpkg md5sums.
 PAYLOADS = {"docker-ce": "usr/bin/dockerd", "docker-ce-cli": "usr/bin/docker",
             "containerd.io": "usr/bin/containerd"}
@@ -50,6 +50,7 @@ COLLISION_PATHS = ("/usr/bin/dockerd", "/usr/bin/docker", "/usr/bin/containerd",
                    "/usr/lib/systemd/system/containerd.service")
 MAX_PLAN = 32
 BUDGET, CHILD_CAP, ALARM = 210, 180, 235
+WORKDIR = '/var/tmp'
 BASE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
             "DEBIAN_FRONTEND": "noninteractive", "HOME": "/root"}
 
@@ -87,7 +88,8 @@ def safe_tree(path, uids=(0,)):
 def system_paths():
     for path in ("/var/lib/dpkg", "/var/lib/dpkg/status", "/usr", "/usr/bin", "/var/tmp"):
         info = os.lstat(path)
-        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0:
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+                or info.st_mode & 0o022 and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX)):
             raise Refusal("unsafe or unowned system path: " + path)
     for path in COLLISION_PATHS:
         parent = os.path.dirname(path)
@@ -95,7 +97,7 @@ def system_paths():
             raise Refusal("unsafe link parent: " + parent)
 
 
-def verify_payloads():
+def verify_payloads(root=Path('/')):
     """Compare mandatory payloads with the installed packages' own md5sums."""
     shas = {}
     wanted = {name: [rel] for name, rel in PAYLOADS.items()}
@@ -104,7 +106,8 @@ def verify_payloads():
         metadata = call(["/usr/bin/dpkg-query", "--control-show", package, "md5sums"]).decode()
         expected = dict(line.split(None, 1)[::-1] for line in metadata.splitlines() if line.strip())
         for relative in relatives:
-            artifact = Path("/") / relative
+            artifact = root / relative
+            safe_tree(artifact, uids=(os.geteuid(),))
             if artifact.is_symlink() or not artifact.is_file() or relative not in expected:
                 raise Refusal("installed pinned artifact missing: " + package)
             data = artifact.read_bytes()
@@ -117,7 +120,9 @@ def verify_payloads():
 def health():
     if call(["/usr/bin/dpkg", "--audit"]).strip():
         raise Refusal("broken dpkg state")
-    if call(["/usr/bin/apt-mark", "showhold"]).strip():
+    # dpkg reads selections without loading ambient APT configuration/hooks.
+    selections = call(["/usr/bin/dpkg", "--get-selections"]).decode().splitlines()
+    if any(row.split()[-1:] == ['hold'] for row in selections):
         raise Refusal("held packages require explicit resolution")
 
 
@@ -138,6 +143,7 @@ def preflight():
     for path in (UBUNTU_KEY, "/etc/ssl/certs/ca-certificates.crt"):
         if not Path(path).is_file():
             raise Refusal("archive keyring/CA dependency missing")
+        safe_tree(path)
     before = installed()
     for name in CONFLICTS:
         if name in before:
@@ -193,7 +199,7 @@ def setup(root):
 
 
 def fetch_key(run, key):
-    run(["/usr/bin/curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--proto-redir", "=https",
+    run(["/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error", "--proto", "=https", "--proto-redir", "=https",
          "--max-time", "30", "--max-filesize", str(KEY_MAX), "--output", str(key), KEY_URL], plain=True)
     if key.is_symlink() or not key.is_file() or key.stat().st_size > KEY_MAX or digest(key) != KEY_SHA256:
         raise Refusal("Docker key SHA256 mismatch")
@@ -213,6 +219,8 @@ def check_plan(text):
         if not match:
             raise Refusal("unparseable simulation line")
         name, old, version = match.group(1), match.group(2), match.group(3)
+        if name in seen or not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', name):
+            raise Refusal('duplicate or unsupported simulation package')
         if old and name not in PINS:
             raise Refusal("simulation upgrades unrelated package: " + name)
         if name in CONFLICTS:
@@ -222,21 +230,55 @@ def check_plan(text):
         raise Refusal("simulation plan too large")
     if any(seen.get(n) != v for n, v in PINS.items()):
         raise Refusal("simulation does not select exact reviewed versions")
+    return seen
+
+
+def verify_archives(root, plan, run):
+    """Native archive metadata handles encoded epochs; constrain every staged package."""
+    found, report = {}, []
+    files = sorted((root / 'archives').glob('*.deb'))
+    if len(files) > MAX_PLAN:
+        raise Refusal('too many downloaded archives')
+    for path in files:
+        safe_tree(path)
+        sha = digest(path)
+        hinted = path.name.split('_', 1)[0]
+        if hinted in ARCHIVES and sha != ARCHIVES[hinted]:
+            raise Refusal('trio archive digest mismatch: ' + hinted)
+        fields = run(['/usr/bin/dpkg-deb', '-f', str(path), 'Package', 'Version', 'Architecture'], plain=True).decode().splitlines()
+        # dpkg-deb labels fields when multiple field names are requested.
+        metadata = dict(line.split(': ', 1) for line in fields if ': ' in line)
+        name, version, arch = (metadata.get(k) for k in ('Package', 'Version', 'Architecture'))
+        if name in found or plan.get(name) != version or arch not in ('amd64', 'all'):
+            raise Refusal('archive does not match reviewed simulation')
+        if name in ARCHIVES and sha != ARCHIVES[name]:
+            raise Refusal('trio archive digest mismatch: ' + name)
+        found[name] = version
+        report.append({'package': name, 'version': version, 'sha256': sha, 'bytes': path.stat().st_size})
+    if found != plan:
+        raise Refusal('downloaded archives do not cover reviewed simulation')
+    return report
 
 
 def receipt_for(after, shas):
     here = Path(__file__).parent
     return {"format": "labapp-docker-receipt-v1", "snapshot": SNAPSHOT, "pins": PINS,
             "archives": ARCHIVES, "key_sha256": KEY_SHA256,
+            "sources": {'docker': 'https://download.docker.com/linux/ubuntu noble stable amd64',
+                        'ubuntu': f'https://snapshot.ubuntu.com/ubuntu/{SNAPSHOT}/ noble noble-updates noble-security main universe',
+                        'ubuntu_key_sha256': digest(UBUNTU_KEY)},
             "module": {n: digest(here / n) for n in ("install-docker.py", "hhfab_release.py")},
-            "installed": {n: after[n] for n in PINS}, "payload_sha256": shas}
+            "installed": after, "payload_sha256": shas}
 
 
 def install(receipt_path=None):
     started = time.monotonic()
     before = preflight()
     complete = all(before.get(n) == v for n, v in PINS.items())
-    with tempfile.TemporaryDirectory(prefix="labapp-docker-", dir="/var/tmp") as temporary:
+    check_receipt_path(receipt_path)
+    if receipt_path is not None and os.path.lexists(receipt_path) and not complete:
+        raise Refusal('existing receipt requires complete installed trio')
+    with tempfile.TemporaryDirectory(prefix="labapp-docker-", dir=WORKDIR) as temporary:
         root = Path(temporary)
         apt, config, key = setup(root)
         safe_tree(root)
@@ -247,20 +289,22 @@ def install(receipt_path=None):
                 raise Refusal("installation deadline exceeded")
             env = dict(BASE_ENV) if plain else {**BASE_ENV, "APT_CONFIG": config}
             return call(args, min(CHILD_CAP, remaining), env=env)
+        # Every invocation authenticates the reviewed sources and key, including
+        # reruns. An installed version string is not repository authentication.
+        fetch_key(run, key)
+        run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
+        safe_tree(root, uids=(0, apt_uid()))
+        run([*apt, "check"])
+        archives = []
         if not complete:
-            fetch_key(run, key)
-            run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
-            safe_tree(root, uids=(0, apt_uid()))
-            # Configured-but-unsatisfied relations are not a dpkg audit failure.
-            run([*apt, "check"])
             selected = [n + "=" + v for n, v in PINS.items()]
             plan = run([*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
-            check_plan(plan.decode(errors="replace"))
+            reviewed = check_plan(plan.decode(errors="replace"))
             run([*apt, "--yes", "--no-remove", "--no-install-recommends", "--download-only", "install", *selected])
-            for name, version in PINS.items():
-                files = sorted((root / "archives").glob(f"{name}_{version.split(':')[-1]}_amd64.deb"))
-                if len(files) != 1 or digest(files[0]) != ARCHIVES[name]:
-                    raise Refusal("trio archive digest mismatch: " + name)
+            archives = verify_archives(root, reviewed, run)
+            repeated = run([*apt, '--simulate', '--no-download', '--no-remove', '--no-install-recommends', 'install', *selected])
+            if check_plan(repeated.decode(errors='replace')) != reviewed:
+                raise Refusal('simulation changed before install')
             run([*apt, "--yes", "--no-remove", "--no-install-recommends", "--no-download", "install", *selected])
         run([*apt, "check"])
         after = installed()
@@ -270,7 +314,7 @@ def install(receipt_path=None):
         shas = verify_payloads()
         receipt = receipt_for(after, shas)
     persist(receipt_path, receipt)
-    print(json.dumps({**receipt, "changed": before != after,
+    print(json.dumps({**receipt, 'downloaded_archives': archives, "changed": before != after,
                       "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))
 
 
@@ -281,10 +325,26 @@ def apt_uid():
         return 0
 
 
+def check_receipt_path(path):
+    if path is None:
+        return
+    path = Path(os.path.abspath(path))
+    for parent in reversed(path.parents):
+        info = os.lstat(parent)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise Refusal('unsafe receipt parent')
+    if os.path.lexists(path):
+        safe_tree(path, uids=(os.geteuid(),))
+        if path.stat().st_size > 1024 * 1024:
+            raise Refusal('oversized receipt')
+
+
 def persist(path, receipt):
     """Rerun compares an existing receipt; first run exclusively creates it."""
     if path is None:
         return
+    check_receipt_path(path)
     path = Path(path)
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
     if os.path.lexists(path):

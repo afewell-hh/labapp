@@ -657,10 +657,17 @@ python3 -m unittest discover -s build/provision -p test_install_docker.py -v
 It refuses non-root, unsupported OS/architecture, foreign architectures, holds,
 dpkg audit problems, conflicting packages (`docker.io`, `containerd`, `runc`,
 ...), installed version drift, a partial trio, unowned payload-path collisions,
-and simulations that remove, purge or upgrade unrelated packages. A rerun
-with the exact trio installed makes no network call: it checks package health
-and verifies payloads against dpkg md5sums, then compares the optional receipt
-(source/hash identity). Partial dpkg failure leaves a failed disposable target;
+and simulations that remove, purge or upgrade unrelated packages. Downloaded
+archives must cover the reviewed simulation exactly; native `dpkg-deb` reads
+metadata after authentication, and a second simulation must match before install.
+The 32-package plan ceiling is an initial finite bound, not a proven closure.
+A rerun with the exact trio installed re-fetches the reviewed key and authenticates
+fresh source indexes, checks package health and verifies payloads against dpkg
+md5sums, then compares the optional receipt (module/source/key hashes, full installed
+package state and payload SHA256). dpkg metadata verifies consistency; it is not
+independent installed-file SHA provenance. Unsafe receipt parents/types are refused
+before acquisition; an existing receipt cannot authorize first installation.
+Partial dpkg failure leaves a failed disposable target;
 there is no rollback or repair. Budgets (210s APT, 180s child, 235s alarm, 240s
 outer) are unproved initial assumptions.
 
@@ -668,4 +675,9 @@ Not covered: rootless extras, buildx/compose and other recommendations (baseline
 gaps, not complete Docker equivalence), user/group access, daemon readiness,
 k3d, VLAB, reboot, course behavior, snapshot dependency solvability and
 historical snapshot freshness/Valid-Until. These need separate integration
-evidence. No test or install has been run for this source.
+evidence. [Noble APT 2.8.3 sources.list](https://manpages.ubuntu.com/manpages/noble/man5/sources.list.5.html)
+documents default Valid-Until enforcement and source-specific historical-repository
+controls; this module retains secure defaults and refuses expired metadata.
+The [snapshot service](https://snapshot.ubuntu.com/) documents historical selection
+and intended retention, which do not establish this target's freshness or closure.
+Sources accessed 2026-10-27. Native installation remains unrun for this source.

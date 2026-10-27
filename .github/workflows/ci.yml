@@ -228,6 +228,24 @@ jobs:
     timeout-minutes: 22
     steps:
       - uses: actions/checkout@v4
+      - name: Docker component offline mocked regressions
+        run: |
+          test -f build/provision/test_install_docker.py
+          test_home=$(mktemp -d /tmp/labapp-docker-tests.XXXXXX)
+          mkdir -m 700 "$test_home/tmp"
+          umask 022
+          env -i HOME="$test_home" TMPDIR="$test_home/tmp" PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -I -B - <<'PY'
+          import os
+          import sys
+          import unittest
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_install_docker.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required Docker suite discovered no tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
       - name: Required failure and bounded execution regressions
         run: python3 -m unittest discover -s build/provision -p test_qemu.py -v
       - name: Two fresh unchanged installations and nonroot offline fixture
