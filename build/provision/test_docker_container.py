@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 import docker_container as dc
+from contextlib import redirect_stdout
 from hhfab_release import Refusal
 
 RUNNER = Path(__file__).with_name('test-docker.sh')
@@ -26,30 +27,6 @@ ARCHIVES = {'docker-ce': 'a' * 64, 'docker-ce-cli': 'b' * 64, 'containerd.io': '
 PINS = {'docker-ce': V, 'docker-ce-cli': V, 'containerd.io': C}
 KEY = 'k' * 64
 APT = '/usr/bin/apt-get'
-FIRST_COMMANDS = [['/usr/bin/curl'], [APT, 'update'], [APT, 'check'],
-                  [APT, '--simulate', 'install', 'x'], [APT, '--download-only', 'install', 'x'],
-                  ['/usr/bin/dpkg-deb', '-f', 'x'], [APT, '--simulate', '--no-download', 'install', 'x'],
-                  [APT, '--yes', '--no-download', 'install', 'x'], [APT, 'check']]
-RERUN_COMMANDS = [['/usr/bin/curl'], [APT, 'update'], [APT, 'check'], [APT, 'check']]
-
-FAKE_INSTALLER = '''
-PINS = %r
-ARCHIVES = %r
-KEY_SHA256 = %r
-MAX_PLAN = 32
-ALARM = 235
-PAYLOADS = {'docker-ce': 'usr/bin/dockerd'}
-EXTRA_PAYLOADS = ()
-
-def call(args, seconds=10, env=None):
-    return WORLD.respond(args)
-
-def install():
-    raise AssertionError('driver must enter through main()')
-
-def main():
-    WORLD.main(call)
-''' % (PINS, ARCHIVES, KEY)
 
 
 class Clock:
@@ -118,21 +95,18 @@ def archive_rows(system):
 
 
 class World:
-    """Scripted installer behavior; main() mimics the unchanged installer's call()/stdout use."""
+    """Synthetic CLI boundary; never starts the native installer."""
     def __init__(self, system, clock, plans):
         self.system, self.clock, self.plans, self.count = system, clock, plans, 0
         self.fail_stage, self.fail_message = None, ''
 
-    def respond(self, args):
-        if self.fail_stage and dc.stage_of(args) == self.fail_stage:
-            raise Refusal(self.fail_message)
-        return b''
-
-    def main(self, call):
+    def run(self, args, seconds, limit, env):
+        assert args == ['/usr/bin/python3', 'install-docker.py', '--receipt', str(dc.RECEIPT)]
+        assert seconds == 240 and limit == dc.MAX_STDOUT and env == dc.ENV
         plan = self.plans[self.count]
         self.count += 1
-        for args in plan['commands']:
-            call(args, 10, None)
+        if self.fail_stage:
+            return 1, self.fail_message.encode()
         self.clock.now += plan.get('elapsed', 1)
         if plan.get('interrupt'):
             raise KeyboardInterrupt
@@ -140,13 +114,13 @@ class World:
         out = {**receipt_data(self.system), 'changed': plan['changed'],
                'downloaded_archives': plan['archives'](self.system), 'seconds': 1.0}
         plan.get('tweak', lambda o: None)(out)
-        print(json.dumps(out))
+        return 0, json.dumps(out).encode()
 
 
 def run_case(first=None, rerun=None, budget=600, fail_stage=None, fail_message='', mutate=None):
     system, clock = FakeSystem(), Clock()
-    first_plan = {'commands': FIRST_COMMANDS, 'effect': install_effect, 'changed': True, 'archives': archive_rows}
-    rerun_plan = {'commands': RERUN_COMMANDS, 'effect': lambda s: None, 'changed': False, 'archives': lambda s: []}
+    first_plan = {'effect': install_effect, 'changed': True, 'archives': archive_rows}
+    rerun_plan = {'effect': lambda s: None, 'changed': False, 'archives': lambda s: []}
     first_plan.update(first or {})
     rerun_plan.update(rerun or {})
     world = World(system, clock, [first_plan, rerun_plan])
@@ -155,11 +129,10 @@ def run_case(first=None, rerun=None, budget=600, fail_stage=None, fail_message='
         mutate(system)
 
     def load(_path):
-        namespace = {'WORLD': world}
-        exec(FAKE_INSTALLER, namespace)
-        return namespace
+        return {'PINS': PINS, 'ARCHIVES': ARCHIVES, 'KEY_SHA256': KEY, 'MAX_PLAN': 32,
+                'PAYLOADS': {'docker-ce': 'usr/bin/dockerd'}, 'EXTRA_PAYLOADS': ()}
     report, code = dc.execute(system, Path('install-docker.py'), budget, 'ubuntu@sha256:test',
-                              load=load, clock=clock, sources=SOURCES)
+                              load=load, clock=clock, sources=SOURCES, run=world.run)
     return report, code, system, world
 
 
@@ -167,12 +140,15 @@ class DriverTests(unittest.TestCase):
     def test_install_then_rerun_in_same_target_passes_with_evidence(self):
         report, code, system, world = run_case()
         self.assertEqual((code, report['result'], world.count), (0, 'pass', 2))
-        self.assertEqual([dc.keyed(run['stages']) for run in report['runs']], [dc.FIRST, dc.RERUN])
+        self.assertEqual(len(report['runs']), 2)
         self.assertEqual(report['closure'], {**PINS, 'iptables': '1.8'})
         self.assertEqual(report['base'], 'ubuntu@sha256:test')
         self.assertEqual(report['source_sha256'], SOURCES)
         self.assertEqual(report['fixture']['docker_data_sentinel'], True)
         self.assertEqual(report['receipt_sha256'], 'r' * 64)
+        self.assertEqual(report['prepared_packages'], {'bash': '5.2', 'curl': '8.5'})
+        self.assertEqual(report['runs'][0]['installer_output']['downloaded_archives'], archive_rows(system))
+        self.assertEqual(report['runs'][1]['installer_output']['module'], SOURCES)
         json.dumps(report)
 
     def failure(self, expected, **kw):
@@ -181,17 +157,13 @@ class DriverTests(unittest.TestCase):
         self.assertIn(expected, report['error'])
         return report, world
 
-    def test_rerun_must_reauthenticate_and_not_install(self):
-        report, world = self.failure('re-authenticate', rerun={'commands': [[APT, 'check'], [APT, 'check']]})
-        self.assertEqual(report['phase'], 'rerun')
-        self.failure('re-authenticate', rerun={'commands': RERUN_COMMANDS + [[APT, '--yes', '--no-download', 'install', 'x']]})
-
     def test_rerun_state_and_identity_must_be_preserved(self):
         def package(s): s.pkgs['extra'] = '1'
         def payload(s): s.payload_map['usr/bin/dockerd'] = ['p' * 64, 11, 20]
         def receipt(s): s.receipt_value['identity'][1] = 99
+        def sentinel(s): s.sentinel_value = [9, 2, 3]
         for effect, text in ((package, 'rerun changed packages'), (payload, 'payload identity'),
-                             (receipt, 'receipt identity')):
+                             (receipt, 'receipt identity'), (sentinel, 'sentinel')):
             with self.subTest(text):
                 self.failure(text, rerun={'effect': effect})
         self.failure('reported a change', rerun={'changed': True})
@@ -203,11 +175,12 @@ class DriverTests(unittest.TestCase):
         def hold(s): install_effect(s); s.hold_list.append('bash')
         def policy(s): install_effect(s); s.apt['apt.conf.d/99'] = 'new'
         def sentinel(s): install_effect(s); s.sentinel_value = None
+        def replace_sentinel(s): install_effect(s); s.sentinel_value = [9, 2, 3]
         def daemon(s): install_effect(s); s.daemon_list.append('dockerd')
         def audit(s): install_effect(s); s.audit_text = 'half-installed'
         for effect, text in ((remove, 'removed or changed'), (upgrade, 'removed or changed'),
                              (hold, 'held packages'), (policy, 'global APT'),
-                             (sentinel, 'sentinel'), (daemon, 'daemon'), (audit, 'audit')):
+                             (sentinel, 'sentinel'), (replace_sentinel, 'sentinel'), (daemon, 'daemon'), (audit, 'audit')):
             with self.subTest(effect.__name__):
                 report, world = self.failure(text, first={'effect': effect})
                 self.assertEqual(world.count, 1, 'a failure must never trigger the rerun')
@@ -234,18 +207,12 @@ class DriverTests(unittest.TestCase):
                 self.assertTrue(report['error'])
         self.failure('receipt missing', first={'effect': gone})
 
-    def test_stage_order_is_enforced_on_first_run(self):
-        commands = [c for c in FIRST_COMMANDS if '--simulate' not in c]
-        self.failure('stage sequence', first={'commands': commands})
-
     def test_transport_failure_is_final_with_primary_error_and_no_rerun(self):
         message = "command failed: apt-get code=100 output_tail=b'E: Failed to fetch 503 Service Unavailable'"
         report, code, system, world = run_case(fail_stage='update', fail_message=message)
         self.assertEqual((code, report['result'], world.count), (1, 'fail', 1))
         self.assertTrue(report['transport_suspected'])
         self.assertIn('503 Service Unavailable', report['error'])
-        self.assertEqual([row[:2] for row in report['runs'][0]['stages']],
-                         [['key-fetch', 'ok'], ['update', 'failed']])
         self.assertEqual(len(report['runs']), 1)
         self.assertEqual(system.pkgs, {'bash': '5.2', 'curl': '8.5'})
 
@@ -259,7 +226,7 @@ class DriverTests(unittest.TestCase):
     def test_error_text_is_bounded_and_escaped(self):
         report, code, _, _ = run_case(fail_stage='update', fail_message='\x1b[31m' + 'x' * 10000)
         self.assertEqual(code, 1)
-        self.assertLessEqual(len(report['error']), dc.DETAIL + 2)
+        self.assertLessEqual(len(report['error']), 2 * dc.DETAIL + 256)
         self.assertNotIn('\x1b', report['error'])
 
     def test_total_budget_is_not_widened(self):
@@ -275,33 +242,19 @@ class DriverTests(unittest.TestCase):
         report, code, _, world = run_case(first={'interrupt': True})
         self.assertEqual((code, report['result'], world.count), (130, 'interrupted', 1))
 
-    def test_instrument_passes_results_and_errors_through(self):
-        log, ticks = [], iter(range(100))
-        def original(args, seconds=10, env=None):
-            if args[-1] == 'boom':
-                raise Refusal('primary')
-            return b'out'
-        call = dc.instrument(original, log, clock=lambda: next(ticks))
-        self.assertEqual(call([APT, 'check'], 5, None), b'out')
-        with self.assertRaisesRegex(Refusal, 'primary'):
-            call([APT, 'boom'])
-        self.assertEqual([row[:2] for row in log], [['check', 'ok'], ['other', 'failed']])
-
-    def test_stage_labels_expose_names_not_arguments(self):
-        cases = {('/usr/bin/curl', '--output', 'k'): 'key-fetch', (APT, 'update'): 'update',
-                 (APT, 'check'): 'check', (APT, '--simulate', 'install', 'p=1'): 'simulate',
-                 (APT, '--download-only', 'install', 'p=1'): 'download',
-                 (APT, '--yes', '--no-download', 'install', 'p=1'): 'install',
-                 ('/usr/bin/dpkg-deb', '-f', 'a.deb'): 'dpkg-deb', (APT, 'moo'): 'other'}
-        for args, stage in cases.items():
-            self.assertEqual(dc.stage_of(list(args)), stage)
+    def test_cli_boundary_preserves_failure_and_bounded_output(self):
+        with self.assertRaisesRegex(Refusal, 'CLI failed'):
+            dc.run_once(Path('installer'), Path('receipt'), 500,
+                        run=lambda *a, **kw: (130, b'interrupted'))
+        with self.assertRaisesRegex(Refusal, 'insufficient'):
+            dc.run_once(Path('installer'), Path('receipt'), 239)
 
     def test_real_installer_exposes_every_value_the_driver_reads(self):
         module = dc.load_installer(Path(__file__).with_name('install-docker.py'))
         for name in ('PINS', 'ARCHIVES', 'KEY_SHA256', 'MAX_PLAN', 'ALARM', 'PAYLOADS', 'EXTRA_PAYLOADS', 'main', 'call'):
             self.assertIn(name, module)
         self.assertIs(module['install'].__globals__['call'], module['call'])
-        self.assertGreater(dc.BUDGET_MAX, 2 * module['ALARM'])
+        self.assertGreater(dc.BUDGET_MAX, 2 * 240)
 
 
 class SystemProbeTests(unittest.TestCase):
@@ -336,7 +289,7 @@ class SystemProbeTests(unittest.TestCase):
                 self.assertEqual(set(tree), {'l', 'sub/f'})
                 self.assertEqual(system.receipt()['data'], {'a': 1})
                 self.assertEqual(system.receipt(), system.receipt())
-                self.assertEqual(len(system.sentinel()), 3)
+                self.assertEqual(len(system.sentinel()), 4)
                 rows = system.payloads([str(receipt).lstrip('/')])
                 self.assertEqual(len(next(iter(rows.values()))), 3)
                 sentinel.unlink()
@@ -359,6 +312,31 @@ class SystemProbeTests(unittest.TestCase):
                     patch.object(dc, 'bounded', lambda *a, **k: (0, b'')):
                 with self.assertRaisesRegex(Refusal, 'not effective'):
                     dc.System().plant()
+
+    def test_existing_regular_service_policy_is_preserved_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, sentinel = root / 'policy-rc.d', root / 'data' / 'sentinel'
+            original = b'#!/bin/sh\nexit 42\n'
+            policy.write_bytes(original)
+            policy.chmod(0o755)
+            with patch.object(dc, 'POLICY', policy), patch.object(dc, 'SENTINEL', sentinel):
+                result = dc.System().plant()
+            self.assertTrue(result['policy_preexisting'])
+            self.assertEqual(policy.with_name('policy-rc.d.labapp-original').read_bytes(), original)
+            self.assertEqual(policy.read_bytes(), b'#!/bin/sh\nexit 101\n')
+            self.assertEqual(result['original_policy_sha256'], dc.digest(policy.with_name('policy-rc.d.labapp-original')))
+
+    def test_aggregate_report_overflow_is_failure_and_preserves_primary_status(self):
+        for primary, expected in ((0, 1), (1, 1), (130, 130)):
+            with patch.object(dc, 'execute', return_value=({'result': 'pass', 'large': 'x' * dc.MAX_REPORT}, primary)), \
+                    patch('sys.stdout', io.StringIO()) as out:
+                code = dc.main(['run', '--budget', '500'], system=object())
+            self.assertEqual(code, expected)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report['result'], 'fail')
+            self.assertIn('exceeds byte cap', report['error'])
+            self.assertLess(len(out.getvalue().encode()), dc.MAX_REPORT)
 
     def test_cli_validates_budget_and_returns_driver_exit_code(self):
         for bad in ('0', '601'):
@@ -429,7 +407,7 @@ elif a[0] == 'inspect':
             'true' if 'privileged' in modes else 'false', 1 << 30, 2 * 10 ** 9,
             [x for x in create if x.startswith('--pids-limit=')][0].split('=')[1], json.dumps([bind])))
     else:
-        print('Applied synthetic')
+        print('swap=%s network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' % ('0' if 'swap_drift' in modes else '1073741824'))
 elif a[:2] == ['container', 'ls']:
     if 'daemon_down' in modes:
         save()
@@ -482,7 +460,7 @@ class HostLauncherTests(unittest.TestCase):
         self.assert_owned_gone(state)
         create = state['create']
         text = ' '.join(create)
-        for required in ('--init', '--memory=1g', '--memory-swap=1g', '--cpus=2', '--pids-limit=128',
+        for required in ('--platform=linux/amd64', '--init', '--memory=1g', '--memory-swap=1g', '--cpus=2', '--pids-limit=128',
                          '--security-opt=no-new-privileges', '--cap-drop=NET_RAW', '--label'):
             self.assertIn(required, create)
         for flag in ('--privileged', '--network', '--net', '--pid', '--ipc', '--uts', '--userns', '--device',
@@ -520,7 +498,7 @@ class HostLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, 'cleanup failure alone is a failure')
 
     def test_unapplied_containment_or_oom_is_failure(self):
-        for mode, text in (('privileged', 'containment differs'), ('oom', 'oom=true')):
+        for mode, text in (('privileged', 'containment differs'), ('swap_drift', 'containment differs'), ('oom', 'oom=true')):
             with self.subTest(mode):
                 self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
                 result, state = self.launch(mode)

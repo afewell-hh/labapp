@@ -7,14 +7,13 @@ before/after probes. It does not install, repair or retry anything itself, and a
 failure is never rerun or widened. Daemon/systemd readiness is not proved here.
 """
 import argparse
-import contextlib
-import io
 import json
 import os
 from pathlib import Path
 import re
 import runpy
 import sys
+import stat
 import time
 
 from hhfab_release import Refusal, bounded, digest
@@ -27,52 +26,14 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOM
 FIXTURE_PACKAGES = ('python3', 'python3.12', 'curl', 'libcurl4t64', 'ca-certificates',
                     'ubuntu-keyring', 'apt', 'dpkg')
 DAEMONS = ('dockerd', 'containerd', 'containerd-shim')  # /proc comm names (15 chars max)
-# Installer stages that prove authentication/transaction order; other calls are ignored.
-KEYED = ('key-fetch', 'update', 'check', 'simulate', 'download', 'install')
-FIRST = ['key-fetch', 'update', 'check', 'simulate', 'download', 'simulate', 'install', 'check']
-RERUN = ['key-fetch', 'update', 'check', 'check']
 TRANSPORT = re.compile(rb'(?i)\b50[0-9]\b|bad gateway|service unavailable|gateway time-?out|'
                        rb'connection (timed out|failed|reset)|could not (connect|resolve)|'
                        rb'temporary failure|timed out')
-MAX_STDOUT, MAX_LOG, DETAIL, BUDGET_MAX = 1024 * 1024, 256, 4096, 600
+MAX_STDOUT, MAX_REPORT, DETAIL, BUDGET_MAX = 1024 * 1024, 60 * 1024, 4096, 600
 
 
 class Finding(Exception):
     """A harness assertion about observed state failed; fixed safe message."""
-
-
-def stage_of(args):
-    """Stage label for an installer child command (name only, never arguments)."""
-    name = Path(args[0]).name
-    if name == 'curl':
-        return 'key-fetch'
-    if name != 'apt-get':
-        return name
-    if '--simulate' in args:
-        return 'simulate'
-    for stage in ('update', 'check'):
-        if args[-1] == stage:
-            return stage
-    if '--download-only' in args:
-        return 'download'
-    return 'install' if 'install' in args else 'other'
-
-
-def instrument(original, log, clock=time.monotonic):
-    """Observe the installer's own call(); results and exceptions pass through unchanged."""
-    def call(args, seconds=10, env=None):
-        started = clock()
-        status = 'failed'
-        try:
-            result = original(args, seconds, env)
-            status = 'ok'
-            return result
-        finally:
-            # Never raise here: it would replace the installer's primary error. An
-            # overflowing log is dropped and fails the stage-sequence check instead.
-            if len(log) < MAX_LOG:
-                log.append([stage_of(args), status, round(clock() - started, 3)])
-    return call
 
 
 class System:
@@ -125,7 +86,7 @@ class System:
         if not os.path.lexists(SENTINEL):
             return None
         info = os.lstat(SENTINEL)
-        return [info.st_ino, info.st_size, info.st_mtime_ns]
+        return [digest(SENTINEL), info.st_ino, info.st_size, info.st_mtime_ns]
 
     def daemons(self):
         found = []
@@ -148,9 +109,22 @@ class System:
 
     def plant(self):
         """Explicitly deny service startup and add a Docker-data sentinel; refuse a used target."""
-        for path in (POLICY, SENTINEL):
-            if os.path.lexists(path):
-                raise Refusal('fixture path already exists; target is not fresh')
+        if os.path.lexists(SENTINEL):
+            raise Refusal('fixture path already exists; target is not fresh')
+        policy_existing = os.path.lexists(POLICY)
+        original_sha = None
+        if policy_existing:
+            info = POLICY.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o022 or info.st_nlink != 1 or info.st_size > 4096):
+                raise Refusal('unsafe existing service denial policy')
+            # Preserve the original trusted image fixture, but never execute it.
+            original_sha = digest(POLICY)
+            backup = POLICY.with_name('policy-rc.d.labapp-original')
+            if os.path.lexists(backup):
+                raise Refusal('service policy backup collision')
+            os.link(POLICY, backup, follow_symlinks=False)
+            POLICY.unlink()
         descriptor = os.open(POLICY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
         with os.fdopen(descriptor, 'wb') as stream:
             stream.write(b'#!/bin/sh\nexit 101\n')
@@ -161,7 +135,9 @@ class System:
         descriptor = os.open(SENTINEL, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(descriptor, 'wb') as stream:
             stream.write(b'labapp docker data sentinel\n')
-        return {'policy_rc_d': 'exit 101 (service startup denied)', 'docker_data_sentinel': True}
+        return {'policy_rc_d': 'exit 101 (service startup denied)',
+                'policy_preexisting': policy_existing, 'original_policy_sha256': original_sha, 'policy_sha256': digest(POLICY),
+                'docker_data_sentinel': True}
 
 
 def snapshot(system, payload_paths):
@@ -181,10 +157,6 @@ def common(state):
         raise Finding('a Docker daemon process is running; service startup was denied')
 
 
-def keyed(log):
-    return [stage for stage, _, _ in log if stage in KEYED]
-
-
 def receipt_matches(out, state, sources):
     receipt = state['receipt']
     if receipt is None:
@@ -200,13 +172,13 @@ def receipt_matches(out, state, sources):
         raise Finding('receipt module hashes differ from source hashes')
 
 
-def check_first(c, before, after, out, log, sources):
-    if keyed(log) != FIRST:
-        raise Finding('first-run APT stage sequence is not the reviewed sequence')
+def check_first(c, before, after, out, sources):
     common(before)
     common(after)
     if any(after['packages'].get(n) != v for n, v in before['packages'].items()):
         raise Finding('a preexisting package was removed or changed')
+    if after['sentinel'] != before['sentinel']:
+        raise Finding('Docker data sentinel identity changed')
     if after['holds'] != before['holds'] or after['apt'] != before['apt']:
         raise Finding('holds or global APT configuration changed')
     if any(after['packages'].get(n) != v for n, v in c['pins'].items()):
@@ -226,10 +198,10 @@ def check_first(c, before, after, out, log, sources):
     return closure
 
 
-def check_rerun(c, first, second, out, log, sources):
-    if keyed(log) != RERUN:
-        raise Finding('rerun did not re-authenticate and recheck without acquisition or install')
+def check_rerun(c, first, second, out, sources):
     common(second)
+    if second['sentinel'] != first['sentinel']:
+        raise Finding('Docker data sentinel identity changed')
     if second['packages'] != first['packages'] or second['holds'] != first['holds'] or second['apt'] != first['apt']:
         raise Finding('rerun changed packages, holds or global APT configuration')
     if second['payloads'] != first['payloads']:
@@ -245,27 +217,19 @@ def load_installer(path):
     return runpy.run_path(str(path), run_name='labapp_docker_installer')
 
 
-def run_once(load, installer, receipt, remaining, log, clock):
-    module = load(installer)
-    if remaining < module['ALARM'] + 5:
+def run_once(installer, receipt, remaining, run=bounded):
+    """Run the unchanged normal CLI in a bounded, clean-environment subprocess."""
+    if remaining < 240:
         raise Refusal('insufficient total budget for a bounded installer run')
-    globals_ = module['install'].__globals__
-    globals_['call'] = instrument(globals_['call'], log, clock)
-    captured, argv = io.StringIO(), sys.argv
-    sys.argv = [str(installer), '--receipt', str(receipt)]
-    try:
-        with contextlib.redirect_stdout(captured):
-            module['main']()
-    finally:
-        sys.argv = argv
-    text = captured.getvalue()
-    if len(text) > MAX_STDOUT:
-        raise Refusal('installer output overflow')
-    return module, json.loads(text)
+    code, output = run(['/usr/bin/python3', str(installer), '--receipt', str(receipt)],
+                       240, limit=MAX_STDOUT, env=dict(ENV))
+    if code:
+        raise Refusal(f'installer CLI failed: code={code!r} output_tail={output[-DETAIL:]!r}')
+    return json.loads(output)
 
 
 def execute(system, installer, budget, base, load=load_installer, clock=time.monotonic,
-            receipt=RECEIPT, sources=None):
+            receipt=RECEIPT, sources=None, run=bounded):
     """Returns (report, exit code). The first failure is final: no rerun, retry or repair."""
     started = clock()
     report = {'harness': 'labapp-docker-container-v1', 'base': base, 'budget_seconds': budget,
@@ -279,20 +243,20 @@ def execute(system, installer, budget, base, load=load_installer, clock=time.mon
             p.name: digest(p) for p in (installer, installer.with_name('hhfab_release.py'), Path(__file__))}
         report['fixture'] = {**system.fixture(), **system.plant()}
         before = snapshot(system, [])
-        report['before_package_count'] = len(before['packages'])
+        report['prepared_packages'] = before['packages']
         previous = None
         for number in (1, 2):
             report['phase'] = 'install' if number == 1 else 'rerun'
-            log = []
-            report['runs'].append({'run': number, 'stages': log})
+            report['runs'].append({'run': number, 'invocation': 'python3 install-docker.py --receipt PATH'})
             run_started = clock()
-            _, out = run_once(load, installer, receipt, budget - (clock() - started), log, clock)
+            out = run_once(installer, receipt, budget - (clock() - started), run=run)
             report['runs'][-1]['seconds'] = round(clock() - run_started, 3)
+            report['runs'][-1]['installer_output'] = out
             state = snapshot(system, paths)
             if number == 1:
-                report['closure'] = check_first(c, before, state, out, log, sources)
+                report['closure'] = check_first(c, before, state, out, sources)
             else:
-                check_rerun(c, previous, state, out, log, sources)
+                check_rerun(c, previous, state, out, sources)
             previous = state
         report['result'] = 'pass'
         report['phase'] = 'complete'
@@ -320,7 +284,13 @@ def main(argv=None, system=None):
         parser.error('budget must be 1..%d seconds' % BUDGET_MAX)
     report, code = execute(system or System(), Path(__file__).with_name('install-docker.py'),
                            args.budget, args.base)
-    print(json.dumps(report, sort_keys=True), flush=True)
+    encoded = json.dumps(report, sort_keys=True)
+    if len(encoded.encode()) > MAX_REPORT:
+        # A bounded explicit failure, preserving an existing primary exit status.
+        code = code or 1
+        encoded = json.dumps({'result': 'fail', 'error': 'aggregate evidence report exceeds byte cap',
+                              'primary_exit_code': code, 'report_byte_cap': MAX_REPORT})
+    print(encoded, flush=True)
     return code
 
 

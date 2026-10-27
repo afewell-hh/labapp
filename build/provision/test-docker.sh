@@ -11,6 +11,14 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 base=ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 total=600
+SECONDS=0
+work_timeout() {
+  local cap=$1 remaining=$((total - SECONDS - 1))
+  shift
+  ((remaining > 0)) || return 124
+  ((cap <= remaining)) || cap=$remaining
+  timeout --kill-after=1s "${cap}s" "$@"
+}
 IFS= read -r suffix < /proc/sys/kernel/random/uuid
 run_label="labapp.docker-test.run=${suffix}"
 target="labapp-docker-target-${suffix}"
@@ -41,10 +49,19 @@ cleanup() {
   fi
   if [[ -n "$start_pid" ]]; then
     kill "$start_pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$start_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$start_pid" 2>/dev/null || true
     wait "$start_pid" 2>/dev/null || true
   fi
   if ((failed)); then echo 'docker test: owned cleanup failed' >&2; fi
-  rm -rf -- "$workdir" || failed=1
+  for file in install-docker.py hhfab_release.py docker_container.py; do
+    rm -f -- "$workdir/suite/$file" || failed=1
+  done
+  rm -f -- "$workdir/out" || failed=1
+  rmdir -- "$workdir/suite" "$workdir/docker-config" "$workdir" || failed=1
   return "$failed"
 }
 finish() {
@@ -63,7 +80,7 @@ for dependency in docker timeout tail; do command -v "$dependency" >/dev/null; d
 chmod 755 "$workdir"
 mkdir -m 700 "$workdir/docker-config"
 export DOCKER_CONFIG="$workdir/docker-config"
-timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Version}}'
+work_timeout 5 docker version --format 'Docker server {{.Server.Version}}'
 # Only the public installer, its sibling and the driver are exposed, read-only.
 mkdir -m 755 "$workdir/suite"
 for file in install-docker.py hhfab_release.py docker_container.py; do
@@ -89,16 +106,16 @@ if ! prepare >/tmp/prepare.log 2>&1; then
 fi
 exec python3 /suite/docker_container.py run --base "$LABAPP_BASE_REF" --budget "$((565 - SECONDS))"
 GUEST
-target_id="$(timeout --kill-after=3s 90s docker create --init --name "$target" --label "$run_label" \
+target_id="$(work_timeout 90 docker create --platform=linux/amd64 --init --name "$target" --label "$run_label" \
   --memory=1g --memory-swap=1g --cpus=2 --pids-limit=128 --security-opt=no-new-privileges \
   --cap-drop=NET_RAW -v "$workdir/suite:/suite:ro" \
   --env PYTHONDONTWRITEBYTECODE=1 --env "LABAPP_BASE_REF=$base" \
   "$base" timeout --kill-after=5s 570s bash -ceu "$guest")"
 [[ "$target_id" =~ ^[a-f0-9]{64}$ ]]
-timeout --kill-after=1s 5s docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
+work_timeout 5 docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
 remaining=$((total - SECONDS - 5))
 if ((remaining < 60)); then echo 'docker test: insufficient total budget remains' >&2; exit 1; fi
-timeout --kill-after=5s "${remaining}s" docker start -a "$target_id" >"$workdir/out" 2>&1 &
+timeout --kill-after=1s "${remaining}s" docker start -a "$target_id" >"$workdir/out" 2>&1 &
 start_pid=$!
 status=0
 wait "$start_pid" || status=$?
@@ -106,13 +123,18 @@ start_pid=
 if ((status == 124 || status == 137)); then
   echo 'docker test: supervisor timeout; not native APT evidence' >&2
 fi
-exit_code="$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$target_id")"
-oom="$(timeout --kill-after=1s 5s docker inspect --format '{{.State.OOMKilled}}' "$target_id")"
-applied="$(timeout --kill-after=1s 5s docker inspect --format \
+# Preserve attach failure even if later daemon observation would also fail.
+((status == 0)) || exit "$status"
+exit_code="$(work_timeout 5 docker inspect --format '{{.State.ExitCode}}' "$target_id")"
+oom="$(work_timeout 5 docker inspect --format '{{.State.OOMKilled}}' "$target_id")"
+applied="$(work_timeout 5 docker inspect --format \
   'privileged={{.HostConfig.Privileged}} memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}} binds={{json .HostConfig.Binds}}' "$target_id")"
 expected="privileged=false memory=1073741824 nano_cpus=2000000000 pids=128 binds=[\"$workdir/suite:/suite:ro\"]"
-timeout --kill-after=1s 5s docker inspect --format \
-  'Applied swap={{.HostConfig.MemorySwap}} network={{.HostConfig.NetworkMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}} devices={{json .HostConfig.Devices}}' "$target_id"
+isolation="$(work_timeout 5 docker inspect --format \
+  'swap={{.HostConfig.MemorySwap}} network={{.HostConfig.NetworkMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}} devices={{json .HostConfig.Devices}}' "$target_id")"
+[[ "$isolation" == 'swap=1073741824 network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' ]] || {
+  echo 'docker test: applied containment differs from request' >&2; exit 1;
+}
 echo "docker test: ${applied}"
 failed=0
 [[ "$applied" == "$expected" ]] || { echo 'docker test: applied containment differs from request' >&2; failed=1; }

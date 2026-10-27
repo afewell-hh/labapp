@@ -712,8 +712,17 @@ packages, unchanged `/etc/apt`, an intact sentinel, no Docker daemon process, a
 receipt that matches dpkg state, payload and source hashes, and a rerun that
 re-fetches the key, runs authenticated `update` and `check` twice, acquires and
 installs nothing, and preserves package state, payload and receipt identity.
-Rerun stage order is observed through the installer's own `call()` without
-changing its behavior.
+The driver invokes the normal `python3 install-docker.py --receipt PATH` CLI
+unchanged in a bounded subprocess. It does not intercept calls or claim an
+independently observed authentication-stage trace; authentication assertions come
+from native APT success and the reviewed installer's receipt/implementation.
+Each structured installer result (including archive digests/bytes and receipt
+fields), prepared package inventory and source hashes is retained in the bounded
+report. The aggregate JSON report is capped at 60 KiB and exported whole within
+the host's 64 KiB capture tail. Oversized evidence is an explicit failure and
+preserves any primary failure exit status. A preexisting trusted regular service policy is preserved at
+`/usr/sbin/policy-rc.d.labapp-original` before planting the fixed denial; both are
+disposable fixture data and deleted with the target.
 
 Containment (assumptions to measure, not demonstrated fit): `--init`, 2 CPUs, 1 GiB
 (swap equal), 128 PIDs, `no-new-privileges`, `NET_RAW` dropped, default bridge
@@ -733,5 +742,4 @@ failure: `transport_suspected` is only a label.
 Not proved: systemd or daemon readiness, `docker`/`containerd` API behavior,
 user/group access, recommendations, snapshot solvability or freshness, other
 CPUs/platforms, or any image. Mocked tests do not show installability. The CI
-step for the offline tests must be added with the harness (workflow edits need the
-lead); no native CI invocation is authorized yet.
+step runs the real mocked lifecycle suite; no native CI invocation is authorized yet.
