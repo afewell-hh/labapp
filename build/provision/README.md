@@ -681,3 +681,57 @@ controls; this module retains secure defaults and refuses expired metadata.
 The [snapshot service](https://snapshot.ubuntu.com/) documents historical selection
 and intended retention, which do not establish this target's freshness or closure.
 Sources accessed 2026-10-27. Native installation remains unrun for this source.
+
+### Docker package container proof (#319, source only)
+
+`test-docker.sh` is a test-only host launcher (Docker, `timeout`; no arguments or
+overrides) that creates exactly ONE fresh Ubuntu 24.04 amd64 container from the
+pinned `ubuntu@sha256:68ee...33ac` base. Inside it, fixture preparation installs
+`python3=3.12.3-0ubuntu2.1`, `python3.12=3.12.3-1ubuntu0.17` and
+`ca-certificates=20240203` (the `test-qemu.sh` pins) plus **unpinned** `curl` and
+its libraries, so the fixture is only as reproducible as the archive; the driver
+`docker_container.py` records the resolved versions, the Python version, the
+base image id/digest and the source SHA256 values. The driver denies service
+startup (`/usr/sbin/policy-rc.d` exits 101, verified), plants a Docker-data
+sentinel, then runs the unchanged `install-docker.py` twice in the same target
+(install, then rerun with the same receipt path) with independent before/after
+probes. It does not duplicate installer logic, retry, widen limits or repair.
+
+```bash
+# Separately scoped lead execution only: acquires the base image, Ubuntu fixture
+# packages, the Docker key/indexes and the packages (needs outbound network).
+timeout --kill-after=30s 11m bash build/provision/test-docker.sh
+# Offline mocked lifecycle/failure tests (no APT, network, container or Docker):
+python3 -m unittest discover -s build/provision -p test_docker_container.py -v
+```
+
+Success requires: the exact trio versions and declared archive SHA256 values, the
+reviewed key SHA256, an archive set equal to the installed dependency closure
+(recorded), clean `dpkg --audit`, no holds, no removed/changed preexisting
+packages, unchanged `/etc/apt`, an intact sentinel, no Docker daemon process, a
+receipt that matches dpkg state, payload and source hashes, and a rerun that
+re-fetches the key, runs authenticated `update` and `check` twice, acquires and
+installs nothing, and preserves package state, payload and receipt identity.
+Rerun stage order is observed through the installer's own `call()` without
+changing its behavior.
+
+Containment (assumptions to measure, not demonstrated fit): `--init`, 2 CPUs, 1 GiB
+(swap equal), 128 PIDs, `no-new-privileges`, `NET_RAW` dropped, default bridge
+network, no privileged mode, host socket, devices, host network or credentials.
+The docker client uses an empty private `DOCKER_CONFIG`; only a read-only copy of
+the three public files is mounted. Total work, including acquisition and
+preparation, is 600s (guest wrapper 570s, installer runs refused when the
+remaining budget is under their 235s alarm plus margin); cleanup uses bounded
+5-20s Docker calls and no renewal. The target is removed by exact nonce-bearing
+name AND ownership label (also after lost create responses, failure, SIGINT/
+SIGTERM and timeout) together with its processes, volume and temp files, and the
+host workdir is removed. A cleanup failure is reported but never replaces a
+primary failure code; a supervisor timeout (124/137) is labelled and is not APT
+evidence. A transport failure, unresolved dependency or budget issue stays a
+failure: `transport_suspected` is only a label.
+
+Not proved: systemd or daemon readiness, `docker`/`containerd` API behavior,
+user/group access, recommendations, snapshot solvability or freshness, other
+CPUs/platforms, or any image. Mocked tests do not show installability. The CI
+step for the offline tests must be added with the harness (workflow edits need the
+lead); no native CI invocation is authorized yet.
