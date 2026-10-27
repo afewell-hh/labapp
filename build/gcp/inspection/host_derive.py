@@ -126,8 +126,27 @@ def validate(report):
     return {r['id']: r for r in fixed}
 
 
+MIN_PYYAML = (6, 0)
+
+
+def safe_loader():
+    """Distribution libyaml-backed CSafeLoader or refusal; never the pure-Python loader.
+
+    Official hhfab 0.43.1 input has a tab after `ip:`: libyaml accepts it, pure
+    SafeLoader does not. Availability and version are checked explicitly.
+    """
+    loader = getattr(yaml, 'CSafeLoader', None)
+    version = getattr(yaml, '__version__', '')
+    match = re.fullmatch(r'([0-9]+)\.([0-9]+)(?:\.[0-9]+)?', version) if type(version) is str else None
+    parser = getattr(getattr(yaml, '_yaml', None), 'CParser', None)
+    require(isinstance(loader, type) and isinstance(parser, type) and
+            issubclass(loader, parser) and getattr(yaml, '__with_libyaml__', False) is True and
+            match is not None and (int(match[1]), int(match[2])) >= MIN_PYYAML)
+    return loader
+
+
 class YamlReader:
-    """Event preflight BEFORE composition; bounded SafeLoader nodes only."""
+    """Event preflight BEFORE composition; bounded CSafeLoader nodes only."""
     def __init__(self):
         self.documents = 0
         self.events = 0
@@ -136,9 +155,10 @@ class YamlReader:
         require(type(text) is str and len(text.encode('utf-8')) <= h.TEXT_LIMIT)
         text = text.replace('\r\n', '\n')
         require('\r' not in text and not any(ord(c) < 32 and c not in '\n\t' for c in text))
+        loader = safe_loader()
         depth = docs = 0
         try:
-            for event in yaml.parse(text, Loader=yaml.SafeLoader):
+            for event in yaml.parse(text, Loader=loader):
                 self.events += 1
                 require(self.events <= 100000)
                 require(not isinstance(event, events.AliasEvent) and
@@ -154,8 +174,8 @@ class YamlReader:
                     depth -= 1
                 if isinstance(event, events.ScalarEvent):
                     require(len(event.value.encode('utf-8')) <= 4096)
-            # SafeLoader COMPOSES nodes: no constructors, object hooks or coercion.
-            return [self.convert(n, 0) for n in yaml.compose_all(text, Loader=yaml.SafeLoader)]
+            # CSafeLoader COMPOSES nodes: no constructors, object hooks or coercion.
+            return [self.convert(n, 0) for n in yaml.compose_all(text, Loader=loader)]
         except (yaml.YAMLError, RecursionError, UnicodeError):
             raise Refused('invalid private host baseline') from None
 
@@ -174,7 +194,10 @@ class YamlReader:
         tag, value = node.tag.removeprefix('tag:yaml.org,2002:'), node.value
         if tag == 'str':
             return value
-        require(node.style is None)
+        # CParser's plain-node style is '', unlike the Python composer's None
+        # (PyYAML 6.0.1 yaml/_yaml.pyx:_compose_scalar_node). Quoted and block
+        # styles must never satisfy a typed non-string scalar.
+        require(node.style == '')
         if tag == 'int':
             require(re.fullmatch(r'0|[1-9][0-9]*|-[1-9][0-9]*', value) is not None and len(value) <= 32)
             return int(value)
@@ -436,6 +459,9 @@ def vlab_projection(docs):
 
 def derive(report):
     fixed = validate(report)
+    # Dependency refusal must abort the whole operation, rather than becoming
+    # a per-file YAML gap and emitting a seemingly usable candidate.
+    safe_loader()
     result = {'schema_version': 1, 'binary_identities': [], 'fabric': {}, 'topology': {},
               'vlab': {}, 'network': [], 'shell_catalog': [], 'gaps': [],
               'effective': False, 'runtime': 'unknown'}

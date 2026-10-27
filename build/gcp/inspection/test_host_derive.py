@@ -237,6 +237,54 @@ class TypedYamlTests(unittest.TestCase):
         with self.assertRaises(d.Refused):
             reader.read('a: 1')
 
+    def test_official_separation_tab_accepted_with_safety_gates_intact(self):
+        # Public upstream hhfab 0.43.1 template shape: tab between `ip:` and `dhcp`.
+        pure = 'ip:\tdhcp # public upstream template\n'
+        with self.assertRaises(d.yaml.YAMLError):
+            d.yaml.safe_load(pure)  # pure SafeLoader refuses it; libyaml accepts it
+        self.assertEqual(d.YamlReader().read(pure), [{'ip': 'dhcp'}])
+        plain = d.yaml.compose('1', Loader=d.safe_loader())
+        self.assertEqual(plain.style, '')  # CParser's plain style, not None.
+        self.assertIs(type(d.YamlReader().convert(plain, 0)), int)
+        result = d.YamlReader().read('a:\t1\nb:\ttrue\nc:\t"1"\nd:\tnull\n')[0]
+        self.assertEqual([type(result[k]) for k in 'abcd'], [int, bool, str, type(None)])
+        for body in ('ip:\t&x dhcp', 'ip:\t*x', 'ip:\t!!str dhcp', 'ip:\t{<<: x}', 'ip:\tdhcp\nip:\tdhcp',
+                     '1:\tx', 'a:\tyes', 'a:\t01', 'a:\t1.5', 'a:\t' + 'x' * 4097):
+            with self.subTest(body=repr(body)), self.assertRaises(d.Refused):
+                d.YamlReader().read(body)
+
+    def test_loader_preflight_has_no_permissive_fallback(self):
+        self.assertIs(d.safe_loader(), d.yaml.CSafeLoader)
+        for loader in (None, object(), d.yaml.SafeLoader):
+            with self.subTest(loader=type(loader)), mock.patch.object(d.yaml, 'CSafeLoader', loader):
+                with self.assertRaises(d.Refused):
+                    d.YamlReader().read('a: 1')
+        with mock.patch.object(d.yaml, '__with_libyaml__', False):
+            with self.assertRaises(d.Refused):
+                d.YamlReader().read('a: 1')
+        for version in ('5.4.1', '', 'x', '6.0garbage', '6.0rc1', None, 6.0):
+            with self.subTest(version=version), mock.patch.object(d.yaml, '__version__', version):
+                with self.assertRaises(d.Refused):
+                    d.YamlReader().read('a: 1')
+
+    def test_unavailable_loader_aborts_derivation_and_leaves_no_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            source, output = parent / 'report', parent / 'candidate'
+            source.write_text(json.dumps(empty_report()))
+            source.chmod(0o600)
+            with mock.patch.object(d.yaml, 'CSafeLoader', None):
+                with self.assertRaises(d.Refused):
+                    d.derive(empty_report())
+                with self.assertRaises(d.Refused):
+                    d.write_candidate(source, output)
+            self.assertFalse(output.exists())
+
+    def test_composition_never_calls_constructors(self):
+        with mock.patch.object(d.yaml.CSafeLoader, 'construct_document', side_effect=AssertionError):
+            self.assertEqual(d.YamlReader().read('ip:\tdhcp\n'), [{'ip': 'dhcp'}])
+
     def test_preflight_rejects_before_composition(self):
         with mock.patch.object(d.yaml, 'compose_all', side_effect=AssertionError):
             with self.assertRaises(d.Refused):
