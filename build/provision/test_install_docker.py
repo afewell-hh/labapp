@@ -374,9 +374,29 @@ except KeyboardInterrupt:sys.exit(130)
                 self.module['persist'](path, {'a': 2})
             link = Path(d) / 'link.json'
             os.symlink(path, link)
-            with self.assertRaisesRegex(Refusal, 'link'):
+            with self.assertRaisesRegex(Refusal, 'regular receipt'):
                 self.module['persist'](link, receipt)
             self.assertEqual([p.name for p in Path(d).iterdir() if p.name.startswith('.docker')], [])
+
+    def test_existing_receipt_type_and_identity_refused_before_acquisition(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            directory = root / 'directory'
+            directory.mkdir()
+            receipt = root / 'receipt.json'
+            receipt.write_text('{"source":"wrong"}')
+            def forbidden(*a, **k):
+                self.fail('acquisition or native command before receipt refusal')
+            patches = {'preflight': lambda: dict(self.module['PINS']),
+                       'fetch_key': forbidden, 'call': forbidden,
+                       'verify_payloads': lambda: {'synthetic': 'verified'},
+                       'receipt_for': lambda after, shas: {'source': 'expected'}}
+            with patch.dict(self.g, patches):
+                for path, reason in ((directory, 'regular receipt'), (receipt, 'source/hash identity')):
+                    with self.subTest(path=path.name), self.assertRaisesRegex(Refusal, reason):
+                        self.module['install'](path)
+            self.assertEqual(receipt.read_text(), '{"source":"wrong"}')
+            self.assertTrue(directory.is_dir())
 
     def test_deadline_exceeded_and_cleanup(self):
         log, patches = self.transaction([{}])

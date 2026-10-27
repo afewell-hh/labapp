@@ -276,8 +276,12 @@ def install(receipt_path=None):
     before = preflight()
     complete = all(before.get(n) == v for n, v in PINS.items())
     check_receipt_path(receipt_path)
-    if receipt_path is not None and os.path.lexists(receipt_path) and not complete:
-        raise Refusal('existing receipt requires complete installed trio')
+    if receipt_path is not None and os.path.lexists(receipt_path):
+        if not complete:
+            raise Refusal('existing receipt requires complete installed trio')
+        # Refuse already-known source/state/payload drift before acquisition.
+        # persist only compares here: check_receipt_path requires an existing file.
+        persist(receipt_path, receipt_for(before, verify_payloads()))
     with tempfile.TemporaryDirectory(prefix="labapp-docker-", dir=WORKDIR) as temporary:
         root = Path(temporary)
         apt, config, key = setup(root)
@@ -335,6 +339,8 @@ def check_receipt_path(path):
                 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
             raise Refusal('unsafe receipt parent')
     if os.path.lexists(path):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise Refusal('regular receipt file required')
         safe_tree(path, uids=(os.geteuid(),))
         if path.stat().st_size > 1024 * 1024:
             raise Refusal('oversized receipt')
