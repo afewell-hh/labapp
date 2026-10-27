@@ -23,6 +23,7 @@ IFS= read -r suffix < /proc/sys/kernel/random/uuid
 run_label="labapp.docker-test.run=${suffix}"
 target="labapp-docker-target-${suffix}"
 target_id=
+echo "docker test: ownership name=${target} label=${run_label}"
 start_pid=
 workdir="$(mktemp -d)"
 owned_container() {
@@ -40,12 +41,26 @@ cleanup() {
     failed=1
   elif [[ -n "$object" ]]; then
     if [[ "$object" =~ ^[a-f0-9]{64}$ ]]; then
-      timeout --kill-after=1s 20s docker rm -fv "$object" >/dev/null || failed=1
-      remaining="$(owned_container)" || failed=1
-      [[ -z "$remaining" ]] || failed=1
+      if [[ -n "$target_id" && "$object" != "$target_id" ]]; then
+        echo 'docker test: owned identity differs from created immutable ID' >&2
+        failed=1
+      else
+        echo "docker test: cleanup owned name=${target} id=${object} recovered=$([[ -z "$target_id" ]] && echo true || echo false)"
+        target_id=$object
+        timeout --kill-after=1s 20s docker rm -fv "$object" >/dev/null || failed=1
+        remaining="$(owned_container)" || failed=1
+        [[ -z "$remaining" ]] || failed=1
+      fi
     else
       failed=1
     fi
+  fi
+  if [[ -n "$target_id" ]]; then
+    remaining="$(timeout --kill-after=1s 5s docker container ls -aq --no-trunc --filter "id=$target_id")" || failed=1
+    [[ -z "$remaining" ]] || failed=1
+  fi
+  if ((failed == 0)); then
+    echo "docker test: cleanup checked exact owned absence name=${target} id=${target_id:-not-observed} label=${run_label}"
   fi
   if [[ -n "$start_pid" ]]; then
     kill "$start_pid" 2>/dev/null || true
@@ -112,6 +127,7 @@ target_id="$(work_timeout 90 docker create --platform=linux/amd64 --init --name 
   --env PYTHONDONTWRITEBYTECODE=1 --env "LABAPP_BASE_REF=$base" \
   "$base" timeout --kill-after=5s 570s bash -ceu "$guest")"
 [[ "$target_id" =~ ^[a-f0-9]{64}$ ]]
+echo "docker test: created name=${target} id=${target_id} label=${run_label}"
 work_timeout 5 docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
 remaining=$((total - SECONDS - 5))
 if ((remaining < 60)); then echo 'docker test: insufficient total budget remains' >&2; exit 1; fi
@@ -135,7 +151,7 @@ isolation="$(work_timeout 5 docker inspect --format \
 [[ "$isolation" == 'swap=1073741824 network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' ]] || {
   echo 'docker test: applied containment differs from request' >&2; exit 1;
 }
-echo "docker test: ${applied}"
+echo "docker test: applied id=${target_id} ${applied} ${isolation}"
 failed=0
 [[ "$applied" == "$expected" ]] || { echo 'docker test: applied containment differs from request' >&2; failed=1; }
 [[ "$exit_code" == 0 && "$oom" == false ]] || { echo "docker test: guest exit=${exit_code} oom=${oom}" >&2; failed=1; }

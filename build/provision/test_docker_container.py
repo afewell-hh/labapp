@@ -202,16 +202,26 @@ class DriverTests(unittest.TestCase):
         self.failure('fresh bounded', mutate=lambda s: s.pkgs.update(PINS))
 
     def test_architecture_qualified_native_dependency_matches_unqualified_archive(self):
-        def qualified(s): install_effect(s); s.pkgs['libmnl0:amd64'] = '1.0.5'
+        def qualified(s):
+            install_effect(s)
+            s.pkgs['libmnl0:amd64'] = '1.0.5'
+            s.receipt_value['data'] = receipt_data(s)
         report, code, _, _ = run_case(first={'effect': qualified, 'archives': bare_archives})
         self.assertEqual((code, report['result']), (0, 'pass'), report)
         self.assertEqual(report['closure']['libmnl0:amd64'], '1.0.5')  # original dpkg key retained
         self.assertNotIn('libmnl0', report['closure'])
+        self.assertEqual(len(report['runs']), 2)
+        for run in report['runs']:
+            self.assertEqual(run['installer_output']['installed']['libmnl0:amd64'], '1.0.5')
+            self.assertNotIn('libmnl0', run['installer_output']['installed'])
 
     def test_architecture_normalization_refuses_drift(self):
         def foreign(s): install_effect(s); s.pkgs['libmnl0:i386'] = '1.0.5'
         def collide(s): install_effect(s); s.pkgs.update({'libmnl0:amd64': '1.0.5', 'libmnl0': '1.0.5'})
-        def qualified(s): install_effect(s); s.pkgs['libmnl0:amd64'] = '1.0.5'
+        def qualified(s):
+            install_effect(s)
+            s.pkgs['libmnl0:amd64'] = '1.0.5'
+            s.receipt_value['data'] = receipt_data(s)
         def mismatch(out):
             for row in out['downloaded_archives']:
                 if row['package'] == 'libmnl0':
@@ -298,6 +308,16 @@ class SystemProbeTests(unittest.TestCase):
         with self.probe(b'secret-looking output', code=2), self.assertRaises(Refusal) as raised:
             dc.System().packages()
         self.assertNotIn('secret', str(raised.exception))
+
+    def test_fixture_summary_resolves_native_qualified_library_without_mutating_inventory(self):
+        installed = {'curl': '8.5', 'libcurl4t64:amd64': '8.5-native'}
+        system = dc.System()
+        with patch.object(system, 'packages', return_value=installed), \
+                patch.object(system, 'run', return_value=b'amd64\n'), \
+                patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"\n'):
+            fixture = system.fixture()
+        self.assertEqual(fixture['packages']['libcurl4t64'], '8.5-native')
+        self.assertEqual(installed, {'curl': '8.5', 'libcurl4t64:amd64': '8.5-native'})
 
     def test_file_probes_hash_links_and_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -404,6 +424,8 @@ elif a[0] == 'create':
         save()
         sys.exit(125)
     s['containers'][ident] = {'id': ident, 'name': name, 'label': label}
+    if 'renamed' in modes:
+        s['containers'][ident]['name'] += '-renamed'
     s['containers']['f' * 64] = {'id': 'f' * 64, 'name': name + '-foreign', 'label': label}
     save()
     if 'create_lost' in modes:
@@ -441,12 +463,13 @@ elif a[:2] == ['container', 'ls']:
         sys.exit(1)
     filters = [a[i + 1] for i, v in enumerate(a) if v == '--filter']
     for obj in s['containers'].values():
-        if all({'name': lambda v: v == '^/' + obj['name'] + '$', 'label': lambda v: v == obj['label']}[f.split('=', 1)[0]](f.split('=', 1)[1])
+        if all({'name': lambda v: v == '^/' + obj['name'] + '$', 'label': lambda v: v == obj['label'], 'id': lambda v: v == obj['id']}[f.split('=', 1)[0]](f.split('=', 1)[1])
                for f in filters):
             print(obj['id'])
 elif a[0] == 'rm':
     assert a[1] == '-fv' and not s['containers'][a[-1]]['name'].endswith('-foreign')
-    s['containers'].pop(a[-1])
+    if 'remove_stuck' not in modes:
+        s['containers'].pop(a[-1])
 else:
     raise AssertionError(a)
 save()
@@ -485,6 +508,11 @@ class HostLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"result": "pass"', result.stdout)
         self.assert_owned_gone(state)
+        name = state['create'][state['create'].index('--name') + 1]
+        ident = next(c[-1] for c in state['calls'] if c[0] == 'rm')
+        self.assertIn('created name=%s id=%s' % (name, ident), result.stdout)
+        self.assertIn('applied id=' + ident, result.stdout)
+        self.assertIn('cleanup checked exact owned absence name=%s id=%s' % (name, ident), result.stdout)
         create = state['create']
         text = ' '.join(create)
         for required in ('--platform=linux/amd64', '--init', '--memory=1g', '--memory-swap=1g', '--cpus=2', '--pids-limit=128',
@@ -538,6 +566,25 @@ class HostLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assert_owned_gone(state)
         self.assertFalse(any(c[0] == 'start' for c in state['calls']))
+        self.assertIn('recovered=true', result.stdout)
+        self.assertIn('cleanup checked exact owned absence', result.stdout)
+
+    def test_known_id_renamed_container_is_not_claimed_absent(self):
+        result, state = self.launch('renamed')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('owned cleanup failed', result.stderr)
+        self.assertNotIn('cleanup checked exact owned absence', result.stdout)
+        self.assertFalse(any(c[0] == 'rm' for c in state['calls']))
+        self.assertTrue(any(obj['name'].endswith('-renamed') for obj in state['containers'].values()))
+
+    def test_still_present_cleanup_is_failure_without_absence_receipt(self):
+        for mode, code in (('remove_stuck', 1), ('timeout+remove_stuck', 124)):
+            with self.subTest(mode):
+                self.state.write_text(json.dumps({'containers': {}, 'calls': []}))
+                result, _ = self.launch(mode)
+                self.assertEqual(result.returncode, code)
+                self.assertIn('owned cleanup failed', result.stderr)
+                self.assertNotIn('cleanup checked exact owned absence', result.stdout)
 
     def test_exact_name_with_foreign_label_is_never_removed(self):
         result, state = self.launch('name_collision')

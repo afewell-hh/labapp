@@ -102,10 +102,12 @@ class System:
 
     def fixture(self):
         installed = self.packages()
+        arch = self.run(['/usr/bin/dpkg', '--print-architecture']).decode().strip()
+        summary = unqualified(installed, arch)
         release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
         return {'os_release': {k: release.get(k) for k in ('ID', 'VERSION_ID', 'VERSION_CODENAME')},
-                'packages': {name: installed.get(name) for name in FIXTURE_PACKAGES},
-                'architecture': self.run(['/usr/bin/dpkg', '--print-architecture']).decode().strip()}
+                'packages': {name: summary.get(name) for name in FIXTURE_PACKAGES},
+                'architecture': arch}
 
     def plant(self):
         """Explicitly deny service startup and add a Docker-data sentinel; refuse a used target."""

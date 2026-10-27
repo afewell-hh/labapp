@@ -682,7 +682,7 @@ The [snapshot service](https://snapshot.ubuntu.com/) documents historical select
 and intended retention, which do not establish this target's freshness or closure.
 Sources accessed 2026-10-27. Native installation remains unrun for this source.
 
-### Docker package container proof (#319, source only)
+### Docker package container proof
 
 `test-docker.sh` is a test-only host launcher (Docker, `timeout`; no arguments or
 overrides) that creates exactly ONE fresh Ubuntu 24.04 amd64 container from the
@@ -734,7 +734,9 @@ remaining budget is under their 235s alarm plus margin); cleanup uses bounded
 5-20s Docker calls and no renewal. The target is removed by exact nonce-bearing
 name AND ownership label (also after lost create responses, failure, SIGINT/
 SIGTERM and timeout) together with its processes, volume and temp files, and the
-host workdir is removed. A cleanup failure is reported but never replaces a
+host workdir is removed. Public logs include the nonce-bearing name/ownership label,
+created or recovered immutable ID, applied containment and a checked absence receipt
+only after successful exact-name/label and immutable-ID queries. A cleanup failure is reported but never replaces a
 primary failure code; a supervisor timeout (124/137) is labelled and is not APT
 evidence. A transport failure, unresolved dependency or budget issue stays a
 failure: `transport_suspected` is only a label.
@@ -742,4 +744,26 @@ failure: `transport_suspected` is only a label.
 Not proved: systemd or daemon readiness, `docker`/`containerd` API behavior,
 user/group access, recommendations, snapshot solvability or freshness, other
 CPUs/platforms, or any image. Mocked tests do not show installability. The CI
-step runs the real mocked lifecycle suite; no native CI invocation is authorized yet.
+step runs the real mocked lifecycle suite.
+
+The maintained `docker-package-proof.yml` workflow is manual-only, accepts no
+inputs and runs only from this repository's `main`. Separately scoped lead
+execution can dispatch it with:
+
+```bash
+gh workflow run docker-package-proof.yml --repo afewell-hh/labapp --ref main
+```
+
+It checks out the exact dispatch commit without persisted Git credentials,
+records commit/tree, four public source hashes, actual host Python/UID/platform
+and Docker client/server versions, then invokes `test-docker.sh` exactly once
+with an empty private HOME/TMP and cleared environment. Contents read is its only
+GitHub permission; no secrets, cloud credentials or environments are requested.
+A fixed concurrency group serializes dispatches without cancellation. The 13-minute
+job budget encloses the 11-minute command bound (600s work plus bounded cleanup;
+outer termination has a 30s kill margin). No native trial runs on a push, PR or
+merge. Read the actual outcome and identity/containment/cleanup receipts in the
+run log; a green source/mock job alone proves no installation. A hard job or
+runner cancellation may prevent exact cleanup observation: hosted-runner disposal
+is the fallback, not a verified container deletion receipt. A failed trial remains
+failed and needs lead disposition before any new dispatch.
