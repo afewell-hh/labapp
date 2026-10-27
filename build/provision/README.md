@@ -630,3 +630,42 @@ Sources (accessed2026-10-25): [Debian native APT on both machines](https://www.d
 [QEMU8.2.2 boot-sector pattern](https://github.com/qemu/qemu/blob/v8.2.2/tests/qtest/boot-sector.c),
 [debug exit](https://github.com/qemu/qemu/blob/v8.2.2/hw/misc/debugexit.c),
 [debug console](https://github.com/qemu/qemu/blob/v8.2.2/hw/char/debugcon.c).
+
+## Fixed baseline Docker package component (#317, source only)
+
+`install-docker.py` is a standalone root/noninteractive Ubuntu 24.04 noble amd64
+Python 3.12 module (needs `hhfab_release.py`, apt/dpkg, curl, CA certificates and
+the Ubuntu archive keyring). It installs exactly `docker-ce` and `docker-ce-cli`
+`5:29.1.3-1~ubuntu.24.04~noble` and `containerd.io`
+`2.2.1-1~ubuntu.24.04~noble` with `--no-install-recommends`, using a private
+owned APT config/key/sources/preferences/lists/cache (Docker stable/noble/amd64
+plus Ubuntu snapshot `20260114T000000Z` noble, noble-updates, noble-security).
+The Docker key is fetched over HTTPS and must have SHA256
+`1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570`; APT
+authenticates Release, indexes and archives, and the three downloaded `.deb`
+SHA256 values (#315 review) are checked before the first dpkg mutation. No global
+`/etc/apt` change, `trusted=yes`, purge, removal, downgrade, upgrade or hold.
+
+```bash
+# Run only on a disposable guest, after separate lead authorization.
+sudo timeout --kill-after=3s 240s python3 build/provision/install-docker.py \
+  --receipt /var/tmp/labapp-docker-receipt.json
+# Offline mocked tests (no APT, network, container or system change):
+python3 -m unittest discover -s build/provision -p test_install_docker.py -v
+```
+
+It refuses non-root, unsupported OS/architecture, foreign architectures, holds,
+dpkg audit problems, conflicting packages (`docker.io`, `containerd`, `runc`,
+...), installed version drift, a partial trio, unowned payload-path collisions,
+and simulations that remove, purge or upgrade unrelated packages. A rerun
+with the exact trio installed makes no network call: it checks package health
+and verifies payloads against dpkg md5sums, then compares the optional receipt
+(source/hash identity). Partial dpkg failure leaves a failed disposable target;
+there is no rollback or repair. Budgets (210s APT, 180s child, 235s alarm, 240s
+outer) are unproved initial assumptions.
+
+Not covered: rootless extras, buildx/compose and other recommendations (baseline
+gaps, not complete Docker equivalence), user/group access, daemon readiness,
+k3d, VLAB, reboot, course behavior, snapshot dependency solvability and
+historical snapshot freshness/Valid-Until. These need separate integration
+evidence. No test or install has been run for this source.
