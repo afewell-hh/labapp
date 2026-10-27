@@ -219,6 +219,29 @@ jobs:
         run: python3 -m unittest discover -s build/provision -p test_component_prerequisites.py -v
       - name: Installer integrity and preservation regressions
         run: python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
+      - name: Required kubectl installer offline regressions
+        run: |
+          test -f build/provision/test_install_kubectl.py
+          test_home=$(mktemp -d /tmp/labapp-kubectl-tests.XXXXXX)
+          mkdir -m 700 "$test_home/tmp"
+          trap 'rmdir "$test_home/tmp" "$test_home"' EXIT
+          umask 022
+          env -i HOME="$test_home" TMPDIR="$test_home/tmp" PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -I -B - <<'PY'
+          import os
+          import stat
+          import sys
+          import unittest
+          print({'python': sys.version, 'uid': os.getuid(),
+                 'home_mode': oct(stat.S_IMODE(os.stat(os.environ['HOME']).st_mode)),
+                 'tmp_mode': oct(stat.S_IMODE(os.stat(os.environ['TMPDIR']).st_mode))}, flush=True)
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_install_kubectl.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required kubectl suite discovered no tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
       - name: Run unchanged installer and installed CLI smoke checks
         run: timeout --kill-after=30s 10m bash build/provision/test-install-hhfab.sh
 

@@ -36,6 +36,7 @@ PINS = {VERSION: {
 }}
 # Finite assumptions, not measured fit: curl transfer, child (transfer plus grace), whole run.
 TRANSFER, CHILD, TOTAL = 120, 125, 180
+RESULT_LIMIT = 4096
 CURL_DIRS = ("/usr/bin", "/bin")
 CHILD_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 
@@ -107,6 +108,10 @@ def install(version, platform_name, destination, binary=None):
             or platform.machine() not in ("x86_64", "amd64")):
         raise Refusal("unsupported version or platform")
     pin = PINS[version]
+    if destination == Path("/usr/local/bin") and os.geteuid() != 0:
+        raise Refusal("default install directory requires root")
+    if len(json.dumps(str(destination / "kubectl"))) > 1024:
+        raise Refusal("target path exceeds result budget")
     directory(destination)
     target = destination / "kubectl"
     existing = None
@@ -159,28 +164,41 @@ def install(version, platform_name, destination, binary=None):
             finally:
                 os.close(descriptor)
     finally:
-        # Exact owned stage only; a cleanup failure must not mask the primary error.
-        with contextlib.suppress(OSError):
+        # Preserve a primary failure, but never report success after failed cleanup.
+        primary = sys.exc_info()[0] is not None
+        try:
             shutil.rmtree(stage)
+        except OSError:
+            if not primary:
+                raise Refusal("owned stage cleanup failed after publication") from None
     return result(version, pin, target, status)
 
 
 def result(version, pin, target, status):
     info = regular(target)
+    observed = digest(target)
+    after = regular(target)
+    if (identity(info) != identity(after) or info.st_uid != os.geteuid()
+            or info.st_size != pin["size"] or observed != pin["sha256"]
+            or stat.S_IMODE(info.st_mode) != 0o755):
+        raise Refusal("installed target changed or fails verification")
     here = Path(__file__).resolve()
     helper = Path(sys.modules["hhfab_release"].__file__).resolve()
-    return {
+    outcome = {
         "tool": "kubectl", "version": version, "platform": PLATFORM, "source_url": pin["url"],
         "pinned_size": pin["size"], "pinned_sha256": pin["sha256"],
         "module_sha256": hashlib.sha256(here.read_bytes()).hexdigest(),
         "helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
-        "target": str(target), "target_sha256": digest(target),
+        "target": str(target), "target_sha256": observed,
         "target_mode": format(stat.S_IMODE(info.st_mode), "04o"), "status": status,
         "verified": "size and sha256 of installed bytes against the repo pin only",
         "not_verified": "signature, certificate, redirect chain, runtime, baseline-path equivalence",
         "executed": False,
         "atomicity": "single rename or no-clobber link; no rollback after publication",
     }
+    if len(json.dumps(outcome, sort_keys=True).encode("utf-8")) + 1 > RESULT_LIMIT:
+        raise Refusal("result exceeds output budget after publication")
+    return outcome
 
 
 def main():

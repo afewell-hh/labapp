@@ -314,8 +314,9 @@ class InstallTests(unittest.TestCase):
 
         def mutate(source, target, pin):
             real(source, target, pin)
-            self.target.unlink()
-            self.target.write_bytes(PAYLOAD)
+            replacement = self.root / "replacement"
+            replacement.write_bytes(PAYLOAD)
+            os.replace(replacement, self.target)
         with patch.object(kinstaller, "copy_binary", mutate), \
                 self.assertRaisesRegex(release.Refusal, "destination changed"):
             self.run_install()
@@ -328,6 +329,53 @@ class InstallTests(unittest.TestCase):
                 patch.object(kinstaller, "copy_binary", side_effect=release.Refusal("primary")), \
                 self.assertRaisesRegex(release.Refusal, "primary"):
             self.run_install()
+
+    def test_cleanup_failure_after_publication_refuses_success(self):
+        with patch.object(kinstaller.shutil, "rmtree", side_effect=OSError("cleanup")), \
+                self.assertRaisesRegex(release.Refusal, "cleanup failed"):
+            self.run_install()
+        self.assertEqual(self.target.read_bytes(), PAYLOAD)
+        self.assertEqual(len(list(self.destination.glob(".kubectl-stage-*"))), 1)
+
+    def test_default_requires_root_and_long_result_path_refuses_before_mutation(self):
+        with patch.object(kinstaller.os, "geteuid", return_value=1000), \
+                patch.object(kinstaller, "directory", side_effect=AssertionError("must refuse early")), \
+                self.assertRaisesRegex(release.Refusal, "requires root"):
+            kinstaller.install("1.35.0", "linux/amd64", Path("/usr/local/bin"), self.binary)
+        with patch.object(kinstaller, "directory", side_effect=AssertionError("must refuse early")), \
+                self.assertRaisesRegex(release.Refusal, "result budget"):
+            kinstaller.install("1.35.0", "linux/amd64", Path("/" + "x" * 1100), self.binary)
+        self.assertEqual(self.names(), [])
+
+    def test_result_refuses_observed_change_on_unchanged_and_installed_paths(self):
+        original = kinstaller.result
+        def changed(version, pin, target, status):
+            target.write_bytes(PAYLOAD[:-1] + b"X")
+            return original(version, pin, target, status)
+        for existing in (False, True):
+            if existing:
+                self.target.write_bytes(PAYLOAD)
+                self.target.chmod(0o755)
+            with patch.object(kinstaller, "result", changed), \
+                    self.assertRaisesRegex(release.Refusal, "fails verification"):
+                self.run_install()
+            self.assertEqual(self.names(), ["kubectl"])
+            self.target.unlink()
+
+    def test_result_refuses_change_during_hash_and_oversized_report(self):
+        self.run_install()
+        original = kinstaller.digest
+        def changed(path):
+            value = original(path)
+            self.target.chmod(0o644)
+            return value
+        with patch.object(kinstaller, "digest", changed), \
+                self.assertRaisesRegex(release.Refusal, "fails verification"):
+            kinstaller.result("1.35.0", self.pin, self.target, "unchanged")
+        self.target.chmod(0o755)
+        with patch.object(kinstaller, "RESULT_LIMIT", 1), \
+                self.assertRaisesRegex(release.Refusal, "output budget"):
+            kinstaller.result("1.35.0", self.pin, self.target, "unchanged")
 
     # --- bounded structured result --------------------------------------
     def test_result_binds_identity_and_states_limits(self):
