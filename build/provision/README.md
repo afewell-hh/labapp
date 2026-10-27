@@ -846,6 +846,24 @@ user/group access, recommendations, snapshot solvability or freshness, other
 CPUs/platforms, or any image. Mocked tests do not show installability. The CI
 step runs the real mocked lifecycle suite.
 
+Before either containment comparison can reject the target, the launcher emits
+requested and observed values for the fixed ten applied/isolation fields only.
+Values use Bash escaping with at most 128 input bytes per value and an explicit
+truncation flag; validation compares the full original values, without aliases
+or normalization. Inspect failures, missing records and extra record counts are
+reported separately; extra values are omitted. No environment or host census is
+printed. A failed inspect or mismatch prevents container start. These diagnostics
+do not identify the missing field/value from the earlier failed native trial.
+
+Launcher and workflow host cleanup print exact owned path absence receipts only
+after checking both existence and symlink presence. The launcher removes only its
+known regular files and empty directories; replaced types and unknown children
+(including dangling links) are preserved and cause cleanup failure. The workflow
+removes only its four empty private directories. Cleanup failure prevents success
+and preserves a primary failure code, including 124/130/143. Offline tests execute
+the actual launcher and the maintained workflow cleanup function against synthetic
+Docker state and temporary paths; they do not prove native cleanup or installability.
+
 The maintained `docker-package-proof.yml` workflow is manual-only, accepts no
 inputs and runs only from this repository's `main`. Separately scoped lead
 execution can dispatch it with:

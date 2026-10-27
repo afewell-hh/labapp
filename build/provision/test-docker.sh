@@ -26,6 +26,43 @@ target_id=
 echo "docker test: ownership name=${target} label=${run_label}"
 start_pid=
 workdir="$(mktemp -d)"
+# Printable, bounded Bash quoting for the fixed public diagnostic fields only.
+# Truncation is for display; comparisons below always use the complete strings.
+display() {
+  local LC_ALL=C value=$1 truncated=false
+  ((${#value} <= 128)) || truncated=true
+  printf '%q truncated=%s' "${value:0:128}" "$truncated"
+}
+diagnose() {
+  local group=$1 status=$2 actual=$3 requested=$4 i match
+  local -a fields observed expected
+  if [[ "$group" == applied ]]; then
+    fields=(privileged memory nano_cpus pids binds)
+  else
+    fields=(swap network security cap_drop devices)
+  fi
+  mapfile -t expected <<<"$requested"
+  observed=()
+  [[ -z "$actual" ]] || mapfile -t observed <<<"$actual"
+  echo "docker test: ${group} inspect_status=${status} fields=${#observed[@]} expected_fields=5"
+  for i in "${!fields[@]}"; do
+    printf 'docker test: %s field=%s requested=' "$group" "${fields[i]}"
+    display "${expected[i]}"
+    if ((status != 0)); then
+      printf ' observed=<inspect-unavailable> match=false\n'
+    elif ((i >= ${#observed[@]})); then
+      printf ' observed=<missing> match=false\n'
+    else
+      [[ "${observed[i]}" == "${expected[i]}" ]] && match=true || match=false
+      printf ' observed='
+      display "${observed[i]}"
+      printf ' match=%s\n' "$match"
+    fi
+  done
+  if ((${#observed[@]} > 5)); then
+    echo "docker test: ${group} extra_fields=$((${#observed[@]} - 5)) values=omitted"
+  fi
+}
 owned_container() {
   timeout --kill-after=1s 5s docker container ls -aq --no-trunc \
     --filter "name=^/${target}$" --filter "label=$run_label"
@@ -72,18 +109,40 @@ cleanup() {
     wait "$start_pid" 2>/dev/null || true
   fi
   if ((failed)); then echo 'docker test: owned cleanup failed' >&2; fi
-  for file in install-docker.py hhfab_release.py docker_container.py; do
-    rm -f -- "$workdir/suite/$file" || failed=1
-  done
-  rm -f -- "$workdir/out" || failed=1
-  rmdir -- "$workdir/suite" "$workdir/docker-config" "$workdir" || failed=1
+  local host_failed=0 file path
+  # Never follow replaced directories or unlink unknown children/types. rmdir
+  # preserves unexpected entries, including dangling links, for inspection.
+  if [[ -d "$workdir" && ! -L "$workdir" ]]; then
+    if [[ -d "$workdir/suite" && ! -L "$workdir/suite" ]]; then
+      for file in install-docker.py hhfab_release.py docker_container.py; do
+        path="$workdir/suite/$file"
+        if [[ -f "$path" && ! -L "$path" ]]; then rm -f -- "$path" || host_failed=1
+        elif [[ -e "$path" || -L "$path" ]]; then host_failed=1; fi
+      done
+      rmdir -- "$workdir/suite" 2>/dev/null || host_failed=1
+    elif [[ -e "$workdir/suite" || -L "$workdir/suite" ]]; then host_failed=1; fi
+    if [[ -f "$workdir/out" && ! -L "$workdir/out" ]]; then rm -f -- "$workdir/out" || host_failed=1
+    elif [[ -e "$workdir/out" || -L "$workdir/out" ]]; then host_failed=1; fi
+    for path in "$workdir/docker-config" "$workdir"; do
+      if [[ -d "$path" && ! -L "$path" ]]; then rmdir -- "$path" 2>/dev/null || host_failed=1
+      elif [[ -e "$path" || -L "$path" ]]; then host_failed=1; fi
+    done
+  fi
+  if [[ -e "$workdir" || -L "$workdir" ]]; then host_failed=1; fi
+  printf 'docker test: host temp cleanup '
+  if ((host_failed)); then
+    printf 'failed preserved workdir='; display "$workdir"; printf '\n'
+    failed=1
+  else
+    printf 'checked exact owned absence workdir='; display "$workdir"; printf '\n'
+  fi
   return "$failed"
 }
 finish() {
   local result=$?
   trap - EXIT
   # Bounded sanitized diagnostics from the guest; guest output is public data.
-  if [[ -f "$workdir/out" ]]; then tail -c 65536 "$workdir/out" || true; fi
+  if [[ -d "$workdir" && ! -L "$workdir" && -f "$workdir/out" && ! -L "$workdir/out" ]]; then tail -c 65536 "$workdir/out" || true; fi
   # A cleanup failure is reported but never replaces a primary failure code.
   cleanup || { [[ "$result" -ne 0 ]] || result=1; }
   exit "$result"
@@ -129,16 +188,30 @@ target_id="$(work_timeout 90 docker create --platform=linux/amd64 --init --name 
 [[ "$target_id" =~ ^[a-f0-9]{64}$ ]]
 echo "docker test: created name=${target} id=${target_id} label=${run_label}"
 work_timeout 5 docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
+applied_status=0 isolation_status=0
 applied="$(work_timeout 5 docker inspect --format \
-  'privileged={{.HostConfig.Privileged}} memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}} binds={{json .HostConfig.Binds}}' "$target_id")"
-expected="privileged=false memory=1073741824 nano_cpus=2000000000 pids=128 binds=[\"$workdir/suite:/suite:ro\"]"
+  '{{.HostConfig.Privileged}}
+{{.HostConfig.Memory}}
+{{.HostConfig.NanoCpus}}
+{{.HostConfig.PidsLimit}}
+{{json .HostConfig.Binds}}' "$target_id")" || applied_status=$?
+printf -v expected 'false\n1073741824\n2000000000\n128\n["%s/suite:/suite:ro"]' "$workdir"
 isolation="$(work_timeout 5 docker inspect --format \
-  'swap={{.HostConfig.MemorySwap}} network={{.HostConfig.NetworkMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}} devices={{json .HostConfig.Devices}}' "$target_id")"
-[[ "$isolation" == 'swap=1073741824 network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' ]] || {
+  '{{.HostConfig.MemorySwap}}
+{{.HostConfig.NetworkMode}}
+{{json .HostConfig.SecurityOpt}}
+{{json .HostConfig.CapDrop}}
+{{json .HostConfig.Devices}}' "$target_id")" || isolation_status=$?
+expected_isolation=$'1073741824\ndefault\n["no-new-privileges"]\n["NET_RAW"]\n[]'
+diagnose applied "$applied_status" "$applied" "$expected"
+diagnose isolation "$isolation_status" "$isolation" "$expected_isolation"
+((applied_status == 0)) || exit "$applied_status"
+((isolation_status == 0)) || exit "$isolation_status"
+[[ "$isolation" == "$expected_isolation" ]] || {
   echo 'docker test: applied containment differs from request' >&2; exit 1;
 }
-echo "docker test: applied id=${target_id} ${applied} ${isolation}"
 [[ "$applied" == "$expected" ]] || { echo 'docker test: applied containment differs from request' >&2; exit 1; }
+echo "docker test: applied id=${target_id}"
 remaining=$((total - SECONDS - 5))
 if ((remaining < 60)); then echo 'docker test: insufficient total budget remains' >&2; exit 1; fi
 timeout --kill-after=1s "${remaining}s" docker start -a "$target_id" >"$workdir/out" 2>&1 &
