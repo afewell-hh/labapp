@@ -390,6 +390,47 @@ are refused before mutation; an over-budget final report refuses after publicati
 behavior, installation-time fit and equivalence to the baseline image's kubectl path,
 owner and mode are not verified (`not_verified`; cosign is outside this slice).
 
+### Native kubectl install and rerun proof (source only)
+
+`kubectl_native_proof.py` runs the unchanged `install-kubectl.py` CLI twice
+(`--version 1.35.0 --platform linux/amd64 --install-dir <private>/install`, network mode) against
+one private, harness-created destination, for a manual-only workflow on a fresh GitHub-hosted
+Ubuntu 24.04 runner (Python 3.12 stdlib and curl; no APT, container or VM). It proves only that
+the unchanged CLI can acquire, byte-install and idempotently rerun in a caller-owned directory.
+It does not prove root or `/usr/local/bin` installation, a pinned-container base, image/VM
+integration or kubectl runtime; kubectl is never executed. No native run has happened yet; the
+first real download and timing will be measured only by one separately authorized dispatch.
+
+```bash
+# Cleared environment; ROOT is a caller-owned 0700 directory with empty 0700 home/ and tmp/.
+env -i PATH=/usr/bin:/bin HOME=$ROOT/home TMPDIR=$ROOT/tmp LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+  python3 -B /absolute/kubectl_native_proof.py --root $ROOT --commit <40-hex> --tree <40-hex>
+# Offline synthetic tests (no network, no kubectl execution). CI additionally refuses zero tests.
+python3 -m unittest discover -s build/provision -p test_kubectl_native_proof.py -v
+```
+
+One JSON report is printed (a `preflight` line first, then the final report) and the exit status is
+0 only if both invocations and cleanup passed. Before the first call the harness records the
+commit/tree it was given, SHA256 of itself, the installer and `hhfab_release.py`, the observed OS,
+Python, UID and curl version, and that `install/kubectl` is absent. After each call it verifies
+independently of the installer: exit status, a single-line JSON result whose tool, version,
+platform, URL, pin, module/helper hashes, target path, mode, status (`installed`, then
+`unchanged`) and `executed: false` match; the target's bytes, size, 0755 mode, owner and link
+count; that the directory holds only `kubectl`; and that no process remains in the installer's
+session. The rerun must leave the target's inode, mtime and ctime unchanged. Per-call seconds are
+reported (finite assumptions, not measured fit).
+
+Limits are initial assumptions: 600s total work (alarm), a separate 60s cleanup (alarm), and
+185s per call around the installer's own unchanged 120/125/180s limits; no renewal, widening,
+retry or repair. Any failure, including timeout, stays failed and preserves the primary error;
+cleanup errors are reported separately. Cleanup removes only the recorded install-directory
+inode, a `kubectl` file matching the recorded inode, and `.kubectl-stage-*` directories holding
+only an owned single-link `kubectl`; any other child (or non-empty `home`/`tmp`) is left in place
+and reported as a cleanup failure. A hard runner cancellation (SIGKILL) gives no cleanup
+receipt, and later runner disposal is not one. Trusted: the interpreter, `/usr/bin/curl`, the
+module directory, the runner and the destination; this is not a defense against a hostile
+concurrent writer or a descendant that leaves the installer's session.
+
 ## Offline-delivered guest prerequisite probe
 
 `component_prerequisites.py` is a small **guest** check for an explicitly
