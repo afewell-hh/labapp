@@ -129,6 +129,16 @@ target_id="$(work_timeout 90 docker create --platform=linux/amd64 --init --name 
 [[ "$target_id" =~ ^[a-f0-9]{64}$ ]]
 echo "docker test: created name=${target} id=${target_id} label=${run_label}"
 work_timeout 5 docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
+applied="$(work_timeout 5 docker inspect --format \
+  'privileged={{.HostConfig.Privileged}} memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}} binds={{json .HostConfig.Binds}}' "$target_id")"
+expected="privileged=false memory=1073741824 nano_cpus=2000000000 pids=128 binds=[\"$workdir/suite:/suite:ro\"]"
+isolation="$(work_timeout 5 docker inspect --format \
+  'swap={{.HostConfig.MemorySwap}} network={{.HostConfig.NetworkMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}} devices={{json .HostConfig.Devices}}' "$target_id")"
+[[ "$isolation" == 'swap=1073741824 network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' ]] || {
+  echo 'docker test: applied containment differs from request' >&2; exit 1;
+}
+echo "docker test: applied id=${target_id} ${applied} ${isolation}"
+[[ "$applied" == "$expected" ]] || { echo 'docker test: applied containment differs from request' >&2; exit 1; }
 remaining=$((total - SECONDS - 5))
 if ((remaining < 60)); then echo 'docker test: insufficient total budget remains' >&2; exit 1; fi
 timeout --kill-after=1s "${remaining}s" docker start -a "$target_id" >"$workdir/out" 2>&1 &
@@ -143,17 +153,7 @@ fi
 ((status == 0)) || exit "$status"
 exit_code="$(work_timeout 5 docker inspect --format '{{.State.ExitCode}}' "$target_id")"
 oom="$(work_timeout 5 docker inspect --format '{{.State.OOMKilled}}' "$target_id")"
-applied="$(work_timeout 5 docker inspect --format \
-  'privileged={{.HostConfig.Privileged}} memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}} binds={{json .HostConfig.Binds}}' "$target_id")"
-expected="privileged=false memory=1073741824 nano_cpus=2000000000 pids=128 binds=[\"$workdir/suite:/suite:ro\"]"
-isolation="$(work_timeout 5 docker inspect --format \
-  'swap={{.HostConfig.MemorySwap}} network={{.HostConfig.NetworkMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}} devices={{json .HostConfig.Devices}}' "$target_id")"
-[[ "$isolation" == 'swap=1073741824 network=default security=["no-new-privileges"] cap_drop=["NET_RAW"] devices=[]' ]] || {
-  echo 'docker test: applied containment differs from request' >&2; exit 1;
-}
-echo "docker test: applied id=${target_id} ${applied} ${isolation}"
 failed=0
-[[ "$applied" == "$expected" ]] || { echo 'docker test: applied containment differs from request' >&2; failed=1; }
 [[ "$exit_code" == 0 && "$oom" == false ]] || { echo "docker test: guest exit=${exit_code} oom=${oom}" >&2; failed=1; }
 ((status == 0)) || failed=1
 echo "docker test: elapsed ${SECONDS}s of ${total}s"

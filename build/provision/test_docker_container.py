@@ -537,6 +537,7 @@ class HostLauncherTests(unittest.TestCase):
         result, state = self.launch('guest_fail')
         self.assertEqual(result.returncode, 1)
         self.assertIn('"result": "fail"', result.stdout)
+        self.assertIn('docker test: applied id=', result.stdout)
         self.assert_owned_gone(state)
 
     def test_supervisor_timeout_is_labeled_and_not_pass(self):
@@ -560,6 +561,9 @@ class HostLauncherTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(text, result.stderr)
                 self.assert_owned_gone(state)
+                if mode != 'oom':
+                    self.assertFalse(any(c[0] == 'start' for c in state['calls']),
+                                     'unverified containment must prevent native execution')
 
     def test_lost_create_response_recovers_exact_owned_container(self):
         result, state = self.launch('create_lost')
