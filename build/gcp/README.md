@@ -214,6 +214,18 @@ with libyaml; otherwise fixed refusal, no pure-Python or other fallback) because
 the public official hhfab 0.43.1 template has a tab in `ip:<tab>dhcp` that pure
 SafeLoader refuses. An earlier `invalid_yaml` gap shows only that this parser
 refused, not that the source was malformed; its actual cause remains unverified.
+The version floor selects the Ubuntu 24.04 dependency family (distribution
+PyYAML 6.0.1 on Python 3.12), not a claim that every older release rejects tabs.
+Only numeric final-release version metadata is accepted; a missing or broken
+C loader aborts derivation before any candidate is written, even with no YAML
+records. A local test on a different Python/package build does not establish
+Ubuntu runtime compatibility. Primary implementation references, accessed
+2026-10-27: PyYAML 6.0.1
+[`parse`/`compose_all`](https://github.com/yaml/pyyaml/blob/6.0.1/lib/yaml/__init__.py),
+[`CSafeLoader`](https://github.com/yaml/pyyaml/blob/6.0.1/lib/yaml/cyaml.py),
+and [CParser node composition](https://github.com/yaml/pyyaml/blob/6.0.1/yaml/_yaml.pyx);
+libyaml 0.2.5 [separation scanning](https://github.com/yaml/libyaml/blob/0.2.5/src/scanner.c);
+the [official template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml).
 CRLF is normalized for parsing; lone CR/control characters refuse. Limits are
 depth32, scalar4096UTF-8 bytes,64documents/file,256documents and100,000events
 aggregate. Integer/bool/string/null types remain distinct; quoted values never

@@ -103,8 +103,21 @@ raw source. These are observed persisted facts, not new-build or upgrade pins.
 
 - The captured `hhfab` binary is byte-identical to the official
   `hhfab-v0.43.1-linux-amd64` release member. No guest application was executed.
-  The receipt also records observed byte lengths and SHA-256 digests for
-  `helm`, `k3d` and `kubectl`; their versions remain unknown.
+  The other recorded binary identities were subsequently resolved as follows.
+
+| Binary / version (linux/amd64) | Source bytes | Source SHA-256 | Identity evidence |
+| --- | ---: | --- | --- |
+| `helm` 3.19.4 | 60,182,712 | `ea22096683b9b61005584501e36168a1eadc5b6883a89df299f5a55e4e2dd283` | [Accepted official archive-member comparison and independent audit](https://github.com/afewell-hh/labapp/issues/314#issuecomment-6430812209); acquired archive verified before member hashing. |
+| `k3d` 5.7.4 | 24,215,704 | `1ac1da365236736a8df8c32107b54aca208384ab1d9a06771443c85ad698a5eb` | [Accepted publisher checksum/asset-size metadata match](https://github.com/afewell-hh/labapp/issues/313#issuecomment-6428750111); no binary acquired. |
+| `kubectl` 1.35.0 | 58,597,560 | `a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989` | [Accepted publisher checksum/asset-size metadata match](https://github.com/afewell-hh/labapp/issues/313#issuecomment-6428750111); no binary acquired. |
+
+These identities retain the approved source receipt's lengths and hashes.
+The Helm archive digest covers a different object from the binary digest above.
+HTTPS/checksum provenance does not establish verified signatures; these matches
+establish neither runtime behavior nor full appliance equivalence, and select
+no new installation or upgrade pins. Oras presence, hash and version remain
+unknown.
+
 - The complete captured wiring matches the parsed documents of the existing
   root [`wiringd.yaml`](../../wiringd.yaml), SHA-256
   `c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a`:
@@ -133,6 +146,13 @@ terminology; they do not measure runtime allocation or host capacity.
 
 The fabric file was rejected during YAML parsing, so no Fabric settings were
 recovered from it; secret-bearing text was neither repaired nor published.
+That historical refusal does not establish malformed source YAML: the public
+official hhfab 0.43.1 template includes a separation tab accepted by libyaml
+but refused by the earlier pure-Python parser. The actual cause of the source
+refusal remains unverified; the original private report was deleted. The
+trusted host deriver now requires libyaml-backed CSafeLoader and a supported
+PyYAML version (see [parser requirements](../../build/gcp/README.md)); this
+change recovers no additional historical source facts.
 The captured generic modules and sysctl files yielded no selected settings;
 the selected bridge-specific modules and sysctl files were missing. These
 bounded observations do not prove that equivalent settings are absent elsewhere.

@@ -136,9 +136,11 @@ def safe_loader():
     SafeLoader does not. Availability and version are checked explicitly.
     """
     loader = getattr(yaml, 'CSafeLoader', None)
-    version = str(getattr(yaml, '__version__', ''))
-    match = re.match(r'([0-9]+)\.([0-9]+)', version)
-    require(loader is not None and getattr(yaml, '__with_libyaml__', False) is True and
+    version = getattr(yaml, '__version__', '')
+    match = re.fullmatch(r'([0-9]+)\.([0-9]+)(?:\.[0-9]+)?', version) if type(version) is str else None
+    parser = getattr(getattr(yaml, '_yaml', None), 'CParser', None)
+    require(isinstance(loader, type) and isinstance(parser, type) and
+            issubclass(loader, parser) and getattr(yaml, '__with_libyaml__', False) is True and
             match is not None and (int(match[1]), int(match[2])) >= MIN_PYYAML)
     return loader
 
@@ -454,6 +456,9 @@ def vlab_projection(docs):
 
 def derive(report):
     fixed = validate(report)
+    # Dependency refusal must abort the whole operation, rather than becoming
+    # a per-file YAML gap and emitting a seemingly usable candidate.
+    safe_loader()
     result = {'schema_version': 1, 'binary_identities': [], 'fabric': {}, 'topology': {},
               'vlab': {}, 'network': [], 'shell_catalog': [], 'gaps': [],
               'effective': False, 'runtime': 'unknown'}

@@ -252,16 +252,35 @@ class TypedYamlTests(unittest.TestCase):
 
     def test_loader_preflight_has_no_permissive_fallback(self):
         self.assertIs(d.safe_loader(), d.yaml.CSafeLoader)
-        with mock.patch.object(d.yaml, 'CSafeLoader', None):
-            with self.assertRaises(d.Refused):
-                d.YamlReader().read('a: 1')
+        for loader in (None, object(), d.yaml.SafeLoader):
+            with self.subTest(loader=type(loader)), mock.patch.object(d.yaml, 'CSafeLoader', loader):
+                with self.assertRaises(d.Refused):
+                    d.YamlReader().read('a: 1')
         with mock.patch.object(d.yaml, '__with_libyaml__', False):
             with self.assertRaises(d.Refused):
                 d.YamlReader().read('a: 1')
-        for version in ('5.4.1', '', 'x'):
+        for version in ('5.4.1', '', 'x', '6.0garbage', '6.0rc1', None, 6.0):
             with self.subTest(version=version), mock.patch.object(d.yaml, '__version__', version):
                 with self.assertRaises(d.Refused):
                     d.YamlReader().read('a: 1')
+
+    def test_unavailable_loader_aborts_derivation_and_leaves_no_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            source, output = parent / 'report', parent / 'candidate'
+            source.write_text(json.dumps(empty_report()))
+            source.chmod(0o600)
+            with mock.patch.object(d.yaml, 'CSafeLoader', None):
+                with self.assertRaises(d.Refused):
+                    d.derive(empty_report())
+                with self.assertRaises(d.Refused):
+                    d.write_candidate(source, output)
+            self.assertFalse(output.exists())
+
+    def test_composition_never_calls_constructors(self):
+        with mock.patch.object(d.yaml.CSafeLoader, 'construct_document', side_effect=AssertionError):
+            self.assertEqual(d.YamlReader().read('ip:\tdhcp\n'), [{'ip': 'dhcp'}])
 
     def test_preflight_rejects_before_composition(self):
         with mock.patch.object(d.yaml, 'compose_all', side_effect=AssertionError):
