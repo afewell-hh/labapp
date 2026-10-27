@@ -94,6 +94,11 @@ def archive_rows(system):
             for n, v in system.pkgs.items() if n not in ('bash', 'curl')]
 
 
+def bare_archives(system):
+    """Archive rows as install-docker.py records them: the unqualified control Package field."""
+    return [{**row, 'package': row['package'].split(':')[0]} for row in archive_rows(system)]
+
+
 class World:
     """Synthetic CLI boundary; never starts the native installer."""
     def __init__(self, system, clock, plans):
@@ -195,6 +200,28 @@ class DriverTests(unittest.TestCase):
         self.failure('installer identity differs', first={'tweak': wrong_key})
         self.failure('Docker trio', first={'effect': trio_missing})
         self.failure('fresh bounded', mutate=lambda s: s.pkgs.update(PINS))
+
+    def test_architecture_qualified_native_dependency_matches_unqualified_archive(self):
+        def qualified(s): install_effect(s); s.pkgs['libmnl0:amd64'] = '1.0.5'
+        report, code, _, _ = run_case(first={'effect': qualified, 'archives': bare_archives})
+        self.assertEqual((code, report['result']), (0, 'pass'), report)
+        self.assertEqual(report['closure']['libmnl0:amd64'], '1.0.5')  # original dpkg key retained
+        self.assertNotIn('libmnl0', report['closure'])
+
+    def test_architecture_normalization_refuses_drift(self):
+        def foreign(s): install_effect(s); s.pkgs['libmnl0:i386'] = '1.0.5'
+        def collide(s): install_effect(s); s.pkgs.update({'libmnl0:amd64': '1.0.5', 'libmnl0': '1.0.5'})
+        def qualified(s): install_effect(s); s.pkgs['libmnl0:amd64'] = '1.0.5'
+        def mismatch(out):
+            for row in out['downloaded_archives']:
+                if row['package'] == 'libmnl0':
+                    row['version'] = '9.9'
+        self.failure('unexpected architecture', first={'effect': foreign, 'archives': bare_archives})
+        self.failure('collide', first={'effect': collide, 'archives': bare_archives})
+        self.failure('downloaded archives differ',
+                     first={'effect': qualified, 'archives': bare_archives, 'tweak': mismatch})
+        # A qualified archive name is not the installer's unqualified Package field: still refused.
+        self.failure('downloaded archives differ', first={'effect': qualified})
 
     def test_receipt_must_bind_state_payload_and_source_hashes(self):
         def installed(s): install_effect(s); s.receipt_value['data']['installed'] = {}

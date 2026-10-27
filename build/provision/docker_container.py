@@ -172,7 +172,24 @@ def receipt_matches(out, state, sources):
         raise Finding('receipt module hashes differ from source hashes')
 
 
-def check_first(c, before, after, out, sources):
+def unqualified(packages, arch):
+    """Comparison-only view: strip dpkg's native `:arch` qualifier (Multi-Arch: same `${binary:Package}`).
+
+    Any other qualifier or a name collision after stripping is drift, never normalized away.
+    The caller's original keys remain the state/receipt identity.
+    """
+    result = {}
+    for name, version in packages.items():
+        base, sep, qualifier = name.partition(':')
+        if sep and (qualifier != arch or not base):
+            raise Finding('installed package has an unexpected architecture qualifier')
+        if base in result:
+            raise Finding('package names collide after architecture normalization')
+        result[base] = version
+    return result
+
+
+def check_first(c, before, after, out, sources, arch='amd64'):
     common(before)
     common(after)
     if any(after['packages'].get(n) != v for n, v in before['packages'].items()):
@@ -184,10 +201,11 @@ def check_first(c, before, after, out, sources):
     if any(after['packages'].get(n) != v for n, v in c['pins'].items()):
         raise Finding('exact Docker trio versions are not installed')
     closure = {n: v for n, v in after['packages'].items() if n not in before['packages']}
-    if not set(c['pins']) <= set(closure) or len(closure) > c['max_plan']:
+    bare = unqualified(closure, arch)
+    if not set(c['pins']) <= set(bare) or len(closure) > c['max_plan']:
         raise Finding('selected dependency closure is not a fresh bounded trio install')
     archives = {row['package']: row for row in out.get('downloaded_archives', [])}
-    if ({n: row['version'] for n, row in archives.items()} != closure
+    if ({n: row['version'] for n, row in archives.items()} != bare
             or any(archives[n]['sha256'] != sha for n, sha in c['archives'].items())):
         raise Finding('downloaded archives differ from installed closure or declared trio hashes')
     if (out.get('pins'), out.get('archives'), out.get('key_sha256')) != (c['pins'], c['archives'], c['key_sha256']):
@@ -254,7 +272,8 @@ def execute(system, installer, budget, base, load=load_installer, clock=time.mon
             report['runs'][-1]['installer_output'] = out
             state = snapshot(system, paths)
             if number == 1:
-                report['closure'] = check_first(c, before, state, out, sources)
+                report['closure'] = check_first(c, before, state, out, sources,
+                                                  report['fixture']['architecture'])
             else:
                 check_rerun(c, previous, state, out, sources)
             previous = state
