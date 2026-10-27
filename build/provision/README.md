@@ -337,6 +337,59 @@ to `latest` and `/usr/local/bin`; this module deliberately requires explicit
 version selection. The docs overview was unavailable through the research browser;
 no installation claim relies on that page.
 
+## Pinned kubectl installer
+
+`install-kubectl.py` installs only kubectl 1.35.0 linux/amd64 from
+`https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl`, exactly 58,597,560 bytes,
+SHA256 `a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989`
+(#321). There is no stable/latest fallback, upgrade or force mode. It is not called by
+cloud-init or Packer. No native download, install, rerun or runtime check has been run.
+
+```bash
+# Ubuntu 24.04: Python 3.12 stdlib and curl; root for /usr/local/bin. Keep
+# hhfab_release.py alongside the module. Paths must be absolute; cwd is irrelevant.
+python3 /absolute/path/build/provision/install-kubectl.py --version 1.35.0 --platform linux/amd64
+# Caller-owned alternate directory and a local file (fully verified before any mutation):
+python3 /absolute/path/build/provision/install-kubectl.py --version 1.35.0 --platform linux/amd64 \
+  --install-dir /absolute/owned/bin --binary /absolute/kubectl
+# Offline synthetic tests (no network, no kubectl execution). CI additionally refuses zero tests.
+python3 -m unittest discover -s build/provision -p test_install_kubectl.py -v
+```
+
+Behavior for `DIR/kubectl`: absent installs atomically (no-clobber link from an owned
+stage); exact pinned bytes with mode 0755 are unchanged; exact pinned bytes with another
+mode are replaced through the stage (never chmod in place); any other existing bytes are
+refused. Symlink, directory, special-file, hardlink or non-caller-owned targets, and a
+destination change observed before publication, are refused. `DIR` must be absolute,
+caller-owned, not group/world writable, with real (non-symlink) directory components;
+ownership and mode are checked only on `DIR`, not every ancestor. Callers must trust the
+interpreter, `curl`, module directory and `DIR`, and exclude concurrent mutation; this is
+not a defense against a hostile concurrent writer. A failure before publication keeps the
+prior target; there is no rollback after publication.
+
+Download uses `/usr/bin/curl` or `/bin/curl` with `--disable` first, HTTPS-only initial and
+redirect protocols, no retries, `--max-filesize` equal to the pin, 120s transfer, a
+125s bounded child (output capped, process group killed and reaped) and a 180s whole-run
+alarm. These are finite assumptions, not measured fit. The child gets only
+`PATH=/usr/bin:/bin` and `LC_ALL=C`, no stdin or TTY; no proxy, curlrc or credential
+variables are forwarded. After download, size and SHA256 are checked again explicitly. The
+owned `.kubectl-stage-*` directory is cleaned on success, failure, timeout and SIGTERM.
+Cleanup failure preserves any primary error; otherwise it refuses success after publication,
+with no rollback promise. kubectl is never executed.
+
+Python 3.10+ supports synthetic host tests; the representative native target remains
+Ubuntu 24.04 Python 3.12. The child inherits cwd, but absolute paths and disabled curl
+configuration keep operations independent of cwd.
+
+On success one JSON line (at most 4096 UTF-8 bytes) binds tool, version, platform, source URL, pinned size/hash,
+SHA256 of this module and of `hhfab_release.py`, the observed target path, SHA256 and
+mode, and `status` (`installed`, `unchanged` or `mode-repaired`). It verifies bytes
+against the repo pin only. The target is rechecked for pinned bytes, owner, mode and
+observed identity stability before reporting. Escaped target paths over 1024 characters
+are refused before mutation; an over-budget final report refuses after publication. The release signature/certificate, redirect chain, runtime
+behavior, installation-time fit and equivalence to the baseline image's kubectl path,
+owner and mode are not verified (`not_verified`; cosign is outside this slice).
+
 ## Offline-delivered guest prerequisite probe
 
 `component_prerequisites.py` is a small **guest** check for an explicitly
