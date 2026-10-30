@@ -1,0 +1,91 @@
+---
+name: helm native install and rerun proof
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helm-native-proof
+  cancel-in-progress: false
+
+jobs:
+  helm-proof:
+    if: >-
+      github.repository_id == '1089062808' &&
+      github.repository_owner_id == '193945001' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record public source and host identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          git show -s --format='Source commit %H tree %T' HEAD
+          sha256sum build/provision/helm_native_proof.py build/provision/install-helm.py \
+            build/provision/hhfab_release.py
+          printf 'Runner image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          /usr/bin/python3 -I -B -c 'import os,platform,sys; print("Host Python",sys.version); print("Host UID",os.getuid()); print("Host",platform.platform())'
+      - name: One bounded native install and rerun trial
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          commit="$(git rev-parse HEAD)"
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          image="${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          proof="$PWD/build/provision/helm_native_proof.py"
+          private="$(mktemp -d "$RUNNER_TEMP/labapp-helm-proof.XXXXXXXX")"
+          chmod 700 "$private"
+          root_identity=$(stat -c %d:%i:%u:%a -- "$private")
+          home_identity=uncreated
+          tmp_identity=uncreated
+          # Hard cancellation gives no cleanup receipt; runner disposal is not one.
+          cleanup_host() {
+            local primary=$? cleanup=0 owned expected
+            trap - EXIT
+            trap '' INT TERM
+            if [[ ! -d "$private" || -L "$private" || $(stat -c %d:%i:%u:%a -- "$private") != "$root_identity" ]]; then
+              echo 'Helm proof: host root identity changed; paths retained' >&2
+              cleanup=1
+            else
+              for owned in "$private/tmp" "$private/home" "$private"; do
+                case "$owned" in
+                  "$private") expected=$root_identity ;;
+                  "$private/home") expected=$home_identity ;;
+                  "$private/tmp") expected=$tmp_identity ;;
+                esac
+                if [[ -d "$owned" && ! -L "$owned" && $(stat -c %d:%i:%u:%a -- "$owned") == "$expected" ]]; then
+                  rmdir -- "$owned" || cleanup=1
+                else
+                  cleanup=1
+                fi
+                if [[ -e "$owned" || -L "$owned" ]]; then
+                  cleanup=1
+                else
+                  printf 'Helm proof host cleanup absent: %s\n' "$owned"
+                fi
+              done
+            fi
+            if (( primary != 0 )); then exit "$primary"; fi
+            exit "$cleanup"
+          }
+          trap cleanup_host EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          mkdir -m 700 "$private/home" "$private/tmp"
+          home_identity=$(stat -c %d:%i:%u:%a -- "$private/home")
+          tmp_identity=$(stat -c %d:%i:%u:%a -- "$private/tmp")
+          env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$private/home" TMPDIR="$private/tmp" \
+            LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --kill-after=30s 700s \
+            /usr/bin/python3 -B "$proof" --root "$private" --commit "$commit" --tree "$tree" \
+            --runner-image "$image"

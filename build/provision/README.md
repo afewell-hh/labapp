@@ -961,3 +961,50 @@ private 0700 HOME/TMP, env-i, Python -I -B and umask022, and removes only its ex
 empty outer directories with checked absence while preserving any primary code.
 Synthetic tests exercise actual install/parser/CLI and bounded fake children;
 they do not establish native download/install/runtime or image equivalence.
+
+
+### Native Helm install and rerun proof
+
+`helm_native_proof.py` runs the unchanged Helm installer CLI twice in the same
+private 0700 caller-owned `ROOT/install`: first `installed`, then `unchanged`.
+Its only options are `--root ABS --commit 40hex --tree 40hex` and optional
+`--runner-image TEXT`. Invoke with Python 3.12 on Ubuntu 24.04 x86_64, a cleared
+environment, and an existing 0700 root containing empty caller-owned 0700 `home`
+and `tmp` directories. The production command always selects version 3.19.4,
+platform linux/amd64 and network mode; there is no archive override or Helm execution.
+
+The manual-only `.github/workflows/helm-native-proof.yml` has no inputs, fixes
+repository/owner/main guards and read-only permissions, and checks out exact
+`github.sha` without persisted credentials. A real trial needs separate lead
+scope. Source qualification alone provides no native installation evidence.
+
+The bounded stdout report records source/helper/proof and host Python identities,
+public archive/member pins, actual JSON and per-call timings. Strict JSON fields
+and types bind each independent lstat/hash/lstat target snapshot, including size,
+owner, mode, device and inode. The complete first/rerun snapshots, including
+mtime/ctime, must match. Only `helm` may remain in the install directory; this
+checks remaining entries, not whether a transient stage ever existed.
+
+Fixed initial assumptions are 600s work, 60s cleanup, 185s per installer,
+700s outer timeout plus 30s kill grace and a 13-minute job. Grace consumes the
+same absolute envelope; no retry or renewal occurs. Deadline124, INT130,
+TERM143 and installer nonzero codes survive cleanup failures. The wrapper waits
+only for its direct children. Graceful nested curl cleanup relies on the accepted
+installer's own killpg/wait; no descendant census is claimed. Forced escalation
+fails with nested cleanup unverified. Hard cancellation/disposal is no absence receipt.
+
+Cleanup removes only the observed owned target and exact empty install directory.
+Root/HOME/TMP/install identities are checked; unknown children, leftover stages
+and replaced paths are retained and prevent success. The later host trap checks
+root identity before touching children, removes only exact empty HOME/TMP/root,
+and prints each positively observed absence. The wrapper leaves HOME/TMP for
+that trap and reports this distinction explicitly. Trusted quiescent paths and
+normal OS scheduling are required; this is not a hostile multiuser sandbox.
+
+CI requires the actual `test_helm_native_proof.py` suite with zero-test refusal,
+env-i, private0700 HOME/TMP, umask022 and Python-I-B. A parent socket audit hook
+and inspected fake children bound offline qualification; the hook is not inherited
+child or OS network isolation. Tests exercise the wrapper, the maintained shell
+cleanup body, and an explicitly synthetic real-installer archive with recomputed
+pins. They never execute Helm or real curl. Checksum-only trust does not prove
+GPG/provenance, installed baseline metadata, runtime or full image/course equivalence.
