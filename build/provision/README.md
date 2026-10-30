@@ -598,6 +598,16 @@ The pinned socat package provides the exact `socat -> socat1` link; its regular
 `socat1` payload and that fixed link target are both verified. Minimal-image
 documentation exclusions do not bypass verification of the required tools.
 
+Bounded-child refusals retain a fixed public command label; APT transaction
+failures also identify `update`, `pre-check`, `simulate`, `install` or
+`post-check`. Labels never copy command arguments, environment or paths.
+Known timeout/output-overflow/deadline refusals retain their fixed reason;
+unknown bounded-refusal text is withheld. The unchanged combined-output cap is
+1 MiB; returned nonzero commands retain the existing bounded
+4096-byte output tail. Interruption still unwinds cleanup and exits 130.
+These diagnostics locate a new observed failure; they cannot reconstruct the
+stage or cause of earlier failures or prove installation/runtime success.
+
 The explicit disconnected path uses the **same installer** and fixed selection:
 
 ```bash
