@@ -887,3 +887,77 @@ run log; a green source/mock job alone proves no installation. A hard job or
 runner cancellation may prevent exact cleanup observation: hosted-runner disposal
 is the fallback, not a verified container deletion receipt. A failed trial remains
 failed and needs lead disposition before any new dispatch.
+
+## Pinned Helm installer
+
+`install-helm.py` installs only Helm 3.19.4 linux/amd64. Ubuntu 24.04 Python 3.12
+stdlib and sibling `hhfab_release.py` are required; network mode additionally
+needs `/usr/bin/curl` or `/bin/curl`. Invoke explicitly, without sudo inside the
+module, environment overrides, prompts or TTY:
+
+```bash
+# Root for the default existing /usr/local/bin; all supplied paths absolute.
+python3 /absolute/build/provision/install-helm.py --version 3.19.4 --platform linux/amd64
+python3 /absolute/build/provision/install-helm.py --version 3.19.4 --platform linux/amd64 \
+  --install-dir /absolute/caller-owned/bin --archive /absolute/helm.tar.gz
+```
+
+The repo trust pins are the official
+`https://get.helm.sh/helm-v3.19.4-linux-amd64.tar.gz`, 18,014,603 bytes,
+SHA256 `759c656fbd9c11e6a47784ecbeac6ad1eb16a9e76d202e51163ab78504848862`,
+and selected binary 60,182,712 bytes,
+SHA256 `ea22096683b9b61005584501e36168a1eadc5b6883a89df299f5a55e4e2dd283`.
+Trust is checksum-only against these source pins. GPG signature verification and
+upstream-build provenance remain unverified. Exact layout comes from the
+[bounded artifact inspection](https://github.com/afewell-hh/labapp/issues/332#issuecomment-6528657450):
+ordered `linux-amd64/` (directory, 0 bytes), `linux-amd64/LICENSE` (regular,
+11,373), `linux-amd64/README.md` (regular, 3,699), `linux-amd64/helm` (regular,
+60,182,712). The exact accepted archive modes are 0755/0644/0644/0755; baseline installed
+path, owner and mode equivalence are unknown.
+
+The entire compressed size/hash is checked through one no-follow single-link
+regular-file descriptor before physical tar parsing. The same descriptor is
+rewound; input identity is checked again after parsing. A Helm-only streaming
+512-byte parser checks checksums, exact names/order/types/sizes/modes, empty link and
+prefix fields, GNU ustar magic, zero member padding and at least two zero end
+blocks with an entirely zero block-aligned final tail. Extensions (PAX/GNU
+long-name/sparse), links, special files, duplicates, extra/missing members and
+traversal are refused by this exact physical contract. Expanded bytes, including
+headers, padding and tail, are capped at 70 MiB (observed archive 60,211,200 bytes).
+The single gzip stream must reach CRC-validated EOF without concatenation or
+trailing compressed bytes. Only the selected member is streamed to disk and
+size/hash verified; no extract/extractall or binary invocation occurs.
+
+`DIR/helm` absent installs with a no-clobber link from a private stage. Exact
+0755 pinned bytes return `unchanged` without consulting archive or curl. Matching
+bytes with another mode use verified staged replacement (`mode-repaired`);
+different bytes are refused, with no force/upgrade/latest fallback. Symlinks,
+hardlinks, special files and non-caller-owned targets are refused. Every directory
+component must be real; only the final directory's ownership and group/world
+writability are checked. Callers must trust and keep quiescent the interpreter,
+module/helper directory, curl, archive input, destination and ancestors. Observed
+target identity is checked immediately before replacement; absence publication
+is no-clobber. These checks do not defeat hostile concurrent writers. Failure
+before publication preserves prior bytes; there is no rollback after publication
+or power-loss durability promise. Directory fsync is best-effort.
+
+Curl starts with `--disable`, HTTPS-only initial/redirect protocols, no retries,
+fixed absolute paths, cwd `/`, stdin `/dev/null` and only PATH=/usr/bin:/bin and
+LC_ALL=C. Transfer/child/total budgets are 120/125/180 seconds, initial finite
+assumptions rather than measured fit; combined child output is capped at 1 MiB,
+and child process groups are killed/reaped on failures/cancellation. The owned
+stage is checked by directory identity; only its known regular archive/binary
+children are removed. Unknown children and changed types are preserved and fail
+cleanup. Cleanup errors preserve the primary failure; after publication they
+prevent success. SIGTERM maps to a cleanup-capable interruption; SIGKILL cannot
+promise cleanup.
+
+One JSON line of at most 4096 UTF-8 bytes binds source/member pins, module/helper
+hashes, observed target identity/hash/mode and status; it states unverified GPG,
+provenance, redirect chain, runtime and baseline metadata equivalence. No receipt
+file, config, cluster, credentials, cloud-init or Packer integration is created.
+The required CI step discovers `test_install_helm.py` with a zero-test guard,
+private 0700 HOME/TMP, env-i, Python -I -B and umask022, and removes only its exact
+empty outer directories with checked absence while preserving any primary code.
+Synthetic tests exercise actual install/parser/CLI and bounded fake children;
+they do not establish native download/install/runtime or image equivalence.

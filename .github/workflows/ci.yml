@@ -219,6 +219,67 @@ jobs:
         run: python3 -m unittest discover -s build/provision -p test_component_prerequisites.py -v
       - name: Installer integrity and preservation regressions
         run: python3 -m unittest discover -s build/provision -p test_install_hhfab.py -v
+      - name: Required Helm installer offline regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/provision/test_install_helm.py
+          test_root=$(mktemp -d /tmp/labapp-helm-tests.XXXXXX)
+          root_identity=$(stat -c %d:%i:%u:%a -- "$test_root")
+          home_identity=uncreated
+          tmp_identity=uncreated
+          cleanup_helm_tests() {
+            primary=$?
+            trap - EXIT
+            cleanup=0
+            for owned in "$test_root/tmp" "$test_root/home" "$test_root"; do
+              case "$owned" in
+                "$test_root") expected=$root_identity ;;
+                "$test_root/home") expected=$home_identity ;;
+                "$test_root/tmp") expected=$tmp_identity ;;
+              esac
+              if [[ -d "$owned" && ! -L "$owned" && $(stat -c %d:%i:%u:%a -- "$owned") == "$expected" ]]; then
+                rmdir -- "$owned" || cleanup=1
+              else
+                cleanup=1
+              fi
+              if [[ -e "$owned" || -L "$owned" ]]; then
+                cleanup=1
+              else
+                printf 'Helm test cleanup absent: %s\n' "$owned"
+              fi
+            done
+            if (( primary != 0 )); then exit "$primary"; fi
+            exit "$cleanup"
+          }
+          trap cleanup_helm_tests EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          mkdir -m 700 "$test_root/home" "$test_root/tmp"
+          home_identity=$(stat -c %d:%i:%u:%a -- "$test_root/home")
+          tmp_identity=$(stat -c %d:%i:%u:%a -- "$test_root/tmp")
+          umask 022
+          env -i HOME="$test_root/home" TMPDIR="$test_root/tmp" PATH=/usr/bin:/bin python3 -I -B - <<'PY'
+          import os
+          import stat
+          import sys
+          import unittest
+          def audit(event, args):
+              if event.startswith('socket.'):
+                  raise RuntimeError('offline suite socket operation denied')
+          sys.addaudithook(audit)
+          print({'python': sys.version, 'uid': os.getuid(),
+                 'home_mode': oct(stat.S_IMODE(os.stat(os.environ['HOME']).st_mode)),
+                 'tmp_mode': oct(stat.S_IMODE(os.stat(os.environ['TMPDIR']).st_mode))}, flush=True)
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_install_helm.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required Helm suite discovered no tests')
+          print(f'Required Helm tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
       - name: Required kubectl installer offline regressions
         run: |
           test -f build/provision/test_install_kubectl.py
