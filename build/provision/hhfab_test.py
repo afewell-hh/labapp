@@ -151,6 +151,47 @@ def no_switch_smoke(cli, init, validate, case):
     return summary
 
 
+def config_import_smoke(cli, validate, source, case, wiring, binary):
+    """Import only the generated public 0.43.1 candidate, never original inputs."""
+    require(case.is_dir() and not case.is_symlink() and not list(case.iterdir())
+            and case != source, "config import requires fresh owned empty case")
+    pin = PINS["0.43.1"]
+
+    def tool_identity():
+        require(binary.is_file() and not binary.is_symlink()
+                and binary.stat().st_size == pin[2] and digest(binary) == pin[3],
+                "config import binary identity mismatch")
+
+    def fixture_identity(directory):
+        require({p.name for p in directory.iterdir()} == {"fab.yaml", ".registry.yaml", "include", "result"}
+                and (directory / "include").is_dir() and (directory / "result").is_dir(),
+                "config import fixture outputs mismatch")
+        require({p.name for p in (directory / "include").iterdir()} == {"wiringd.yaml"}
+                and not list((directory / "result").iterdir()), "config import fixture contents mismatch")
+        return tree_hashes(directory)
+
+    tool_identity()
+    check_wiring(wiring)
+    before = fixture_identity(source)
+    require(before["include/wiringd.yaml"] == WIRING_SHA, "config import source wiring mismatch")
+    require(cli("init", case, ["--config", str(source / "fab.yaml"),
+                              "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog",
+                              "--wiring", str(wiring)])[0] == 0, "official config import refused")
+
+    def preserved():
+        require(fixture_identity(source) == before, "config import changed source fixture")
+        require(fixture_identity(case) == before, "config import changed candidate bytes or objects")
+        check_wiring(wiring)
+        tool_identity()
+
+    preserved()
+    require(validate(case)[0] == 0, "official validate refused imported config")
+    preserved()
+    require(validate(case)[0] == 0, "official imported config validation rerun refused")
+    preserved()
+    return {"scope": "generated-public-candidate-only", "tree_sha256": before}
+
+
 def lane(version):
     import yaml
     require(hasattr(yaml, "CSafeLoader"), "distribution CSafeLoader unavailable")
@@ -206,6 +247,12 @@ def lane(version):
     checks.append("deterministic-fresh-text")
     good = case
     good_hashes = tree_hashes(good)
+    imported = None
+    if version == "0.43.1":
+        imported = config_import_smoke(cli, validate, good,
+                                      Path(tempfile.mkdtemp(prefix="import-", dir="/work")),
+                                      Path("/suite/wiringd.yaml"), binary)
+        checks.append("public-config-import-preserved-and-revalidated")
     negatives = {
         "malformed-yaml": b"kind: [\n",
         "unsupported-gvk": b"apiVersion: unsupported.example/v1\nkind: Surprise\nmetadata: {name: bad}\n",
@@ -260,8 +307,12 @@ def lane(version):
     require(all(set(v) == {"cpu", "ram", "disk"} and all(type(n) is int and 0 < n < 65536 for n in v.values())
                 for v in SIZES.values()), "invalid separate sizing fixture")
     checks.append("sizing-fixture-only")
-    print(json.dumps({"schema": 1, "version": version, "status": "passed", "checks": checks,
-                      "fresh_runs": summaries, "no_switch": no_switch, "sizing_scope": "fixture-only; not upstream VLAB validation"}, sort_keys=True))
+    report = {"schema": 1, "version": version, "status": "passed", "checks": checks,
+              "fresh_runs": summaries, "no_switch": no_switch,
+              "sizing_scope": "fixture-only; not upstream VLAB validation"}
+    if imported is not None:
+        report["config_import"] = imported
+    print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":
