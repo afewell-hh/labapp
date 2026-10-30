@@ -120,6 +120,131 @@ except KeyboardInterrupt:
         self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
 
 
+class CommandDiagnosticTests(unittest.TestCase):
+    """Actual call/transaction boundaries; only synthetic failures or tiny Python children."""
+    STAGES = ('update', 'pre-check', 'simulate', 'install', 'post-check')
+
+    def setUp(self):
+        self.module = runpy.run_path(str(INSTALL))
+        self.globals = self.module['call'].__globals__
+
+    def test_bounded_refusal_labels_are_fixed_and_preserve_reason(self):
+        for executable, label in (
+                ('/usr/bin/apt-get', 'apt-get'), ('/usr/bin/dpkg', 'dpkg'),
+                ('/usr/bin/dpkg-query', 'dpkg-query'), ('/usr/bin/apt-mark', 'apt-mark'),
+                ('/usr/bin/apt-config', 'apt-config'), ('/usr/bin/gpgv', 'gpgv'),
+                ('/private/secret-command', 'other')):
+            for reason in ('command output overflow', 'command timeout', 'overall deadline exceeded'):
+                args = [executable, '/private/secret-argument', 'token=secret']
+                with self.subTest(executable=executable, reason=reason), \
+                     patch.dict(self.globals, {'bounded': Mock(side_effect=Refusal(reason))}):
+                    with self.assertRaises(Refusal) as caught:
+                        self.module['call'](args, 7)
+                    self.assertEqual(str(caught.exception), f'command={label}: {reason}')
+                    self.globals['bounded'].assert_called_once_with(args, 7, env=self.module['ENV'])
+
+    def test_unknown_bounded_refusal_does_not_export_exception_text(self):
+        with patch.dict(self.globals, {'bounded': Mock(side_effect=Refusal('secret-token sentinel\n/private/path'))}):
+            with self.assertRaises(Refusal) as caught:
+                self.module['call'](['/private/secret-command', 'token=secret'])
+        self.assertEqual(str(caught.exception), 'command=other: command refused')
+
+    def test_returned_nonzero_keeps_existing_bounded_tail_and_code(self):
+        output = b'x' * 5000 + b'fixed failure'
+        with patch.dict(self.globals, {'bounded': Mock(return_value=(100, output))}):
+            with self.assertRaises(Refusal) as caught:
+                self.module['call'](['/usr/bin/apt-get', 'check'])
+        self.assertEqual(str(caught.exception),
+                         f"command failed: apt-get code=100 output_tail={output[-4096:]!r}")
+
+    def test_every_transaction_stage_keeps_refusal_and_stops_later_work(self):
+        for failing, stage in enumerate(self.STAGES):
+            for reason in ('command output overflow', 'command timeout'):
+                calls = []
+                def bounded_call(args, seconds, env=None):
+                    calls.append(args)
+                    self.assertEqual(seconds, 180)
+                    self.assertIs(env, self.module['ENV'])
+                    if len(calls) == failing + 1:
+                        raise Refusal(reason)
+                    return 0, b''
+                with self.subTest(stage=stage, reason=reason), \
+                     tempfile.TemporaryDirectory() as directory, \
+                     patch.dict(self.globals, {'bounded': bounded_call,
+                                              'installed': Mock(side_effect=AssertionError('later inventory')),
+                                              'verify_tools': Mock(side_effect=AssertionError('later verification'))}), \
+                     patch('time.monotonic', return_value=10):
+                    with self.assertRaises(Refusal) as caught:
+                        self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], 10,
+                                                    {}, None, None, None)
+                    self.assertEqual(str(caught.exception), f'stage={stage}: command=apt-get: {reason}')
+                    expected = [
+                        ['/usr/bin/apt-get', '-o', 'APT::Update::Error-Mode=any', 'update'],
+                        ['/usr/bin/apt-get', 'check'],
+                        ['/usr/bin/apt-get', '--simulate', '--no-remove', '--no-install-recommends',
+                         'install', *[name + '=' + version for name, version in self.module['PINS'].items()]],
+                        ['/usr/bin/apt-get', '--yes', '--no-remove', '--no-install-recommends',
+                         'install', *[name + '=' + version for name, version in self.module['PINS'].items()]],
+                        ['/usr/bin/apt-get', 'check'],
+                    ]
+                    self.assertEqual(calls, expected[:failing + 1])
+
+    def test_transaction_nonzero_retains_stage_and_native_failure(self):
+        calls = []
+        def native(args, seconds, env=None):
+            calls.append(args)
+            return (100, b'fixed native failure') if args[-1] == 'check' else (0, b'')
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(self.globals, {'bounded': native}), patch('time.monotonic', return_value=10):
+            with self.assertRaises(Refusal) as caught:
+                self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], 10, {}, None, None, None)
+        self.assertEqual(str(caught.exception),
+                         "stage=pre-check: command failed: apt-get code=100 output_tail=b'fixed native failure'")
+        self.assertEqual([args[-1] for args in calls], ['update', 'check'])
+
+    def test_deadline_has_stage_without_starting_child(self):
+        forbidden = Mock(side_effect=AssertionError('child after deadline'))
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(self.globals, {'bounded': forbidden}), patch('time.monotonic', return_value=211):
+            with self.assertRaisesRegex(Refusal, '^stage=update: installation deadline exceeded$'):
+                self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], 0, {}, None, None, None)
+        forbidden.assert_not_called()
+
+    def test_interrupt_is_same_exception_and_stops_transaction(self):
+        interrupted = KeyboardInterrupt()
+        child = Mock(side_effect=interrupted)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(self.globals, {'bounded': child}), patch('time.monotonic', return_value=10):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], 10, {}, None, None, None)
+        self.assertIs(caught.exception, interrupted)
+        child.assert_called_once()
+
+    def test_bounded_failure_unwinds_install_workspace_and_environment(self):
+        before = set(Path('/var/tmp').glob('labapp-qemu-*'))
+        environment = dict(self.module['ENV'])
+        with patch.dict(self.globals, {'preflight': lambda: {},
+                                      'bounded': Mock(side_effect=Refusal('command output overflow'))}):
+            with self.assertRaisesRegex(Refusal, '^stage=update: command=apt-get: command output overflow$'):
+                self.module['install']()
+        self.assertEqual(self.module['ENV'], environment)
+        self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
+
+    def test_actual_bounded_timeout_and_default_output_cap_reap_children(self):
+        for action, seconds, reason in (
+                ('time.sleep(10)', .3, 'command timeout'),
+                ('os.write(1, b"x" * (2 * 1024 * 1024)); time.sleep(10)', 2, 'command output overflow')):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                pidfile = Path(directory) / 'pid'
+                program = ('import os,time; from pathlib import Path; '
+                           f'Path({str(pidfile)!r}).write_text(str(os.getpid())); {action}')
+                with self.assertRaises(Refusal) as caught:
+                    self.module['call']([sys.executable, '-c', program], seconds)
+                self.assertEqual(str(caught.exception), f'command=other: {reason}')
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pidfile.read_text()), 0)
+
+
 class WitnessTests(unittest.TestCase):
     def test_fixture_and_invalid_nonce(self):
         data, expected = witness.fixture('a' * 32)

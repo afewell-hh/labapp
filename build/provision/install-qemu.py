@@ -27,7 +27,19 @@ ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
 
 
 def call(args, seconds=10):
-    code, out = bounded(args, seconds, env=ENV)
+    # Labels are public constants, never command arguments, paths or child output.
+    command = {
+        '/usr/bin/apt-get': 'apt-get', '/usr/bin/dpkg': 'dpkg',
+        '/usr/bin/dpkg-query': 'dpkg-query', '/usr/bin/apt-mark': 'apt-mark',
+        '/usr/bin/apt-config': 'apt-config', '/usr/bin/gpgv': 'gpgv',
+    }.get(args[0], 'other')
+    try:
+        code, out = bounded(args, seconds, env=ENV)
+    except Refusal as exc:
+        reason = str(exc)
+        if reason not in ('command timeout', 'command output overflow', 'overall deadline exceeded'):
+            reason = 'command refused'
+        raise Refusal(f"command={command}: {reason}") from None
     if code:
         raise Refusal(f"command failed: {Path(args[0]).name} code={code!r} output_tail={out[-4096:]!r}")
     return out
@@ -106,14 +118,17 @@ def install(bundle=None, receipt_sha=None, base=None):
 
 
 def _transaction(root, apt, started, before, bundle, receipt_sha, base):
-    def run(args):
+    def run(stage, args):
         remaining = 210 - (time.monotonic() - started)
         if remaining <= 0:
-            raise Refusal("installation deadline exceeded")
-        return call(args, min(180, remaining))
+            raise Refusal(f"stage={stage}: installation deadline exceeded")
+        try:
+            return call(args, min(180, remaining))
+        except Refusal as exc:
+            raise Refusal(f"stage={stage}: {exc}") from None
     expected_state = None
     if bundle is None:
-        run([*apt, "-o", "APT::Update::Error-Mode=any", "update"])
+        run('update', [*apt, "-o", "APT::Update::Error-Mode=any", "update"])
     else:
         expected_state = offline.receive(Path(bundle), receipt_sha, root, base, SNAPSHOT, PINS, call)
         apt = [*apt, '--no-download']
@@ -127,11 +142,11 @@ def _transaction(root, apt, started, before, bundle, receipt_sha, base):
                 ENV['APT_CONFIG'] = saved_config
     # dpkg audit can be clean despite configured-but-unsatisfied dependency
     # relations. Refuse that base before install can implicitly repair it.
-    run([*apt, "check"])
+    run('pre-check', [*apt, "check"])
     selected = [name + "=" + version for name, version in PINS.items()]
     # --no-remove and no downgrade/hold override remain active for simulation
     # and actual transaction. Standard signed Release/index/deb verification.
-    run([*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
+    run('simulate', [*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
     if bundle is None or not all(before.get(name) == version for name, version in PINS.items()):
         if expected_state is not None:
             saved_config = ENV.pop('APT_CONFIG')
@@ -140,8 +155,8 @@ def _transaction(root, apt, started, before, bundle, receipt_sha, base):
                     raise Refusal('target state drift immediately before transaction')
             finally:
                 ENV['APT_CONFIG'] = saved_config
-        run([*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
-    run([*apt, "check"])
+        run('install', [*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
+    run('post-check', [*apt, "check"])
     archives = [{"name": p.name, "bytes": p.stat().st_size, "sha256": digest(p)}
                 for p in sorted((root / "archives").glob("*.deb"))]
     after = installed()
