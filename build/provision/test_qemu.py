@@ -244,6 +244,55 @@ class CommandDiagnosticTests(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pidfile.read_text()), 0)
 
+    def test_actual_container_signature_callback_accepts_only_authentication_refusal(self):
+        # Run the maintained harness and installer transaction together. Stop at
+        # the inventory immediately after the signature assertion; never execute
+        # the later missing-pin, installation or held-package native fixtures.
+        class SignatureBoundaryReached(Exception):
+            pass
+        cases = (
+            ('signature', (100, RetryPolicyAndEvidenceTests.NO_PUBKEY), SignatureBoundaryReached, ''),
+            ('transport', (100, b'503 Service Unavailable'), AssertionError, 'transport-only'),
+            ('unclassified', (100, b'unrelated error'), AssertionError, 'unclassified'),
+            ('succeeded', (0, RetryPolicyAndEvidenceTests.NO_PUBKEY), AssertionError, 'succeeded'),
+            ('timeout', Refusal('command timeout'), AssertionError, ''),
+        )
+        for name, outcome, exception, reason in cases:
+            with self.subTest(name=name):
+                owned = []
+                original_call = self.globals['call']
+                inventory = Mock(side_effect=[{}, SignatureBoundaryReached()])
+                def native_update(args, seconds, env=None):
+                    self.assertEqual(args[0], '/usr/bin/apt-get')
+                    self.assertEqual(args[-1], 'update')
+                    self.assertIn('APT::Update::Error-Mode=any', args)
+                    self.assertIs(env, self.module['ENV'])
+                    source = Path(next(arg.split('=', 1)[1] for arg in args
+                                       if arg.startswith('Dir::Etc::sourcelist=')))
+                    text = source.read_text()
+                    self.assertNotIn('/usr/share/keyrings/ubuntu-archive-keyring.gpg', text)
+                    key = Path(text.split('[signed-by=', 1)[1].split(']', 1)[0])
+                    self.assertEqual(key.read_bytes(), b'')
+                    owned.extend((source.parent, key.parent))
+                    if isinstance(outcome, Refusal):
+                        raise outcome
+                    return outcome
+                with patch.dict(self.globals, {'preflight': lambda: {}, 'installed': inventory}), \
+                     patch.dict(self.module, {'installed': inventory}), \
+                     patch.object(container, 'transport', return_value={}), \
+                     patch.object(container.runpy, 'run_path', return_value=self.module), \
+                     patch.object(container, 'bounded', side_effect=native_update) as native, \
+                     patch.object(Path, 'rglob', return_value=[]):
+                    with self.assertRaisesRegex(exception, reason):
+                        container.install()
+                    self.assertIs(self.globals['call'], original_call)
+                    self.assertEqual(inventory.call_count, 2 if name == 'signature' else 1)
+                    native.assert_called_once()
+                self.assertEqual(len(owned), 2)
+                for path in owned:
+                    self.assertFalse(path.exists())
+                    self.assertFalse(path.is_symlink())
+
 
 class WitnessTests(unittest.TestCase):
     def test_fixture_and_invalid_nonce(self):

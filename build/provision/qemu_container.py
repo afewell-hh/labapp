@@ -241,7 +241,7 @@ def install():
         try:
             module['install']()
         except Refusal as exc:
-            assert str(exc) == 'actual signature refusal'
+            assert str(exc) == 'stage=update: actual signature refusal'
         else:
             raise AssertionError('untrusted signature accepted')
         finally:
