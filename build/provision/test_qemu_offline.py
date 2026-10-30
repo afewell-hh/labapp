@@ -217,6 +217,10 @@ class SelectionTests(unittest.TestCase):
                 for value in bad:
                     with self.subTest(selected=selected, value=value), self.assertRaises(Refusal):
                         protocol.check_state(value, protocol.BASE, selected)
+                for key in good:
+                    value = dict(good); del value[key]
+                    with self.subTest(missing=key), self.assertRaises(Refusal):
+                        protocol.check_state(value, protocol.BASE, selected)
 
     def test_actual_capture_binds_selected_descriptor_and_fingerprint(self):
         for selected in (protocol.TEST, protocol.BASELINE):
@@ -231,10 +235,6 @@ class SelectionTests(unittest.TestCase):
                 state = protocol.capture(call, protocol.BASE, selected)
                 self.assertEqual({key:state[key] for key in ('selection','snapshot','pins')}, protocol.selection(selected))
                 self.assertEqual(protocol.check_state(state, protocol.BASE, selected), b'fixture installed status')
-                for key in good:
-                    value = dict(good); del value[key]
-                    with self.subTest(missing=key), self.assertRaises(Refusal):
-                        protocol.check_state(value, protocol.BASE, selected)
 
     def test_selected_signature_set_and_actual_gpg_failure(self):
         for selected in (protocol.TEST, protocol.BASELINE):
