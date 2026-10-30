@@ -608,12 +608,31 @@ unknown bounded-refusal text is withheld. The unchanged combined-output cap is
 These diagnostics locate a new observed failure; they cannot reconstruct the
 stage or cause of earlier failures or prove installation/runtime success.
 
+### Explicit historical QEMU selection
+
+The no-option default and explicit `--selection test-20261024` retain the four
+TEST pins above. `--selection baseline-20260114` instead requests ONLY the two
+observed `qemu-system-x86` and `qemu-utils` versions
+`1:8.2.2+ds-0ubuntu1.11`, using `20260114T000000Z`. These are the only two
+source-defined selections; unknown names refuse before preflight/workspace/APT.
+There are no arbitrary package, mirror, date, environment or profile overrides.
+
+Historical success verifies exact versions plus regular nonsymlink
+`/usr/bin/qemu-system-x86_64` and `/usr/bin/qemu-img` against installed dpkg
+md5sums. It does not require invented original socat/SeaBIOS pins or reuse the
+TEST member hashes. Native signed APT authenticates acquired packages; dpkg
+md5sums detect installed-payload drift. Dependency versions are target-specific
+observations in the full installed map, not recovered original companion pins.
+This partial QEMU contract does not certify firmware, socat, KVM, VLAB or image
+equivalence. The unchanged `qemu_witness.py` still requires TEST .18 and its
+firmware hashes; historical .11 must refuse before launching QEMU.
+
 The explicit disconnected path uses the **same installer** and fixed selection:
 
 ```bash
 # On the actual disposable target, before other package/policy changes:
 sudo python3 build/provision/install-qemu.py --capture-state /tmp/qemu-state.json \
-  --base-id gce-image:IMMUTABLE_IMAGE_ID
+  --base-id gce-image:IMMUTABLE_IMAGE_ID --selection baseline-20260114
 # Trusted lead copies that private data to the trusted acquisition host:
 timeout --kill-after=30s 9m bash build/provision/prepare-qemu-offline.sh \
   /private/qemu-state.json /private/new-qemu-bundle
@@ -621,8 +640,18 @@ timeout --kill-after=30s 9m bash build/provision/prepare-qemu-offline.sh \
 # On the same target after authenticated transfer:
 sudo timeout --kill-after=3s 240s python3 build/provision/install-qemu.py \
   --offline /private/new-qemu-bundle --receipt-sha256 EXPECTED_SHA256 \
-  --base-id gce-image:IMMUTABLE_IMAGE_ID
+  --base-id gce-image:IMMUTABLE_IMAGE_ID --selection baseline-20260114
 ```
+
+Use the same explicit selection for capture and installation. The two-argument
+acquisition launcher reads the validated captured selection; it has no independent
+selection override. State/bundle v2 bind exact selection/snapshot/pins, immutable
+base, source (installer, protocol, bounded helper, acquisition module and launcher),
+keyring, status and policy. Nested descriptors/types are checked against source;
+received fields never become executable policy. Old v1 or source-mismatched
+captures/bundles refuse and are never rewritten or migrated. Capture fresh state
+from the actual target after source changes. No new freshness grace or expiry
+bypass is introduced: date/Valid-Until checks and all existing budgets remain.
 
 The immutable base identifier is **caller attested**, not a guest proof of GCE
 identity. The trusted lead must verify the actual lease/instance/disk-image
@@ -710,7 +739,21 @@ python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
 # before any public snapshot request, then strict signature/missing-pin checks.
 timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
+# Separate lead scope required; not activated by ordinary CI:
+timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh --selection baseline-20260114
 ```
+
+The existing offline harness passes the digest printed at the trusted acquisition
+boundary into the disconnected target independently of the copied bundle. The
+target requires that digest and never derives its expected value from its receipt.
+Explicit historical selection propagates through actual capture, receive and CLI
+calls, and omits ONLY the TEST runtime witness. Default ordinary CI remains TEST
+with its witness. Source/fake qualification is not an authenticated historical
+acquisition or install result; the later single bounded native trial needs separate
+lead scope, actual measured stage outcomes and audited cleanup. Existing shell
+traps do not establish independent host-workdir absence or hard-cancellation cleanup.
+Both offline launcher finish traps preserve a primary nonzero exit when cleanup
+also fails, including 124/130/143; cleanup-only failure prevents success.
 
 Ordinary HTTP/digest refusals require a native integer nonzero exit and the
 expected bounded status evidence. A supervisor timeout or output overflow is a

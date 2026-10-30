@@ -19,10 +19,13 @@ def acquire():
     print('QEMU acquisition stage: validate-state', flush=True)
     module = runpy.run_path('/suite/install-qemu.py')
     state = protocol.load(Path('/target-state.json'))
-    status = protocol.check_state(state, state['base'])
+    if not isinstance(state, dict):
+        raise Refusal('target state mapping required')
+    descriptor = protocol.selection(state.get('selection'))
+    status = protocol.check_state(state, state.get('base'), descriptor['selection'])
     root = Path('/work/bundle')
     root.mkdir(mode=0o755)
-    apt, config = protocol.setup(root, module['SNAPSHOT'])
+    apt, config = protocol.setup(root, descriptor['snapshot'])
     module['ENV']['APT_CONFIG'] = config
     copied_status = root / 'status'
     copied_status.write_bytes(status)
@@ -37,20 +40,19 @@ def acquire():
     call([*apt, '-o', 'APT::Update::Error-Mode=any', 'update'], 180)
     print('QEMU acquisition stage: dependency-check', flush=True)
     call([*apt, 'check'], 30)
-    selected = [name + '=' + version for name, version in module['PINS'].items()]
+    selected = [name + '=' + version for name, version in descriptor['pins'].items()]
     call([*apt, '--simulate', '--no-remove', '--no-install-recommends', 'install', *selected], 30)
     print('QEMU acquisition stage: download', flush=True)
     call([*apt, '--download-only', '--yes', '--no-remove', '--no-install-recommends', 'install', *selected], 180)
     print('QEMU acquisition stage: signatures-inventory', flush=True)
-    protocol.signatures(root, call)
+    protocol.signatures(root, call, descriptor['selection'])
     files = protocol.inventory(root)
     # Export only data. No config/status working files are accepted in a bundle.
     for name in ('status', 'fixed.conf', 'sources.list'):
         (root / name).unlink()
     for name in ('parts', 'preferences'):
         (root / name).rmdir()
-    receipt = {'format': 'labapp-qemu-bundle-v1', 'snapshot': module['SNAPSHOT'],
-               'pins': module['PINS'], 'state': state, 'files': files}
+    receipt = {'format': 'labapp-qemu-bundle-v2', **descriptor, 'state': state, 'files': files}
     (root / 'receipt.json').write_bytes(protocol.encoded(receipt))
     # tmpfs disappears when Docker stops the container. Export only this already
     # validated bounded data tree to the owned writable layer before exit.
