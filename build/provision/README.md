@@ -245,6 +245,30 @@ objects/output, native refusal propagation and rerun preservation. These tests
 prove neither systemd/Docker/KVM,
 image boot/reboot, a live fabric, telemetry/GitOps nor student acceptance.
 
+The 0.43.1 lane additionally imports its generated public `fab.yaml` into a
+separate new empty directory using `init --config PATH`, explicit
+`ghcr.io/githedgehog` registry and unchanged canonical `--wiring`. It checks
+exact FAB, registry and wiring bytes plus expected output directories before
+native validation, after validation and after an unchanged validation rerun.
+The first fixture and pinned binary must stay unchanged throughout; unexpected,
+missing or symlinked outputs fail. Each CLI or preservation refusal stops before
+the next command. The existing bounded executor and launcher own cancellation
+and cleanup; no extra deadline, acquisition or retry is introduced. The 0.50.4
+lane is unchanged. Only hashes and a `generated-public-candidate-only` scope
+appear in the report. These public development inputs do not recover original
+Fabric values or prove baseline/runtime equivalence. The maintained synthetic
+suite exercises this actual helper's command binding, preservation, native
+refusals, source/tool mutation and occupied-destination refusal without executing
+hhfab; its existing required CI invocation includes these cases.
+
+Import source, accessed 2026-10-30: exact
+[0.43.1 configuration](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/cmdconfig.go)
+reads and validates imported FAB/wiring, then writes those original bytes without
+serialization; `validate` loads/hydrates in memory. The
+[0.43.1 CLI](https://github.com/githedgehog/fabricator/blob/v0.43.1/cmd/hhfab/main.go)
+binds `--config` to `ImportConfig`. No `--force`, regeneration or runtime command
+is used for import.
+
 Primary sources, accessed 2026-10-25: official versioned
 [0.43.1 CLI](https://github.com/githedgehog/fabricator/blob/v0.43.1/cmd/hhfab/main.go),
 [configuration](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/cmdconfig.go),

@@ -231,6 +231,122 @@ class NoSwitchSmokeTests(unittest.TestCase):
                 self.assertNotIn("private diagnostic", str(result))
 
 
+class ConfigImportTests(unittest.TestCase):
+    """Run the maintained import helper and CLI binding with a nonexecuting spy."""
+    def run_import(self, failure=None, mutation=None, occupied=False):
+        from unittest.mock import patch
+        calls = []
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source, case = root / "source", root / "import"
+            source.mkdir()
+            case.mkdir()
+            (source / "include").mkdir()
+            (source / "result").mkdir()
+            (source / "fab.yaml").write_bytes(NoSwitchSmokeTests.FABRIC)
+            (source / ".registry.yaml").write_bytes(b"prefix: githedgehog\nrepo: ghcr.io\n")
+            wiring = Path(__file__).resolve().parents[2] / "wiringd.yaml"
+            (source / "include/wiringd.yaml").write_bytes(wiring.read_bytes())
+            binary = root / "verified-binary"
+            binary.write_bytes(b"synthetic binary, never executed")
+            pin = (0, "unused", binary.stat().st_size, subject.digest(binary))
+            if occupied:
+                (case / "foreign").write_bytes(b"preserve")
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(root / "home")}
+            cache = root / "cache"
+
+            def bounded(argv, seconds, env=None):
+                calls.append((argv, seconds, env))
+                stage = ("init", "validate", "rerun")[len(calls) - 1]
+                if failure == stage:
+                    return 1, b"private diagnostic must not escape"
+                if stage == "init":
+                    for path in ("include", "result"):
+                        (case / path).mkdir()
+                    for path in ("fab.yaml", ".registry.yaml", "include/wiringd.yaml"):
+                        (case / path).write_bytes((source / path).read_bytes())
+                if mutation and mutation[0] == stage:
+                    target, action = mutation[1:]
+                    if target == "binary":
+                        binary.write_bytes(b"replaced")
+                    elif target.startswith("source/"):
+                        (source / target.removeprefix("source/")).write_bytes(b"changed")
+                    elif action == "extra-dir":
+                        (case / target).mkdir()
+                    elif action == "remove":
+                        (case / target).unlink()
+                    elif action == "symlink":
+                        (case / target).unlink()
+                        (case / target).symlink_to(source / "fab.yaml")
+                    else:
+                        (case / target).write_bytes(b"changed")
+                return 0, b""
+
+            with patch.dict(subject.PINS, {"0.43.1": pin}), patch.object(subject, "bounded", side_effect=bounded), \
+                    patch.object(subject.time, "monotonic", return_value=10):
+                cli, _, validate = subject.fixture_cli(binary, cache, env, 25)
+                try:
+                    result = subject.config_import_smoke(cli, validate, source, case, wiring, binary)
+                except subject.Refusal as error:
+                    result = error
+            foreign = (case / "foreign").read_bytes() if occupied else None
+            return result, calls, source, case, wiring, binary, cache, env, foreign
+
+    def test_exact_import_and_two_validate_bindings_and_safe_report(self):
+        result, calls, source, case, wiring, binary, cache, env, _ = self.run_import()
+        tail = ["--workdir", str(case), "--cache-dir", str(cache)]
+        self.assertEqual([c[0] for c in calls], [
+            [str(binary), "init", *tail, "--config", str(source / "fab.yaml"),
+             "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog", "--wiring", str(wiring)],
+            [str(binary), "validate", *tail, "--hydrate-mode", "if-not-present"],
+            [str(binary), "validate", *tail, "--hydrate-mode", "if-not-present"]])
+        self.assertTrue(all(seconds == 15 and child_env is env for _, seconds, child_env in calls))
+        self.assertEqual(set(result), {"scope", "tree_sha256"})
+        self.assertEqual(result["scope"], "generated-public-candidate-only")
+        self.assertEqual(set(result["tree_sha256"]), {"fab.yaml", ".registry.yaml", "include/wiringd.yaml"})
+        self.assertEqual(result["tree_sha256"]["include/wiringd.yaml"], subject.WIRING_SHA)
+
+    def test_each_native_refusal_stops_before_later_command(self):
+        for stage, count in (("init", 1), ("validate", 2), ("rerun", 3)):
+            with self.subTest(stage=stage):
+                result, calls, *_ = self.run_import(failure=stage)
+                self.assertIsInstance(result, subject.Refusal)
+                self.assertEqual(len(calls), count)
+                self.assertNotIn("private diagnostic", str(result))
+
+    def test_import_byte_object_and_shape_changes_stop_before_validation(self):
+        for target, action in (("fab.yaml", "write"), ("include/wiringd.yaml", "write"),
+                               (".registry.yaml", "write"), ("fab.yaml", "remove"),
+                               ("include/extra.yaml", "write"), ("result/extra", "write"),
+                               ("unexpected", "extra-dir"), ("include/unexpected", "extra-dir"),
+                               ("fab.yaml", "symlink")):
+            with self.subTest(target=target, action=action):
+                result, calls, *_ = self.run_import(mutation=("init", target, action))
+                self.assertIsInstance(result, subject.Refusal)
+                self.assertEqual(len(calls), 1)
+
+    def test_validation_and_rerun_mutations_are_failures(self):
+        for stage, count in (("validate", 2), ("rerun", 3)):
+            for target in ("fab.yaml", "include/wiringd.yaml", "source/fab.yaml", "binary"):
+                with self.subTest(stage=stage, target=target):
+                    result, calls, *_ = self.run_import(mutation=(stage, target, "write"))
+                    self.assertIsInstance(result, subject.Refusal)
+                    self.assertEqual(len(calls), count)
+
+    def test_import_must_not_mutate_first_fixture_or_verified_tool(self):
+        for target in ("source/fab.yaml", "source/include/wiringd.yaml", "binary"):
+            with self.subTest(target=target):
+                result, calls, *_ = self.run_import(mutation=("init", target, "write"))
+                self.assertIsInstance(result, subject.Refusal)
+                self.assertEqual(len(calls), 1)
+
+    def test_occupied_destination_preserved_without_any_child(self):
+        result, calls, *_, foreign = self.run_import(occupied=True)
+        self.assertIsInstance(result, subject.Refusal)
+        self.assertEqual(calls, [])
+        self.assertEqual(foreign, b"preserve")
+
+
 class OwnershipTests(ownership.CleanupTests):
     """Reuse established daemon model; synthetic runs prove ownership, not CLI."""
     def run_harness(self, mode):
