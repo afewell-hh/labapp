@@ -1197,7 +1197,15 @@ read/mutation interval**. This path therefore requires exclusive owner mutation
 of this new namespace; other workers and existing WIF identities must have no
 router authority. It cannot provide an atomic delete-by-ID guarantee. The
 helper persists an attempt before each mutation and the returned operation
-before polling. Lost responses stay unresolved and are never blindly retried;
+before polling. Each action has a distinct durable request UUID; the initial
+mutation response and every operation poll must return that exact UUID in
+`clientOperationId`, alongside matching immutable targetID, targetLink, owner,
+region and successful status. Missing, changed or cross-action UUIDs refuse
+progress. The PATCH operationType is only a bounded sanitized server label;
+the fixed endpoint and exact own UUID establish phase correlation, without
+guessing a verb label. DELETE retains its documented deletion type check.
+Manual INSERT capture is separate and does not assume a submitted client UUID.
+Lost responses stay unresolved and are never blindly retried;
 existing captured operations may be polled again without renewing any deadline.
 
 Each token child uses the existing bounded command/process-group cleanup;

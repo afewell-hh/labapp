@@ -297,19 +297,39 @@ class API:
         return self._request('DELETE', ROUTER + '?requestId=' + str(uuid.UUID(request_id)))
 
 
-def operation(value, router_id, kind):
+def attempt(state, filename):
+    value = state.read(filename, optional=True)
+    if value is None:
+        return None
+    require(type(value) is dict and set(value) == {'request_id'})
+    request_id = value['request_id']
+    require(type(request_id) is str and str(uuid.UUID(request_id)) == request_id
+            and uuid.UUID(request_id).int != 0)
+    return request_id
+
+
+def operation(value, router_id, kind, request_id=None):
     require(type(value) is dict and value.get('targetLink') == ROUTER
-            and value.get('targetId') == router_id and value.get('operationType') == kind
+            and value.get('targetId') == router_id
             and value.get('region') == REGION and value.get('user') == OWNER
             and value.get('status') in ('PENDING', 'RUNNING', 'DONE') and not value.get('error')
             and not value.get('httpErrorStatusCode'))
+    label = value.get('operationType')
+    require(type(label) is str and re.fullmatch('[a-zA-Z][a-zA-Z0-9_.-]{0,127}', label))
+    if kind == 'insert':
+        require(label == 'insert' and request_id is None)
+    else:
+        require(kind in ('patch', 'delete') and request_id is not None
+                and value.get('clientOperationId') == request_id)
+        if kind == 'delete':
+            require(label == 'delete')
     name(value['name'])
     return value['status'] == 'DONE'
 
 
-def terminal(api, value, router_id, kind):
+def terminal(api, value, router_id, kind, request_id=None):
     captured_name = value['name']
-    while not operation(value, router_id, kind):
+    while not operation(value, router_id, kind, request_id):
         api.check()
         time.sleep(1)
         value = api.operation(captured_name)
@@ -411,6 +431,10 @@ def cleanup(state, api):
     nat_config = state.read('nat.json', optional=True)
     nat_op = state.read('nat-operation.json', optional=True)
     delete_op = state.read('delete-operation.json', optional=True)
+    nat_request = attempt(state, 'nat-attempt.json')
+    delete_request = attempt(state, 'delete-attempt.json')
+    require(all(v != pending['request_id'] for v in (nat_request, delete_request) if v is not None)
+            and (nat_request is None or nat_request != delete_request), 'mutation UUIDs must be distinct')
     final_records = state.read('final-allocations.json', optional=True)
     if final_records is not None:
         require(type(final_records) is list and len(final_records) <= 64)
@@ -419,7 +443,7 @@ def cleanup(state, api):
         records = final_records
     if nat_op is not None:
         require(final_records is not None, 'captured PATCH allocation evidence unavailable')
-        nat_op = terminal(api, nat_op, captured['id'], 'patch')
+        nat_op = terminal(api, nat_op, captured['id'], 'patch', nat_request)
         router = api.router()  # A pending captured PATCH may remove NAT during polling.
     if router is not None:
         require(router_base(router, pending) == captured, 'router identity/config changed')
@@ -461,13 +485,15 @@ def cleanup(state, api):
                 state.write('final-allocations.json', records)
             # This is deliberately NOT an atomic ID/fingerprint precondition.
             request_id = str(uuid.uuid4())
+            require(request_id not in (pending['request_id'], delete_request))
             state.write('nat-attempt.json', {'request_id': request_id})
+            nat_request = request_id
             value = api.remove_nat(request_id)
             require(value is not None, 'NAT delete did not return operation')
             state.write('nat-operation.json', value)
-            nat_op = terminal(api, value, captured['id'], 'patch')
+            nat_op = terminal(api, value, captured['id'], 'patch', nat_request)
         if nat_op is not None:
-            terminal(api, nat_op, captured['id'], 'patch')
+            terminal(api, nat_op, captured['id'], 'patch', nat_request)
         empty = api.router()
         require(empty is not None and router_base(empty, pending) == captured
                 and not empty.get('nats'), 'NAT absence not confirmed')
@@ -476,7 +502,9 @@ def cleanup(state, api):
             require(state.read('delete-attempt.json', optional=True) is None, 'router attempt outcome unresolved')
             require(api.router() == empty, 'router changed before delete')
             request_id = str(uuid.uuid4())
+            require(request_id not in (pending['request_id'], nat_request))
             state.write('delete-attempt.json', {'request_id': request_id})
+            delete_request = request_id
             value = api.remove_router(request_id)
             require(value is not None, 'router delete did not return operation')
             state.write('delete-operation.json', value)
@@ -484,8 +512,8 @@ def cleanup(state, api):
     require(records is not None and delete_op is not None, 'cleanup terminal evidence unavailable')
     require(type(records) is list and len(records) <= 64)
     if nat_op is not None:
-        terminal(api, nat_op, captured['id'], 'patch')
-    terminal(api, delete_op, captured['id'], 'delete')
+        terminal(api, nat_op, captured['id'], 'patch', nat_request)
+    terminal(api, delete_op, captured['id'], 'delete', delete_request)
     require(api.router() is None, 'router404 not observed; successor or incomplete delete')
     for record in records:
         stored_allocation(record)

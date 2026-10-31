@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from build.gcp import trial_egress as e
+from build.gcp.prelogin.hook import Refused as FileRefused
 
 
 def pending():
@@ -31,9 +32,12 @@ def router(nat=False):
     return value
 
 
-def op(kind='insert', status='DONE'):
-    return {'name': 'operation-' + kind, 'targetLink': e.ROUTER, 'targetId': '123',
-            'operationType': kind, 'region': e.REGION, 'user': e.OWNER, 'status': status}
+def op(kind='insert', status='DONE', request_id=None, label=None):
+    value = {'name': 'operation-' + kind, 'targetLink': e.ROUTER, 'targetId': '123',
+             'operationType': label or kind, 'region': e.REGION, 'user': e.OWNER, 'status': status}
+    if request_id is not None:
+        value['clientOperationId'] = request_id
+    return value
 
 
 def address():
@@ -71,18 +75,18 @@ class FakeAPI:
     def operation(self, key):
         return deepcopy(self.ops[key])
 
-    def remove_nat(self, _request_id):
+    def remove_nat(self, request_id):
         self.calls.append('PATCH')
         self.value.pop('nats')
         self.allocated = False
-        self.ops['operation-patch'] = op('patch')
-        return op('patch')
+        self.ops['operation-patch'] = op('patch', request_id=request_id)
+        return op('patch', request_id=request_id)
 
-    def remove_router(self, _request_id):
+    def remove_router(self, request_id):
         self.calls.append('DELETE')
         self.value = None
-        self.ops['operation-delete'] = op('delete')
-        return op('delete')
+        self.ops['operation-delete'] = op('delete', request_id=request_id)
+        return op('delete', request_id=request_id)
 
 
 class Egress(unittest.TestCase):
@@ -242,7 +246,7 @@ class Egress(unittest.TestCase):
             submit(request_id)
             api.value = router(True)  # Submission accepted; NAT is still present.
             api.allocated = True
-            return op('patch', 'RUNNING')
+            return op('patch', 'RUNNING', request_id=request_id)
         api.remove_nat = pending_patch
         with patch.object(api, 'check', side_effect=e.Failure('interrupted', 143)):
             with self.assertRaises(e.Failure): e.cleanup(self.state, api)
@@ -252,7 +256,7 @@ class Egress(unittest.TestCase):
             self.assertEqual(operation_name, 'operation-patch')
             api.value.pop('nats', None)
             api.allocated = False
-            return op('patch')
+            return deepcopy(api.ops['operation-patch'])
         api.operation = finished
         with patch.object(e.time, 'sleep', return_value=None):
             e.cleanup(self.state, api)
@@ -273,6 +277,68 @@ class Egress(unittest.TestCase):
         for change in ({'targetId': '999'}, {'error': {'errors': [{}]}}, {'status': 'UNKNOWN'}, {'user': 'other'}):
             with self.assertRaises(e.Failure): e.operation({**op(), **change}, '123', 'insert')
 
+    def test_patch_server_label_uses_exact_durable_uuid_instead_of_guessed_verb(self):
+        self.owned()
+        api = FakeAPI()
+        submit = api.remove_nat
+        def server_label(request_id):
+            return {**submit(request_id), 'operationType': 'updateRouter'}
+        api.remove_nat = server_label
+        e.cleanup(self.state, api)
+        saved = self.state.read('nat-operation.json')
+        self.assertEqual(saved['operationType'], 'updateRouter')
+        self.assertEqual(saved['clientOperationId'], self.state.read('nat-attempt.json')['request_id'])
+        self.assertEqual(api.calls.count('DELETE'), 1)
+
+    def test_initial_missing_wrong_or_cross_action_uuid_refuses(self):
+        request_id = '22222222-2222-4222-8222-222222222222'
+        other_id = '33333333-3333-4333-8333-333333333333'
+        for kind in ('patch', 'delete'):
+            for returned in (None, other_id):
+                with self.assertRaises(e.Failure):
+                    e.operation(op(kind, request_id=returned), '123', kind, request_id)
+            self.assertTrue(e.operation(op(kind, request_id=request_id), '123', kind, request_id))
+        self.owned()
+        api = FakeAPI()
+        submit = api.remove_nat
+        def missing_nonce(request_id):
+            value = submit(request_id)
+            value.pop('clientOperationId')
+            return value
+        api.remove_nat = missing_nonce
+        with self.assertRaises(e.Failure): e.cleanup(self.state, api)
+        self.assertNotIn('DELETE', api.calls)
+
+    def test_changed_or_missing_poll_uuid_refuses_before_next_mutation(self):
+        request_id = '22222222-2222-4222-8222-222222222222'
+        for returned in (None, '33333333-3333-4333-8333-333333333333'):
+            api = Mock()
+            api.operation.return_value = op('patch', request_id=returned)
+            with patch.object(e.time, 'sleep', return_value=None):
+                with self.assertRaises(e.Failure):
+                    e.terminal(api, op('patch', 'RUNNING', request_id), '123', 'patch', request_id)
+            api.remove_router.assert_not_called()
+        self.owned()
+        api = FakeAPI()
+        submit = api.remove_nat
+        def pending_patch(request_id):
+            return {**submit(request_id), 'status': 'RUNNING'}
+        api.remove_nat = pending_patch
+        api.operation = lambda _: op('patch', request_id='33333333-3333-4333-8333-333333333333')
+        with patch.object(e.time, 'sleep', return_value=None):
+            with self.assertRaises(e.Failure): e.cleanup(self.state, api)
+        self.assertNotIn('DELETE', api.calls)
+
+    def test_reused_action_uuid_refuses_before_any_mutation(self):
+        self.owned()
+        request_id = '22222222-2222-4222-8222-222222222222'
+        self.state.write('nat-attempt.json', {'request_id': request_id})
+        self.state.write('delete-attempt.json', {'request_id': request_id})
+        api = FakeAPI()
+        with self.assertRaises(e.Failure): e.cleanup(self.state, api)
+        self.assertNotIn('PATCH', api.calls)
+        self.assertNotIn('DELETE', api.calls)
+
     def test_router404_without_terminal_delete_is_not_success(self):
         self.owned()
         api = FakeAPI()
@@ -282,9 +348,9 @@ class Egress(unittest.TestCase):
     def test_terminal_delete_successor_withholds_success(self):
         self.owned()
         api = FakeAPI(False)
-        def replacement(_request_id):
+        def replacement(request_id):
             api.value = {**router(), 'id': '999'}
-            return op('delete')
+            return op('delete', request_id=request_id)
         api.remove_router = replacement
         with self.assertRaises(e.Failure): e.cleanup(self.state, api)
 
@@ -305,14 +371,17 @@ class Egress(unittest.TestCase):
     def test_private_files_links_foreign_owner_and_duplicate_json_refuse(self):
         self.state.write('target.json', {'ok': True})
         os.link(self.directory / 'target.json', self.directory / 'hard.json')
-        with self.assertRaises(e.guest.Failure): self.state.read('hard.json')
+        with self.assertRaises(FileRefused): self.state.read('hard.json')
+        (self.directory / 'hard.json').unlink()
         (self.directory / 'soft.json').symlink_to(self.directory / 'target.json')
-        with self.assertRaises((e.guest.Failure, OSError)): self.state.read('soft.json')
+        with self.assertRaises(e.guest.Failure): self.state.read('soft.json')
         (self.directory / 'bad.json').write_bytes(b'{"x":1,"x":2}')
         (self.directory / 'bad.json').chmod(0o600)
         with self.assertRaises(e.guest.Failure): self.state.read('bad.json')
+        self.assertEqual((self.directory / 'target.json').stat().st_nlink, 1)
+        self.assertEqual((self.directory / 'target.json').stat().st_mode & 0o777, 0o600)
         with patch.object(e.os, 'geteuid', return_value=os.geteuid() + 1):
-            with self.assertRaises(e.guest.Failure): self.state.read('target.json')
+            with self.assertRaises(FileRefused): self.state.read('target.json')
 
     def test_intent_deadlines_cannot_renew_and_source_cannot_change(self):
         for change in ({'cleanup_at': 1700008401}, {'hard_at': 1700009001}, {'sources': {}}, {'schema': True}):
