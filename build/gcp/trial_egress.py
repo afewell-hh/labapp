@@ -345,9 +345,11 @@ def ip_set(value):
     require(type(rows) is list and len(rows) <= 1)
     found = set()
     for row in rows:
-        require(set(row) == {'natName', 'natIpInfoMappings'} and row['natName'] == NAT)
-        require(type(row['natIpInfoMappings']) is list and len(row['natIpInfoMappings']) <= 64)
-        for item in row['natIpInfoMappings']:
+        require(type(row) is dict and {'natName'} <= set(row) <= {'natName', 'natIpInfoMappings'}
+                and row['natName'] == NAT)
+        mappings = row.get('natIpInfoMappings', [])
+        require(type(mappings) is list and len(mappings) <= 64)
+        for item in mappings:
             require(set(item) == {'natIp', 'usage', 'mode'} and item['mode'] == 'AUTO'
                     and item['usage'] in ('IN_USE', 'UNUSED'))
             ip = str(ipaddress.IPv4Address(item['natIp']))
@@ -455,7 +457,7 @@ def cleanup(state, api):
         if not router.get('nats'):
             require((nat_config is None and state.read('nat-attempt.json', optional=True) is None)
                     or nat_op is not None, 'NAT vanished without terminal owned operation')
-        ips = ip_set(api.ips())
+        ips = ip_set(api.ips()) if router.get('nats') else set()
         if records is None:
             records = allocations(api, ips)
             initial = state.read('initial-allocations.json', optional=True) or []
@@ -499,7 +501,6 @@ def cleanup(state, api):
         empty = api.router()
         require(empty is not None and router_base(empty, pending) == captured
                 and not empty.get('nats'), 'NAT absence not confirmed')
-        require(not ip_set(api.ips()), 'NAT allocations still associated')
         if delete_op is None:
             require(state.read('delete-attempt.json', optional=True) is None, 'router attempt outcome unresolved')
             require(api.router() == empty, 'router changed before delete')

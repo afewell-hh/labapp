@@ -62,6 +62,8 @@ class FakeAPI:
 
     def ips(self):
         self.calls.append('ips')
+        if not self.value or not self.value.get('nats'):
+            raise e.Failure('NAT runtime endpoint unsupported without configured NAT')
         return {'result': [{'natName': e.NAT, 'natIpInfoMappings': [
             {'natIp': '203.0.113.10', 'usage': 'IN_USE', 'mode': 'AUTO'}]}]} if self.allocated else {}
 
@@ -118,6 +120,47 @@ class Egress(unittest.TestCase):
         e.cleanup(self.state, api)
         self.assertNotIn('PATCH', api.calls)
         self.assertIn('DELETE', api.calls)
+        self.assertNotIn('ips', api.calls)
+
+    def test_resumed_pending_patch_skips_runtime_endpoint_after_nat_removal(self):
+        self.owned()
+        api = FakeAPI()
+        e.capture_nat(self.state, api)
+        remove = api.remove_nat
+        def pending_patch(request_id):
+            value = remove(request_id)
+            value['status'] = 'RUNNING'
+            api.ops['operation-patch'] = value
+            return value
+        api.remove_nat = pending_patch
+        with patch.object(e.time, 'sleep', side_effect=e.Failure('interrupted', 143)):
+            with self.assertRaises(e.Failure) as caught:
+                e.cleanup(self.state, api)
+        self.assertEqual(caught.exception.code, 143)
+        self.assertEqual(api.calls.count('PATCH'), 1)
+        self.assertNotIn('DELETE', api.calls)
+        api.ops['operation-patch']['status'] = 'DONE'
+        count = api.calls.count('ips')
+        result = e.cleanup(self.state, api)
+        self.assertTrue(result['router_absent'] and result['allocations_absent'])
+        self.assertEqual(api.calls.count('ips'), count)
+        self.assertEqual(api.calls.count('PATCH'), 1)
+        self.assertEqual(api.calls.count('DELETE'), 1)
+        self.assertIn('address', api.calls)
+
+    def test_configured_nat_runtime_endpoint_errors_refuse_before_mutation(self):
+        self.owned()
+        for phase in (e.capture_nat, e.cleanup):
+            with self.subTest(phase=phase.__name__):
+                api = FakeAPI()
+                api.ips = Mock(side_effect=e.Failure('HTTP400 Nat name not found'))
+                with self.assertRaises(e.Failure):
+                    phase(self.state, api)
+                api.ips.assert_called_once_with()
+                self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+                for filename in ('nat.json', 'initial-allocations.json', 'allocations.json',
+                                 'nat-attempt.json', 'delete-attempt.json'):
+                    self.assertIsNone(self.state.read(filename, optional=True))
 
     def test_pending_lost_capture_never_adopts_even_when_router404(self):
         self.state.write('intent.json', pending())
@@ -160,6 +203,64 @@ class Egress(unittest.TestCase):
         e.capture_nat(self.state, api)
         self.assertEqual(self.state.read('initial-allocations.json')[0]['id'], '456')
         e.cleanup(self.state, api)
+
+    def test_observed_omitted_empty_mappings_capture_nat_and_normal_cleanup(self):
+        self.state.write('intent.json', pending())
+        self.state.write('create-operation.json', op())
+        api = FakeAPI(False)
+        e.capture(self.state, api)
+        api.value['nats'] = router(True)['nats']
+        api.value['nats'][0].update(tcpTimeWaitTimeoutSec=120, effectiveTcpTimeWaitTimeoutSec=120)
+        def omitted_empty():
+            if not api.value or not api.value.get('nats'):
+                raise e.Failure('NAT runtime endpoint unsupported without configured NAT')
+            return {'result': [{'natName': e.NAT}]}
+        api.ips = omitted_empty
+        e.capture_nat(self.state, api)
+        self.assertEqual(self.state.read('initial-allocations.json'), [])
+        self.assertEqual(self.state.read('nat.json'), api.value['nats'])
+        result = e.cleanup(self.state, api)
+        self.assertTrue(result['router_absent'] and result['allocations_absent'])
+        self.assertEqual([c for c in api.calls if c in ('PATCH', 'DELETE')], ['PATCH', 'DELETE'])
+        for filename in ('allocations.json', 'final-allocations.json'):
+            self.assertEqual(self.state.read(filename), [])
+        self.assertIsNotNone(self.state.read('nat-operation.json'))
+        self.assertIsNotNone(self.state.read('delete-operation.json'))
+        self.assertIsNone(api.router())
+        self.assertEqual(api.addresses(), [])
+
+    def test_named_omitted_or_explicit_empty_mappings_are_equivalent(self):
+        for row in ({'natName': e.NAT}, {'natName': e.NAT, 'natIpInfoMappings': []}):
+            self.assertEqual(e.ip_set({'result': [row]}), set())
+        for value in ({}, {'result': []}):
+            self.assertEqual(e.ip_set(value), set())
+
+    def test_malformed_nat_mapping_rows_refuse_capture_and_cleanup_before_mutation(self):
+        self.owned()
+        rows = [None, [], ['natName'], 'natName', 1, {}, {'natName': 'foreign'},
+                {'natName': None}, {'natIpInfoMappings': []},
+                {'natName': e.NAT, 'unknown': []}]
+        rows.extend({'natName': e.NAT, 'natIpInfoMappings': value}
+                    for value in (None, {}, '', 0, False))
+        invalid_items = [None, [], 1, {}, {'natIp': '203.0.113.10', 'usage': 'IN_USE', 'mode': 'MANUAL'},
+                         {'natIp': '203.0.113.10', 'usage': 'foreign', 'mode': 'AUTO'},
+                         {'natIp': 'invalid', 'usage': 'IN_USE', 'mode': 'AUTO'},
+                         {'natIp': '203.0.113.10', 'usage': 'IN_USE', 'mode': 'AUTO', 'unknown': True}]
+        rows.extend({'natName': e.NAT, 'natIpInfoMappings': [item]} for item in invalid_items)
+        item = {'natIp': '203.0.113.10', 'usage': 'IN_USE', 'mode': 'AUTO'}
+        rows.append({'natName': e.NAT, 'natIpInfoMappings': [item, item]})
+        rows.append({'natName': e.NAT, 'natIpInfoMappings': [item] * 65})
+        for row in rows:
+            for phase in (e.capture_nat, e.cleanup):
+                with self.subTest(row=row, phase=phase.__name__):
+                    api = FakeAPI()
+                    api.ips = lambda: {'result': [row]}
+                    with self.assertRaises((e.Failure, TypeError, ValueError)):
+                        phase(self.state, api)
+                    self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+                    for filename in ('nat.json', 'initial-allocations.json', 'allocations.json',
+                                     'nat-attempt.json', 'delete-attempt.json'):
+                        self.assertIsNone(self.state.read(filename, optional=True))
 
     def test_observed_false_encrypted_interconnect_field_survives_capture_and_cleanup(self):
         self.state.write('intent.json', pending())

@@ -1173,7 +1173,15 @@ commands, in order, are:
    `true`, malformed values and unexpected API fields/configuration fail closed
    for review; encrypted VLAN router support is not enabled.
 4. After separately approved NAT setup, `capture-nat` records its exact closed
-   configuration and initial allocation identities. Partial NAT setup remains
+   configuration and initial allocation identities. Creation must explicitly
+   set writable `tcpTimeWaitTimeoutSec` to120 and require returned
+   `effectiveTcpTimeWaitTimeoutSec`120; never set the output-only effective
+   field. Current Router v1 documents an unset effective timeout of30 or120,
+   and [NAT tuning](https://docs.cloud.google.com/nat/docs/tune-nat-configuration)
+   states gateways created after2026-09-30 default to30 (checked2026-10-31).
+   The approved120 configuration remains fixed. An exact named NAT row may
+   omit empty `natIpInfoMappings`; null, non-list, foreign or malformed rows
+   still refuse. Partial NAT setup remains
    cleanable from the previously captured router identity even if this step
    was not reached. Unknown or changed captured configuration refuses cleanup.
 5. `cleanup`: run immediately when the network is no longer needed, including
@@ -1191,7 +1199,8 @@ be reported. The early140minute trigger reserves one-minute polling plus the
 eight-minute cleanup budget within150minutes while the host remains available.
 
 Cleanup rechecks exact identity/full configuration immediately before each
-mutation. It refreshes runtime `getNatIpInfo` and correlates each IP with an
+mutation. While the verified router has a configured NAT, it refreshes runtime
+`getNatIpInfo` and correlates each IP with an
 exact regional `NAT_AUTO` address name, immutable ID, purpose and selfLink,
 including list/get agreement. It retains initial and refreshed allocation
 identities. No deletion is selected by address text or numeric IP. Unknown
@@ -1205,8 +1214,13 @@ mutation for owner recovery. A captured pending PATCH is polled before rereading
 NAT state, without submitting another PATCH.
 
 The only PATCH is `{"nats":[]}` against the verified sole owned NAT. Then
-require the terminal successful operation with matching targetID, exact empty
-router and no runtime NAT associations before deleting the empty router.
+require the terminal successful operation with matching targetID and exact
+empty router before deleting it. When a strict router read proves no configured
+NAT (including router-only setup or a resumed terminal PATCH), do not call the
+NAT-specific runtime endpoint: it can return HTTP400 `Nat name not found.`
+Configuration absence does not prove address release. Keep all captured
+allocation identities and require their actual absence below; endpoint errors
+while a NAT is configured still refuse.
 Require terminal router deletion, actual router404 and actual GET404 for every
 captured address identity, followed by another router404. Address release may
 propagate within the fixed budget; a changed address ID, later router, failure
