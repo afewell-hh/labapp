@@ -340,6 +340,7 @@ def execute(argv, deadline, cap=30, user=False):
         except (OSError, subprocess.TimeoutExpired):
             if primary is None:
                 raise Failure('child containment unverified') from None
+            print('vlab-core: child group containment unverified', file=sys.stderr)
         finally:
             child.stdout.close()
 
@@ -814,6 +815,10 @@ def reserve(mode, deadline=None):
         value = state()
         phase = 'prepared' if mode == 'fresh' else 'resumable'
         require(value['phase'] == phase, 'startup phase refused')
+        if mode == 'resume':
+            require(value.get('stop_verified') == {'operation': value['operation'],
+                                                  'invocation': value['invocation']},
+                    'verified resume stop absent')
     end = deadline if deadline is not None else time.monotonic() + START_SECONDS[mode]
     for other in UNIT:
         require(system_show(other, end)['ActiveState'] in ('inactive', 'failed'),
@@ -829,6 +834,7 @@ def reserve(mode, deadline=None):
         value.pop('invocation', None)
         value.pop('service', None)
         value.pop('stopping', None)
+        value.pop('stop_verified', None)
         save(value)
         return value
 
@@ -846,6 +852,9 @@ def unit_gate(mode):
     with locked():
         value = state()
         if mode == 'resume' and value['phase'] == 'resumable':
+            require(value.get('stop_verified') == {'operation': value['operation'],
+                                                  'invocation': value['invocation']},
+                    'verified boot stop absent')
             now = time.monotonic()
             require(system_show('fresh', now + 5)['ActiveState'] in ('inactive', 'failed'),
                     'conflicting fresh unit refused')
@@ -854,6 +863,7 @@ def unit_gate(mode):
             value.pop('service', None)
             value.pop('invocation', None)
             value.pop('stopping', None)
+            value.pop('stop_verified', None)
         require(value['phase'] == 'starting' and value['mode'] == mode
                 and 'invocation' not in value, 'unit startup reservation refused')
         value['invocation'] = invocation
@@ -1050,6 +1060,7 @@ def unit_ready(mode):
     critical = critical_snapshot(deadline)
     if mode == 'resume':
         require(critical == value['critical'], 'resume changed critical state')
+    check_live(value, deadline)
     with locked():
         current = state()
         require(current['operation'] == value['operation'] and current['phase'] == 'starting',
@@ -1077,6 +1088,24 @@ def unit_finished(mode):
             save(value)
 
 
+def verify_inactive(mode, invocation, observed, deadline):
+    """Positive post-stop receipt for only this fixed service and cgroup."""
+    fields = system_show(mode, deadline)
+    require(fields['ActiveState'] in ('inactive', 'failed') and fields.get('MainPID') == '0',
+            'service stop unverified')
+    require(fields.get('InvocationID') in ('', invocation) if invocation else
+            fields.get('InvocationID') == '', 'post-stop invocation differs')
+    group = '/system.slice/' + UNIT[mode]
+    require(fields.get('ControlGroup') in ('', group)
+            and (observed is None or observed['group'] == group), 'post-stop cgroup differs')
+    cgroup = no_links(CGROUP / group.lstrip('/'))
+    remaining(deadline)
+    if cgroup.exists():
+        events = pairs([line.split() for line in read(cgroup / 'cgroup.events', 4096).decode().splitlines()])
+        require(events.get('populated') == '0', 'service cgroup remains populated')
+    remaining(deadline)
+
+
 def stop_owned(value, deadline):
     fields = system_show(value['mode'], deadline)
     require(fields.get('InvocationID') in ('', value.get('invocation', '')),
@@ -1094,20 +1123,27 @@ def stop_owned(value, deadline):
             current['stopping'] = {'operation': value['operation'], 'invocation': value['invocation']}
             save(current)
         execute([SYSTEMCTL, 'stop', UNIT[value['mode']]], deadline, 30)
-    fields = system_show(value['mode'], deadline)
-    require(fields['ActiveState'] in ('inactive', 'failed') and fields.get('MainPID') == '0',
-            'service stop unverified')
-    group = observed['group'] if observed else '/system.slice/' + UNIT[value['mode']]
-    cgroup = CGROUP / group.lstrip('/')
-    if cgroup.exists():
-        events = pairs([line.split() for line in read(cgroup / 'cgroup.events', 4096).decode().splitlines()])
-        require(events.get('populated') == '0', 'service cgroup remains populated')
+    verify_inactive(value['mode'], value.get('invocation'), observed, deadline)
     with locked():
         current = state()
         require(current['operation'] == value['operation']
                 and current.get('invocation') == value.get('invocation'), 'stop commit operation changed')
         if current['phase'] == 'stop-observed':
+            binding = {'operation': value['operation'], 'invocation': value['invocation']}
+            require(current.get('stopping') == binding, 'stop observation intent differs')
             current['phase'] = 'resumable' if current['mode'] == 'resume' else 'stopped'
+            current['stop_verified'] = binding
+            save(current)
+        elif current['phase'] in ('stopped', 'resumable'):
+            require(current.get('stop_verified') == {'operation': value['operation'],
+                                                    'invocation': value['invocation']},
+                    'previous stop verification absent')
+        elif current['phase'] == 'ready':
+            current['phase'] = 'failed'
+            save(current)
+            raise Failure('owned stop completion not observed')
+        elif current['phase'] == 'starting':
+            current['phase'] = 'failed'
             save(current)
     return True
 
@@ -1126,17 +1162,30 @@ def start(mode):
     except BaseException:
         # Preserve primary return/signal/timeout if exact cleanup cannot be verified.
         try:
+            cleanup_deadline = time.monotonic() + 35
             with locked():
                 current = state()
                 require(current['operation'] == value['operation'], 'operation changed')
             # A queued activation before gate still needs explicit cancellation.
             if 'invocation' not in current:
-                fields = system_show(mode, time.monotonic() + 5)
-                require(fields.get('InvocationID', '') == '' and fields.get('MainPID') == '0',
-                        'ungated service identity uncertain')
-                execute([SYSTEMCTL, 'stop', UNIT[mode]], time.monotonic() + 30, 30)
+                fields = system_show(mode, cleanup_deadline)
+                with locked():
+                    current = state()
+                    require(current['operation'] == value['operation'], 'cleanup operation changed')
+                if 'invocation' in current:
+                    stop_owned(current, cleanup_deadline)
+                else:
+                    require(fields.get('InvocationID', '') == '' and fields.get('MainPID') == '0',
+                            'ungated service identity uncertain')
+                    execute([SYSTEMCTL, 'stop', UNIT[mode]], cleanup_deadline, 30)
+                    # Gate can race after the pre-stop observation. Bind only
+                    # its recorded invocation in this same reserved operation.
+                    with locked():
+                        current = state()
+                        require(current['operation'] == value['operation'], 'cleanup operation changed')
+                    verify_inactive(mode, current.get('invocation'), current.get('service'), cleanup_deadline)
             else:
-                stop_owned(current, time.monotonic() + 35)
+                stop_owned(current, cleanup_deadline)
             with locked():
                 current = state()
                 require(current['operation'] == value['operation'], 'cleanup operation changed')
@@ -1157,9 +1206,7 @@ def stop():
     with locked():
         current = state()
         require(current['operation'] == value['operation'], 'stop operation changed')
-        if current['phase'] == 'ready':
-            current['phase'] = 'resumable' if current['mode'] == 'resume' else 'stopped'
-            save(current)
+        require(current['phase'] in ('failed', 'stopped', 'resumable'), 'stop state unverified')
 
 
 def activate_resume():
@@ -1173,7 +1220,9 @@ def activate_resume():
     require(critical_snapshot(deadline) == value['critical'], 'post-stop critical state changed')
     with locked():
         current = state()
-        require(current['operation'] == value['operation'] and current['phase'] in ('ready', 'stopped'),
+        require(current['operation'] == value['operation'] and current['phase'] == 'stopped'
+                and current.get('stop_verified') == {'operation': value['operation'],
+                                                     'invocation': value['invocation']},
                 'activation operation changed')
         current['phase'] = 'resumable'
         save(current)

@@ -436,6 +436,95 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(self.call('start-fresh'), 124)
         self.assertEqual(core.state()['containment'], 'verified')
         self.assertTrue(any(c[0][:2] == [core.SYSTEMCTL, 'stop'] for c in self.calls))
+        stopped = next(i for i, c in enumerate(self.calls) if c[0][:2] == [core.SYSTEMCTL, 'stop'])
+        post = [c for c in self.calls[stopped + 1:] if c[0][:2] == [core.SYSTEMCTL, 'show']]
+        self.assertTrue(post, 'positive post-stop observation required')
+        self.assertTrue(all(c[1] == self.calls[stopped][1] for c in post), 'cleanup deadline renewed')
+
+    def test_pregate_timeout_populated_cgroup_is_not_verified(self):
+        self.prepared()
+        self.activation = False
+        group = core.CGROUP / 'system.slice' / core.UNIT['fresh']
+        group.mkdir(parents=True)
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+        self.assertEqual(self.call('start-fresh'), 124)
+        self.assertNotEqual(core.state().get('containment'), 'verified')
+        self.assertIn('containment unverified', self.stderr.getvalue())
+        self.assertTrue((group / 'cgroup.events').exists())
+
+    def test_pregate_timeout_gate_race_binds_only_same_operation(self):
+        self.prepared()
+        self.activation = False
+        actual = self.command
+        def raced_gate(argv, *args, **kwargs):
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['fresh']]:
+                self.phase['fresh'] = 'activating'
+                self.invocation['fresh'] = 'a' * 32
+                core.unit_gate('fresh')
+            return actual(argv, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=raced_gate):
+            self.assertEqual(self.call('start-fresh'), 124)
+        self.assertEqual(core.state()['invocation'], 'a' * 32)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_pregate_timeout_foreign_operation_is_never_adopted(self):
+        self.prepared()
+        self.activation = False
+        actual = self.command
+        def different_operation(argv, *args, **kwargs):
+            raw = actual(argv, *args, **kwargs)
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['fresh']]:
+                value = core.state()
+                value['operation'] = 'f' * 32
+                core.save(value)
+            return raw
+        with patch.object(core, 'execute', side_effect=different_operation):
+            self.assertEqual(self.call('start-fresh'), 124)
+        self.assertEqual(core.state()['operation'], 'f' * 32)
+        self.assertNotEqual(core.state().get('containment'), 'verified')
+        self.assertIn('containment unverified', self.stderr.getvalue())
+
+    def test_pregate_timeout_post_stop_still_active_is_uncertain(self):
+        self.prepared()
+        self.activation = False
+        actual = self.command
+        def still_active(argv, *args, **kwargs):
+            raw = actual(argv, *args, **kwargs)
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['fresh']]:
+                self.phase['fresh'] = 'active'
+            return raw
+        with patch.object(core, 'execute', side_effect=still_active):
+            self.assertEqual(self.call('start-fresh'), 124)
+        self.assertNotEqual(core.state().get('containment'), 'verified')
+        self.assertIn('containment unverified', self.stderr.getvalue())
+
+    def test_stale_ready_without_stoppost_cannot_activate_resume(self):
+        self.fresh()
+        self.phase['fresh'] = 'failed'  # manager completion without ExecStopPost
+        self.assertEqual(self.call('activate-resume'), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotIn('stop_verified', core.state())
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_stale_ready_without_stoppost_cannot_be_promoted_by_public_stop(self):
+        self.fresh()
+        self.phase['fresh'] = 'inactive'
+        self.assertEqual(self.call('stop'), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotIn('stop_verified', core.state())
+
+    def test_foreground_exit_during_critical_hash_cannot_seal_ready(self):
+        self.prepared()
+        actual = core.critical_snapshot
+        def failed_while_hashing(deadline):
+            snapshot = actual(deadline)
+            self.phase['fresh'] = 'failed'
+            return snapshot
+        with patch.object(core, 'critical_snapshot', side_effect=failed_while_hashing):
+            self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotIn('critical', core.state())
 
     def test_primary_timeout_survives_cleanup_failure(self):
         self.prepared()
@@ -802,6 +891,32 @@ class FormatAndSourceTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(core.Failure) as raised:
                 core.execute([sys.executable, '-I', '-B', '-c', code], core.time.monotonic() + 3, cap)
             self.assertEqual(raised.exception.code, expected)
+
+    def test_executor_cleanup_uncertainty_keeps_primary_and_fixed_diagnostic(self):
+        original_popen = core.subprocess.Popen
+        for failure in ('kill', 'reap'):
+            def create(*args, **kwargs):
+                child = original_popen(*args, **kwargs)
+                actual_wait = child.wait
+                calls = [0]
+                def wait(*args, **kwargs):
+                    calls[0] += 1
+                    if failure == 'reap' and calls[0] > 1:
+                        raise subprocess.TimeoutExpired('SYNTHETIC_PRIVATE_DETAIL', 2)
+                    return actual_wait(*args, **kwargs)
+                child.wait = wait
+                return child
+            with self.subTest(failure=failure), ExitStack() as stack:
+                stack.enter_context(patch.object(core.subprocess, 'Popen', side_effect=create))
+                if failure == 'kill':
+                    stack.enter_context(patch.object(core.os, 'killpg', side_effect=OSError('SYNTHETIC_PRIVATE_DETAIL')))
+                errors = stack.enter_context(patch('sys.stderr', new_callable=io.StringIO))
+                with self.assertRaises(core.Failure) as raised:
+                    core.execute([sys.executable, '-I', '-B', '-c', 'raise SystemExit(19)'],
+                                 core.time.monotonic() + 3)
+                self.assertEqual(raised.exception.code, 19)
+                self.assertIn('child group containment unverified', errors.getvalue())
+                self.assertNotIn('SYNTHETIC_PRIVATE_DETAIL', errors.getvalue())
 
     def test_bounded_executor_sanitizes_environment(self):
         with patch.dict(os.environ, {'HHFAB_JOIN_TOKEN': 'DO_NOT_FORWARD', 'KUBECONFIG': '/bad'}):
