@@ -16,15 +16,24 @@ from .access_recovery import (FailedAccessRecovery, GcsFailedDisposals, LIMIT,
                               OWNER_SELF, OwnerRecovery, ReadCloud, path, validate_proof)
 from .auth_http import HttpResponse
 from .cloud import ApiError, ForbiddenOperation
-from .controller import Controller, Refused
+from .controller import Config, Controller, Refused
 from .gcs import StoreError
 from .oslogin import OwnKeyImport, SelfLogin
 from .test_access import BUCKET, GCS, key
-from .test_lifecycle import U1, U2
-from .test_vlab_trial_profile import FIELDS, world
+from .test_lifecycle import U1, U2, World
 
 TRIAL = 'a' * 40
 POLICY_SOURCE = 'b' * 40
+FIELDS = ('profile', 'request_id', 'epoch', 'run_id', 'attempt', 'body_hash',
+          'ids', 'boot_image', 'boot_image_id', 'reserved_at', 'deadline', 'operation')
+
+
+def world():
+    w = World()
+    w.cfg = Config(boot_image=spec.COMPONENT_IMAGE, profile=spec.UBUNTU_VLAB_CORE,
+                   now=w.clock.now, sleep=w.clock.sleep)
+    w.ctl = Controller(w.store, w.cloud, w.cfg)
+    return w
 
 
 class Profile:
