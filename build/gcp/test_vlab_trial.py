@@ -23,7 +23,7 @@ def snapshot():
             'epoch': 1, 'run_id': 123, 'attempt': 1, 'body_hash': 'b'*64, 'ids': {'instance': '1234', 'boot': '5678'},
             'boot_image': host.spec.COMPONENT_IMAGE, 'boot_image_id': host.spec.COMPONENT_IMAGE_ID,
             'reserved_at': start.strftime('%Y-%m-%dT%H:%M:%SZ'), 'deadline': (start+timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'operation': 'op-fixed', 'source_sha': 'a'*40, 'self_user': 'users/12345'}
+            'operation': 'op-fixed', 'source_sha': 'a'*40, 'self_user': 'users/110405050082684214272'}
     value['preflight'] = {'lease': value['request_id'], 'vm_id': '1234', 'source_sha': 'a'*40,
                           'checked_at': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
                           **{key: 'c'*64 for key in ('quota_sha256', 'network_sha256', 'images_sha256', 'access_sha256', 'egress_sha256')}}
@@ -242,6 +242,44 @@ class OwnerTrial(unittest.TestCase):
         self.assertFalse(receipt['local_files_absent'])
         self.assertFalse(receipt['own_key_absent'])
 
+    def test_owner_profile_mismatch_or_malformed_refuses_before_key_generation(self):
+        for raw in ('54321', 'users/54321', '0', '012345', '１２３４５', None, True, 12345):
+            with self.subTest(raw=raw):
+                value = snapshot()
+                registration = Mock()
+                registration.current.return_value = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
+                calls = []
+                def command(args, *unused, **kwargs):
+                    calls.append(args)
+                    if args[:3] == ['gcloud', 'auth', 'list']: return (host.OWNER+'\n').encode()
+                    if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)\n'
+                    if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
+                        return guest.encoded({'name': raw})
+                    raise AssertionError('unexpected command after invalid profile')
+                with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
+                     patch.object(host, 'OwnKeyImport') as importer, patch.object(host, 'cleanup_dispatch') as cancel, \
+                     patch('builtins.print'):
+                    code = host.trial(value, self.directory, self.directory,
+                                      registration=registration, records=Mock(), login=Mock(user=value['self_user']))
+                self.assertNotEqual(code, 0)
+                self.assertFalse(any(args[0] == '/usr/bin/ssh-keygen' for args in calls))
+                registration.register.assert_not_called()
+                importer.assert_not_called()
+                cancel.assert_called_once_with(value)
+
+    def test_actual_main_selects_closed_owner_login_adapter(self):
+        value = snapshot()
+        login, registration, records = Mock(), Mock(), Mock()
+        with patch.object(guest, 'regular', return_value=guest.encoded(value)), \
+             patch.object(host, 'private_directory', return_value=self.directory), \
+             patch.object(host, 'GcsAccessRecords', return_value=records), \
+             patch.object(host, 'OwnerRegistration', return_value=registration), \
+             patch.object(host.SelfLogin, 'for_owner', return_value=login) as owner, \
+             patch.object(host, 'trial', return_value=0) as trial:
+            self.assertEqual(host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', 'output']), 0)
+        owner.assert_called_once_with(value['self_user'], token_provider=host.gcloud_token)
+        self.assertIs(trial.call_args.kwargs['login'], login)
+
     def test_actual_owner_pipeline_stages_fixed_inputs_then_closes_before_key_receipt(self):
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
@@ -267,7 +305,7 @@ class OwnerTrial(unittest.TestCase):
             if args[:3] == ['gcloud', 'auth', 'list']: return (host.OWNER+'\n').encode()
             if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)\n'
             if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
-                return guest.encoded({'name': value['self_user']})
+                return guest.encoded({'name': value['self_user'].removeprefix('users/')})
             if args[:2] == ['gcloud', 'version']: return b'{"Google Cloud SDK":"575.0.0"}'
             if args[0] == '/usr/bin/ssh-keygen' and '-q' in args:
                 target = Path(args[-1])

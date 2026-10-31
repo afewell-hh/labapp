@@ -14,7 +14,7 @@ from .access_records import (AccessError, Context, GcsAccessRecords, KINDS, LIMI
                              canonical, digest, public_key, validate_record)
 from .auth_http import HttpResponse
 from .controller import Controller, FREE, Refused
-from .oslogin import OwnKeyImport, SelfLogin, cleanup_own_key
+from .oslogin import OwnKeyImport, SelfLogin, cleanup_own_key, profile_user
 from .test_base_build import world
 from .test_lifecycle import U1, U2
 from .test_capture import C1
@@ -311,6 +311,89 @@ class AccessGCS(unittest.TestCase):
 
 
 class OwnKeyTests(unittest.TestCase):
+    def test_owner_factory_requires_fixed_canonical_expected_identity(self):
+        login = SelfLogin.for_owner('users/110405050082684214272', token_provider=lambda: 'fake-token')
+        self.assertEqual(login.user, 'users/110405050082684214272')
+        for value in ('110405050082684214272', 'users/123456789', 'users/owner@example.com', 'users/0',
+                      'users/01', 'users/１２３', 'users/'+'9'*129, None, 123, True):
+            with self.subTest(value=value), self.assertRaises(AccessError):
+                SelfLogin.for_owner(value, token_provider=lambda: 'fake-token')
+
+    @patch(__name__ + '.SELF', 'users/110405050082684214272')
+    def test_owner_wire_principal_is_fixed_email_for_get_import_and_exact_delete(self):
+        f = Fixture()
+        f.os.profile['name'] = SELF.removeprefix('users/')
+        wire_calls = []
+        class OwnerTransport:
+            def request(self, method, url, **kwargs):
+                wire_calls.append((method, url))
+                prefix = 'https://oslogin.googleapis.com/v1/users/art%40githedgehog.com'
+                if not url.startswith(prefix):
+                    raise AssertionError('owner wire principal differs')
+                # Reuse the existing fake's exact canonical-identity assertions.
+                return f.os.request(method, 'https://oslogin.googleapis.com/v1/' + SELF + url[len(prefix):], **kwargs)
+        f.login = SelfLogin.for_owner(SELF, token_provider=lambda: 'fake-token', transport=OwnerTransport())
+        f.imported()
+        self.assertEqual(f.stored('import')['server_name'], SELF + '/sshPublicKeys/server_opaque-01')
+        self.assertEqual(f.stored('import')['response_sha256'], digest({'loginProfile': f.os.profile}))
+        f.clean()
+        base = 'https://oslogin.googleapis.com/v1/users/art%40githedgehog.com'
+        self.assertEqual(set(wire_calls), {
+            ('GET', base + '/loginProfile?projectId=' + spec.PROJECT),
+            ('POST', base + ':importSshPublicKey?projectId=' + spec.PROJECT),
+            ('DELETE', base + '/sshPublicKeys/server_opaque-01')})
+        self.assertEqual(f.login.user, SELF)
+        self.assertEqual(f.os.profile['name'], SELF.removeprefix('users/'))
+
+    def test_profile_identity_normalizes_only_bounded_ascii_numeric_bare_ids(self):
+        for value in ('1', '110405050082684214272', '9'*128):
+            self.assertEqual(profile_user(value), 'users/' + value)
+        for value in (SELF, 'users/existing@example.com', 'users/001'):
+            self.assertEqual(profile_user(value), value)
+        for value in (None, True, 123, '', '0', '01', '9'*129, '１２３', '١٢٣',
+                      '123\n', ' 123', '123 ', '+123', '-123', '1.0', '1/2',
+                      '/users/123', 'users/users/123', 'existing@example.com'):
+            with self.subTest(value=value), self.assertRaises(AccessError):
+                profile_user(value)
+
+    def test_bare_profile_prepare_import_cleanup_preserves_raw_response_and_exact_paths(self):
+        f = Fixture()
+        f.os.profile['name'] = SELF.removeprefix('users/')
+        observed = f.login.profile()
+        self.assertEqual(observed, f.os.profile)
+        self.assertEqual(observed['name'], '123456789')
+        f.imported()
+        self.assertEqual(f.stored('import')['response_sha256'], digest({'loginProfile': f.os.profile}))
+        f.clean()
+        self.assertEqual(f.os.profile['name'], '123456789')
+        self.assertEqual([method for method, _, _ in f.os.calls].count('POST'), 1)
+        self.assertTrue(any(method == 'DELETE' for method, _, _ in f.os.calls))
+        self.assertEqual(f.stored('removed')['server_name'], SELF + '/sshPublicKeys/server_opaque-01')
+
+    def test_foreign_or_malformed_profile_refuses_before_import(self):
+        for value in ('987654321', 'users/foreign', '0', '01', '１２３', '123\n', None, True, 123):
+            with self.subTest(value=value):
+                f = Fixture(); f.os.profile['name'] = value
+                with self.assertRaises(AccessError): f.session().prepare(key())
+                self.assertFalse(f.posts())
+                self.assertNotIn(f.context.path('intent'), f.gcs.objects)
+
+    def test_foreign_import_profile_is_uncertain_and_cannot_authorize_cleanup(self):
+        f = Fixture(); session = f.session(); session.prepare(key())
+        f.os.on_import = lambda: f.os.profile.update(name='987654321')
+        with self.assertRaises(AccessError): session.import_once()
+        self.assertEqual(len(f.posts()), 1)
+        self.assertNotIn(f.context.path('import'), f.gcs.objects)
+        with self.assertRaises(AccessError): f.clean()
+        self.assertFalse(any(method == 'DELETE' for method, _, _ in f.os.calls))
+
+    def test_bare_profile_does_not_relax_server_key_resource_names(self):
+        f = Fixture(); f.os.profile['name'] = '123456789'
+        entry = f.os.add(key(2))
+        entry['name'] = '123456789/sshPublicKeys/server_opaque-01'
+        with self.assertRaises(AccessError): f.session().prepare(key())
+        self.assertFalse(f.posts())
+
     def test_intent_durable_before_sole_import_exact_http_and_server_identity(self):
         f = Fixture()
         f.os.on_import = lambda: self.assertIn(f.context.path('intent'), f.gcs.objects)
