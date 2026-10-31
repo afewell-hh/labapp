@@ -834,6 +834,7 @@ class OwnedProcessGroup(unittest.TestCase):
         proc = self.popen(kernel)
         session = Mock()
         session.remaining.return_value = 30
+        session.cleanup_remaining.return_value = 15
         master = host.Master(self.temp, snapshot(), 'owner', session, threading.Event())
         return kernel, proc, master
 
