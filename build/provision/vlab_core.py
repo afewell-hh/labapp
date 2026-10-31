@@ -28,6 +28,8 @@ import sys
 import time
 import uuid
 
+import owned_process
+
 ROOT = Path('/var/lib/labapp-vlab-core')
 WORK = Path('/home/ubuntu/hhfab')
 CACHE = Path('/home/ubuntu/.cache/hhfab')
@@ -79,7 +81,8 @@ AUX = {'/usr/bin/sudo': 'sudo', '/usr/bin/qemu-img': 'qemu-utils',
 # #368 first-failure bundle: fixed root-private diagnostic, never readiness authority.
 FIRST_FAILURE = 'first-failure.json'
 FIRST_FAILURE_LIMIT = 32 * 1024  # SERIALIZED bytes, enforced after JSON/base64 encoding
-FAILURE_CAPS = {'primary': 4096, 'manager': 2048, 'journal': 8192}  # raw bytes before base64
+FAILURE_CAPS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
+FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
 SNAPSHOT_SECONDS = 10      # one shared absolute budget for BOTH queries incl. their reaping
 SNAPSHOT_REAP = 1.0        # held back inside each query's end to kill/reap its child
 MANAGER_SECONDS, JOURNAL_SECONDS = 2, 8
@@ -291,7 +294,7 @@ def retain_failure_output(raw):
         os.close(fd)
 
 
-def execute(argv, deadline, cap=30, user=False):
+def execute(argv, deadline, cap=30, user=False, *, retain=True):
     """Bounded capture, never forward raw output. Only direct children are reaped.
 
     systemd owns long-lived VLAB descendants; short private CLI queries get their
@@ -328,10 +331,11 @@ def execute(argv, deadline, cap=30, user=False):
         return bytes(raw)
     except BaseException as exc:
         primary = exc
-        try:
-            retain_failure_output(bytes(raw))
-        except BaseException:
-            print('vlab-core: private diagnostics unverified', file=sys.stderr)
+        if retain:
+            try:
+                retain_failure_output(bytes(raw))
+            except BaseException:
+                print('vlab-core: private diagnostics unverified', file=sys.stderr)
         raise
     finally:
         try:
@@ -372,7 +376,7 @@ def diagnostic_run(argv, end, keep):
     work_end = end - SNAPSHOT_REAP
     if time.monotonic() >= work_end:
         return 'unavailable', b'', False, 'confirmed'
-    child = None
+    child = group = None
     cleanup = 'confirmed'
     status, tail, truncated = 'unavailable', bytearray(), False
     try:
@@ -381,13 +385,21 @@ def diagnostic_run(argv, end, keep):
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      start_new_session=True)
         except OSError:
-            return 'unavailable', b'', False, 'confirmed'
+            return 'unavailable', b'', False, ('confirmed' if time.monotonic() < end else 'uncertain')
+        cleanup = 'uncertain'
+        group = owned_process.OwnedGroup(child)
+        # Popen cannot be interrupted by this helper. A late return is uncertain,
+        # never permission to renew the absolute budget or send a late signal.
+        if time.monotonic() >= work_end:
+            raise Failure('diagnostic work deadline exhausted')
         complete = False
         with selectors.DefaultSelector() as selector:
             selector.register(child.stdout, selectors.EVENT_READ)
             while True:
                 left = work_end - time.monotonic()
                 if left <= 0 or not selector.select(left):
+                    break
+                if time.monotonic() >= work_end:
                     break
                 chunk = os.read(child.stdout.fileno(), 65536)
                 if not chunk:
@@ -397,36 +409,34 @@ def diagnostic_run(argv, end, keep):
                 if len(tail) > keep:
                     truncated = True
                     del tail[:-keep]
-        if complete:
-            try:
-                code = child.wait(timeout=max(0.01, work_end - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                code = None
-            if code == 0:
+        if complete and time.monotonic() < work_end:
+            # Observation only: retain the unreaped leader anchor through KILL.
+            code = group.status()
+            while code is None and time.monotonic() < work_end:
+                left = work_end - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(.01, left))
+                code = group.status()
+            if code == 0 and time.monotonic() < work_end:
                 status = 'truncated' if truncated else 'ok'
     except BaseException:
         status, tail, truncated = 'unavailable', bytearray(), False
         cleanup = 'uncertain'
     finally:
         if child is not None:
-            try:
+            if group is not None:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait(timeout=max(0.05, end - time.monotonic()))
-                try:
-                    os.killpg(child.pid, 0)
-                except ProcessLookupError:
-                    pass
-                else:
+                    cleanup = 'confirmed' if group.close(0, until=end) else 'uncertain'
+                except BaseException:
                     cleanup = 'uncertain'
-            except BaseException:
-                cleanup = 'uncertain'
             try:
                 child.stdout.close()
             except BaseException:
                 cleanup = 'uncertain'
+            if time.monotonic() >= end:
+                cleanup = 'uncertain'
+                status = 'unavailable'
     if status == 'unavailable':
         tail = bytearray()
     return status, bytes(tail), truncated, cleanup
@@ -438,6 +448,34 @@ def render_failure(header, parts):
     for name, (status, raw) in parts.items():
         body[name] = {**header[name], 'status': status, 'output': base64.b64encode(raw).decode()}
     return json.dumps(body, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def last_failure_context():
+    """One fixed descriptor-checked tail; observed context, never inner provenance."""
+    fd = None
+    try:
+        no_links(ROOT)
+        root = ROOT.lstat()
+        require(stat.S_ISDIR(root.st_mode) and root.st_uid == ROOT_UID
+                and stat.S_IMODE(root.st_mode) == 0o700)
+        path = ROOT / 'last-command-output'
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == ROOT_UID
+                and stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+                and 0 <= before.st_size <= LIMIT)
+        cap = FAILURE_CAPS['command_context']
+        os.lseek(fd, max(0, before.st_size - cap), os.SEEK_SET)
+        raw = os.read(fd, cap + 1)
+        require(len(raw) == min(cap, before.st_size)
+                and stable_stat(os.fstat(fd)) == stable_stat(before)
+                and stable_stat(path.lstat()) == stable_stat(before))
+        return ('truncated' if before.st_size > cap else 'ok', raw) if raw else ('unavailable', b'')
+    except BaseException:
+        return 'unavailable', b''
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def write_first_failure(raw):
@@ -471,6 +509,8 @@ def capture_first_failure(mode, value, primary, deadline):
     committed no operation): operation/invocation are then null, and no older
     state operation or unbound manager/journal history is ever selected.
     """
+    if time.monotonic() >= deadline:
+        return  # FULL skip: no file-only exception after the original work cutoff.
     target = ROOT / FIRST_FAILURE
     if target.exists() or target.is_symlink():
         return
@@ -488,6 +528,9 @@ def capture_first_failure(mode, value, primary, deadline):
     if current_ok and (current['nonce'] != nonce or (value is not None and (
             current.get('operation') != operation or current.get('mode') != mode))):
         current, state_status = None, 'invalid'
+    if value is None and (current is None or current.get('phase') != 'prepared'
+                          or any(key in current for key in ('mode', 'operation', 'invocation'))):
+        return  # A null reservation must never mask an older live binding.
     invocation = None
     if value is not None and current is not None \
             and re.fullmatch(r'[0-9a-f]{32}', str(current.get('invocation', ''))):
@@ -519,6 +562,7 @@ def capture_first_failure(mode, value, primary, deadline):
     out = bytes(out)
     primary_status = 'unavailable' if not out else ('truncated' if len(out) > FAILURE_CAPS['primary'] else 'ok')
     parts = {'primary': (primary_status, out[-FAILURE_CAPS['primary']:]),
+             'command_context': last_failure_context() if operation is not None else ('unavailable', b''),
              'manager': ('unavailable', b''), 'journal': ('unavailable', b'')}
     cleanup = 'confirmed'
     unit = UNIT[mode]
@@ -551,14 +595,17 @@ def capture_first_failure(mode, value, primary, deadline):
               'invocation': invocation, 'boot': boot_id, 'stage': stage, 'query_cleanup': cleanup,
               'state': {'status': state_status, 'phase': token('phase'),
                         'containment': token('containment'), 'service_result': token('service_result')},
-              'primary': {'message': message, 'code': code}, 'manager': {}, 'journal': {}}
+              'primary': {'message': message, 'code': code},
+              'command_context': {'label': FAILURE_CONTEXT}, 'manager': {}, 'journal': {}}
     rendered = render_failure(header, parts)
-    for name in ('journal', 'primary', 'manager'):
+    for name in ('journal', 'primary', 'command_context', 'manager'):
         # Serialized (not raw) bound: shed the oldest output until it fits.
         while len(rendered) > FIRST_FAILURE_LIMIT and parts[name][1]:
             parts[name] = ('truncated', parts[name][1][len(parts[name][1]) // 2 + 1:])
             rendered = render_failure(header, parts)
     if len(rendered) > FIRST_FAILURE_LIMIT:
+        return
+    if time.monotonic() >= end:
         return
     write_first_failure(rendered)
 
@@ -643,7 +690,7 @@ def save(value):
 
 def source_snapshot(directory):
     records = {name: identity(directory / name, True, limit=STATIC_LIMIT)
-               for name in ('vlab_core.py', 'ensure-bridge-ipv4.py',
+               for name in ('vlab_core.py', 'owned_process.py', 'ensure-bridge-ipv4.py',
                             'journald@labapp-vlab.conf', *UNIT.values())}
     require(all(r['uid'] == ROOT_UID and stat.S_IMODE(r['mode']) == 0o644
                 and r['links'] == 1 for r in records.values()),
@@ -872,7 +919,8 @@ def prepare(input_path):
                     and stat.S_IMODE(directory.stat().st_mode) == 0o755,
                     'installation directory refused')
         source = Path(__file__).resolve().parent
-        for name in ('vlab_core.py', 'ensure-bridge-ipv4.py', 'journald@labapp-vlab.conf', *UNIT.values()):
+        for name in ('vlab_core.py', 'owned_process.py', 'ensure-bridge-ipv4.py',
+                     'journald@labapp-vlab.conf', *UNIT.values()):
             raw = read(source / name)
             target = LIB / name
             if target.exists():
@@ -1505,7 +1553,9 @@ def start(mode):
         # operation of its own, so the bundle binds null operation/invocation.
         value = reserve(mode, end)
         # The lock is RELEASED before synchronous manager/dependency waiting.
-        execute([SYSTEMCTL, 'start', UNIT[mode]], end, START_SECONDS[mode])
+        # Preserve the fixed last failed command before the generic manager wrapper
+        # could overwrite it. The primary Failure still carries that wrapper's bytes.
+        execute([SYSTEMCTL, 'start', UNIT[mode]], end, START_SECONDS[mode], retain=False)
         with locked():
             current = state()
             require(current['operation'] == value['operation'] and current['phase'] == 'ready',

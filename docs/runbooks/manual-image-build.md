@@ -361,6 +361,10 @@ attach it to issues, CI artifacts or images. See the
 [core](../../build/provision/README.md#root-private-first-failure-bundle-issue-368) and
 [owner](../../build/gcp/README.md#fixed-owner-local-canonical-trial) contracts. This does
 not diagnose historical run 41242950882/1.
+Capture is fully skipped after the original start work cutoff. Its separately
+labeled last-command context is an observation before manager-wrapper/cleanup
+overwrite, not proof of the first inner failure or of hhfab execution. The original
+primary status and containment/disposal requirements remain authoritative.
 
 The outer VM stays RUNNING through inner public stop/resume. Absolute admission
 cutoffs reserve the final fifteen of120minutes for cleanup. The500GiB disk is

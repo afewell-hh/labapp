@@ -5,7 +5,7 @@ bounded executor tests create inspected Python stdlib children (no network).
 Fakes prove source sequencing/refusal, not systemd namespaces/cgroups or VLAB.
 """
 import base64
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import copy
 import io
 import json
@@ -25,6 +25,7 @@ import yaml
 import vlab_core as core
 VERIFY_PREREQUISITES = core.verify_prerequisites
 DIAGNOSTIC_RUN = core.diagnostic_run
+EXECUTE = core.execute
 SENTINEL = 'PRIVATE-SENTINEL-' + 'z' * 8
 
 
@@ -205,7 +206,7 @@ class GuestFixture(unittest.TestCase):
             return 'ok', ('ActiveState=failed\nInvocationID=' + invocation + '\n').encode(), False, 'confirmed'
         return 'ok', b'JOURNAL-TAIL ' + SENTINEL.encode(), False, 'confirmed'
 
-    def command(self, argv, deadline, cap=30, user=False):
+    def command(self, argv, deadline, cap=30, user=False, *, retain=True):
         self.calls.append((list(argv), deadline, cap, user))
         core.remaining(deadline)
         if self.failure and self.failure(argv):
@@ -351,6 +352,15 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(self.call('start-fresh'), 1)
         self.assertFalse(self.execs)
         self.assertTrue((self.base / 'retained-result').is_dir())
+
+    def test_prepared_source_pins_include_deployed_owned_process_sibling(self):
+        self.prepared()
+        self.assertIn('owned_process.py', core.state()['source'])
+        self.assertEqual((core.LIB / 'owned_process.py').read_bytes(),
+                         (Path(core.__file__).parent / 'owned_process.py').read_bytes())
+        (core.LIB / 'owned_process.py').write_bytes(b'public changed component')
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse(self.execs)
 
     def test_fresh_gate_and_run_recheck_before_exec_without_adoption(self):
         self.prepared()
@@ -758,6 +768,61 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual((core.ROOT / 'last-command-output').read_bytes(), b'CLEANUP-OVERWRITE')
         self.assertIn('containment unverified', self.stderr.getvalue())
 
+    def test_manager_wrapper_preserves_observed_inner_context_then_cleanup_cannot_overwrite_bundle(self):
+        self.prepared()
+        actual = self.command
+        inner = ('OBSERVED-INNER-' + SENTINEL).encode()
+        wrapper = b'generic manager failed'
+        class Selector:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def register(self, *_): pass
+            def select(self, *_): return [True]
+        child = SimpleNamespace(pid=4242, stdout=SimpleNamespace(fileno=lambda: 123, close=lambda: None),
+                                wait=lambda **_: 1, poll=lambda: 1)
+        def command(argv, deadline, cap=30, user=False, *, retain=True):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                self.assertFalse(retain)  # actual start consumer disables only wrapper retention
+                core.retain_failure_output(inner)
+                with patch.object(core.subprocess, 'Popen', return_value=child), \
+                     patch.object(core.selectors, 'DefaultSelector', Selector), \
+                     patch.object(core.os, 'read', side_effect=[wrapper, b'']), \
+                     patch.object(core.os, 'killpg', side_effect=ProcessLookupError):
+                    return EXECUTE(argv, deadline, cap, user, retain=retain)
+            return actual(argv, deadline, cap, user, retain=retain)
+        def cleanup(*_):
+            self.assertEqual(self.raw_section('command_context'), inner)
+            core.retain_failure_output(b'CLEANUP-OVERWRITE')
+            raise core.Failure('synthetic cleanup failure', 29)
+        with patch.object(core, 'execute', side_effect=command), \
+             patch.object(core, 'cleanup_start', side_effect=cleanup):
+            self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(self.raw_section('primary'), wrapper)
+        self.assertEqual(self.raw_section('command_context'), inner)
+        self.assertEqual(self.bundle()['command_context']['label'], core.FAILURE_CONTEXT)
+        self.assertEqual((core.ROOT / 'last-command-output').read_bytes(), b'CLEANUP-OVERWRITE')
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_command_context_fixed_reader_refuses_missing_foreign_links_and_replacement(self):
+        self.prepared()
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path = core.ROOT / 'last-command-output'
+        core.retain_failure_output(b'x' * 4096 + b'TAIL')
+        status, raw = core.last_failure_context()
+        self.assertEqual((status, len(raw), raw[-4:]), ('truncated', 2048, b'TAIL'))
+        path.chmod(0o640)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path.chmod(0o600)
+        alias = self.base / 'alias'
+        os.link(path, alias)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        alias.unlink()
+        with patch.object(core, 'stable_stat', side_effect=[1, 2]):
+            self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path.unlink()
+        path.symlink_to(self.fab_path)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+
     def test_manager_primary_output_is_taken_directly_and_no_invocation_means_no_journal(self):
         self.prepared()
         actual = self.command
@@ -774,17 +839,13 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual([d[0][0] for d in self.diagnostics], [core.SYSTEMCTL])  # no journalctl, no history
         self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
 
-    def test_reservation_refusal_binds_null_operation_and_runs_no_query_or_cleanup(self):
+    def test_reservation_refusal_cannot_capture_an_older_operation(self):
         self.prepared()
         stale = core.state()
         stale.update(phase='failed', mode='fresh', operation='c' * 32, invocation='d' * 32)
         core.save(stale)
         self.assertEqual(self.call('start-fresh'), 1)
-        bundle = self.bundle()
-        self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation'], bundle['nonce']),
-                         ('reserve', None, None, 'b' * 32))  # the older operation is never adopted
-        self.assertEqual(bundle['primary']['message'], 'startup phase refused')
-        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('unavailable', 'unavailable'))
+        self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
         self.assertEqual(self.diagnostics, [])
         self.assertEqual(core.state(), stale)
         self.assertFalse(any(c[0][:2] in ([core.SYSTEMCTL, 'start'], [core.SYSTEMCTL, 'stop']) for c in self.calls))
@@ -870,37 +931,133 @@ class GuestFixture(unittest.TestCase):
         for name, cap in core.FAILURE_CAPS.items():
             self.assertLessEqual(len(base64.b64decode(bundle[name]['output'], validate=True)), cap)
 
-    def test_diagnostic_run_is_tail_bounded_and_confirms_group_cleanup(self):
-        script = 'import sys;sys.stdout.write("a"*1000+"TAIL")'
-        status, raw, truncated, cleanup = DIAGNOSTIC_RUN([sys.executable, '-I', '-c', script],
-                                                         time.monotonic() + 8, 100)
+    @contextmanager
+    def diagnostic_fixture(self, *, late=None, code=0, ownership='owned', persistent=False,
+                           hold_pipe=False, signal_error=None, wait_timeout=False, spawn_error=False):
+        """Actual runner + actual OwnedGroup, entirely mocked kernel/process/clock/I/O."""
+        late = late or {}
+        now, events, chunks = [0.0], [], [b'a' * 1000 + b'TAIL', b'']
+        proc = SimpleNamespace(pid=4242, returncode=None, reaped=False)
+        def tick():
+            now[0] += .001
+            return now[0]
+        def advance(point):
+            now[0] += late.get(point, 0)
+        def waitid(kind, pid, options):
+            self.assertEqual((kind, pid, options), (os.P_PID, 4242, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+            self.assertFalse(proc.reaped)
+            events.append(('observe',))
+            if ownership == 'lost':
+                raise ChildProcessError
+            return SimpleNamespace(si_pid=4243 if ownership == 'foreign' else 4242,
+                                   si_code=os.CLD_EXITED, si_status=code)
+        def killpg(pid, number):
+            self.assertEqual(pid, 4242)
+            self.assertTrue(number == 0 or not proc.reaped, 'destructive signal after reap')
+            events.append(('signal', number))
+            advance('probe' if number == 0 else 'signal')
+            if number == 0:
+                if not persistent:
+                    raise ProcessLookupError
+            elif signal_error is not None:
+                raise signal_error
+        def wait(timeout):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 8 - now[0])
+            self.assertFalse(proc.reaped)
+            events.append(('reap',))
+            advance('reap')
+            if wait_timeout:
+                raise subprocess.TimeoutExpired('fixed fixture', timeout)
+            proc.reaped, proc.returncode = True, code
+            return code
+        def close():
+            events.append(('pipe-close',))
+            advance('pipe-close')
+        proc.stdout = SimpleNamespace(fileno=lambda: 123, close=close)
+        proc.wait = wait
+        def popen(argv, **kwargs):
+            self.assertEqual(argv, [core.JOURNALCTL, '--fixed-fixture'])
+            self.assertEqual(kwargs, dict(cwd='/', env=core.SAFE_ENV, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True))
+            events.append(('spawn',))
+            advance('spawn')
+            if spawn_error:
+                raise OSError
+            return proc
+        class Selector:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def register(self, stream, event):
+                self_test.assertIs(stream, proc.stdout)
+                self_test.assertEqual(event, core.selectors.EVENT_READ)
+            def select(self, timeout):
+                self_test.assertGreater(timeout, 0)
+                if hold_pipe:
+                    now[0] += timeout
+                    return []
+                advance('select')
+                return [True]
+        self_test = self
+        with ExitStack() as stack:
+            for target, name, value in ((core.subprocess, 'Popen', popen),
+                                        (core.selectors, 'DefaultSelector', Selector),
+                                        (core.os, 'read', lambda *_: chunks.pop(0)),
+                                        (core.os, 'waitid', waitid), (core.os, 'killpg', killpg),
+                                        (core.time, 'monotonic', tick),
+                                        (core.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds)),
+                                        (core.owned_process, 'monotonic', tick),
+                                        (core.owned_process, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))):
+                stack.enter_context(patch.object(target, name, value))
+            yield events, lambda end=8: DIAGNOSTIC_RUN([core.JOURNALCTL, '--fixed-fixture'], end, 100)
+
+    def test_diagnostic_runner_anchors_leader_until_kill_then_sole_reap_and_esrch(self):
+        with self.diagnostic_fixture() as (events, run):
+            status, raw, truncated, cleanup = run()
         self.assertEqual((status, truncated, cleanup, len(raw)), ('truncated', True, 'confirmed', 100))
         self.assertTrue(raw.endswith(b'TAIL'))
-        self.assertEqual(DIAGNOSTIC_RUN([sys.executable, '-I', '-c', 'import sys;print("x");sys.exit(3)'],
-                                        time.monotonic() + 8, 100), ('unavailable', b'', False, 'confirmed'))
-        with patch.object(core.subprocess, 'Popen', side_effect=AssertionError('no spawn when exhausted')):
-            self.assertEqual(DIAGNOSTIC_RUN(['/nonexistent'], time.monotonic() + 0.5, 100),
-                             ('unavailable', b'', False, 'confirmed'))
+        reap = events.index(('reap',))
+        self.assertIn(('signal', signal.SIGKILL), events[:reap])
+        self.assertEqual(events[reap + 1:], [('signal', 0), ('pipe-close',)])
+        self.assertEqual(events.count(('reap',)), 1)
 
-    def test_diagnostic_run_deadline_includes_descendant_reaping(self):
-        # A descendant keeps the pipe open past the child's exit: only the shared end stops it.
-        script = ('import subprocess,sys;subprocess.Popen([sys.executable,"-I","-c","import time;time.sleep(30)"]);'
-                  'sys.stdout.write("started")')
-        started = time.monotonic()
-        result = DIAGNOSTIC_RUN([sys.executable, '-I', '-c', script], started + 3.0, 100)
-        self.assertEqual(result, ('unavailable', b'', False, 'confirmed'))
-        self.assertLess(time.monotonic() - started, 3.8)
+    def test_diagnostic_runner_requires_positive_reap_and_group_absence(self):
+        for changes, expected in ((dict(code=3), ('unavailable', 'confirmed')),
+                                  (dict(hold_pipe=True), ('unavailable', 'confirmed')),
+                                  (dict(persistent=True), ('truncated', 'uncertain')),
+                                  (dict(wait_timeout=True), ('truncated', 'uncertain')),
+                                  (dict(signal_error=ProcessLookupError()), ('truncated', 'uncertain')),
+                                  (dict(signal_error=PermissionError()), ('truncated', 'uncertain'))):
+            with self.subTest(changes=changes), self.diagnostic_fixture(**changes) as (_, run):
+                result = run()
+                self.assertEqual((result[0], result[3]), expected)
 
-    def test_diagnostic_run_reports_uncertain_cleanup_instead_of_clean(self):
-        real = os.killpg
-        def survivor(pid, sig):
-            if sig == 0:
-                return None  # group still answers: not positively gone
-            return real(pid, sig)
-        with patch.object(core.os, 'killpg', side_effect=survivor):
-            status, raw, _, cleanup = DIAGNOSTIC_RUN([sys.executable, '-I', '-c', 'print(1)'],
-                                                     time.monotonic() + 8, 100)
-        self.assertEqual(cleanup, 'uncertain')
+    def test_diagnostic_runner_refuses_signals_after_ownership_loss(self):
+        for ownership in ('lost', 'foreign'):
+            with self.subTest(ownership=ownership), self.diagnostic_fixture(ownership=ownership) as (events, run):
+                self.assertEqual(run()[3], 'uncertain')
+                self.assertFalse(any(event[0] == 'signal' for event in events))
+
+    def test_diagnostic_runner_never_renews_budget_and_late_steps_are_uncertain(self):
+        for point in ('spawn', 'select', 'signal', 'reap', 'probe', 'pipe-close'):
+            with self.subTest(point=point), self.diagnostic_fixture(late={point: 9}) as (events, run):
+                self.assertEqual(run(), ('unavailable', b'', point not in ('spawn', 'select'), 'uncertain'))
+                if point == 'spawn':
+                    self.assertEqual(events, [('spawn',), ('pipe-close',)])
+                if point == 'signal':
+                    self.assertNotIn(('reap',), events)
+        with self.diagnostic_fixture(spawn_error=True, late={'spawn': 9}) as (_, run):
+            self.assertEqual(run()[3], 'uncertain')
+        with self.diagnostic_fixture() as (events, run):
+            self.assertEqual(run(end=.5), ('unavailable', b'', False, 'confirmed'))
+            self.assertEqual(events, [])
+
+    def test_capture_fully_skips_after_original_work_deadline(self):
+        self.prepared()
+        with patch.object(core, 'state', side_effect=AssertionError('no read after cutoff')), \
+             patch.object(core, 'write_first_failure', side_effect=AssertionError('no write after cutoff')):
+            core.capture_first_failure('fresh', None, core.Failure(), time.monotonic() - 1)
+        self.assertEqual(self.diagnostics, [])
 
     def test_public_start_preserves_int_and_term_over_cleanup_failure(self):
         self.prepared()

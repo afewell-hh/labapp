@@ -42,7 +42,7 @@ PHASES = {'access': 15, 'stage': 35, 'fresh': 70, 'strict': 80,
           'resume': 95, 'persistence': 105}
 SOURCES = {
     name: 'build/provision/' + name for name in (
-        'vlab_trial.py', 'labapp-vlab-trial.service', 'vlab_core.py',
+        'vlab_trial.py', 'labapp-vlab-trial.service', 'vlab_core.py', 'owned_process.py',
         'ensure-bridge-ipv4.py', 'journald@labapp-vlab.conf',
         'labapp-vlab-fresh.service', 'hhfab-vlab-resume.service',
         'install-qemu.py', 'qemu_offline.py', 'qemu_acquire.py',
@@ -518,7 +518,8 @@ def bootstrap(incoming, expected_manifest):
 # this strict reader is shared by guest export and the owner host. Raw sections are
 # untrusted text: only structure, sizes, enums and bindings are validated here.
 FAILURE_LIMIT = 32 * 1024
-FAILURE_SECTIONS = {'primary': 4096, 'manager': 2048, 'journal': 8192}
+FAILURE_SECTIONS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
+FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
 FAILURE_STATUS = ('ok', 'truncated', 'unavailable', 'invalid')
 FAILURE_STAGES = ('reserve', 'manager', 'unit', 'final')
 HEX32 = '[0-9a-f]{32}'
@@ -533,7 +534,7 @@ def first_failure_bundle(raw):
     except (ValueError, RecursionError):
         raise Failure('failure bundle JSON refused') from None
     fields = {'schema', 'source', 'nonce', 'mode', 'operation', 'invocation', 'boot', 'stage',
-              'query_cleanup', 'state', 'primary', 'manager', 'journal'}
+              'query_cleanup', 'state', 'primary', 'command_context', 'manager', 'journal'}
     require(type(value) is dict and set(value) == fields and value['schema'] == 1
             and type(value['schema']) is int and value['source'] == 'vlab_core'
             and value['mode'] in ('fresh', 'resume') and value['stage'] in FAILURE_STAGES
@@ -551,7 +552,7 @@ def first_failure_bundle(raw):
                     for k in ('phase', 'containment', 'service_result')))
     for name, cap in FAILURE_SECTIONS.items():
         section = value[name]
-        extra = {'message', 'code'} if name == 'primary' else set()
+        extra = {'message', 'code'} if name == 'primary' else {'label'} if name == 'command_context' else set()
         require(type(section) is dict and set(section) == {'status', 'output'} | extra
                 and section['status'] in FAILURE_STATUS and type(section['output']) is str)
         try:
@@ -564,8 +565,11 @@ def first_failure_bundle(raw):
             require(section['message'] is None or type(section['message']) is str
                     and re.fullmatch('[ -~]{1,128}', section['message']))
             require(section['code'] is None or type(section['code']) is int and 0 <= section['code'] < 256)
+        if name == 'command_context':
+            require(section['label'] == FAILURE_CONTEXT)
     # Output can exist only for an exact bound identity.
     require(value['manager']['status'] == 'unavailable' or value['operation'] is not None)
+    require(value['command_context']['status'] == 'unavailable' or value['operation'] is not None)
     require(value['journal']['status'] in ('unavailable',) or value['invocation'] is not None)
     return value
 
@@ -596,9 +600,12 @@ def export_failure(nonce):
     operation, invocation = current.get('operation'), current.get('invocation')
     for item in (operation, invocation):
         require(item is None or type(item) is str and re.fullmatch(HEX32, item))
-    if bundle['operation'] is not None:
-        require(current.get('mode') == 'fresh' and operation == bundle['operation'])
-        require(bundle['invocation'] is None or invocation == bundle['invocation'])
+    require(operation == bundle['operation'] and invocation == bundle['invocation'])
+    if operation is None:
+        require(current.get('phase') == 'prepared'
+                and all(key not in current for key in ('mode', 'operation', 'invocation')))
+    else:
+        require(current.get('mode') == 'fresh')
     envelope = {'schema': 1, 'source_sha': value['source_sha'], 'nonce': nonce, 'mode': 'fresh',
                 'operation': operation, 'invocation': invocation, 'boot': boot}
     return encoded(envelope) + b'\n' + raw

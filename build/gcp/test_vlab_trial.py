@@ -1428,6 +1428,7 @@ class GuestDiagnostics(unittest.TestCase):
                   'invocation': 'f' * 32, 'boot': self.boot_uuid, 'stage': 'unit', 'query_cleanup': 'confirmed',
                   'state': {'status': 'ok', 'phase': 'failed', 'containment': 'verified', 'service_result': None},
                   'primary': {**section(), 'message': 'synthetic ready failure', 'code': 17},
+                  'command_context': {**section(), 'label': guest.FAILURE_CONTEXT},
                   'manager': section('ok', b'InvocationID=' + b'f' * 32 + b'\n'),
                   'journal': section('ok', b'native detail ' + SENTINEL.encode())}
         bundle.update(changes)
@@ -1485,6 +1486,8 @@ class GuestDiagnostics(unittest.TestCase):
             'resume mode': self.export_bytes(mode='resume'), 'other boot': self.export_bytes(boot='3' * 8 + self.boot_uuid[8:]),
             'envelope operation differs': self.export_bytes(operation='9' * 32),
             'envelope invocation differs': self.export_bytes(invocation='9' * 32),
+            'null bundle invocation conflicts': self.export_bytes(self.failure_bundle(invocation=None)),
+            'null envelope invocation conflicts': self.export_bytes(invocation=None),
             'bundle nonce': self.export_bytes(self.failure_bundle(nonce=other)),
             'bundle boot': self.export_bytes(self.failure_bundle(boot='3' * 8 + self.boot_uuid[8:])),
             'bundle mode': self.export_bytes(self.failure_bundle(mode='resume')),
@@ -1505,11 +1508,20 @@ class GuestDiagnostics(unittest.TestCase):
         null = self.failure_bundle(stage='reserve', operation=None, invocation=None,
                                    manager={'status': 'unavailable', 'output': ''},
                                    journal={'status': 'unavailable', 'output': ''})
-        private, (code, receipt, _, _) = self.private_drive(self.export_bytes(null))
+        private, (code, receipt, _, _) = self.private_drive(self.export_bytes(null, operation=None, invocation=None))
         self.assertEqual(receipt['private_diagnostic'], 'captured')
+        self.setUp()
+        private, (code, receipt, _, _) = self.private_drive(self.export_bytes(null))
+        self.assertEqual(receipt['private_diagnostic'], 'invalid')  # old live operation cannot vouch for null
         self.setUp()
         private, (code, receipt, _, _) = self.private_drive(b'absent')
         self.assertEqual((receipt['private_diagnostic'], list(private.iterdir())), ('absent', []))
+
+    def test_capture_acceptance_requires_host_initial_boot(self):
+        for boot in (None, '', host.ZERO_BOOT):
+            with self.subTest(boot=boot):
+                self.assertEqual(host.accept_failure(self.export_bytes(), 'a' * 40, self.nonce, boot),
+                                 ('invalid', None))
 
     def test_guest_query_uncertainty_is_not_reported_as_clean_capture(self):
         bundle = self.failure_bundle(query_cleanup='uncertain')

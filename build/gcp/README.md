@@ -1485,6 +1485,8 @@ through that same master (`cleanup=True`, no new SSH, reauthentication, reconnec
 retry). It takes no path or selector. The host mandatorily compares the returned
 envelope and bundle header with its OWN source SHA, nonce, fixed mode `fresh` and
 initial boot UUID, and the envelope with the bundle's operation/invocation
+(including null equality; a reservation export requires prepared guest state with
+no mode/operation/invocation)
 (see the [core bundle](../provision/README.md#root-private-first-failure-bundle-issue-368));
 `absent`, `invalid`, transport loss or timeout, and an exhausted budget are explicit
 statuses, never a cleanup exemption.

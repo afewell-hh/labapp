@@ -1177,11 +1177,19 @@ class FirstFailureExport(unittest.TestCase):
             trial.export_failure('9' * 32)
 
     def test_reservation_bundle_has_null_binding_and_runs_no_query(self):
+        prepared = {'schema': 1, 'nonce': NONCE, 'phase': 'prepared'}
+        self.core.atomic(self.state_root / 'state.json', prepared)
         self.capture(value=False, error=self.core.Failure('startup phase refused'))
         bundle = trial.first_failure_bundle((self.state_root / self.core.FIRST_FAILURE).read_bytes())
         self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']), ('reserve', None, None))
         self.assertEqual(self.queries, [])
-        self.assertIn(b'"operation":"' + self.operation.encode(), self.export().partition(b'\n')[0])
+        self.assertIn(b'"operation":null', self.export().partition(b'\n')[0])
+        for changes in ({'operation': self.operation}, {'invocation': self.invocation},
+                        {'mode': 'fresh'}, {'phase': 'failed'}, {'operation': None}):
+            with self.subTest(changes=changes):
+                self.core.atomic(self.state_root / 'state.json', dict(prepared, **changes))
+                with self.assertRaises(trial.Failure):
+                    self.export()
 
     def test_unsafe_file_identity_is_refused(self):
         self.capture()
@@ -1226,6 +1234,9 @@ class FirstFailureExport(unittest.TestCase):
             'journal without invocation': dict(good, invocation=None),
             'control char message': dict(good, primary=dict(good['primary'], message='bad\nline')),
             'code out of range': dict(good, primary=dict(good['primary'], code=256)),
+            'context label': dict(good, command_context=dict(good['command_context'], label='first inner failure')),
+            'context cap': dict(good, command_context=dict(good['command_context'], status='ok',
+                               output=base64.b64encode(b'x' * 2049).decode())),
             'extra state field': dict(good, state=dict(good['state'], text=SENTINEL)),
         }
         for name, bad in cases.items():

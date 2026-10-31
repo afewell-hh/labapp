@@ -1140,7 +1140,7 @@ bridge policy explicitly selects `hhbr`/`172.30.0.2/21` and all three namespace
 bridge netfilter hooks off, without firewall flush. Those are candidate choices;
 actual Docker/k3d coexistence and traffic remain trial gates.
 
-Stage `vlab_core.py`, the unchanged `ensure-bridge-ipv4.py`,
+Stage `vlab_core.py`, its `owned_process.py` sibling, the unchanged `ensure-bridge-ipv4.py`,
 `labapp-vlab-fresh.service`, `hhfab-vlab-resume.service` and
 `journald@labapp-vlab.conf` together in a trusted root-controlled directory.
 The first command installs exactly those maintained siblings and fixed units;
@@ -1470,14 +1470,24 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
 * **Binding.** Header: state nonce (the trial nonce), `mode`, `operation`,
   `invocation`, boot id and a derived `stage` (`reserve` | `manager` | `unit` |
   `final`; a coarse locator, not a per-substep proof). A reservation refusal has no
-  operation of this call, so `operation`/`invocation` are null and no older state
+  operation of this call, so `operation`/`invocation` are null only for matching
+  `prepared` state with no mode/operation/invocation keys. Conflicting live bindings
+  are refused at capture, guest export and host acceptance; no older state
   operation, manager history or journal is adopted. If the state is unreadable or
   differs from the reserved operation, the `state` section is `unavailable`/`invalid`
   and `invocation` is null.
 * **Sections** (each `ok | truncated | unavailable | invalid`, raw bytes base64):
-  `primary` is the in-flight `Failure.private_output` (tail, at most 4 KiB), the fixed
+  `primary` is the in-flight `Failure.private_output` (tail, at most 2 KiB), the fixed
   Failure message literal and code; it is `unavailable` when the exception has none
-  (never an exception `repr`). `state` is a fixed token subset. `manager` is one
+  (never an exception `repr`). `command_context` is a separately labeled observation:
+  "last failed command output observed before manager-wrapper overwrite/core cleanup".
+  It reads only the fixed `last-command-output` file, at most a 2 KiB tail, with
+  descriptor/path identity, root ownership, regular single-link 0600 and stable
+  size/timestamp checks. Missing, unsafe or changed files are `unavailable`.
+  The outer `systemctl start` alone uses `retain=False` so its generic output
+  cannot overwrite that context; its actual bytes still belong to `primary`.
+  This does not identify the first inner failure, prove hhfab executed or grant
+  readiness/containment authority. `state` is a fixed token subset. `manager` is one
   `systemctl show` of the fixed unit for `ActiveState,SubState,Result,InvocationID,
   ExecMainCode,ExecMainStatus,ExecMainPID` (at most 2 KiB, 2 s). A different
   `InvocationID` makes it `invalid` (output dropped); a forgotten unit makes it
@@ -1487,13 +1497,22 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   8 s). It remains allowed when the manager forgot the unit, and there is no unit-only
   fallback or history search. Success is never assumed from missing `ExecMain*`.
 * **Budget.** Both queries share one absolute deadline
-  `min(start end, now + 10 s)` that includes spawn, I/O and kill/reap (the last second
-  of each query is held back for containment). Exhausted budget leaves the query
-  sections `unavailable`; the file-only sections are still written. `query_cleanup`
+  `min(start end, now + 10 s)` that includes spawn, I/O, kill/reap and pipe close
+  (the last second of each query is held back for containment). If the original
+  start work budget is exhausted, capture is fully skipped, including file-only
+  sections. No wait or signal renews the deadline; late spawn/cleanup/close is
+  uncertain. `query_cleanup`
   is `confirmed` only after the direct child was reaped and its process group is
   positively gone, otherwise `uncertain`. This is the GUEST process namespace: an
   uncertain guest query is contained by the guardian and VM disposal and is never
   reported as a clean capture.
+  The deployed sibling is byte-identical to `build/gcp/owned_process.py`, guarded
+  by CI `cmp`. It keeps the leader unreaped through all destructive signals,
+  observes with `waitid(WNOWAIT)`, uses one final positive-PID wait, then requires
+  group ESRCH. Lost ownership refuses further destructive signals. Normal child
+  wait semantics and no foreign reaper are prerequisites; escaped sessions are
+  outside this process-group boundary. `Popen` itself is not interruptible here:
+  a late return cannot be reported as within-budget cleanup.
 * **Untrusted.** Raw sections may contain anything hhfab, kubectl or a unit printed
   (possibly credentials). They stay root-private and are never read by the worker,
   never staged into candidate/images/CI artifacts/GitHub.
@@ -1504,14 +1523,29 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   `<envelope>\n<bundle>`. The envelope is built from `contract.json`
   (`source_sha`), the LIVE core `state.json` (`operation`, `invocation`) and the live
   boot id, independently of the bundle header; the bundle must match it and the
-  contract nonce/boot. The strict validator (`first_failure_bundle`) is shared with
+  contract nonce/boot. Operation and invocation equality includes null values;
+  null reservation requires legitimate prepared state. The strict validator (`first_failure_bundle`) is shared with
   the owner host. A root-compromised guest could forge both records; the check detects
   stale, foreign or replaced data, not a hostile root, and all bytes remain untrusted.
 
-Offline fixtures (`test_vlab_core.py`, `test_vlab_trial.py`) use fake queries and
+The diagnostic runner fixtures (`test_vlab_core.py`) mock Popen, waitid, killpg,
+selector/I/O and monotonic time while exercising the actual runner and unchanged
+OwnedGroup; they start no child. Other existing executor tests remain separate.
+Offline bundle fixtures (`test_vlab_core.py`, `test_vlab_trial.py`) use fake queries and
 files; they do not show native systemd scheduling, real `journalctl` selection or
 namespace retention, or VLAB readiness. The cause of canonical run 41242950882/1
 remains unknown.
+
+Version scope: Ubuntu 24.04's systemd 255; official version-255 documentation
+read 2026-10-31: [systemd.exec](https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html)
+(`SERVICE_RESULT` is a service result; main-process exit variables require an
+identified main process), [journalctl](https://www.freedesktop.org/software/systemd/man/255/journalctl.html)
+(different field matches combine with AND; an exact namespace selects that journal),
+[journal fields](https://www.freedesktop.org/software/systemd/man/255/systemd.journal-fields.html)
+(trusted boot/unit/invocation fields; boot is 128-bit hex), and
+[systemd D-Bus properties](https://www.freedesktop.org/software/systemd/man/255/org.freedesktop.systemd1.html)
+(`ExecMain*` describe current or last main process as known). These are documented
+semantics, not a native scheduling, journal-retention or readiness test.
 
 Required offline command, in its own interpreter (CI refuses zero discovery):
 

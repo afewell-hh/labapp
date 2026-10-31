@@ -577,6 +577,7 @@ def accept_failure(raw, source_sha, nonce, boot):
     if raw == b'absent':
         return 'absent', None
     try:
+        guest.require(type(boot) is str and re.fullmatch(guest.UUID, boot) and boot != ZERO_BOOT)
         guest.require(type(raw) is bytes and 0 < len(raw) <= EXPORT_READ_LIMIT and raw != b'invalid')
         first, separator, rest = raw.partition(b'\n')
         guest.require(separator == b'\n')
@@ -591,9 +592,8 @@ def accept_failure(raw, source_sha, nonce, boot):
                           and re.fullmatch(guest.HEX32, envelope[key]))
         bundle = guest.first_failure_bundle(rest)
         guest.require(bundle['nonce'] == nonce and bundle['mode'] == 'fresh' and bundle['boot'] == boot)
-        if bundle['operation'] is not None:
-            guest.require(bundle['operation'] == envelope['operation'])
-            guest.require(bundle['invocation'] is None or bundle['invocation'] == envelope['invocation'])
+        guest.require(bundle['operation'] == envelope['operation']
+                      and bundle['invocation'] == envelope['invocation'])
         return 'captured', raw
     except Exception:
         return 'invalid', None

@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Verify shared owned-process deployment bytes
+        run: cmp build/gcp/owned_process.py build/provision/owned_process.py
       - name: Install trusted lead-side YAML dependency
         run: |
           sudo apt-get update
