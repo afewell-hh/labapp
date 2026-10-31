@@ -23,6 +23,18 @@ from .gcs import _decode
 PROFILE_LIMIT = 65_536
 
 
+def profile_user(value):
+    """Compare LoginProfile.name with a configured users/ID, without rewriting it.
+
+    OS Login v1 defines the returned name as a unique ID, whereas request paths
+    use users/{user}. Accept only bounded ASCII positive decimal bare IDs;
+    existing canonical names retain their exact validation and comparison.
+    """
+    if isinstance(value, str) and re.fullmatch(r'[1-9][0-9]{0,127}', value):
+        value = 'users/' + value
+    return self_user(value)
+
+
 def _wire(value):
     try:
         if not isinstance(value, str) or len(value) > 4096 or '\n' in value or '\r' in value:
@@ -47,11 +59,27 @@ class SelfLogin:
     """
     def __init__(self, user, *, token_provider, transport=None):
         self.user = self_user(user)
+        self._request_user = self.user
         self.token_provider = token_provider
         self.http = transport if transport is not None else HttpTransport()
 
+    @classmethod
+    def for_owner(cls, user, *, token_provider, transport=None):
+        """Fixed end-user wire principal, separate from the numeric response ID.
+
+        End-user REST requests require the authenticated email principal. This
+        adapter is only for the trusted owner coordinator, which verifies the
+        active account and absence of impersonation before any profile request.
+        No caller-selected wire alias, fallback or identity discovery is exposed.
+        """
+        if user != 'users/110405050082684214272':
+            raise AccessError('owner requires fixed canonical SELF identity')
+        login = cls(user, token_provider=token_provider, transport=transport)
+        login._request_user = 'users/art@githedgehog.com'
+        return login
+
     def _request(self, method, suffix, payload=None, *, import_clock=None, work_deadline=None):
-        url = 'https://oslogin.googleapis.com/v1/' + quote(self.user, safe='/') + suffix
+        url = 'https://oslogin.googleapis.com/v1/' + quote(self._request_user, safe='/') + suffix
         try:
             headers = bearer_headers(self.token_provider)
             headers['Accept-Encoding'] = 'identity'
@@ -77,7 +105,7 @@ class SelfLogin:
 
     def _profile(self, value):
         if (not isinstance(value, dict) or set(value) - {'name', 'posixAccounts', 'sshPublicKeys'} or
-                value.get('name') != self.user):
+                profile_user(value.get('name')) != self.user):
             raise AccessError('SELF profile identity/schema mismatch')
         keys = value.get('sshPublicKeys', {})
         accounts = value.get('posixAccounts', [])

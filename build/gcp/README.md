@@ -751,8 +751,28 @@ list, overwrite, delete or slot-write operation. No private key is accepted.
 identity and an expected canonical SELF name. It only addresses that profile,
 one public-key import and exact server-fingerprint deletion. These inputs are
 trusted runner configuration; matching the returned profile name is not token
-introspection or proof of deployed WIF. A newly dedicated identity might lack a
-POSIX profile/account before its first import. Missing/ambiguous profile or
+introspection or proof of deployed WIF.
+The [OS Login v1 LoginProfile](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/LoginProfile)
+returns a unique user ID in `name`, while
+[request paths](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users/getLoginProfile)
+use `users/{user}` (docs checked 2026-10-31; SDK575 returns the profile unchanged).
+Only profile identity comparisons accept a bounded positive ASCII decimal bare
+ID by comparing `users/` plus that ID with the configured canonical identity.
+Already canonical names retain exact validation; bare email/alias names are
+refused. Profiles and import-response digests preserve the original raw name;
+access bindings and SSH-key resource-name checks stay canonical.
+The owner coordinator selects the closed `SelfLogin.for_owner` adapter: only
+the expected identity must be exactly `users/110405050082684214272`, and GET/import/
+DELETE requests use the fixed authenticated `users/art@githedgehog.com`
+principal, as SDK575 does for end-user credentials. No wire principal is read
+from input, no alias fallback exists, and returned key names must still match
+the expected numeric identity. The existing generic `SelfLogin` request path
+is unchanged. The coordinator checks its fixed active account and absence of
+impersonation before requesting a profile or generating/importing a key.
+Rotating the owner identity requires a reviewed source update to these fixed
+identity values and the coordinator's `OWNER` constant.
+A newly dedicated identity might lack a POSIX profile/account before its first
+import. Missing/ambiguous profile or
 nonroot project POSIX identity refuses access; no key/bootstrap repair is
 attempted. Live SELF/account behavior remains an explicit deployment gate.
 

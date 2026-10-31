@@ -37,7 +37,7 @@ from .lifecycle.cloud import PolicyCloud, ForbiddenOperation
 from .lifecycle.compute import ComputeRestTransport
 from .lifecycle.controller import Config, Controller, Refused
 from .lifecycle.gcs import GcsSlotStore
-from .lifecycle.oslogin import OwnKeyImport, SelfLogin, cleanup_own_key
+from .lifecycle.oslogin import OwnKeyImport, SelfLogin, cleanup_own_key, profile_user
 
 OWNER = 'art@githedgehog.com'
 SNAPSHOT_FIELDS = ('profile', 'request_id', 'epoch', 'run_id', 'attempt', 'body_hash',
@@ -407,7 +407,8 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         guest.require(impersonation in ('', '(unset)') and not os.environ.get('CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'),
                       'owner impersonation unsupported')
         owner_profile = guest.data(command(['gcloud', 'compute', 'os-login', 'describe-profile', '--format=json'], 20))
-        guest.require(owner_profile.get('name') == snapshot['self_user'] == login.user, 'canonical SELF identity differs')
+        guest.require(profile_user(owner_profile.get('name')) == snapshot['self_user'] == login.user,
+                      'canonical SELF identity differs')
         version = guest.data(command(['gcloud', 'version', '--format=json'], 15))
         guest.require(version.get('Google Cloud SDK') == '575.0.0')
         command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(output / 'oslogin')], 10)
@@ -584,7 +585,7 @@ def main(argv=None):
     records = GcsAccessRecords(BUCKET, token_provider=token)
     registration = OwnerRegistration(GcsSlotStore(BUCKET, token_provider=token),
                      PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
-    login = SelfLogin(snapshot['self_user'], token_provider=token)
+    login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login)
 
 
