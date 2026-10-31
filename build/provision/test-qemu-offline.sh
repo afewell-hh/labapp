@@ -66,6 +66,13 @@ cleanup() {
   fi
   if ((failed)); then echo 'qemu test: owned cleanup failed' >&2; fi
   rm -rf -- "$workdir" || failed=1
+  # A successful rm is not absence evidence: check the exact owned path again.
+  if [[ -e "$workdir" || -L "$workdir" ]]; then
+    echo "qemu test: host scratch still present: $workdir" >&2
+    failed=1
+  else
+    echo "qemu test: host scratch absent: $workdir"
+  fi
   return "$failed"
 }
 finish() {
@@ -108,8 +115,10 @@ timeout --kill-after=3s 30s docker cp "$runtime_id:/target-state.json" "$workdir
 # This digest comes from the trusted acquisition result, independently of the
 # bundle subsequently copied to the disconnected target. Never hash receipt there
 # to invent the expected value.
+acquisition_start=$SECONDS
 acquisition="$(timeout --kill-after=10s 9m bash "$here/prepare-qemu-offline.sh" "$workdir/state.json" "$workdir/bundle")"
 printf '%s\n' "$acquisition"
+printf 'qemu test: acquisition seconds %s\n' "$((SECONDS - acquisition_start))"
 expected="$(python3 -c 'import json,re,sys; r=json.loads(sys.argv[1]); s=r["receipt_sha256"]; assert isinstance(s,str) and re.fullmatch("[a-f0-9]{64}",s); print(s)' "$acquisition")"
 timeout --kill-after=3s 30s docker cp "$workdir/bundle" "$runtime_id:/bundle"
 timeout --kill-after=5s 510s docker exec "$runtime_id" python3 /suite/qemu_offline_container.py \

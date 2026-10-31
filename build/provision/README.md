@@ -755,6 +755,19 @@ traps do not establish independent host-workdir absence or hard-cancellation cle
 Both offline launcher finish traps preserve a primary nonzero exit when cleanup
 also fails, including 124/130/143; cleanup-only failure prevents success.
 
+For either selection the target harness prints one bounded public JSON report each
+for the unchanged installer's install and rerun (`qemu_offline_report`: pins, `changed`,
+installer-reported and harness-measured seconds, archive names/sizes/digests), then
+`final_installed_package_map` from the rerun. Resolved auxiliary package versions are
+reported as found, not pinned. After the harness workspace, install and rerun it also
+prints `target_scratch_absent`: a positive re-read of `/var/tmp/labapp-qemu-*` showing
+nothing new remains. The host launcher prints measured acquisition seconds and
+`host scratch absent: PATH` only after rechecking the exact owned workdir (a leftover
+fails the run); `prepare-qemu-offline.sh` does the same for its owned output on
+failure. On failure the original error or cancellation is re-raised after best-effort
+scratch evidence on stderr. These reports and census do not replace the receipt,
+selection, ownership or package-policy checks and are not hard-cancellation evidence.
+
 Ordinary HTTP/digest refusals require a native integer nonzero exit and the
 expected bounded status evidence. A supervisor timeout or output overflow is a
 fixture failure; only the dedicated hang case expects the external timeout.
