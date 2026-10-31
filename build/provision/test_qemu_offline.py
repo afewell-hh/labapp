@@ -378,6 +378,37 @@ class SelectionTests(unittest.TestCase):
                 result = subprocess.run(['bash', '-c', program], capture_output=True, timeout=3)
                 self.assertEqual(result.returncode, primary or 1, (name, primary, result.stderr))
 
+    def test_actual_acquisition_finish_preserves_primary_with_unwritable_stderr(self):
+        source = Path(__file__).with_name('prepare-qemu-offline.sh').read_text()
+        finish = 'finish() {' + source.split('finish() {', 1)[1].split('\ntrap finish EXIT', 1)[0]
+        # Only the maintained EXIT trap executes. Cleanup is a literal stub and
+        # rm is a function limited to rmdir of this test's empty private output.
+        # No Docker, native guest, APT or broad filesystem removal occurs.
+        for primary in (0, 1, 124, 130, 143):
+            for cleanup_code in (0, 1):
+                for removal_code in (0, 1):
+                    for closed in (False, True):
+                        with self.subTest(primary=primary, cleanup=cleanup_code,
+                                          removal=removal_code, closed=closed), \
+                             tempfile.TemporaryDirectory() as directory:
+                            output = Path(directory) / 'owned-output'
+                            output.mkdir()
+                            remove = 'rmdir -- "$output"' if removal_code == 0 else 'return 1'
+                            program = ('set -eu\noutput_owned=1\noutput=$1\n'
+                                       'cleanup() { return ' + str(cleanup_code) + '; }\n'
+                                       'rm() { ' + remove + '; }\n' + finish +
+                                       '\ntrap finish EXIT\n' + ('exec 2>&-\n' if closed else '') +
+                                       'exit ' + str(primary) + '\n')
+                            result = subprocess.run(['bash', '-c', program, 'fixture', str(output)],
+                                                    capture_output=True, timeout=3)
+                            expected = primary or cleanup_code
+                            self.assertEqual(result.returncode, expected, result.stderr)
+                            if expected and not closed:
+                                notice = b'owned output absent' if removal_code == 0 else b'owned output still present'
+                                self.assertIn(notice, result.stderr)
+                                self.assertIn(b'output is not trusted', result.stderr)
+                            self.assertEqual(output.exists(), not expected or removal_code != 0)
+
 
 class ObservabilityTests(unittest.TestCase):
     def result(self, selected, **changes):
