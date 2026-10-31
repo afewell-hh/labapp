@@ -359,6 +359,8 @@ class SelectionTests(unittest.TestCase):
                 args = ['bash', str(script)] + ([] if selected == protocol.TEST else ['--selection', selected])
                 result = subprocess.run(args, env=env, capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout.decode(), r'qemu test: acquisition seconds \d+')
+                self.assertRegex(result.stdout.decode(), r'qemu test: host scratch absent: /')
                 calls = json.loads(state.read_text())['calls']
                 capture = next(args for args in calls if '--capture-state' in args)
                 actual = next(args for args in calls if '--receipt-sha256' in args)
@@ -375,6 +377,146 @@ class SelectionTests(unittest.TestCase):
                            '\ntrap finish EXIT\nexit '+str(primary)+'\n')
                 result = subprocess.run(['bash', '-c', program], capture_output=True, timeout=3)
                 self.assertEqual(result.returncode, primary or 1, (name, primary, result.stderr))
+
+
+class ObservabilityTests(unittest.TestCase):
+    def result(self, selected, **changes):
+        policy = protocol.selection(selected)
+        packages = {**policy['pins'], 'libc6': '2.39-0ubuntu8.7', 'libfoo1:amd64': '1:1.0~rc1+dfsg-2'}
+        value = {'snapshot': policy['snapshot'], 'pins': policy['pins'], 'resolved_installed': packages,
+                 'downloaded_archives': [{'name': 'qemu-utils_1%3a8.2.2+ds-0ubuntu1.11_amd64.deb',
+                                          'bytes': 5, 'sha256': '1' * 64}],
+                 'changed': True, 'seconds': 12.5}
+        if selected == protocol.BASELINE:
+            value['selection'] = selected
+        return {**value, **changes}
+
+    def test_public_report_is_bounded_validated_and_selection_bound(self):
+        for selected in (protocol.TEST, protocol.BASELINE):
+            report = target.public_report('install', self.result(selected), 3.14159, selected)
+            self.assertEqual(report['harness_seconds'], 3.142)
+            self.assertEqual(report['installer_seconds'], 12.5)
+            self.assertEqual(report['pins'], protocol.selection(selected)['pins'])
+            self.assertEqual(report['installed_package_count'], len(self.result(selected)['resolved_installed']))
+            self.assertNotIn('resolved_installed', report)
+            json.dumps(report)
+            good = self.result(selected)
+            policy_pins = protocol.selection(selected)['pins']
+            other =protocol.BASELINE if selected == protocol.TEST else protocol.TEST
+            bad = [None, [], {}, {**good, 'extra': 1}, self.result(selected, snapshot='20000101T000000Z'),
+                   self.result(selected, pins={}), self.result(selected, changed=1),
+                   self.result(selected, seconds=True), self.result(selected, seconds=-1),
+                   self.result(selected, resolved_installed={}),
+                   self.result(selected, resolved_installed={**good['resolved_installed'], 'bad name': '1'}),
+                   self.result(selected, resolved_installed={**good['resolved_installed'], 'x': 'a b'}),
+                   self.result(selected, resolved_installed={
+                       **good['resolved_installed'], 'qemu-utils': '0:other'}),
+                   self.result(selected, resolved_installed={
+                       **policy_pins, **{'p%d' % i: '1' for i in range(target.MAX_PACKAGES)}}),
+                   self.result(selected, downloaded_archives=[{'name': '../x.deb', 'bytes': 1, 'sha256': '1' * 64}]),
+                   self.result(selected, downloaded_archives=[{'name': 'a.deb', 'bytes': 1}]),
+                   self.result(selected, downloaded_archives=[
+                       {'name': 'a.deb', 'bytes': 1, 'sha256': '1' * 64}] * (target.MAX_ARCHIVES + 1)),
+                   self.result(selected, selection=other)]
+            for value in bad:
+                with self.subTest(selected=selected, value=str(value)[:80]), self.assertRaises(Refusal):
+                    target.public_report('rerun', value, 1, selected)
+
+    def test_invoke_measures_duration_and_observes_only_success(self):
+        observed = []
+        payload = json.dumps(self.result(protocol.BASELINE)).encode()
+        with patch.object(target, 'bounded', return_value=(0, payload)), \
+             patch.object(target.time, 'monotonic', side_effect=[10.0, 12.5]):
+            result = target.invoke('1' * 64, True, selected=protocol.BASELINE, observe=observed)
+        self.assertEqual(observed, [(result, 2.5)])
+        for code in (1, 0):
+            with patch.object(target, 'bounded', return_value=(code, b'qemu install: x')):
+                if code:
+                    target.invoke('1' * 64, selected=protocol.BASELINE, observe=observed)
+                else:
+                    with self.assertRaises(AssertionError):
+                        target.invoke('1' * 64, selected=protocol.BASELINE, observe=observed)
+        self.assertEqual(len(observed), 1)
+        with patch.object(target, 'bounded', return_value=(1, b'qemu install: refused')), \
+             self.assertRaisesRegex(AssertionError, 'actual unchanged offline CLI failed: qemu install: refused'):
+            target.invoke('1' * 64, True, selected=protocol.BASELINE, observe=observed)
+        self.assertEqual(len(observed), 1)
+
+    def test_scratch_absence_is_positive_exact_prefix_and_ignores_preexisting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'labapp-qemu-old').mkdir()
+            (root / 'unrelated').mkdir()
+            with patch.object(target, 'SCRATCH_ROOT', root):
+                before = target.scratch()
+                self.assertEqual(before, ['labapp-qemu-old'])
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    target.scratch_absent('install', before)
+                self.assertEqual(json.loads(out.getvalue())['target_scratch_absent'], 'install')
+                (root / 'labapp-qemu-new').mkdir()
+                with self.assertRaisesRegex(AssertionError, 'labapp-qemu-new'):
+                    target.scratch_absent('install', before)
+                with patch.object(target.Path, 'iterdir', side_effect=OSError('census failed')), \
+                     self.assertRaises(OSError):
+                    target.scratch_absent('install', before)
+
+    def test_main_failure_and_cancellation_preserved_when_evidence_fails(self):
+        for primary in (protocol.Refusal('primary refusal'), AssertionError('primary assertion'), KeyboardInterrupt()):
+            # First call is the pre-run census; the second is the post-failure evidence.
+            for after in ([], OSError('census failed'), ['labapp-qemu-leftover']):
+                with self.subTest(primary=repr(primary), after=repr(after)):
+                    stderr = io.StringIO()
+                    with patch.object(target, 'scratch', side_effect=[[], after]), \
+                         patch.object(target, 'run', side_effect=primary), \
+                         contextlib.redirect_stderr(stderr), self.assertRaises(type(primary)) as raised:
+                        target.main(protocol.BASELINE, '1' * 64)
+                    self.assertIs(raised.exception, primary)
+                    self.assertTrue(stderr.getvalue())
+        with patch.object(target, 'scratch', side_effect=AssertionError('touched')):
+            with self.assertRaisesRegex(Refusal, 'independent'):
+                target.main(protocol.BASELINE, 'not-a-digest')
+
+    def test_emit_prints_one_report_and_returns_installer_result(self):
+        result = self.result(protocol.BASELINE)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(target.emit('rerun', [(result, 1.0)], protocol.BASELINE), result)
+        line = json.loads(out.getvalue())
+        self.assertEqual(line['qemu_offline_report'], 'rerun')
+        self.assertEqual(len(out.getvalue().splitlines()), 1)
+
+    def launcher(self, root, rm_noop=False):
+        script = root / 'test-qemu-offline.sh'
+        script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+        helper = root / 'prepare-qemu-offline.sh'
+        helper.write_text('#!/bin/bash\nset -eu\nmkdir "$2"\nprintf \'{"receipt_sha256":"' + 'a' * 64 + '"}\\n\'\n')
+        source = ownership.FAKE_DOCKER.replace("elif key == 'reference':", "elif key == 'id':\n                match &= val == obj['id']\n            elif key == 'reference':")
+        source = source.replace("elif a[0] == 'start':", "elif a[0] == 'exec':\n    pass\nelif a[0] == 'cp':\n    if a[-2].endswith(':/target-state.json'):\n        Path(a[-1]).write_text('{}')\nelif a[0] == 'start':")
+        fake = root / 'docker'
+        fake.write_text(source)
+        fake.chmod(0o755)
+        if rm_noop:
+            fake_rm = root / 'rm'
+            fake_rm.write_text('#!/bin/bash\nexit 0\n')
+            fake_rm.chmod(0o755)
+        state = root / 'daemon.json'
+        state.write_text(json.dumps({'containers': {}, 'images': {}, 'calls': []}))
+        (root / 'tmp').mkdir()
+        env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], TMPDIR=str(root / 'tmp'),
+                   FAKE_DOCKER_STATE=str(state), FAKE_DOCKER_MODE='success')
+        return subprocess.run(['bash', str(script), '--selection', protocol.BASELINE], env=env,
+                              capture_output=True, timeout=15)
+
+    def test_actual_launcher_cleanup_reports_absence_and_leftover_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.launcher(Path(directory))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list((Path(directory) / 'tmp').iterdir()), [])
+        with tempfile.TemporaryDirectory() as directory:
+            # A no-op rm leaves the exact owned workdir behind: success must not be reported.
+            result = self.launcher(Path(directory), rm_noop=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'host scratch still present', result.stderr)
+            self.assertNotIn(b'host scratch absent', result.stdout)
 
 
 if __name__ == '__main__':
