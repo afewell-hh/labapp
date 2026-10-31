@@ -62,14 +62,157 @@ APT_TMP = Path('/var/tmp')
 
 
 class Failure(Exception):
-    def __init__(self, message='fixed trial refused', code=1):
+    """Fixed nonsecret refusal. category/child_status feed the closed diagnostic."""
+    def __init__(self, message='fixed trial refused', code=1, category='policy', child_status=None):
         super().__init__(message)
-        self.code = code
+        # A process exit status is 1..255; anything else cannot round-trip.
+        self.code = code if type(code) is int and 0 < code < 256 else 1
+        self.category = category
+        self.child_status = child_status
 
 
-def require(condition, message='fixed trial refused'):
+def require(condition, message='fixed trial refused', category='policy'):
     if not condition:
-        raise Failure(message)
+        raise Failure(message, 1, category)
+
+
+# Closed, reviewed diagnostic vocabulary (issue #364). Operations are source
+# literals set BEFORE the work; no argv, path, user or resource value is ever a label.
+PHASE_NAMES = ('startup', 'stage', 'fresh', 'strict', 'resume', 'persistence')
+OPERATIONS = {
+    'startup': ('worker-binding',),
+    'stage': ('account-policy', 'daemon-absent-check', 'aux-inventory', 'aux-audit', 'aux-holds',
+              'aux-setup', 'aux-update', 'aux-check', 'aux-simulate', 'aux-simulate-exact',
+              'aux-download', 'aux-files', 'aux-install', 'aux-postcheck', 'aux-cleanup',
+              'install-qemu', 'install-docker', 'install-hhfab', 'install-kubectl', 'sudo-check',
+              'daemon-start', 'docker-account', 'docker-socket', 'docker-fresh-groups',
+              'docker-daemons', 'docker-access', 'kvm-device', 'tun-device', 'parser-check',
+              'core-load', 'fab-validate', 'package-receipt', 'core-contract', 'resource-check',
+              'core-prepare', 'prestart-audit'),
+    'fresh': ('core-start-fresh',),
+    'strict': ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-create'),
+    'resume': ('core-stop', 'offline-audit', 'core-activate-resume', 'core-start-resume'),
+    'persistence': ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-verify', 'nonce-remove',
+                    'core-final-stop', 'complete')}
+GUARDIAN_OPERATIONS = ('guardian-init', 'worker-spawn', 'worker-supervision')
+ORIGINS = ('worker', 'guardian', 'unknown')
+CATEGORIES = ('none', 'policy', 'capability', 'child-exit', 'child-signal', 'child-timeout',
+              'output-overflow', 'phase-cutoff', 'heartbeat-loss', 'oom-event', 'resource-floor',
+              'boot-change', 'status-invalid', 'core-refusal', 'interrupted', 'exception')
+ORIGIN_CATEGORIES = {
+    'worker': ('policy', 'capability', 'child-exit', 'child-signal', 'child-timeout', 'output-overflow',
+               'phase-cutoff', 'resource-floor', 'status-invalid', 'core-refusal', 'interrupted', 'exception'),
+    'guardian': ('policy', 'child-signal', 'phase-cutoff', 'heartbeat-loss', 'oom-event', 'resource-floor',
+                 'boot-change', 'status-invalid', 'interrupted', 'exception'),
+    'unknown': ('status-invalid',)}
+DIAGNOSTIC_FIELDS = {'origin', 'phase', 'operation', 'category', 'child_status'}
+RESULT_FIELDS = {'schema', 'code', 'contained', 'nonce', 'diagnostic'}
+STATUS_FIELDS = {'schema', 'nonce', 'seq', 'state', 'phase', 'operation', 'code', 'diagnostic'}
+SUCCESS = {'origin': 'worker', 'phase': 'persistence', 'operation': 'complete',
+           'category': 'none', 'child_status': None}
+MAX_RESULT = 4096
+
+
+def child_status_ok(category, status):
+    if status is None:
+        return category != 'child-signal'
+    if type(status) is not int:
+        return False
+    if category == 'child-signal':
+        return -64 <= status <= -1
+    if category == 'child-exit':
+        return 1 <= status <= 255
+    return category == 'status-invalid' and -64 <= status <= 255
+
+
+def operation_ok(origin, phase, operation):
+    if phase not in PHASE_NAMES or type(operation) is not str:
+        return False
+    if origin == 'worker':
+        return operation in OPERATIONS[phase]
+    if origin == 'guardian':
+        return operation == 'worker-supervision' or (phase == 'startup' and operation in GUARDIAN_OPERATIONS)
+    return operation == 'worker-supervision' or operation in OPERATIONS[phase]
+
+
+def outcome_code_ok(code, detail):
+    """Observed inner child evidence must agree with the normalized primary code.
+
+    Null is unobserved; status-invalid carries context, not child provenance.
+    """
+    status = detail['child_status']
+    if status is not None and detail['category'] == 'child-exit':
+        return code == status
+    if status is not None and detail['category'] == 'child-signal':
+        return code == 128 - status
+    return True
+
+
+def diagnostic(value):
+    """Strict closed validator; returns a fresh copy built only from vetted values."""
+    require(type(value) is dict and set(value) == DIAGNOSTIC_FIELDS, 'diagnostic refused')
+    origin, phase, operation = value['origin'], value['phase'], value['operation']
+    category, status = value['category'], value['child_status']
+    require(type(origin) is str and origin in ORIGINS and type(phase) is str
+            and operation_ok(origin, phase, operation) and type(category) is str, 'diagnostic refused')
+    if category == 'none':
+        require(value == SUCCESS, 'diagnostic refused')
+    else:
+        require(category in ORIGIN_CATEGORIES[origin] and child_status_ok(category, status), 'diagnostic refused')
+    return {'origin': origin, 'phase': phase, 'operation': operation, 'category': category,
+            'child_status': status}
+
+
+def result_record(value, nonce):
+    """Schema 2 final guardian result. Success needs category none AND code 0."""
+    require(type(value) is dict and set(value) == RESULT_FIELDS, 'result refused')
+    code, contained = value['code'], value['contained']
+    require(type(value['schema']) is int and value['schema'] == 2 and type(code) is int and 0 <= code <= 255
+            and type(contained) is bool and type(value['nonce']) is str and value['nonce'] == nonce, 'result refused')
+    detail = diagnostic(value['diagnostic'])
+    require((code == 0) == (detail['category'] == 'none') and outcome_code_ok(code, detail), 'result refused')
+    return {'schema': 2, 'code': code, 'contained': contained, 'nonce': nonce, 'diagnostic': detail}
+
+
+def worker_status(value, nonce):
+    """Worker-owned root-private checkpoint/terminal record."""
+    require(type(value) is dict and set(value) == STATUS_FIELDS, 'status refused')
+    state, phase, operation, seq = value['state'], value['phase'], value['operation'], value['seq']
+    require(type(value['schema']) is int and value['schema'] == 1 and type(value['nonce']) is str
+            and value['nonce'] == nonce and type(seq) is int and 0 <= seq <= 1000
+            and type(state) is str and state in ('running', 'succeeded', 'failed')
+            and type(phase) is str and operation_ok('worker', phase, operation), 'status refused')
+    code = value['code']
+    if state == 'running':
+        require(code is None and value['diagnostic'] is None, 'status refused')
+        detail = None
+    else:
+        detail = diagnostic(value['diagnostic'])
+        require(detail['origin'] == 'worker' and detail['phase'] == phase
+                and detail['operation'] == operation and type(code) is int, 'status refused')
+        if state == 'succeeded':
+            require(code == 0 and detail == SUCCESS, 'status refused')
+        else:
+            require(1 <= code <= 255 and detail['category'] != 'none'
+                    and outcome_code_ok(code, detail), 'status refused')
+    return {'schema': 1, 'nonce': nonce, 'seq': seq, 'state': state, 'phase': phase,
+            'operation': operation, 'code': code, 'diagnostic': detail}
+
+
+def failure_fields(error, origin):
+    """Code/category/status from any exception, defensively reduced to the closed set.
+
+    The message text, args and traceback are never read.
+    """
+    if isinstance(error, Failure):
+        code, category, status = error.code, error.category, error.child_status
+    elif isinstance(error, KeyboardInterrupt):
+        code, category, status = 130, 'interrupted', None
+    else:
+        code, category, status = 1, 'exception', None
+    if not (type(category) is str and category in ORIGIN_CATEGORIES[origin] and child_status_ok(category, status)):
+        category, status = 'exception', None
+    return code, category, status
 
 
 def encoded(value):
@@ -221,14 +364,14 @@ class Clock:
         end = min(phase_end(self.value, phase), phase_end(self.value, 'persistence'))
         left = min(end - self.wall(), end - self.started_wall - (self.mono() - self.started_mono))
         if left <= 0:
-            raise Failure('absolute phase cutoff', 124)
+            raise Failure('absolute phase cutoff', 124, 'phase-cutoff')
         return left
 
     def cleanup_remaining(self):
         end = stamp(self.value['deadline'])
         left = min(end - self.wall(), end - self.started_wall - (self.mono() - self.started_mono))
         if left <= 0:
-            raise Failure('immutable cleanup cutoff', 124)
+            raise Failure('immutable cleanup cutoff', 124, 'phase-cutoff')
         return left
 
 
@@ -258,19 +401,40 @@ def load_sibling(name):
     return module
 
 
+def call_bounded(args, seconds, env=ENV):
+    """Existing bounded helper; ONLY its two fixed Refusal messages are classified.
+
+    Any other exception propagates unchanged and is reported as ``exception``
+    without its text.
+    """
+    from hhfab_release import bounded, Refusal
+    try:
+        return bounded(args, seconds, limit=1024**2, env=env)
+    except Refusal as error:
+        message = str(error)
+        if message == 'command timeout':
+            raise Failure('bounded child failed', 124, 'child-timeout') from None
+        if message == 'command output overflow':
+            raise Failure('bounded child failed', 1, 'output-overflow') from None
+        raise Failure('bounded child failed', 1, 'exception') from None
+
+
+def child_failure(code, message):
+    """Nonzero child status -> Failure. Negative is the raw subprocess signal."""
+    if code > 0:
+        return Failure(message, code, 'child-exit', code)
+    return Failure(message, 128 - code, 'child-signal', code)
+
+
 def run(argv, clock, phase, cap=30, user=False):
     # Existing bounded implementation caps output and kills/reaps exact process
     # groups. The guardian additionally contains independent systemd services.
-    from hhfab_release import bounded, Refusal
     args = [str(a) for a in argv]
     if user:
         args = ['/usr/sbin/runuser', '-u', 'ubuntu', '--', *args]
-    try:
-        code, out = bounded(args, min(cap, clock.remaining(phase)), limit=1024**2, env=ENV)
-    except Refusal as error:
-        raise Failure('bounded child failed', 124 if 'timeout' in str(error) else 1) from None
+    code, out = call_bounded(args, min(cap, clock.remaining(phase)))
     if code:
-        raise Failure('fixed child failed', code if code > 0 else 128 - code)
+        raise child_failure(code, 'fixed child failed')
     return out
 
 
@@ -369,7 +533,7 @@ def resources(poststage=False):
     free = fs.f_bavail * fs.f_frsize
     mem = memory_available()
     require(fs.f_favail > 4096 and free >= (250 if poststage else 64) * GIB
-            and mem >= (96 if poststage else 16) * GIB, 'resource stop')
+            and mem >= (96 if poststage else 16) * GIB, 'resource stop', 'resource-floor')
     return {'free_bytes': free, 'available_memory': mem}
 
 
@@ -402,46 +566,116 @@ def containment():
     require(ok, 'exact service containment uncertain')
 
 
+def read_status(nonce):
+    """Valid worker status or None (missing/corrupt/oversize/wrong nonce); never raises."""
+    try:
+        return worker_status(data(regular(ROOT / 'worker-status.json', MAX_RESULT, 0)), nonce)
+    except Exception:
+        return None
+
+
+def judge_worker(observed, current, last, phase):
+    """Final (code, diagnostic) from the ACTUAL worker termination plus status evidence.
+
+    observed: raw subprocess returncode (negative = signal). current: the valid
+    status read after the exit, or None. last: last valid status seen at all
+    (context only, never proof). The status can supply a diagnostic, never an
+    exit code, never ``contained`` and never a success the exit does not match.
+    """
+    def supervised(category, status):
+        return {'origin': 'guardian', 'phase': phase, 'operation': 'worker-supervision',
+                'category': category, 'child_status': status}
+    if observed < 0:
+        # Direct worker signal: normalized like the helper (128+N); no inner operation.
+        if observed >= -64:
+            return 128 - observed, supervised('child-signal', observed)
+        return 1, supervised('status-invalid', None)
+    if observed == 0:
+        if current is not None and current['state'] == 'succeeded':
+            return 0, dict(SUCCESS)
+        return 1, supervised('status-invalid', 0)
+    if current is not None and current['state'] == 'failed' and current['code'] == observed:
+        return observed, dict(current['diagnostic'])
+    if last is not None:
+        context = {'origin': 'unknown', 'phase': last['phase'], 'operation': last['operation']}
+    else:
+        context = {'origin': 'unknown', 'phase': phase, 'operation': 'worker-supervision'}
+    return observed, dict(context, category='status-invalid', child_status=observed if observed <= 255 else None)
+
+
+def final_record(nonce, code, contained, detail, phase):
+    """Validated schema-2 record; an invalid pairing degrades to a closed fallback."""
+    try:
+        return result_record({'schema': 2, 'code': code, 'contained': contained,
+                              'nonce': nonce, 'diagnostic': detail}, nonce)
+    except Exception:
+        fallback = {'origin': 'guardian', 'phase': phase if phase in PHASE_NAMES else 'startup',
+                    'operation': 'worker-supervision', 'category': 'exception', 'child_status': None}
+        return result_record({'schema': 2, 'code': code if type(code) is int and 0 < code < 256 else 1,
+                              'contained': contained, 'nonce': nonce, 'diagnostic': fallback}, nonce)
+
+
 def guardian():
     value = contract(data(regular(ROOT / 'contract.json', MAX_SOURCE, 0)))
     clock = Clock(value)
     require(kernel_boot() == value['boot_uuid'])
     # EXCL start reservation prevents restart/reset/renewal, including after reboot.
+    # It is also the SOLE-WRITER proof for result.json: a collision raises here,
+    # before the finally below, so an incumbent's result is never replaced. Contract,
+    # Clock, boot and reservation failures therefore publish no guest result.
     exclusive(ROOT / 'started.json', encoded({'boot': value['boot_uuid'], 'lease': value['lease'],
               'nonce': value['nonce'], 'guardian_pid': os.getpid(), 'remaining': clock.remaining('stage')}))
-    original_oom = oom_count()
     child = None
     result = 1
     contained = False
     children_absent = True
+    phase_seen, operation, last = 'startup', 'guardian-init', None
+    detail = {'origin': 'guardian', 'phase': 'startup', 'operation': 'guardian-init',
+              'category': 'exception', 'child_status': None}
     try:
+        original_oom = oom_count()
         # Initial heartbeat grace is bounded by the same thirty-second loss
         # window; no provisioning starts before the guardian checks it.
         beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
-        require(0 <= time.monotonic() - beat['received'] <= 30)
+        require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
+        operation = 'worker-spawn'
         child = subprocess.Popen([PYTHON, str(ROOT / 'vlab_trial.py'), 'worker'],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        operation = 'worker-supervision'
         minimum = None
         while True:
             phase = data(regular(ROOT / 'phase.json', 4096, 0))['phase']
+            if phase in PHASE_NAMES:
+                phase_seen = phase
             clock.remaining(phase)
-            require(kernel_boot() == value['boot_uuid'])
+            require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
             beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
-            require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost')
-            require(oom_count() == original_oom, 'OOM event')
+            require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
+            require(oom_count() == original_oom, 'OOM event', 'oom-event')
             sample = resources()
             minimum = sample if minimum is None else {k: min(v, minimum[k]) for k, v in sample.items()}
             atomic(ROOT / 'measurements.json', minimum)
             observed = child.poll()
             if observed is not None:
-                result = observed if observed >= 0 else 128 - observed
+                current = read_status(value['nonce'])
+                result, detail = judge_worker(observed, current, current or last, phase_seen)
                 break
+            last = read_status(value['nonce']) or last
             time.sleep(min(5, clock.remaining(phase)))
     except Failure as error:
-        result = error.code
+        # What the guardian itself observed; origin is always guardian here.
+        result, category, status = failure_fields(error, 'guardian')
+        detail = {'origin': 'guardian', 'phase': phase_seen, 'operation': operation,
+                  'category': category, 'child_status': status}
     except KeyboardInterrupt:
         result = 130
+        detail = {'origin': 'guardian', 'phase': phase_seen, 'operation': operation,
+                  'category': 'interrupted', 'child_status': None}
+    except Exception:
+        result = 1
+        detail = {'origin': 'guardian', 'phase': phase_seen, 'operation': operation,
+                  'category': 'exception', 'child_status': None}
     finally:
         if child is not None:
             try:
@@ -467,14 +701,66 @@ def guardian():
         except BaseException:
             pass
         try:
-            atomic(ROOT / 'result.json', {'schema': 1, 'code': result,
-                                         'contained': contained, 'nonce': value['nonce']})
+            # Serialization/validation trouble can only degrade the diagnostic or
+            # clear `contained`; the primary code is captured above, before containment.
+            record = final_record(value['nonce'], result, contained, detail, phase_seen)
+            result = record['code']
+            atomic(ROOT / 'result.json', record)
         except BaseException:
             # The host cannot claim success without this exact receipt.
             contained = False
     # Secondary cleanup never overwrites the primary result. An uncontained
     # success is still operational failure and cannot become clean acceptance.
     return result if result else (0 if contained else 1)
+
+
+_WORKER = None
+
+
+class WorkerStatus:
+    """Sole writer of root-private worker-status.json.
+
+    Ownership is the exclusive create (claim). A collision or earlier binding
+    failure writes nothing, so an incumbent's checkpoint is never replaced. Each
+    checkpoint is committed BEFORE its operation; a write failure stops that
+    operation. The status never carries ``contained`` or any receipt.
+    """
+    def __init__(self, nonce):
+        self.nonce, self.seq = nonce, 0
+        self.phase, self.operation = 'startup', 'worker-binding'
+
+    def record(self, state, seq, phase, operation, code=None, detail=None):
+        return worker_status({'schema': 1, 'nonce': self.nonce, 'seq': seq, 'state': state,
+                              'phase': phase, 'operation': operation, 'code': code,
+                              'diagnostic': detail}, self.nonce)
+
+    def claim(self):
+        exclusive(ROOT / 'worker-status.json', encoded(self.record('running', 0, self.phase, self.operation)))
+
+    def mark(self, phase, operation):
+        # Validate the pair first so an unreviewed label can never be committed.
+        record = self.record('running', self.seq + 1, phase, operation)
+        self.seq, self.phase, self.operation = record['seq'], phase, operation
+        try:
+            atomic(ROOT / 'worker-status.json', record)
+        except Exception:
+            raise Failure('worker checkpoint unavailable', 1, 'status-invalid') from None
+
+    def finish(self, error):
+        if error is None:
+            record = self.record('succeeded', self.seq + 1, self.phase, self.operation, 0, dict(SUCCESS))
+        else:
+            code, category, status = failure_fields(error, 'worker')
+            detail = {'origin': 'worker', 'phase': self.phase, 'operation': self.operation,
+                      'category': category, 'child_status': status}
+            record = self.record('failed', self.seq + 1, self.phase, self.operation, code, detail)
+        atomic(ROOT / 'worker-status.json', record)
+
+
+def mark(phase, operation):
+    """Commit the next fixed checkpoint; a no-op outside a claimed worker run."""
+    if _WORKER is not None:
+        _WORKER.mark(phase, operation)
 
 
 def installed(clock):
@@ -508,10 +794,14 @@ def provision_aux(clock):
     Selected auxiliary full versions are candidate facts, never recovered pins.
     No source edits, global upgrade, removals, downgrades or repair are allowed.
     """
+    mark('stage', 'aux-inventory')
     import qemu_offline
     before = installed(clock)
+    mark('stage', 'aux-audit')
     require(not run(['/usr/bin/dpkg', '--audit'], clock, 'stage').strip())
+    mark('stage', 'aux-holds')
     require(not run(['/usr/bin/apt-mark', 'showhold'], clock, 'stage').strip())
+    mark('stage', 'aux-setup')
     # APT's _apt traversal needs a deliberately public empty working directory;
     # private FAB/receipts stay outside it. No credentials enter this directory.
     public_apt = APT_TMP / ('labapp-vlab-aux-' + str(os.getpid()))
@@ -525,15 +815,17 @@ def provision_aux(clock):
     for name in ('fixed.conf', 'sources.list'):
         (public_apt / name).chmod(0o644)
     apt_env = dict(ENV, APT_CONFIG=config)
-    from hhfab_release import bounded
     def apt_run(args):
-        code, out = bounded(args, min(180, clock.remaining('stage')), limit=1024**2, env=apt_env)
+        code, out = call_bounded(args, min(180, clock.remaining('stage')), apt_env)
         if code:
-            raise Failure('authenticated auxiliary APT refused', code if code > 0 else 128 - code)
+            raise child_failure(code, 'authenticated auxiliary APT refused')
         return out
     try:
+        mark('stage', 'aux-update')
         apt_run([*apt, '-o', 'APT::Update::Error-Mode=any', 'update'])
+        mark('stage', 'aux-check')
         apt_run([*apt, 'check'])
+        mark('stage', 'aux-simulate')
         missing = [name for name in AUX if name not in before]
         simulate = [*apt, '--simulate', '--no-remove', '--no-install-recommends', 'install', *missing]
         plan = auxiliary_plan(apt_run(simulate), before) if missing else {}
@@ -541,16 +833,21 @@ def provision_aux(clock):
         # Pin EVERY selected dependency before mutation. Re-simulate this exact
         # closure, so solver drift or an unexpected additional dependency fails.
         selected = [name + '=' + version for name, version in sorted(plan.items())]
+        mark('stage', 'aux-simulate-exact')
         if selected:
             require(auxiliary_plan(apt_run([*apt, '--simulate', '--no-remove', '--no-install-recommends',
                                              'install', *selected]), before) == plan)
+            mark('stage', 'aux-download')
             apt_run([*apt, '--download-only', '--yes', '--no-remove', '--no-install-recommends', 'install', *selected])
+        mark('stage', 'aux-files')
         files = qemu_offline.inventory(public_apt)
         receipt = {'schema': 1, 'snapshot': AUX_SNAPSHOT, 'before': before, 'closure': plan,
                    'sources_sha256': sha(regular(public_apt / 'sources.list', 16384)), 'files': files}
         exclusive(ROOT / 'aux-intent.json', encoded(receipt))
+        mark('stage', 'aux-install')
         if selected:
             apt_run([*apt, '--no-download', '--yes', '--no-remove', '--no-install-recommends', 'install', *selected])
+        mark('stage', 'aux-postcheck')
         apt_run([*apt, 'check'])
         require(not run(['/usr/bin/dpkg', '--audit'], clock, 'stage').strip())
         after = installed(clock)
@@ -565,6 +862,9 @@ def provision_aux(clock):
         import shutil
         primary = sys.exc_info()[1]
         try:
+            if primary is None:
+                # Never relabel the operation of a failure already in flight.
+                mark('stage', 'aux-cleanup')
             shutil.rmtree(public_apt)
         except BaseException:
             if primary is not None:
@@ -597,6 +897,7 @@ def set_phase(clock, name):
 
 def docker_account(clock):
     """Fixed dedicated-guest adaptation, never an arbitrary account/group tool."""
+    mark('stage', 'docker-account')
     user = pwd.getpwnam('ubuntu')
     group = grp.getgrnam('docker')
     require(user.pw_uid >= 1000 and user.pw_gid != 0 and user.pw_dir == '/home/ubuntu'
@@ -611,13 +912,16 @@ def docker_account(clock):
     after_user, after_group = pwd.getpwnam('ubuntu'), grp.getgrnam('docker')
     require((after_user.pw_uid, after_user.pw_gid, after_group.gr_gid) == before
             and after_group.gr_mem == ['ubuntu'], 'account adaptation changed identity')
+    mark('stage', 'docker-socket')
     socket = Path('/run/docker.sock').lstat()
     require(stat.S_ISSOCK(socket.st_mode) and socket.st_uid == 0 and socket.st_gid == group.gr_gid
             and stat.S_IMODE(socket.st_mode) == 0o660, 'Docker socket policy refused')
     # runuser starts a NEW credential context and obtains supplementary groups;
     # existing SSH processes are never assumed to have gained docker membership.
+    mark('stage', 'docker-fresh-groups')
     actual = run(['/usr/bin/id', '-G'], clock, 'stage', user=True).decode().split()
     require(str(group.gr_gid) in actual and '0' not in actual, 'fresh ubuntu groups refused')
+    mark('stage', 'docker-daemons')
     for unit, executable in (('docker.service', '/usr/bin/dockerd'), ('containerd.service', '/usr/bin/containerd')):
         rows = run([SYSTEMCTL, 'show', unit, '-p', 'MainPID', '-p', 'ActiveState'], clock, 'stage')
         fields = dict(line.split('=', 1) for line in rows.decode().splitlines())
@@ -626,6 +930,7 @@ def docker_account(clock):
         require(os.readlink(proc / 'exe') == executable
                 and next(row for row in (proc / 'status').read_text().splitlines() if row.startswith('Uid:')).split()[1:] == ['0'] * 4,
                 'daemon process identity refused')
+    mark('stage', 'docker-access')
     require(run(['/usr/bin/docker', 'info', '--format', '{{.ServerVersion}}'], clock, 'stage', user=True).strip() == b'29.1.3',
             'daemon version/access refused')
     exclusive(ROOT / 'account-receipt.json', encoded({'uid': user.pw_uid, 'gid': user.pw_gid,
@@ -691,13 +996,41 @@ def core_call(action, clock, phase, extra=(), cap=2700):
 
 
 def worker():
+    global _WORKER
     value = contract(data(regular(ROOT / 'contract.json', MAX_SOURCE, 0)))
-    clock = Clock(value)
     started = data(regular(ROOT / 'started.json', 4096, 0))
+    # Identity of the original guardian child BEFORE any write. A failure here, or
+    # a claim collision, leaves an incumbent's worker-status.json untouched.
     require(started['lease'] == value['lease'] and started['nonce'] == value['nonce']
-            and started['boot'] == value['boot_uuid'] and started['guardian_pid'] == os.getppid()
-            and own_cgroup() == '0::/system.slice/' + UNIT,
-            'worker requires original active guardian cgroup')
+            and started['boot'] == value['boot_uuid'] and started['guardian_pid'] == os.getppid(),
+            'worker requires original active guardian')
+    require(own_cgroup() == '0::/system.slice/' + UNIT, 'worker requires original active guardian cgroup')
+    status = WorkerStatus(value['nonce'])
+    status.claim()
+    _WORKER = status
+    try:
+        try:
+            code = provision(value)
+        except BaseException as error:
+            try:
+                status.finish(error)
+            except BaseException:
+                pass  # the primary failure stays primary
+            raise
+        status.finish(None)
+        return code
+    finally:
+        _WORKER = None
+
+
+INSTALL_OPERATIONS = {'install-qemu.py': 'install-qemu', 'install-docker.py': 'install-docker',
+                      'install-hhfab.py': 'install-hhfab', 'install-kubectl.py': 'install-kubectl'}
+
+
+def provision(value):
+    clock = Clock(value)
+    require(own_cgroup() == '0::/system.slice/' + UNIT, 'worker requires original active guardian cgroup')
+    mark('stage', 'account-policy')
     set_phase(clock, 'stage')
     user = pwd.getpwnam('ubuntu')
     require(user.pw_uid >= 1000 and user.pw_gid != 0 and user.pw_dir == '/home/ubuntu'
@@ -711,9 +1044,9 @@ def worker():
     exclusive(ROOT / 'account-intent.json', encoded({'uid': user.pw_uid, 'gid': user.pw_gid, 'home': user.pw_dir}))
     # Record exact ownership BEFORE package scripts may start these new daemons.
     # A stock/preexisting installation is refused, never adopted or stopped.
+    mark('stage', 'daemon-absent-check')
     for name in ('docker.socket', 'docker.service', 'containerd.service'):
-        from hhfab_release import bounded
-        code, raw = bounded([SYSTEMCTL, 'show', name, '-p', 'LoadState'], min(10, clock.remaining('stage')), env=ENV)
+        code, raw = call_bounded([SYSTEMCTL, 'show', name, '-p', 'LoadState'], min(10, clock.remaining('stage')))
         require(code in (0, 1, 5))
         require(raw == b'LoadState=not-found\n', 'preexisting daemon refused')
     exclusive(ROOT / 'daemon-intent.json', encoded({'units': ['docker.socket', 'docker.service', 'containerd.service']}))
@@ -723,23 +1056,31 @@ def worker():
             ('install-docker.py', ['--receipt', str(ROOT / 'docker-receipt.json')], 235),
             ('install-hhfab.py', ['--version', '0.43.1', '--archive', str(ROOT / 'hhfab.tar.gz')], 125),
             ('install-kubectl.py', ['--version', '1.35.0', '--platform', 'linux/amd64', '--binary', str(ROOT / 'kubectl')], 30)):
+        mark('stage', INSTALL_OPERATIONS[script])
         previous = os.umask(0o022)
         try:
             out = run([PYTHON, str(ROOT / script), *args], clock, 'stage', cap)
         finally:
             os.umask(previous)
         exclusive(ROOT / (script + '.receipt'), out)
+    mark('stage', 'sudo-check')
     require(pwd.getpwnam('ubuntu').pw_dir == '/home/ubuntu')
     run(['/usr/bin/sudo', '-n', '/usr/bin/true'], clock, 'stage', user=True)
+    mark('stage', 'daemon-start')
     run([SYSTEMCTL, 'start', 'containerd.service', 'docker.service'], clock, 'stage', 30)
     docker_account(clock)
     guest_devices()
+    mark('stage', 'parser-check')
     import yaml
     require(yaml.__version__.startswith('6.0') and getattr(yaml, '__with_libyaml__', False)
             and hasattr(yaml, 'CSafeLoader'), 'distribution parser refused')
+    mark('stage', 'core-load')
     core = load_sibling('vlab_core')
+    mark('stage', 'fab-validate')
     core.validate_fab(regular(ROOT / 'fab.yaml', MAX_SOURCE, 0))
+    mark('stage', 'package-receipt')
     receipt = package_receipt(clock, core)
+    mark('stage', 'core-contract')
     core_contract = {'schema': 1, 'dedicated_guest': True, 'nonce': value['nonce'],
                      'fab': str(ROOT / 'fab.yaml'), 'fab_sha256': sha(regular(ROOT / 'fab.yaml', MAX_SOURCE, 0)),
                      'wiring': str(ROOT / 'wiringd.yaml'), 'wiring_sha256': core.WIRING_SHA,
@@ -748,25 +1089,38 @@ def worker():
                                           'forwarded_ports': '0.0.0.0-isolated-by-route', 'build': 'iso',
                                           'controls_restricted': True, 'servers_restricted': True}}
     exclusive(ROOT / 'core-contract.json', encoded(core_contract))
+    mark('stage', 'resource-check')
     resources(poststage=True)
+    mark('stage', 'core-prepare')
     core_call('prepare', clock, 'stage', ['--input', str(ROOT / 'core-contract.json')], 120)
+    mark('stage', 'prestart-audit')
     offline_observations(core, clock)
+    # A phase transition is labelled with the first operation of the new phase.
+    mark('fresh', 'core-start-fresh')
     set_phase(clock, 'fresh')
     core_call('start-fresh', clock, 'fresh')
+    mark('strict', 'strict-inspect')
     set_phase(clock, 'strict')
     before = strict_checks(core, clock, 'strict')
     nonce = Nonce(core, clock, value['nonce'])
     nonce.create()
+    mark('resume', 'core-stop')
     set_phase(clock, 'resume')
     core_call('stop', clock, 'resume', cap=70)
+    mark('resume', 'offline-audit')
     offline_observations(core, clock, complete=True)
+    mark('resume', 'core-activate-resume')
     core_call('activate-resume', clock, 'resume', cap=120)
+    mark('resume', 'core-start-resume')
     core_call('start-resume', clock, 'resume', cap=900)
+    mark('persistence', 'strict-inspect')
     set_phase(clock, 'persistence')
     require(strict_checks(core, clock, 'persistence') == before, 'cluster identity changed')
     nonce.verify()
     nonce.remove()
+    mark('persistence', 'core-final-stop')
     core_call('stop', clock, 'persistence', cap=70)
+    mark('persistence', 'complete')
     exclusive(ROOT / 'success.json', encoded({'schema': 1, 'nonce': value['nonce'], 'cluster': before}))
     return 0
 
@@ -775,27 +1129,57 @@ def guest_devices():
     # Fixed real device opens; no broad chmod/group repair. Failure preserves
     # the actual unsupported stock account/device policy for lead review.
     import fcntl
-    for path in ('/dev/kvm', '/dev/net/tun'):
-        require(stat.S_ISCHR(Path(path).stat().st_mode))
+    for path, operation in (('/dev/kvm', 'kvm-device'), ('/dev/net/tun', 'tun-device')):
+        mark('stage', operation)
+        try:
+            mode = Path(path).stat().st_mode
+        except FileNotFoundError:
+            # Explicit local capability check; any other OSError stays `exception`.
+            raise Failure('device absent', 1, 'capability') from None
+        require(stat.S_ISCHR(mode), 'device type refused', 'capability')
         fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
         try:
             if path == '/dev/kvm':
-                require(fcntl.ioctl(fd, 0xAE00, 0) == 12, 'KVM API refused')
+                require(fcntl.ioctl(fd, 0xAE00, 0) == 12, 'KVM API refused', 'capability')
         finally:
             os.close(fd)
+
+
+def core_failure(error, message):
+    """Reduce an in-process core Failure by its FIXED message literals only.
+
+    The core folds a signal-killed child into status 1, so a status is reported
+    only when it is unambiguous (2..255). Message text is never copied out.
+    """
+    text = str(error)
+    code = getattr(error, 'code', 1)
+    status = None
+    if text == 'child command failed':
+        status = code if type(code) is int and 2 <= code <= 255 else None
+        category = 'child-exit' if status is not None else 'core-refusal'
+    elif text == 'child deadline exceeded':
+        category = 'child-timeout'
+    elif text == 'deadline exceeded':
+        category = 'phase-cutoff'
+    else:
+        category = 'core-refusal'
+    failure = Failure(message, code, category, status)
+    failure.cleanup_uncertain = bool(getattr(error, 'cleanup_uncertain', False))
+    return failure
 
 
 def strict_checks(core, clock, phase):
     end = time.monotonic() + clock.remaining(phase)
     try:
+        mark(phase, 'strict-inspect')
         core.hhfab(['vlab', 'inspect-switches'], end, ['--strict=true', '--wait-applied-for', '30'], cap=600)
         # Real fixed SSH operation, with no interactive shell or arbitrary command.
+        mark(phase, 'strict-ssh')
         core.hhfab(['vlab', 'ssh'], end, ['-n', 'server-01', '--', 'true'], cap=30)
+        mark(phase, 'api-ready')
         return core.api_ready(end)
     except core.Failure as error:
-        failure = Failure('core strict check refused', error.code)
-        failure.cleanup_uncertain = bool(getattr(error, 'cleanup_uncertain', False))
-        raise failure from None
+        raise core_failure(error, 'core strict check refused') from None
 
 
 class Nonce:
@@ -810,15 +1194,14 @@ class Nonce:
         try:
             return self.core.kubectl(args, time.monotonic() + self.clock.remaining(phase))
         except self.core.Failure as error:
-            failure = Failure('nonce API operation refused', error.code)
-            failure.cleanup_uncertain = bool(getattr(error, 'cleanup_uncertain', False))
-            raise failure from None
+            raise core_failure(error, 'nonce API operation refused') from None
 
     def current(self, resource, phase):
         raw = self.call(['get', resource, self.name, '-n', 'default', '--ignore-not-found', '-o', 'json'], phase)
         return data(raw) if raw.strip() else None
 
     def create(self):
+        mark('strict', 'nonce-create')
         for resource in ('vpcs.vpc.githedgehog.com', 'vpcattachments.vpc.githedgehog.com'):
             require(self.current(resource, 'strict') is None, 'nonce collision')
         existing = data(self.call(['get', 'vpcs.vpc.githedgehog.com', '-A', '-o', 'json'], 'strict'))
@@ -870,6 +1253,7 @@ class Nonce:
                         raise error
 
     def verify(self):
+        mark('persistence', 'nonce-verify')
         for obj in self.objects:
             current = self.current(obj['resource'], 'persistence')
             require(current is not None and current['metadata']['uid'] == obj['uid']
@@ -877,6 +1261,7 @@ class Nonce:
 
     def remove(self):
         self.verify()
+        mark('persistence', 'nonce-remove')
         for obj in reversed(self.objects):
             plural = obj['resource'].split('.')[0]
             options = {'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': {'uid': obj['uid']}}
@@ -932,7 +1317,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
     def interrupted(signum, _frame):
-        raise Failure('signal', 143 if signum == signal.SIGTERM else 130)
+        raise Failure('signal', 143 if signum == signal.SIGTERM else 130, 'interrupted')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     try:

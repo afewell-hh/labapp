@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import stat
 import sys
 import tempfile
 import threading
@@ -28,6 +29,16 @@ def snapshot():
                           'checked_at': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
                           **{key: 'c'*64 for key in ('quota_sha256', 'network_sha256', 'images_sha256', 'access_sha256', 'egress_sha256')}}
     return value
+
+
+def worker_detail(category='child-exit', status=17, phase='stage', operation='install-docker'):
+    return {'origin': 'worker', 'phase': phase, 'operation': operation,
+            'category': category, 'child_status': status}
+
+
+def result_value(nonce, code, contained, detail=None):
+    detail = dict(guest.SUCCESS) if detail is None and code == 0 else detail or worker_detail()
+    return {'schema': 2, 'code': code, 'contained': contained, 'nonce': nonce, 'diagnostic': detail}
 
 
 def run_record(value):
@@ -369,7 +380,7 @@ class OwnerTrial(unittest.TestCase):
                 if 'manifest.json' in names:
                     table = guest.manifest(guest.data((output / 'manifest.json').read_bytes()))
                     self_test.assertEqual(set(table['files']), guest.FILES)
-            def remote(self, args, phase, cap=30, cleanup=False, until=None):
+            def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
                 trace.append(('remote', tuple(args), phase))
                 if cleanup and containment_error is not None:
                     raise containment_error
@@ -378,9 +389,11 @@ class OwnerTrial(unittest.TestCase):
                 if 'heartbeat' in args:
                     pulse.set()
                     return b''
-                if '-I' in args and '-c' in args and args[-1].startswith('from pathlib import Path; p='):
+                if args == host.RESULT_COMMAND:
                     self_test.assertTrue(pulse.wait(2), 'separate heartbeat never started')
-                    return guest.encoded({'schema': 1, 'code': observed_code, 'contained': observed_contained, 'nonce': nonce})
+                    self_test.assertLessEqual(limit, 4096 + 128)
+                    return guest.encoded(result_value(nonce, observed_code, observed_contained,
+                                                      worker_detail(status=observed_code) if observed_code else None))
                 return b''
             def close(self):
                 trace.append('master-close')
@@ -416,6 +429,9 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(trace[-3:], ['master-close','removed','captured-cancel'])
         self.assertTrue(all(receipt[k] for k in ('contained','process_absent','own_key_absent','local_files_absent','independent_cleanup_dispatched')))
         self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-result', 'none'))
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']),
+                         ('valid', dict(guest.SUCCESS)))
+        self.assertIsNone(receipt['guest_service'])
 
     def test_live_heartbeat_withholds_containment_channel_files_and_key_receipt(self):
         code, receipt, trace, _, _, heartbeat, output = self.owner_pipeline(
@@ -1102,3 +1118,415 @@ class OwnedProcessGroup(unittest.TestCase):
         receipt = json.loads(printed.call_args.args[0])
         self.assertFalse(receipt['process_absent'])
         self.assertFalse(receipt['own_key_absent'])
+
+
+SENTINEL = 'PRIVATE-SENTINEL-kubeconfig-token-password'
+
+
+class GuestDiagnostics(unittest.TestCase):
+    """Bounded fixed reader, strict schema-2 consumer and pre-stop original-master observation."""
+    nonce = 'd' * 32
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
+        self.directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-diagnostic-')))
+        self.directory.chmod(0o700)
+
+    # -- the fixed reader source, executed in-process against a public fixture ----
+    def read(self, directory, *, fstat=None):
+        source = host.READ_RESULT
+        for old, new, count in (("'/var/lib/labapp-vlab-trial'", repr(str(directory)), 1),
+                                ("('/var','/var/lib',d)", '(d,)', 1), ('st_uid!=0', 'st_uid!=os.geteuid()', 2)):
+            self.assertEqual(source.count(old), count)  # only fixture location/owner are adapted
+            source = source.replace(old, new)
+        buffer = io.BytesIO()
+        with ExitStack() as local:
+            local.enter_context(patch.object(sys, 'stdout', SimpleNamespace(buffer=buffer)))
+            if fstat is not None:
+                local.enter_context(patch.object(os, 'fstat', side_effect=fstat))
+            with self.assertRaises(SystemExit):
+                exec(compile(source, 'fixed-reader', 'exec'), {})
+        return buffer.getvalue()
+
+    def test_reader_has_no_selector_and_imports_no_guest_module(self):
+        self.assertTrue(host.READ_RESULT.startswith('import os,stat,sys\n'))
+        self.assertEqual(host.READ_RESULT.count('import '), 1)
+        self.assertEqual(host.READ_RESULT.count('labapp-vlab-trial'), 1)
+        self.assertNotIn('argv', host.READ_RESULT)
+        self.assertEqual(host.RESULT_COMMAND[:5], ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c'])
+
+    def test_reader_returns_only_bounded_private_regular_file_or_fixed_token(self):
+        root = self.directory / 'guest'
+        self.assertEqual(self.read(root), b'absent')
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
+        self.assertEqual(self.read(root), b'absent')
+        target = root / 'result.json'
+        target.write_bytes(b'{"public":1}')
+        target.chmod(0o600)
+        self.assertEqual(self.read(root), b'{"public":1}')
+        target.chmod(0o644)
+        self.assertEqual(self.read(root), b'invalid')
+        target.chmod(0o600)
+        os.link(target, self.directory / 'second-link')
+        self.assertEqual(self.read(root), b'invalid')
+        (self.directory / 'second-link').unlink()
+        target.write_bytes(b'x' * 4097)
+        self.assertEqual(self.read(root), b'invalid')
+        target.write_bytes(b'x' * 4096)
+        self.assertEqual(self.read(root), b'x' * 4096)
+        target.unlink()
+        other = self.directory / 'other'
+        other.write_bytes(b'PRIVATE')
+        other.chmod(0o600)
+        target.symlink_to(other)
+        self.assertEqual(self.read(root), b'invalid')
+        target.unlink()
+        root.chmod(0o755)
+        target.write_bytes(b'{}')
+        target.chmod(0o600)
+        self.assertEqual(self.read(root), b'invalid')
+
+    def test_reader_refuses_linked_guest_directory(self):
+        real = self.directory / 'real'
+        real.mkdir(mode=0o700)
+        (real / 'result.json').write_bytes(b'{}')
+        (real / 'result.json').chmod(0o600)
+        link = self.directory / 'linked'
+        link.symlink_to(real)
+        self.assertEqual(self.read(link), b'invalid')
+
+    def test_reader_refuses_wrong_owner_nonregular_and_changed_descriptor(self):
+        root = self.directory / 'guest'
+        root.mkdir(mode=0o700)
+        target = root / 'result.json'
+        target.mkdir(mode=0o700)  # openable with NONBLOCK, but not a regular file
+        self.assertEqual(self.read(root), b'invalid')
+        target.rmdir()
+        target.write_bytes(b'{}')
+        target.chmod(0o600)
+        original = os.fstat
+        for field, change in (('st_uid', 1), ('st_ino', 1), ('st_size', 1),
+                              ('st_mtime_ns', 1), ('st_ctime_ns', 1)):
+            calls = []
+            def changed(fd):
+                info = original(fd)
+                calls.append(fd)
+                values = {name: getattr(info, name) for name in
+                          ('st_mode', 'st_nlink', 'st_uid', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')}
+                if field == 'st_uid' or len(calls) == 2:
+                    values[field] += change
+                return SimpleNamespace(**values)
+            with self.subTest(field=field):
+                self.assertEqual(self.read(root, fstat=changed), b'invalid')
+                self.assertEqual(len(calls), 1 if field == 'st_uid' else 2)
+
+    def test_literal_production_reader_uses_only_fixed_path_and_root_owner(self):
+        directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
+        file = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1,
+                               st_size=2, st_ino=42, st_mtime_ns=1, st_ctime_ns=1)
+        buffer = io.BytesIO()
+        with patch.object(os, 'lstat', return_value=directory) as lookup, \
+             patch.object(os, 'open', return_value=91) as opened, \
+             patch.object(os, 'fstat', return_value=file), patch.object(os, 'read', return_value=b'{}') as read, \
+             patch.object(os, 'close') as closed, \
+             patch.object(sys, 'stdout', SimpleNamespace(buffer=buffer)):
+            with self.assertRaises(SystemExit):
+                exec(compile(host.READ_RESULT, 'fixed-reader', 'exec'), {})
+        self.assertEqual([c.args[0] for c in lookup.call_args_list],
+                         ['/var', '/var/lib', '/var/lib/labapp-vlab-trial'])
+        opened.assert_called_once_with('/var/lib/labapp-vlab-trial/result.json',
+                                       os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        read.assert_called_once_with(91, 4097)
+        closed.assert_called_once_with(91)
+        self.assertEqual(buffer.getvalue(), b'{}')
+
+    # -- strict closed consumer ------------------------------------------------
+    def encoded(self, value):
+        return guest.encoded(value)
+
+    def test_valid_failure_and_success_records_are_accepted_and_copied_closed(self):
+        state, record = host.guest_result(self.encoded(result_value(self.nonce, 17, False)), self.nonce)
+        self.assertEqual((state, record['code'], record['diagnostic']), ('valid', 17, worker_detail()))
+        state, record = host.guest_result(self.encoded(result_value(self.nonce, 0, True)), self.nonce)
+        self.assertEqual((state, record['diagnostic']), ('valid', dict(guest.SUCCESS)))
+        self.assertEqual(host.guest_result(b'absent', self.nonce), ('absent', None))
+        self.assertEqual(host.guest_result(b'invalid', self.nonce), ('invalid', None))
+        self.assertEqual(host.guest_result(b'', self.nonce), ('invalid', None))
+
+    def test_consumer_refuses_every_malformed_or_contradictory_record(self):
+        good = result_value(self.nonce, 17, False)
+        def changed(**updates):
+            return dict(good, **updates)
+        def detail(**updates):
+            return dict(good, diagnostic=dict(good['diagnostic'], **updates))
+        cases = {
+            'schema1': {k: good[k] for k in ('code', 'contained', 'nonce')} | {'schema': 1},
+            'extra field': changed(extra=1),
+            'missing field': {k: v for k, v in good.items() if k != 'diagnostic'},
+            'bool schema': changed(schema=True), 'bool code': changed(code=True),
+            'string code': changed(code='17'), 'big code': changed(code=256), 'negative code': changed(code=-1),
+            'int contained': changed(contained=1), 'wrong nonce': changed(nonce='e' * 32),
+            'unknown origin': detail(origin='attacker'), 'unknown category': detail(category='oom-kill'),
+            'unknown phase': detail(phase='access'), 'illegal pair': detail(operation='nonce-create'),
+            'guardian-only op from worker': detail(operation='worker-supervision'),
+            'path label': detail(operation='/root/private'), 'bool status': detail(child_status=True),
+            'big status': detail(child_status=256), 'signal positive': detail(category='child-signal', child_status=9),
+            'exit negative': detail(child_status=-9), 'timeout with status': detail(category='child-timeout', child_status=124),
+            'success code 0 with failure': changed(code=0), 'failure code with none': changed(diagnostic=dict(guest.SUCCESS)),
+            'none with exit': changed(code=0, diagnostic=dict(guest.SUCCESS, child_status=0)),
+            'diagnostic list': changed(diagnostic=[]), 'diagnostic extra': detail(text=SENTINEL),
+            'sentinel operation': detail(operation=SENTINEL), 'sentinel category': detail(category=SENTINEL),
+            'unknown only status-invalid': detail(origin='unknown', category='child-exit'),
+        }
+        for name, value in cases.items():
+            with self.subTest(name):
+                state, record = host.guest_result(guest.encoded(value), self.nonce)
+                self.assertEqual((state, record), ('invalid', None))
+        for name, raw in (('duplicate key', b'{"schema":2,"schema":2}'), ('nan', b'{"schema":2,"code":NaN}'),
+                          ('infinity', b'{"code":Infinity}'), ('not json', b'PRIVATE ' + SENTINEL.encode()),
+                          ('oversize', b' ' * 4097), ('non-utf8', b'\xff\xfe')):
+            with self.subTest(name):
+                self.assertEqual(host.guest_result(raw, self.nonce), ('invalid', None))
+
+    def test_guest_validator_is_the_same_gate_for_status_and_unknown_origin(self):
+        unknown = {'origin': 'unknown', 'phase': 'stage', 'operation': 'install-docker',
+                   'category': 'status-invalid', 'child_status': 137}
+        self.assertEqual(guest.result_record(result_value(self.nonce, 137, False, unknown), self.nonce)['diagnostic'], unknown)
+        # Unknown-origin status is context, so no child normalization is inferred.
+        context = dict(unknown, child_status=17)
+        self.assertEqual(guest.result_record(result_value(self.nonce, 137, False, context), self.nonce)['diagnostic'], context)
+        unobserved = worker_detail(status=None)
+        self.assertEqual(guest.result_record(result_value(self.nonce, 17, False, unobserved), self.nonce)['diagnostic'], unobserved)
+        guardian = {'origin': 'guardian', 'phase': 'stage', 'operation': 'worker-supervision',
+                    'category': 'child-signal', 'child_status': -9}
+        self.assertEqual(guest.result_record(result_value(self.nonce, 137, False, guardian), self.nonce)['code'], 137)
+        with self.assertRaises(guest.Failure):  # a direct worker signal never claims an inner operation
+            guest.diagnostic(dict(guardian, origin='worker'))
+
+    def test_service_observation_is_closed_and_diagnostic_only(self):
+        good = b'ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n'
+        self.assertEqual(host.service_observation(good), {'active_state': 'failed', 'result': 'exit-code',
+                                                          'exec_code': 1, 'exec_status': 1})
+        # signal 9 is reported as the manager reported it, never as an OOM attribution
+        killed = b'ActiveState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=9\n'
+        self.assertEqual(host.service_observation(killed)['result'], 'signal')
+        for raw in (good + b'MainPID=1\n', good + b'Result=success\n', b'ActiveState=failed\n',
+                    good.replace(b'failed', SENTINEL.encode()), good.replace(b'exit-code', b'oom-kill-ish'),
+                    good.replace(b'ExecMainStatus=1', b'ExecMainStatus=256'), good.replace(b'ExecMainCode=1', b'ExecMainCode=9'),
+                    good.replace(b'ExecMainCode=1', b'ExecMainCode=\xd9\xa3'), b'x' * 513, 'text', None,
+                    b'ActiveState=failed\nResult=exit-code\nExecMainCode=-1\nExecMainStatus=1\n'):
+            self.assertIsNone(host.service_observation(raw))
+
+    # -- actual trial orchestration: fake master/process only ---------------------
+    def drive(self, replies, *, fail_bootstrap=False, service=b'', observation_down=False,
+              observation_error=None, stop_error=None):
+        value = snapshot()
+        rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
+        registration, records = Mock(), Mock()
+        registration.current.return_value = rec
+        registration.register.return_value = Mock()
+        login = Mock(user=value['self_user'])
+        importer = Mock()
+        importer.prepare.return_value = ({'posix': {'username': 'owner'}}, 1)
+        trace, pulse, pending = [], threading.Event(), list(replies)
+        services = list(service) if isinstance(service, list) else [service]
+        nonce, boot = self.nonce, '22222222-2222-4222-8222-222222222222'
+        payload_dir, output = self.directory / 'inputs', self.directory / 'output'
+        payload_dir.mkdir()
+        output.mkdir(mode=0o700)
+        pins = {}
+        for name in guest.PAYLOADS:
+            raw = ('PUBLIC-' + name).encode()
+            (payload_dir / name).write_bytes(raw)
+            pins[name] = (len(raw), guest.sha(raw))
+        def command(args, *unused, **kwargs):
+            if args[:3] == ['gcloud', 'auth', 'list']: return (host.OWNER + '\n').encode()
+            if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)\n'
+            if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
+                return guest.encoded({'name': value['self_user'].removeprefix('users/')})
+            if args[:2] == ['gcloud', 'version']: return b'{"Google Cloud SDK":"575.0.0"}'
+            if args[0] == '/usr/bin/ssh-keygen' and '-q' in args:
+                target = Path(args[-1])
+                target.write_text('PUBLIC_SYNTHETIC_KEY_PLACEHOLDER')
+                Path(str(target) + '.pub').write_text('ssh-ed25519 UEVCTElDX0ZJWFRVUkU=')
+            if args[0] == '/usr/bin/openssl': return ('$5$publicfixture$' + 'a' * 43 + '\n').encode()
+            return b'[]'
+        def sources(snap, directory):
+            table = {}
+            for name in guest.SOURCES:
+                raw = ('PUBLIC-SOURCE-' + name).encode()
+                guest.exclusive(directory / name, raw)
+                table[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
+            return table
+        test = self
+        class Session:
+            def start(self): trace.append('master-start')
+            def transfer(self, incoming, names, phase='stage'): trace.append(('transfer', tuple(names)))
+            def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
+                if args == host.RESULT_COMMAND:
+                    trace.append('read-result')
+                    if observation_error is not None and observation_error[0] == 'reader':
+                        raise observation_error[1]
+                    if observation_down: raise guest.Failure('original master lost', 124)
+                    if not fail_bootstrap: test.assertTrue(pulse.wait(2), 'heartbeat never started')
+                    reply = pending.pop(0) if len(pending) > 1 else pending[0]
+                    if isinstance(reply, BaseException): raise reply
+                    return reply
+                if args == host.SERVICE_COMMAND:
+                    trace.append('read-service')
+                    if observation_error is not None and observation_error[0] == 'manager':
+                        raise observation_error[1]
+                    if observation_down: raise guest.Failure('original master lost', 124)
+                    return services.pop(0) if len(services) > 1 else services[0]
+                trace.append(('remote', tuple(args)))
+                if args[:2] == ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']: return boot.encode()
+                if args[0] == '/usr/bin/cat': return nonce.encode()
+                if 'heartbeat' in args:
+                    pulse.set()
+                    return b''
+                if host.BOOTSTRAP in args and fail_bootstrap:
+                    raise guest.Failure('bootstrap refused', 17)
+                if args[:4] == ['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'stop']:
+                    trace.append('stop')
+                    if stop_error is not None: raise stop_error
+                    if observation_down: raise guest.Failure('original master lost', 124)
+                return b''
+            def close(self):
+                trace.append('master-close')
+                return True
+        with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
+             patch.object(host, 'OwnKeyImport', return_value=importer), patch.object(host, 'Master', return_value=Session()), \
+             patch.object(host, 'source_files', side_effect=sources), patch.object(guest, 'PAYLOADS', pins), \
+             patch.object(host, 'extract_ed25519', return_value='ssh-ed25519 UEVCTElDX0ZJWFRVUkU=\n'), \
+             patch.object(host.secrets, 'token_hex', side_effect=lambda n: 'd' * (n * 2)), \
+             patch.object(host.secrets, 'token_urlsafe', return_value='PUBLIC-NONDEPLOYABLE-PASSWORD'), \
+             patch.object(host, 'cleanup_own_key', side_effect=lambda *a, **k: trace.append('remove-key')), \
+             patch.object(host, 'cleanup_dispatch', side_effect=lambda *a: trace.append('dispatch-cleanup')), \
+             patch('builtins.print') as printed:
+            code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login)
+        return code, json.loads(printed.call_args.args[0]), trace, printed.call_args.args[0]
+
+    def test_failed_guest_result_surfaces_closed_diagnostic_and_primary_code(self):
+        code, receipt, trace, _ = self.drive([self.encoded(result_value(self.nonce, 17, True))])
+        self.assertEqual(code, 17)
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']), ('valid', worker_detail()))
+        self.assertEqual((receipt['phase'], receipt['failure_category'], receipt['code']), ('guest-result', 'guest', 17))
+        self.assertNotIn('read-service', trace)  # a genuine result needs no manager observation
+
+    def test_success_code_with_uncontained_result_is_still_operational_failure(self):
+        code, receipt, _, _ = self.drive([self.encoded(result_value(self.nonce, 0, False))])
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['guest_diagnostic'], dict(guest.SUCCESS))
+        self.assertFalse(receipt['contained'])
+
+    def test_unsupported_or_contradictory_result_fails_closed_without_echo(self):
+        for name, value in (('schema1', {'schema': 1, 'code': 0, 'contained': True, 'nonce': self.nonce}),
+                            ('contradiction', dict(result_value(self.nonce, 0, True), code=1)),
+                            ('contradictory exit', result_value(self.nonce, 17, True, worker_detail(status=18))),
+                            ('contradictory signal', result_value(self.nonce, 17, True, worker_detail('child-signal', -9))),
+                            ('sentinel', dict(result_value(self.nonce, 17, True), extra=SENTINEL))):
+            with self.subTest(name):
+                self.setUp()
+                code, receipt, trace, text = self.drive([self.encoded(value)])
+                self.assertEqual(code, 1)
+                self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']), ('invalid', None))
+                self.assertFalse(receipt['contained'])
+                self.assertNotIn(SENTINEL, text)
+                self.assertIn('stop', trace)
+
+    def test_bootstrap_failure_reads_same_master_before_stop_and_keeps_primary(self):
+        service = b'ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n'
+        code, receipt, trace, _ = self.drive([self.encoded(result_value(self.nonce, 17, False))],
+                                             fail_bootstrap=True, service=service)
+        self.assertEqual(code, 17)
+        self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-work', 'guest'))
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']), ('valid', worker_detail()))
+        self.assertEqual(receipt['guest_service'], {'active_state': 'failed', 'result': 'exit-code',
+                                                    'exec_code': 1, 'exec_status': 1})
+        self.assertFalse(receipt['contained'])  # a supplemental read never grants containment
+        self.assertLess(trace.index('read-result'), trace.index('read-service'))
+        self.assertLess(trace.index('read-service'), trace.index('stop'))
+        self.assertEqual(trace.count('master-start'), 1)  # same original master; no reconnect
+
+    def test_bootstrap_failure_with_terminal_service_keeps_primary(self):
+        service = b'ActiveState=inactive\nResult=signal\nExecMainCode=2\nExecMainStatus=9\n'
+        code, receipt, _, _ = self.drive([b'absent'], fail_bootstrap=True, service=service)
+        self.assertEqual(code, 17)
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']), ('pending', None))
+        self.assertEqual(receipt['guest_service']['result'], 'signal')
+        self.assertFalse(receipt['contained'])
+
+    def test_missing_result_polling_stops_promptly_for_terminal_service_after_one_recheck(self):
+        for state in ('inactive', 'failed'):
+            with self.subTest(state=state):
+                self.setUp()
+                service = ('ActiveState=' + state + '\nResult=signal\nExecMainCode=2\nExecMainStatus=9\n').encode()
+                code, receipt, trace, text = self.drive([b'absent'], service=service)
+                self.assertEqual(code, 1)
+                self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']), ('missing', None))
+                self.assertEqual(receipt['guest_service']['active_state'], state)
+                self.assertEqual(trace.count('read-result'), 2)
+                self.assertEqual(trace.count('read-service'), 1)
+                self.assertLess(trace.index('read-service'), trace.index('read-result', trace.index('read-service')))
+                self.assertIn('stop', trace)
+                self.assertIn('dispatch-cleanup', trace)
+                self.assertFalse(receipt['contained'])
+                self.assertNotIn(SENTINEL, text)
+
+    def test_terminal_recheck_accepts_only_genuine_result_and_pending_states_remain_bounded(self):
+        terminal = b'ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n'
+        code, receipt, trace, _ = self.drive([b'absent', self.encoded(result_value(self.nonce, 17, True))], service=terminal)
+        self.assertEqual((code, receipt['contained'], receipt['guest_diagnostic_status']), (17, True, 'valid'))
+        self.assertNotIn('stop', trace)
+        for service in (b'ActiveState=active\nResult=success\nExecMainCode=0\nExecMainStatus=0\n', b'PRIVATE-' + SENTINEL.encode()):
+            self.setUp()
+            cutoff = guest.Failure('cutoff', 124, 'phase-cutoff')
+            code, receipt, trace, text = self.drive([b'absent', cutoff], service=service)
+            self.assertEqual(code, 124)
+            self.assertFalse(receipt['contained'])
+            self.assertIn('stop', trace)
+            self.assertIn('dispatch-cleanup', trace)
+            self.assertNotIn(SENTINEL, text)
+
+    def test_each_supplemental_baseexception_preserves_uncertainty_through_successful_close(self):
+        class ObservationAbort(BaseException):
+            cleanup_uncertain = True
+        for source in ('reader', 'manager', 'stop'):
+            with self.subTest(source=source):
+                self.setUp()
+                error = ObservationAbort(SENTINEL)
+                kwargs = {'stop_error': error} if source == 'stop' else {'observation_error': (source, error)}
+                code, receipt, trace, text = self.drive([b'absent'], fail_bootstrap=True, **kwargs)
+                self.assertEqual(code, 17)
+                self.assertIn('master-close', trace)
+                self.assertIn('dispatch-cleanup', trace)
+                self.assertNotIn('remove-key', trace)
+                self.assertTrue(all(not receipt[k] for k in ('process_absent', 'local_files_absent', 'own_key_absent')))
+                self.assertTrue(any((self.directory / 'output').iterdir()))
+                self.assertNotIn(SENTINEL, text)
+
+    def test_unavailable_master_or_hostile_manager_output_stays_unavailable_and_still_stops(self):
+        code, receipt, trace, _ = self.drive([b'absent'], fail_bootstrap=True, observation_down=True)
+        self.assertEqual(code, 17)
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic'], receipt['guest_service']),
+                         ('unavailable', None, None))
+        self.assertIn('stop', trace)
+        self.setUp()
+        hostile = ('ActiveState=failed\nResult=' + SENTINEL + '\nExecMainCode=1\nExecMainStatus=1\n').encode()
+        code, receipt, _, text = self.drive([b'x' * 5000], fail_bootstrap=True, service=hostile)
+        self.assertEqual(code, 17)
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_service']), ('invalid', None))
+        self.assertNotIn(SENTINEL, text)
+
+    def test_pre_guest_failure_reports_unavailable(self):
+        value = snapshot()
+        with patch.object(host, 'trusted_source', side_effect=guest.Failure('denied', 17)), \
+             patch.object(host, 'cleanup_dispatch'), patch('builtins.print') as output:
+            code = host.trial(value, self.directory, self.directory, registration=Mock(), records=Mock(), login=Mock())
+        self.assertEqual(code, 17)
+        receipt = json.loads(output.call_args.args[0])
+        self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic'], receipt['guest_service']),
+                         ('unavailable', None, None))

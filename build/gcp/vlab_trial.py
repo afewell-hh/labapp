@@ -370,7 +370,7 @@ class Master:
         command(['/usr/bin/ssh', *self.options, '-o', 'ProxyCommand=/usr/bin/false', '-O', 'check', self.target],
                 self.slice(5, until), until=until)
 
-    def remote(self, args, phase, cap=30, cleanup=False, until=None):
+    def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
         phase_end = owned_process.monotonic() + (self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase))
         until = phase_end if until is None else min(until, phase_end)
         self.check(until)
@@ -378,7 +378,7 @@ class Master:
         # is mandatory on EVERY subordinate invocation, including cleanup/SFTP.
         seconds = self.slice(min(cap, self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase)), until)
         raw = command(['/usr/bin/ssh', *self.options, '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false',
-                       self.target, shlex.join(args)], seconds, failed=None if cleanup else self.failed, until=until)
+                       self.target, shlex.join(args)], seconds, limit=limit, failed=None if cleanup else self.failed, until=until)
         self.check(until)
         return raw
 
@@ -438,6 +438,118 @@ n['bootstrap'](p,sys.argv[3])
 """
 
 
+# Fixed stdlib-only reader for the ONE guardian result. It imports nothing from the
+# guest tree, so a failed/corrupt guest module cannot hide the observation. No path,
+# action or command selector exists. It prints the exact <=4096 file bytes or the
+# fixed token ``absent``/``invalid``; every byte is re-validated by the host.
+READ_RESULT = """import os,stat,sys
+def out(b):
+    sys.stdout.buffer.write(b)
+    sys.exit(0)
+d='/var/lib/labapp-vlab-trial'
+try:
+    for q in ('/var','/var/lib',d):
+        s=os.lstat(q)
+        if stat.S_ISLNK(s.st_mode) or not stat.S_ISDIR(s.st_mode) or s.st_uid!=0: out(b'invalid')
+    if stat.S_IMODE(s.st_mode)!=0o700: out(b'invalid')
+except FileNotFoundError:
+    out(b'absent')
+except OSError:
+    out(b'invalid')
+try:
+    f=os.open(d+'/result.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+except FileNotFoundError:
+    out(b'absent')
+except OSError:
+    out(b'invalid')
+try:
+    s=os.fstat(f)
+    if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1 or s.st_uid!=0 or stat.S_IMODE(s.st_mode)!=0o600 or s.st_size>4096: out(b'invalid')
+    b=os.read(f,4097)
+    t=os.fstat(f)
+    if len(b)!=s.st_size or (s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)!=(t.st_ino,t.st_size,t.st_mtime_ns,t.st_ctime_ns): out(b'invalid')
+finally:
+    os.close(f)
+out(b)
+"""
+RESULT_COMMAND = ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', READ_RESULT]
+RESULT_READ_LIMIT = guest.MAX_RESULT + 128
+# Exact reviewed manager properties and closed values (systemd 255 service docs).
+SERVICE_COMMAND = ['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'show', guest.UNIT, '-p', 'ActiveState',
+                   '-p', 'Result', '-p', 'ExecMainCode', '-p', 'ExecMainStatus']
+SERVICE_PROPERTIES = ('ActiveState', 'Result', 'ExecMainCode', 'ExecMainStatus')
+SERVICE_ACTIVE = ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading', 'maintenance')
+SERVICE_RESULTS = ('success', 'resources', 'timeout', 'exit-code', 'signal', 'core-dump', 'watchdog',
+                   'start-limit-hit', 'oom-kill', 'protocol', 'exec-condition')
+
+
+def guest_result(raw, nonce):
+    """-> (state, record). Nothing is copied from the bytes before full validation.
+
+    ``absent`` is pending evidence only, never success. Unsupported schema 1,
+    oversize, duplicate/nonfinite/extra/mistyped fields and a wrong nonce are ``invalid``.
+    """
+    if raw == b'absent':
+        return 'absent', None
+    if type(raw) is not bytes or not raw or raw == b'invalid' or len(raw) > guest.MAX_RESULT:
+        return 'invalid', None
+    try:
+        return 'valid', guest.result_record(guest.data(raw), nonce)
+    except Exception:
+        return 'invalid', None
+
+
+def service_observation(raw):
+    """Closed parse of the fixed manager properties; anything else is unknown (None).
+
+    Diagnostic only: it can never produce a result, `contained` or any receipt, and
+    signal 9 here is not an OOM attribution.
+    """
+    try:
+        if type(raw) is not bytes or len(raw) > 512:
+            return None
+        fields = {}
+        for line in raw.decode('ascii').splitlines():
+            key, separator, value = line.partition('=')
+            if not separator or key not in SERVICE_PROPERTIES or key in fields:
+                return None
+            fields[key] = value
+        if set(fields) != set(SERVICE_PROPERTIES) or fields['ActiveState'] not in SERVICE_ACTIVE \
+                or fields['Result'] not in SERVICE_RESULTS \
+                or not re.fullmatch('[0-9]{1,3}', fields['ExecMainCode']) \
+                or not re.fullmatch('[0-9]{1,3}', fields['ExecMainStatus']) \
+                or int(fields['ExecMainCode']) > 7 or int(fields['ExecMainStatus']) > 255:
+            return None
+        return {'active_state': fields['ActiveState'], 'result': fields['Result'],
+                'exec_code': int(fields['ExecMainCode']), 'exec_status': int(fields['ExecMainStatus'])}
+    except Exception:
+        return None
+
+
+def observe_guest(master, nonce, status, process_uncertain):
+    """One best-effort bounded observation through the SAME original master.
+
+    Called BEFORE the fixed stop (a stop makes the guardian publish its own SIGTERM
+    result). No reconnect, retry, key or private artifact. Supplements, never replaces,
+    the primary failure and never grants `contained`.
+    """
+    detail = service = None
+    try:
+        raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, cleanup=True, limit=RESULT_READ_LIMIT)
+        state, record = guest_result(raw, nonce)
+        status = 'pending' if state == 'absent' else state
+        detail = record['diagnostic'] if state == 'valid' else None
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+    try:
+        service = service_observation(master.remote(SERVICE_COMMAND, 'persistence', cap=8, cleanup=True, limit=1024))
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+    return status, detail, service
+
+
 def cleanup_dispatch(snapshot):
     # Cancel ONLY this captured trusted creator. Its completed workflow_run is
     # checked against the lease by the independent cleanup workflow. The API
@@ -469,6 +581,8 @@ def trial(snapshot, payloads, output, *, registration, records, login):
     master = context = heartbeat_thread = None
     result, contained, process_absent, key_absent, dispatched = 1, False, False, False, False
     phase, failure_category = 'preflight', 'none'
+    # Public guest diagnostic: `unavailable` until a bounded read or observation says otherwise.
+    guest_status, guest_detail, guest_service = 'unavailable', None, None
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -567,19 +681,37 @@ def trial(snapshot, payloads, output, *, registration, records, login):
             clock.remaining('persistence')
             # No private guest diagnostics/FAB/kubeconfigs are pulled. One fixed
             # sanitized result is read after the guardian has contained services.
-            raw = master.remote(['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c',
-                       "from pathlib import Path; p=Path('/var/lib/labapp-vlab-trial/result.json'); print(p.read_text() if p.exists() else '{}')"],
-                       'persistence', cap=8)
-            observed = guest.data(raw)
-            if observed:
-                guest.require(set(observed) == {'schema', 'code', 'contained', 'nonce'} and observed['schema'] == 1
-                              and observed['nonce'] == nonce and type(observed['code']) is int
-                              and type(observed['contained']) is bool)
-                result, contained = observed['code'], observed['contained']
-                phase = 'guest-result'
-                failure_category = 'guest' if result else 'none'
-                break
-            stop.wait(5)
+            raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
+            state, record = guest_result(raw, nonce)
+            if state == 'absent':
+                guest_status = 'pending'
+                # A simple service may have failed exec/import before it could
+                # publish anything. Observe only the original channel, within the
+                # existing work clock; manager data never supplies a result.
+                try:
+                    guest_service = service_observation(master.remote(
+                        SERVICE_COMMAND, 'persistence', cap=8, limit=1024))
+                except BaseException as error:
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
+                    raise
+                if guest_service is None or guest_service['active_state'] not in ('failed', 'inactive'):
+                    stop.wait(5)
+                    continue
+                # Bounded recheck closes the normal result-publication race.
+                # A terminal service without a genuine record fails promptly.
+                raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
+                state, record = guest_result(raw, nonce)
+                if state == 'absent':
+                    guest_status = 'missing'
+                    raise guest.Failure('terminal guest service without result')
+            guest_status = state
+            guest.require(state == 'valid', 'guest result invalid')
+            result, contained = record['code'], record['contained']
+            guest_detail = record['diagnostic']
+            phase = 'guest-result'
+            failure_category = 'guest' if result else 'none'
+            break
     except guest.Failure as error:
         result = error.code
         failure_category = 'guest'
@@ -608,6 +740,9 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         process_absent = master is None and heartbeat_absent and not process_uncertain.is_set()
         if master is not None:
             if not contained and heartbeat_absent:
+                if guest_status in ('unavailable', 'pending'):
+                    # Before the stop below; the primary failure above is retained.
+                    guest_status, guest_detail, guest_service = observe_guest(master, nonce, guest_status, process_uncertain)
                 try:
                     master.remote(['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'stop', guest.UNIT],
                                   'persistence', cap=120, cleanup=True)
@@ -656,7 +791,10 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
                    'phase': phase, 'failure_category': failure_category,
                    'own_key_absent': key_absent, 'local_files_absent': local_absent,
-                   'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id']}
+                   'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id'],
+                   # Closed values only; never text, argv, paths or raw manager output.
+                   'guest_diagnostic_status': guest_status, 'guest_diagnostic': guest_detail,
+                   'guest_service': guest_service}
         # Publicly safe fixed statuses only; cloud deletion/FREE still require
         # independent immutable404/terminal-operation/access-archive receipts.
         print(json.dumps(receipt, sort_keys=True))
