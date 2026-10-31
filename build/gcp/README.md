@@ -857,7 +857,8 @@ then calls `prepare(expected_slot, decision)` to collect a reviewable proof.
 `recover_failed_access(expected_slot, proof, decision)` requires a trusted
 in-process approval callback accepting the canonical SHA256 of that complete
 proof. Decision JSON and an issue link alone confer no authority. Composition
-requires the fixed active owner, no impersonation, clean reviewed source and
+requires the fixed active owner, no impersonation, clean reviewed source bound
+to the loaded module's checkout, and
 the exact original and latest creator first attempt completed with failed or
 cancelled conclusion. A rerun or successor refuses.
 

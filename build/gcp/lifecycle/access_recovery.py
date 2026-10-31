@@ -223,12 +223,13 @@ class FailedAccessRecovery:
         owner = self.__collect(copy.deepcopy(slot), copy.deepcopy(decision))
         now = self.__now()
         exact(owner, ('creator', 'local'))
-        exact(owner['creator'], ('run_id', 'attempt', 'source_sha', 'sha256', 'conclusion'))
+        exact(owner['creator'], ('run_id', 'attempt', 'source_sha', 'sha256', 'latest_sha256', 'conclusion'))
         creator = owner['creator']
         require(creator['run_id'] == slot['run_id'] and creator['attempt'] == slot['attempt'] and
                 creator['source_sha'] == decision['trial_source_sha'] and
                 creator['conclusion'] in ('cancelled', 'failure', 'timed_out'))
         sha(creator['sha256'])
+        sha(creator['latest_sha256'])
         validate_local(owner['local'], slot, decision, now)
         receipts, intent = {}, None
         for kind in KINDS:
@@ -380,6 +381,7 @@ class OwnerRecovery:
         # Injection points are trusted composition, as for existing transports;
         # there is no selector for commands, principals, resources or endpoints.
         import os
+        from pathlib import Path
         from .cli import CREATOR_PATH, REPOSITORY
 
         def collect(slot, decision):
@@ -389,6 +391,9 @@ class OwnerRecovery:
             impersonation = command(['gcloud', 'config', 'get-value', 'auth/impersonate_service_account', '--quiet'], 15).decode().strip()
             require(impersonation in ('', '(unset)') and
                     not os.environ.get('CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'), 'owner impersonation refused')
+            checkout = command(['git', 'rev-parse', '--show-toplevel'], 15).decode().strip()
+            require(Path(checkout).is_absolute() and Path(checkout).resolve() == Path(__file__).resolve().parents[3],
+                    'loaded recovery policy is outside reviewed checkout')
             head = command(['git', 'rev-parse', 'HEAD'], 15).decode().strip()
             require(head == decision['policy_source_sha'] and not command(
                 ['git', 'status', '--porcelain', '--untracked-files=normal'], 15).strip(), 'reviewed clean source required')
@@ -397,15 +402,21 @@ class OwnerRecovery:
             exact_run = github(run_path + '/attempts/' + str(slot['attempt']))
             latest = github(run_path)
             for run in (exact_run, latest):
-                require(run.get('id') == slot['run_id'] and run.get('run_attempt') == slot['attempt'] and
+                require(type(run.get('id')) is int and type(run.get('run_attempt')) is int and
+                    run.get('id') == slot['run_id'] and run.get('run_attempt') == slot['attempt'] and
                     run.get('path') == CREATOR_PATH and run.get('event') == 'workflow_dispatch' and
                     run.get('head_branch') == 'main' and run.get('head_sha') == decision['trial_source_sha'] and
                     run.get('repository', {}).get('full_name') == REPOSITORY and
                     run.get('status') == 'completed' and run.get('conclusion') in
                     ('cancelled', 'failure', 'timed_out'), 'original creator is not terminal failed first attempt')
-            require(exact_run == latest, 'creator observations differ')
+            # The two endpoints legitimately return different jobs_url/logs_url.
+            # All security identity/status fields above must match fixed values;
+            # also require the same terminal conclusion, without equating the
+            # entire endpoint-specific representations. Retain both raw digests.
+            require(exact_run['conclusion'] == latest['conclusion'], 'creator conclusions differ')
             creator = {'run_id': slot['run_id'], 'attempt': slot['attempt'],
                        'source_sha': decision['trial_source_sha'], 'sha256': digest(exact_run),
+                       'latest_sha256': digest(latest),
                        'conclusion': exact_run['conclusion']}
             local = local_review(copy.deepcopy(slot), copy.deepcopy(decision))
             return {'creator': creator, 'local': local}

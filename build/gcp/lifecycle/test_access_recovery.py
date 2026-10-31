@@ -6,6 +6,7 @@ Local process evidence is a trusted lead-review fixture, not OS attestation.
 import copy
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
@@ -81,10 +82,14 @@ class Fixture:
         self.run = dict(id=1, run_attempt=1, path='.github/workflows/labapp-lifecycle-inspect.yml',
             event='workflow_dispatch', head_branch='main', head_sha=TRIAL,
             repository={'full_name': 'afewell-hh/labapp'}, status='completed', conclusion='cancelled')
-        self.latest = None
+        self.latest = dict(self.run, jobs_url='https://api.github.com/repos/afewell-hh/labapp/actions/runs/1/jobs',
+            logs_url='https://api.github.com/repos/afewell-hh/labapp/actions/runs/1/logs')
+        self.run.update(jobs_url='https://api.github.com/repos/afewell-hh/labapp/actions/runs/1/attempts/1/jobs',
+            logs_url='https://api.github.com/repos/afewell-hh/labapp/actions/runs/1/attempts/1/logs')
         self.command_calls, self.github_calls, self.approvals = [], [], []
         self.account = 'art@githedgehog.com'
         self.impersonation, self.dirty, self.head = '(unset)', '', POLICY_SOURCE
+        self.checkout = str(Path(__file__).resolve().parents[3])
         self.proofs = GcsFailedDisposals(BUCKET, token_provider=lambda: 'fake', transport=self.gcs)
         collector = OwnerRecovery.collector(local_review=lambda s, d: copy.deepcopy(self.local),
             command=self.command, github=self.github)
@@ -98,6 +103,7 @@ class Fixture:
             ('gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'): self.account,
             ('gcloud', 'config', 'get-value', 'auth/impersonate_service_account', '--quiet'): self.impersonation,
             ('git', 'rev-parse', 'HEAD'): self.head,
+            ('git', 'rev-parse', '--show-toplevel'): self.checkout,
             ('git', 'status', '--porcelain', '--untracked-files=normal'): self.dirty}
         return choices[tuple(argv)].encode()
 
@@ -144,6 +150,8 @@ class Recovery(unittest.TestCase):
             self.assertEqual(retained['archive'][kind]['observation'], 'observed-absent')
             self.assertEqual(f.records.read(f.context, kind), (None, 0))
         self.assertEqual(f.approvals[-1][0], digest(proof))
+        self.assertNotEqual(proof['observations']['creator']['sha256'],
+                            proof['observations']['creator']['latest_sha256'])
 
     def test_normal_reconcile_still_blocks_even_with_proof_after_all_deadlines(self):
         f = Fixture()
@@ -197,7 +205,7 @@ class Recovery(unittest.TestCase):
 
     def test_fixed_owner_no_impersonation_clean_reviewed_policy_source(self):
         for field, value in [('account', 'other@example.com'), ('impersonation', 'other@example.com'),
-                             ('head', 'f'*40), ('dirty', ' M source.py')]:
+                             ('head', 'f'*40), ('dirty', ' M source.py'), ('checkout', '/tmp/foreign-checkout')]:
             f = Fixture()
             setattr(f, field, value)
             with self.assertRaises(AccessError): f.proof()
@@ -207,6 +215,7 @@ class Recovery(unittest.TestCase):
 
     def test_cancel_acceptance_in_progress_rerun_replacement_or_untrusted_creator_blocks(self):
         for field, value in [('status', 'in_progress'), ('conclusion', None), ('run_attempt', 2),
+                             ('run_attempt', True), ('id', True),
                              ('head_sha', 'f'*40), ('path', 'other.yml'), ('event', 'pull_request'),
                              ('head_branch', 'other'), ('id', 2)]:
             f = Fixture()
@@ -214,6 +223,9 @@ class Recovery(unittest.TestCase):
             with self.assertRaises(AccessError): f.proof()
         f = Fixture()
         f.latest = dict(f.run, run_attempt=2)
+        with self.assertRaises(AccessError): f.proof()
+        f = Fixture()
+        f.latest['conclusion'] = 'failure'
         with self.assertRaises(AccessError): f.proof()
 
     def test_terminal_original_insert_and_exact_delete_are_required(self):
