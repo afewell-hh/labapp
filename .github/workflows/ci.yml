@@ -191,6 +191,41 @@ jobs:
           raise SystemExit(0 if result.wasSuccessful() else 1)
           PY
 
+      - name: Run required exact owner egress cleanup without subprocesses or network
+        run: |
+          test -f build/gcp/test_trial_egress.py
+          test_home=$(mktemp -d /tmp/labapp-egress-tests.XXXXXX)
+          cleanup_test_home() {
+            primary_status=$?
+            trap - EXIT
+            cleanup_status=0
+            rmdir -- "$test_home/tmp" || cleanup_status=1
+            rmdir -- "$test_home" || cleanup_status=1
+            if [ "$primary_status" -ne 0 ]; then exit "$primary_status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_test_home EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          mkdir -m 700 "$test_home/tmp"
+          timeout --kill-after=5s 60s env -i HOME="$test_home" TMPDIR="$test_home/tmp" PATH=/usr/bin:/bin python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          import unittest
+          def guard(event, args):
+              if event.startswith(('socket.', 'subprocess.')) or event in {
+                  'os.system', 'os.posix_spawn', 'os.fork', 'os.forkpty', 'os.exec'}:
+                  raise RuntimeError('offline egress suite forbids processes and network')
+          sys.addaudithook(guard)
+          sys.path.insert(0, str(Path.cwd()))
+          suite = unittest.TestLoader().discover('build/gcp', pattern='test_trial_egress.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required exact owner egress suite discovered no tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+
       - name: Run required fixed shared guest trial entrypoints
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
