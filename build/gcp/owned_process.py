@@ -66,15 +66,23 @@ class OwnedGroup:
         except ChildProcessError:
             self.ownership_lost = True
             raise OwnershipUncertain('owned child no longer waitable') from None
+        except BaseException:
+            self.ownership_lost = True
+            raise
         if info is None:
             return None
-        if info.si_pid != self.pgid or info.si_code not in _EXITED:
+        if (info.si_pid != self.pgid or info.si_code not in _EXITED
+                or type(info.si_status) is not int
+                or not (0 <= info.si_status <= 255 if info.si_code == os.CLD_EXITED
+                        else 0 < info.si_status < signal.NSIG)):
             self.ownership_lost = True
             raise OwnershipUncertain('unexpected child status')
         return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
 
-    def _signal(self, number):
+    def _signal(self, number, until):
         self.status()  # refuses once reaping/lost; ECHILD sends nothing
+        if monotonic() >= until:
+            raise OwnershipUncertain('signal deadline exhausted')
         try:
             os.killpg(self.pgid, number)
         except ProcessLookupError:
@@ -82,7 +90,7 @@ class OwnedGroup:
             self.ownership_lost = True
             raise OwnershipUncertain('anchored group vanished') from None
 
-    def close(self, term_grace, final=CLEANUP_SECONDS):
+    def close(self, term_grace, final=CLEANUP_SECONDS, *, until=None):
         """One idempotent bounded transition; True only on positive group absence."""
         if not self._lock.acquire(blocking=False):
             return False
@@ -90,31 +98,49 @@ class OwnedGroup:
             if self.outcome is not None:
                 return self.outcome
             self.outcome = False  # any exception/reentry leaves the conservative result
+            started = monotonic()
+            finish = started + term_grace + final
+            if until is not None:
+                finish = min(finish, until)
+            grace_end = min(started + term_grace, finish)
             ok = True
             if term_grace:
                 try:
-                    self._signal(signal.SIGTERM)
-                    until = monotonic() + term_grace
-                    while until - monotonic() > 0:
-                        sleep(min(.1, max(.001, until - monotonic())))
+                    if monotonic() >= finish:
+                        raise OwnershipUncertain('closure deadline exhausted')
+                    self._signal(signal.SIGTERM, finish)
+                    while True:
+                        left = grace_end - monotonic()
+                        if left <= 0:
+                            break
+                        sleep(min(.1, left))
                 except BaseException:
                     ok = False
             try:
-                self._signal(signal.SIGKILL)  # still anchored, even if leader already exited
+                if monotonic() >= finish:
+                    raise OwnershipUncertain('closure deadline exhausted')
+                self._signal(signal.SIGKILL, finish)  # still anchored, even if leader already exited
             except BaseException:
                 ok = False
-            finish = monotonic() + final
+            finish = min(finish, monotonic() + final)
             self.reaping = True  # no destructive signal can follow
             try:
-                self.proc.wait(timeout=max(.01, finish - monotonic()))
+                left = finish - monotonic()
+                if left <= 0:
+                    raise OwnershipUncertain('reap deadline exhausted')
+                self.proc.wait(timeout=left)
             except BaseException:
                 ok = False
             if self.proc.returncode is None or self.ownership_lost:
                 ok = False
             while ok:
+                if monotonic() >= finish:
+                    ok = False
+                    break
                 try:
                     os.killpg(self.pgid, 0)
                 except ProcessLookupError:
+                    ok = monotonic() < finish  # late ESRCH is not within-budget evidence
                     break
                 except BaseException:
                     ok = False
@@ -122,7 +148,7 @@ class OwnedGroup:
                 if monotonic() >= finish:
                     ok = False
                     break
-                sleep(min(.05, max(.001, finish - monotonic())))
+                sleep(min(.05, max(0, finish - monotonic())))
             self.outcome = ok
             return ok
         finally:
