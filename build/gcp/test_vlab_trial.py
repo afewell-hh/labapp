@@ -241,6 +241,44 @@ class OwnerTrial(unittest.TestCase):
         self.assertFalse(receipt['process_absent'])
         self.assertFalse(receipt['local_files_absent'])
         self.assertFalse(receipt['own_key_absent'])
+        self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-access', 'guest'))
+
+    def test_access_failure_phase_category_survives_cleanup_without_error_text(self):
+        for stage, error, category in (
+                ('prepare', host.AccessError('PRIVATE-PREPARE'), 'access'),
+                ('import_once', host.AccessError('PRIVATE-IMPORT'), 'access'),
+                ('import_once', RuntimeError('PRIVATE-UNKNOWN'), 'unknown'),
+                ('import_once', KeyboardInterrupt('PRIVATE-INTERRUPT'), 'interrupted')):
+            with self.subTest(stage=stage, category=category):
+                value = snapshot()
+                registration = Mock()
+                registration.current.return_value = dict(value)
+                importer = Mock()
+                importer.prepare.return_value = ({'posix': {'username': 'owner'}}, 1)
+                getattr(importer, stage).side_effect = error
+                def command(args, *unused, **kwargs):
+                    if args[:3] == ['gcloud', 'auth', 'list']: return host.OWNER.encode()
+                    if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)'
+                    if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
+                        return guest.encoded({'name': value['self_user']})
+                    if args[:2] == ['gcloud', 'version']: return b'{"Google Cloud SDK":"575.0.0"}'
+                    return b''
+                with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
+                     patch.object(guest, 'regular', return_value=b'PUBLIC-SYNTHETIC-KEY'), \
+                     patch.object(host, 'OwnKeyImport', return_value=importer), \
+                     patch.object(host, 'Master') as master, \
+                     patch.object(host, 'cleanup_own_key', side_effect=RuntimeError('PRIVATE-CLEANUP')), \
+                     patch.object(host, 'cleanup_dispatch', side_effect=RuntimeError('PRIVATE-DISPATCH')), \
+                     patch('builtins.print') as printed:
+                    code = host.trial(value, self.directory, self.directory, registration=registration,
+                                      records=Mock(), login=Mock(user=value['self_user']))
+                self.assertEqual(code, 130 if category == 'interrupted' else 1)
+                master.assert_not_called()
+                receipt = json.loads(printed.call_args.args[0])
+                self.assertEqual(receipt['phase'], 'access-prepare' if stage == 'prepare' else 'access-import')
+                self.assertEqual(receipt['failure_category'], category)
+                self.assertNotIn('PRIVATE', printed.call_args.args[0])
+                self.assertFalse(receipt['own_key_absent'])
 
     def test_owner_profile_mismatch_or_malformed_refuses_before_key_generation(self):
         for raw in ('54321', 'users/54321', '0', '012345', '１２３４５', None, True, 12345):
@@ -365,3 +403,4 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(trace[-3:], ['master-close','removed','captured-cancel'])
         receipt = json.loads(printed.call_args.args[0])
         self.assertTrue(all(receipt[k] for k in ('contained','process_absent','own_key_absent','local_files_absent','independent_cleanup_dispatched')))
+        self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-result', 'none'))

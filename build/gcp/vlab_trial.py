@@ -30,7 +30,7 @@ import time
 from build.provision import vlab_trial as guest
 from .inspection.hostkey import extract_ed25519
 from .lifecycle import spec
-from .lifecycle.access_records import GcsAccessRecords, canonical
+from .lifecycle.access_records import AccessError, GcsAccessRecords, canonical
 from .lifecycle.auth_http import gcloud_token
 from .lifecycle.cli import BUCKET, CREATOR_PATH, REPOSITORY, verify_disk_provenance
 from .lifecycle.cloud import PolicyCloud, ForbiddenOperation
@@ -395,6 +395,7 @@ def trial(snapshot, payloads, output, *, registration, records, login):
     process_uncertain = threading.Event()
     master = context = heartbeat_thread = None
     result, contained, process_absent, key_absent, dispatched = 1, False, False, False, False
+    phase, failure_category = 'preflight', 'none'
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -416,8 +417,11 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         context = registration.register(public_key)
         importer = OwnKeyImport(records, context, login, producer_run_id=rec['run_id'], producer_attempt=rec['attempt'],
                                 now=lambda: datetime.now(timezone.utc))
+        phase = 'access-prepare'
         intent, _ = importer.prepare(public_key)
+        phase = 'access-import'
         importer.import_once()
+        phase = 'guest-access'
         registration.current()
         hostkey = command(['gcloud', 'compute', 'instances', 'get-guest-attributes', rec['names']['instance'],
                            '--project=' + spec.PROJECT, '--zone=' + spec.ZONE,
@@ -441,6 +445,7 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         master.transfer(incoming, ['marker'], 'access')
         guest.require(master.remote(['/usr/bin/cat', incoming + '/marker'], 'access') == nonce.encode())
         master.remote(['/usr/bin/rm', '--', incoming + '/marker'], 'access')
+        phase = 'guest-work'
         source = source_files(snapshot, output)
         for name, pin in guest.PAYLOADS.items():
             raw = guest.regular(guest.no_links(payloads / name), pin[0], os.geteuid())
@@ -497,16 +502,21 @@ def trial(snapshot, payloads, output, *, registration, records, login):
                               and observed['nonce'] == nonce and type(observed['code']) is int
                               and type(observed['contained']) is bool)
                 result, contained = observed['code'], observed['contained']
+                phase = 'guest-result'
+                failure_category = 'guest' if result else 'none'
                 break
             stop.wait(5)
     except guest.Failure as error:
         result = error.code
+        failure_category = 'guest'
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     except KeyboardInterrupt:
         result = 130
+        failure_category = 'interrupted'
     except Exception as error:
         result = 1
+        failure_category = 'access' if isinstance(error, AccessError) else 'unknown'
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     finally:
@@ -563,6 +573,7 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         except BaseException:
             pass
         receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
+                   'phase': phase, 'failure_category': failure_category,
                    'own_key_absent': key_absent, 'local_files_absent': local_absent,
                    'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id']}
         # Publicly safe fixed statuses only; cloud deletion/FREE still require
