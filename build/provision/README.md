@@ -1451,6 +1451,68 @@ infers an OOM cause. The final file is at most 4096 bytes.
   after a terminal manager observation and bounded reader recheck.
   The historical failed trial's guest cause is unknown and this does not diagnose it.
 
+#### Root-private first-failure bundle (issue #368)
+
+The public boundary above is unchanged: a failed `start-fresh` still reports the
+core's outer status (1 is ambiguous `core-refusal`) at `core-start-fresh`, with no new
+labels or worker transport, and no nested manager/hhfab status is promoted into the
+worker code. Detail needed to find the actual cause is kept in ONE root-private
+`/var/lib/labapp-vlab-core/first-failure.json` (root 0700 directory, mode 0600,
+single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
+
+* **When.** `start()` now holds `reserve()` inside the same failure path. On the first
+  failure the bundle is written BEFORE `cleanup_start`, so a later
+  `last-command-output` overwrite, stop or cleanup failure cannot change it. First
+  failure wins (`link()` never replaces; an existing file or symlink is left alone).
+  Writing is diagnostic only: any error is swallowed (`first-failure capture unverified`
+  on stderr), the primary exception and exit status are untouched and `cleanup_start`
+  runs with its unchanged 35 s budget.
+* **Binding.** Header: state nonce (the trial nonce), `mode`, `operation`,
+  `invocation`, boot id and a derived `stage` (`reserve` | `manager` | `unit` |
+  `final`; a coarse locator, not a per-substep proof). A reservation refusal has no
+  operation of this call, so `operation`/`invocation` are null and no older state
+  operation, manager history or journal is adopted. If the state is unreadable or
+  differs from the reserved operation, the `state` section is `unavailable`/`invalid`
+  and `invocation` is null.
+* **Sections** (each `ok | truncated | unavailable | invalid`, raw bytes base64):
+  `primary` is the in-flight `Failure.private_output` (tail, at most 4 KiB), the fixed
+  Failure message literal and code; it is `unavailable` when the exception has none
+  (never an exception `repr`). `state` is a fixed token subset. `manager` is one
+  `systemctl show` of the fixed unit for `ActiveState,SubState,Result,InvocationID,
+  ExecMainCode,ExecMainStatus,ExecMainPID` (at most 2 KiB, 2 s). A different
+  `InvocationID` makes it `invalid` (output dropped); a forgotten unit makes it
+  `unavailable`. `journal` runs only with a frozen invocation: `journalctl --no-pager
+  --namespace=labapp-vlab --lines=64 --output=short-monotonic _BOOT_ID=<boot without
+  dashes> _SYSTEMD_INVOCATION_ID=<frozen> _SYSTEMD_UNIT=<fixed unit>` (at most 8 KiB,
+  8 s). It remains allowed when the manager forgot the unit, and there is no unit-only
+  fallback or history search. Success is never assumed from missing `ExecMain*`.
+* **Budget.** Both queries share one absolute deadline
+  `min(start end, now + 10 s)` that includes spawn, I/O and kill/reap (the last second
+  of each query is held back for containment). Exhausted budget leaves the query
+  sections `unavailable`; the file-only sections are still written. `query_cleanup`
+  is `confirmed` only after the direct child was reaped and its process group is
+  positively gone, otherwise `uncertain`. This is the GUEST process namespace: an
+  uncertain guest query is contained by the guardian and VM disposal and is never
+  reported as a clean capture.
+* **Untrusted.** Raw sections may contain anything hhfab, kubectl or a unit printed
+  (possibly credentials). They stay root-private and are never read by the worker,
+  never staged into candidate/images/CI artifacts/GitHub.
+* **Retention.** The file lives in the disposable trial VM's core state directory
+  until that VM is disposed. It is not copied by any build step.
+* **Export.** `vlab_trial.py export-failure --nonce N` (root, no path argument, same
+  call style as `heartbeat`) prints `absent`, the fixed token `invalid`, or
+  `<envelope>\n<bundle>`. The envelope is built from `contract.json`
+  (`source_sha`), the LIVE core `state.json` (`operation`, `invocation`) and the live
+  boot id, independently of the bundle header; the bundle must match it and the
+  contract nonce/boot. The strict validator (`first_failure_bundle`) is shared with
+  the owner host. A root-compromised guest could forge both records; the check detects
+  stale, foreign or replaced data, not a hostile root, and all bytes remain untrusted.
+
+Offline fixtures (`test_vlab_core.py`, `test_vlab_trial.py`) use fake queries and
+files; they do not show native systemd scheduling, real `journalctl` selection or
+namespace retention, or VLAB readiness. The cause of canonical run 41242950882/1
+remains unknown.
+
 Required offline command, in its own interpreter (CI refuses zero discovery):
 
 ```bash

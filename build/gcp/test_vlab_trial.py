@@ -1,5 +1,6 @@
 """Owner entrypoints use only fake API/processes and public temporary files."""
 from contextlib import ExitStack, nullcontext
+import base64
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -1133,6 +1134,7 @@ class GuestDiagnostics(unittest.TestCase):
         self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
         self.directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-diagnostic-')))
         self.directory.chmod(0o700)
+        self.exports = []
 
     # -- the fixed reader source, executed in-process against a public fixture ----
     def read(self, directory, *, fstat=None):
@@ -1322,7 +1324,7 @@ class GuestDiagnostics(unittest.TestCase):
 
     # -- actual trial orchestration: fake master/process only ---------------------
     def drive(self, replies, *, fail_bootstrap=False, service=b'', observation_down=False,
-              observation_error=None, stop_error=None):
+              observation_error=None, stop_error=None, private=None, export=b'absent', close=True):
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
         registration, records = Mock(), Mock()
@@ -1381,6 +1383,12 @@ class GuestDiagnostics(unittest.TestCase):
                         raise observation_error[1]
                     if observation_down: raise guest.Failure('original master lost', 124)
                     return services.pop(0) if len(services) > 1 else services[0]
+                if 'export-failure' in args:
+                    trace.append('export')
+                    test.exports.append({'args': list(args), 'cap': cap, 'until': until, 'cleanup': cleanup,
+                                         'limit': limit, 'phase': phase})
+                    if isinstance(export, BaseException): raise export
+                    return export
                 trace.append(('remote', tuple(args)))
                 if args[:2] == ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']: return boot.encode()
                 if args[0] == '/usr/bin/cat': return nonce.encode()
@@ -1396,7 +1404,7 @@ class GuestDiagnostics(unittest.TestCase):
                 return b''
             def close(self):
                 trace.append('master-close')
-                return True
+                return close
         with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
              patch.object(host, 'OwnKeyImport', return_value=importer), patch.object(host, 'Master', return_value=Session()), \
              patch.object(host, 'source_files', side_effect=sources), patch.object(guest, 'PAYLOADS', pins), \
@@ -1406,8 +1414,180 @@ class GuestDiagnostics(unittest.TestCase):
              patch.object(host, 'cleanup_own_key', side_effect=lambda *a, **k: trace.append('remove-key')), \
              patch.object(host, 'cleanup_dispatch', side_effect=lambda *a: trace.append('dispatch-cleanup')), \
              patch('builtins.print') as printed:
-            code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login)
+            code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
+                              private=private)
         return code, json.loads(printed.call_args.args[0]), trace, printed.call_args.args[0]
+
+    # -- #368 owner-private first-failure extraction (fake original master only) ------
+    boot_uuid = '22222222-2222-4222-8222-222222222222'
+
+    def failure_bundle(self, **changes):
+        def section(status='unavailable', raw=b''):
+            return {'status': status, 'output': base64.b64encode(raw).decode()}
+        bundle = {'schema': 1, 'source': 'vlab_core', 'nonce': self.nonce, 'mode': 'fresh', 'operation': 'e' * 32,
+                  'invocation': 'f' * 32, 'boot': self.boot_uuid, 'stage': 'unit', 'query_cleanup': 'confirmed',
+                  'state': {'status': 'ok', 'phase': 'failed', 'containment': 'verified', 'service_result': None},
+                  'primary': {**section(), 'message': 'synthetic ready failure', 'code': 17},
+                  'manager': section('ok', b'InvocationID=' + b'f' * 32 + b'\n'),
+                  'journal': section('ok', b'native detail ' + SENTINEL.encode())}
+        bundle.update(changes)
+        return guest.encoded(bundle)
+
+    def export_bytes(self, bundle=None, **envelope):
+        fields = {'schema': 1, 'source_sha': 'a' * 40, 'nonce': self.nonce, 'mode': 'fresh',
+                  'operation': 'e' * 32, 'invocation': 'f' * 32, 'boot': self.boot_uuid, **envelope}
+        return guest.encoded(fields) + b'\n' + (bundle if bundle is not None else self.failure_bundle())
+
+    def private_drive(self, export, **kwargs):
+        self.exports = []
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        return private, self.drive([self.encoded(result_value(self.nonce, 17, True))], private=private,
+                                   export=export, **kwargs)
+
+    def test_failed_trial_captures_exactly_once_between_stop_and_original_master_close(self):
+        private, (code, receipt, trace, text) = self.private_drive(self.export_bytes(), fail_bootstrap=True)
+        self.assertEqual((code, receipt['private_diagnostic']), (17, 'captured'))
+        self.assertEqual(len(self.exports), 1)
+        self.assertLess(trace.index('stop'), trace.index('export'))
+        self.assertLess(trace.index('export'), trace.index('master-close'))
+        self.assertEqual(trace.count('master-start'), 1)  # no reconnect or reauthentication
+        call = self.exports[0]
+        self.assertEqual((call['args'][:4], call['args'][-3:-1], call['cleanup'], call['phase']),
+                         (['/usr/bin/sudo', '-n', '/usr/bin/python3', str(guest.ROOT / 'vlab_trial.py')],
+                          ['export-failure', '--nonce'], True, 'persistence'))
+        self.assertLessEqual(call['until'] - host.owned_process.monotonic(), host.EXPORT_CAP_SECONDS)
+        files = list(private.iterdir())
+        self.assertEqual([f.name for f in files], ['first-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
+        self.assertEqual(files[0].read_bytes(), self.export_bytes())
+        self.assertEqual(list((self.directory / 'output').iterdir()), [])  # output stays empty
+        self.assertTrue(receipt['local_files_absent'] and receipt['process_absent'])
+        for forbidden in (SENTINEL, str(private), 'native detail'):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail())  # public semantics unchanged
+
+    def test_success_and_missing_private_directory_never_extract(self):
+        self.exports = []
+        code, receipt, trace, _ = self.drive([self.encoded(result_value(self.nonce, 0, True))],
+                                             private=self.directory, export=self.export_bytes())
+        self.assertEqual((receipt['private_diagnostic'], self.exports), ('skipped', []))  # success: no capture
+        self.setUp()
+        self.exports = []
+        code, receipt, trace, _ = self.drive([self.encoded(result_value(self.nonce, 17, True))], export=self.export_bytes())
+        self.assertEqual((receipt['private_diagnostic'], self.exports), ('skipped', []))  # no retention directory
+
+    def test_every_binding_mismatch_or_hostile_export_is_invalid_and_retains_nothing(self):
+        good = self.failure_bundle()
+        other = 'b' * 32
+        cases = {
+            'foreign source': self.export_bytes(source_sha='b' * 40), 'foreign nonce': self.export_bytes(nonce=other),
+            'resume mode': self.export_bytes(mode='resume'), 'other boot': self.export_bytes(boot='3' * 8 + self.boot_uuid[8:]),
+            'envelope operation differs': self.export_bytes(operation='9' * 32),
+            'envelope invocation differs': self.export_bytes(invocation='9' * 32),
+            'bundle nonce': self.export_bytes(self.failure_bundle(nonce=other)),
+            'bundle boot': self.export_bytes(self.failure_bundle(boot='3' * 8 + self.boot_uuid[8:])),
+            'bundle mode': self.export_bytes(self.failure_bundle(mode='resume')),
+            'bundle extra field': self.export_bytes(self.failure_bundle(extra=SENTINEL)),
+            'no envelope': good, 'envelope only': guest.encoded({}) , 'token invalid': b'invalid', 'empty': b'',
+            'oversize': b'x' * (host.EXPORT_READ_LIMIT + 1), 'not bytes': 'text',
+            'extra envelope field': guest.encoded({'schema': 1, 'x': 1}) + b'\n' + good,
+        }
+        for name, raw in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.private_drive(raw)
+                self.assertEqual((code, receipt['private_diagnostic']), (17, 'invalid'))
+                self.assertEqual(list(private.iterdir()), [])
+                self.assertNotIn(SENTINEL, text)
+
+    def test_reservation_style_null_bundle_and_absent_are_accepted_or_explicit(self):
+        null = self.failure_bundle(stage='reserve', operation=None, invocation=None,
+                                   manager={'status': 'unavailable', 'output': ''},
+                                   journal={'status': 'unavailable', 'output': ''})
+        private, (code, receipt, _, _) = self.private_drive(self.export_bytes(null))
+        self.assertEqual(receipt['private_diagnostic'], 'captured')
+        self.setUp()
+        private, (code, receipt, _, _) = self.private_drive(b'absent')
+        self.assertEqual((receipt['private_diagnostic'], list(private.iterdir())), ('absent', []))
+
+    def test_guest_query_uncertainty_is_not_reported_as_clean_capture(self):
+        bundle = self.failure_bundle(query_cleanup='uncertain')
+        private, (code, receipt, _, _) = self.private_drive(self.export_bytes(bundle))
+        self.assertEqual((code, receipt['private_diagnostic']), (17, 'invalid'))
+        self.assertEqual(len(list(private.iterdir())), 1)  # retained, but never labelled captured
+        self.assertTrue(receipt['process_absent'])  # guest namespace is not host process absence
+
+    def test_extraction_failure_timeout_or_budget_never_changes_primary_or_containment(self):
+        for name, export in (('master lost', guest.Failure('original master lost', 124)),
+                             ('timeout', guest.Failure('bounded host child timeout', 124)),
+                             ('generic', RuntimeError(SENTINEL))):
+            with self.subTest(name):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.private_drive(export, fail_bootstrap=True)
+                self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'unavailable', False))
+                self.assertTrue(receipt['process_absent'] and receipt['own_key_absent'])
+                self.assertIn('stop', trace)
+                self.assertEqual(list(private.iterdir()), [])
+                self.assertNotIn(SENTINEL, text)
+        self.setUp()
+        with patch.object(guest.Clock, 'cleanup_remaining', return_value=host.EXPORT_TEARDOWN_RESERVE + 1):
+            private, (code, receipt, trace, _) = self.private_drive(self.export_bytes())
+        self.assertEqual((receipt['private_diagnostic'], self.exports), ('skipped', []))
+        self.assertIn('master-close', trace)
+
+    def test_existing_private_file_is_never_overwritten(self):
+        self.exports = []
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        existing = private / ('first-failure-' + snapshot()['request_id'] + '.bin')
+        existing.write_bytes(b'EARLIER')
+        _, (code, receipt, _, _) = self.private_drive(self.export_bytes())
+        self.assertEqual((receipt['private_diagnostic'], existing.read_bytes()), ('unavailable', b'EARLIER'))
+
+    def test_export_process_uncertainty_stays_sticky_through_successful_close(self):
+        class ExportAbort(BaseException):
+            cleanup_uncertain = True
+        private, (code, receipt, trace, text) = self.private_drive(ExportAbort(SENTINEL), fail_bootstrap=True)
+        self.assertEqual((code, receipt['private_diagnostic']), (17, 'unavailable'))
+        self.assertIn('master-close', trace)
+        self.assertIn('dispatch-cleanup', trace)
+        self.assertNotIn('remove-key', trace)
+        self.assertTrue(all(not receipt[k] for k in ('process_absent', 'local_files_absent', 'own_key_absent')))
+        self.assertTrue(any((self.directory / 'output').iterdir()))
+        self.assertNotIn(SENTINEL, text)
+
+    def test_private_directory_argument_must_be_owner_private_and_outside_output(self):
+        output = self.directory / 'out'
+        output.mkdir(mode=0o700)
+        wide = self.directory / 'wide'
+        wide.mkdir()
+        wide.chmod(0o755)
+        good = self.directory / 'private-good'
+        good.mkdir(mode=0o700)
+        def main(target):
+            with patch.object(host.guest, 'regular', return_value=guest.encoded(snapshot())), \
+                 patch.object(host, 'expected_snapshot'), patch.object(host, 'GcsAccessRecords'), \
+                 patch.object(host, 'GcsSlotStore'), patch.object(host, 'OwnerRegistration'), \
+                 patch.object(host, 'PolicyCloud'), patch.object(host, 'ComputeRestTransport'), \
+                 patch.object(host.SelfLogin, 'for_owner'), patch.object(host, 'trial', return_value=0) as run:
+                try:
+                    return host.main(['--snapshot', str(self.directory / 's'), '--payloads', str(self.directory),
+                                      '--output', str(output), '--private-diagnostics', str(target)]), run
+                except guest.Failure:
+                    return 'refused', run
+        for target in (wide, output, self.directory, self.directory / 'absent-dir'):
+            with self.subTest(target=target.name):
+                outcome = main(target) if target.exists() else None
+                if outcome is None:
+                    with self.assertRaises(OSError):
+                        main(target)
+                    continue
+                self.assertEqual(outcome[0], 'refused')
+                outcome[1].assert_not_called()
+        result, run = main(good)
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.kwargs['private'], good)
 
     def test_failed_guest_result_surfaces_closed_diagnostic_and_primary_code(self):
         code, receipt, trace, _ = self.drive([self.encoded(result_value(self.nonce, 17, True))])

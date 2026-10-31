@@ -1098,3 +1098,149 @@ class SharedTrial(unittest.TestCase):
         with self.assertRaises(trial.Failure):
             status.mark('persistence', 'install-docker')
         self.assertEqual(trial.worker_status(json.loads((self.root / 'worker-status.json').read_text()), NONCE)['seq'], 0)
+
+
+class FirstFailureExport(unittest.TestCase):
+    """#368: real core writer -> fixed guest export -> strict bundle validator (offline fakes only)."""
+    def setUp(self):
+        import vlab_core as core
+        self.core = core
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-export-')))
+        self.root, self.state_root = self.base / 'trial', self.base / 'core'
+        for path in (self.root, self.state_root):
+            path.mkdir(mode=0o700)
+        v = value()
+        (self.root / 'contract.json').write_bytes(trial.encoded(v))
+        reader = trial.regular
+        # Production requires euid 0 (main refuses otherwise); fixtures own files as the test user.
+        self.stack.enter_context(patch.object(trial, 'regular', side_effect=(
+            lambda p, n, uid=None, mode=None: reader(p, n, None if uid == 0 else uid, mode))))
+        for target, name, replacement in ((trial, 'ROOT', self.root), (core, 'ROOT', self.state_root),
+                                          (core, 'ROOT_UID', os.getuid())):
+            self.stack.enter_context(patch.object(target, name, replacement))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=v['boot_uuid']))
+        self.stack.enter_context(patch.object(core, 'boot', return_value=v['boot_uuid']))
+        self.stack.enter_context(patch.object(core, 'ubuntu', return_value=SimpleNamespace(pw_uid=os.getuid())))
+        self.stack.enter_context(patch.object(trial, 'load_sibling', return_value=core))
+        self.queries = []
+        self.stack.enter_context(patch.object(core, 'diagnostic_run', side_effect=self.query))
+        self.v = v
+        self.operation, self.invocation = 'e' * 32, 'f' * 32
+        self.value = {'schema': 1, 'nonce': NONCE, 'mode': 'fresh', 'operation': self.operation,
+                      'phase': 'starting', 'invocation': self.invocation}
+        core.atomic(self.state_root / 'state.json', self.value)
+
+    def query(self, argv, end, keep):
+        self.queries.append(list(argv))
+        if argv[0] == self.core.SYSTEMCTL:
+            return 'ok', ('InvocationID=' + self.invocation + '\n').encode(), False, 'confirmed'
+        return 'ok', b'journal ' + SENTINEL.encode(), False, 'confirmed'
+
+    def capture(self, value=True, error=None):
+        error = error or self.core.Failure('child command failed', 1, b'primary ' + SENTINEL.encode())
+        self.core.capture_first_failure('fresh', self.value if value else None, error, time.monotonic() + 60)
+
+    def export(self):
+        return trial.export_failure(NONCE)
+
+    def test_real_writer_roundtrip_validates_and_binds_independent_envelope(self):
+        self.capture()
+        raw = self.export()
+        first, _, rest = raw.partition(b'\n')
+        envelope = json.loads(first)
+        self.assertEqual(envelope, {'schema': 1, 'source_sha': 'c' * 40, 'nonce': NONCE, 'mode': 'fresh',
+                                    'operation': self.operation, 'invocation': self.invocation,
+                                    'boot': self.v['boot_uuid']})
+        bundle = trial.first_failure_bundle(rest)
+        self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']),
+                         ('unit', self.operation, self.invocation))
+        self.assertLessEqual(len(rest), trial.FAILURE_LIMIT)
+
+    def test_absent_and_every_binding_mismatch_is_refused_not_trusted(self):
+        self.assertEqual(self.export(), b'absent')
+        self.capture()
+        for name, change in (('nonce', lambda s: dict(s, nonce='9' * 32)),
+                             ('operation', lambda s: dict(s, operation='9' * 32)),
+                             ('invocation', lambda s: dict(s, invocation='9' * 32)),
+                             ('mode', lambda s: dict(s, mode='resume'))):
+            with self.subTest(name):
+                self.core.atomic(self.state_root / 'state.json', change(self.value))
+                with self.assertRaises(trial.Failure):
+                    self.export()
+        self.core.atomic(self.state_root / 'state.json', self.value)
+        with patch.object(trial, 'kernel_boot', return_value='33333333-3333-4333-8333-333333333333'), \
+             self.assertRaises(trial.Failure):
+            self.export()  # boot differs from the contract: a different/rebooted guest
+        with self.assertRaises(trial.Failure):
+            trial.export_failure('9' * 32)
+
+    def test_reservation_bundle_has_null_binding_and_runs_no_query(self):
+        self.capture(value=False, error=self.core.Failure('startup phase refused'))
+        bundle = trial.first_failure_bundle((self.state_root / self.core.FIRST_FAILURE).read_bytes())
+        self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']), ('reserve', None, None))
+        self.assertEqual(self.queries, [])
+        self.assertIn(b'"operation":"' + self.operation.encode(), self.export().partition(b'\n')[0])
+
+    def test_unsafe_file_identity_is_refused(self):
+        self.capture()
+        path = self.state_root / self.core.FIRST_FAILURE
+        raw = path.read_bytes()
+        path.chmod(0o640)
+        with self.assertRaises(trial.Failure):
+            self.export()
+        path.chmod(0o600)
+        os.link(path, self.base / 'second')
+        with self.assertRaises(trial.Failure):
+            self.export()
+        (self.base / 'second').unlink()
+        path.unlink()
+        target = self.base / 'foreign'
+        target.write_bytes(raw)
+        target.chmod(0o600)
+        path.symlink_to(target)
+        with self.assertRaises(trial.Failure):
+            self.export()
+        path.unlink()
+        path.write_bytes(raw + b' ' * trial.FAILURE_LIMIT)
+        path.chmod(0o600)
+        with self.assertRaises(trial.Failure):
+            self.export()
+
+    def test_strict_validator_refuses_malformed_hostile_or_oversize_bundles(self):
+        self.capture()
+        good = json.loads((self.state_root / self.core.FIRST_FAILURE).read_bytes())
+        import base64
+        cases = {
+            'extra key': dict(good, extra=1), 'missing key': {k: v for k, v in good.items() if k != 'journal'},
+            'bool schema': dict(good, schema=True), 'wrong source': dict(good, source='other'),
+            'bad stage': dict(good, stage='main-process'), 'bad nonce': dict(good, nonce='X' * 32),
+            'reserve with operation': dict(good, stage='reserve'),
+            'invocation without operation': dict(good, operation=None, stage='reserve'),
+            'bad status': dict(good, journal=dict(good['journal'], status='captured')),
+            'raw text not base64': dict(good, journal=dict(good['journal'], output='not base64!')),
+            'oversize section': dict(good, journal=dict(good['journal'],
+                                     output=base64.b64encode(b'x' * 8193).decode())),
+            'output with unavailable': dict(good, manager=dict(good['manager'], status='unavailable')),
+            'journal without invocation': dict(good, invocation=None),
+            'control char message': dict(good, primary=dict(good['primary'], message='bad\nline')),
+            'code out of range': dict(good, primary=dict(good['primary'], code=256)),
+            'extra state field': dict(good, state=dict(good['state'], text=SENTINEL)),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name), self.assertRaises(trial.Failure):
+                trial.first_failure_bundle(trial.encoded(bad))
+        for raw in (b'', b'[]', b'{"a":1,"a":2}', b'x' * (trial.FAILURE_LIMIT + 1), b'invalid'):
+            with self.subTest(raw[:8]), self.assertRaises(trial.Failure):
+                trial.first_failure_bundle(raw)
+
+    def test_main_maps_any_export_failure_to_one_fixed_token_without_text(self):
+        out = Mock()
+        with patch.object(trial.sys, 'stdout', SimpleNamespace(buffer=out)), \
+             patch.object(trial.os, 'geteuid', return_value=0), \
+             patch.object(trial, 'export_failure', side_effect=OSError(SENTINEL)):
+            self.assertEqual(trial.main(['export-failure', '--nonce', NONCE]), 0)
+        out.write.assert_called_once_with(b'invalid')
+        with patch.object(trial.os, 'geteuid', return_value=0), self.assertRaises(trial.Failure):
+            trial.main(['export-failure', '--nonce', NONCE, '--sequence', '1'])
