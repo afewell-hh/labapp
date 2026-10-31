@@ -374,6 +374,65 @@ class GuestFixture(unittest.TestCase):
         self.assertFalse(self.execs)
         self.assertEqual((core.WORK / 'result/foreign').read_bytes(), b'preserve foreign data')
 
+    def start_with_ready_publication(self, mode, mutate=None):
+        """Force unit-ready's service publication between unit-run's snapshot and final gate.
+
+        Mocks only: Type=exec ExecStartPost is simulated by running the real
+        check_live/save writer inside the window; no native child or systemd.
+        """
+        actual_run = core.unit_run
+        actual_contract = core.verify_contract
+        window = []
+        def in_run(run_mode):
+            window.append(True)
+            try:
+                return actual_run(run_mode)
+            finally:
+                window.pop()
+        def publish(value, deadline):
+            result = actual_contract(value, deadline)
+            if window and 'service' not in core.state():
+                with core.locked():
+                    current = core.state()
+                    current['service'] = core.check_live(current, deadline)
+                    if mutate:
+                        mutate(current)
+                    core.save(current)
+            return result
+        with patch.object(core, 'unit_run', side_effect=in_run), \
+             patch.object(core, 'verify_contract', side_effect=publish):
+            return self.call('start-fresh' if mode == 'fresh' else 'start-resume')
+
+    def test_fresh_ready_publication_before_run_gate_survives(self):
+        self.prepared()
+        self.assertEqual(self.start_with_ready_publication('fresh'), 0, self.stderr.getvalue())
+        self.assertEqual(len(self.execs), 1)
+        self.assertEqual(core.state()['phase'], 'ready')
+
+    def test_resume_ready_publication_before_run_gate_survives(self):
+        self.resumable()
+        self.assertEqual(self.start_with_ready_publication('resume'), 0, self.stderr.getvalue())
+        self.assertEqual(len(self.execs), 1)
+        self.assertEqual(core.state()['phase'], 'ready')
+
+    def test_ready_publication_substitutions_still_refuse_exec(self):
+        def foreign_pid(v): v['service']['pid'] += 1
+        def foreign_invocation(v): v['service']['invocation'] = 'f' * 32
+        def foreign_group(v): v['service']['group'] = '/system.slice/other.service'
+        def other_operation(v): v['operation'] = '0' * 32
+        def other_invocation(v): v['invocation'] = 'e' * 32
+        def other_phase(v): v['phase'] = 'failed'
+        def other_nonce(v): v['nonce'] = 'a' * 32
+        def other_contract(v): v['critical'] = {}
+        for mode in ('fresh', 'resume'):
+            for mutate in (foreign_pid, foreign_invocation, foreign_group, other_operation,
+                           other_invocation, other_phase, other_nonce, other_contract):
+                with self.subTest(mode=mode, mutation=mutate.__name__):
+                    self.setUp()
+                    self.prepared() if mode == 'fresh' else self.resumable()
+                    self.assertEqual(self.start_with_ready_publication(mode, mutate), 1)
+                    self.assertFalse(self.execs)
+
     def test_fresh_gate_refuses_state_created_after_reservation(self):
         self.prepared()
         actual = self.command

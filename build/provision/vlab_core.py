@@ -632,7 +632,10 @@ def atomic(path, value):
 
 
 @contextmanager
-def locked():
+def locked(wait=0):
+    # wait=0 is the default: a competing operation is an immediate refusal.
+    # Only the sibling unit-run/unit-ready actions of one systemd start pass a
+    # small bounded wait, because systemd may run them concurrently.
     no_links(ROOT)
     require(ROOT.is_dir() and ROOT.stat().st_uid == ROOT_UID
             and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'state root refused')
@@ -642,10 +645,15 @@ def locked():
                 and stat.S_IMODE(os.fstat(fd).st_mode) == 0o600 and os.fstat(fd).st_nlink == 1,
                 'lock identity refused')
         # No unbounded flock wait. Competing operation must return a refusal.
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise Failure('another operation owns the lock') from None
+        limit = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= limit:
+                    raise Failure('another operation owns the lock') from None
+                time.sleep(0.01)
         yield
     finally:
         os.close(fd)
@@ -1231,8 +1239,11 @@ def verify_netfilter():
         require(read(Path('/proc/sys/net/bridge') / key, 16).strip() == b'0', 'netfilter policy differs')
 
 
+SIBLING_LOCK_SECONDS = 10
+
+
 def unit_run(mode):
-    with locked():
+    with locked(SIBLING_LOCK_SECONDS):
         value = state()
         require(value['phase'] == 'starting' and value['mode'] == mode
                 and value['invocation'] == invocation_env(), 'run invocation refused')
@@ -1243,8 +1254,21 @@ def unit_run(mode):
         verify_readonly_mounts()
     else:
         fresh_preflight(value)
-    with locked():
-        require(state() == value, 'run operation changed')
+    # Type=exec runs ExecStartPost concurrently with this wrapper, so unit_ready
+    # may have published the live service identity after the snapshot above.
+    # That single additive field is the only tolerated difference, and only when
+    # it matches the live manager identity of this same invocation (the wrapper
+    # pid and start time survive execve). Anything else is a refusal.
+    with locked(SIBLING_LOCK_SECONDS):
+        current = state()
+        if 'service' in value:
+            require(current == value, 'run operation changed')
+        else:
+            published = current.pop('service', None)
+            require(current == value, 'run operation changed')
+            if published is not None:
+                current['service'] = published
+                check_live(current, deadline)
     user = ubuntu()
     os.initgroups('ubuntu', user.pw_gid)
     os.setgid(user.pw_gid)
@@ -1384,7 +1408,7 @@ def bridge_ready(deadline):
 
 
 def unit_ready(mode):
-    with locked():
+    with locked(SIBLING_LOCK_SECONDS):
         value = state()
         require(value['phase'] == 'starting' and value['mode'] == mode
                 and value['invocation'] == invocation_env(), 'readiness invocation refused')

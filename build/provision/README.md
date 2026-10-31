@@ -1157,6 +1157,27 @@ python3 /usr/local/lib/labapp/vlab_core.py start-resume
 python3 /usr/local/lib/labapp/vlab_core.py stop
 ```
 
+Startup action ordering (stable semantics): each fixed unit runs `unit-gate`
+(`ExecStartPre`), `unit-run` (`ExecStart`, a Python wrapper that drops privilege
+and `execve`s hhfab) and `unit-ready` (`ExecStartPost`). For `Type=exec`,
+systemd 255 (Ubuntu 24.04) considers the unit started once the `ExecStart`
+process has been forked and its binary executed, so `ExecStartPost` may run
+concurrently with the wrapper's pre-`execve` checks (systemd.service(5),
+`Type=exec`; systemd.service(5) `ExecStartPost=`). Neither wrapper exec nor
+service activation is readiness. `unit-ready` is the only writer allowed to add
+the `service` identity (invocation, cgroup, main PID, start time) to a `starting`
+state; the wrapper keeps its PID and start time across `execve`. `unit-run`'s
+final gate therefore accepts exactly one difference from its pre-validation
+snapshot: an added `service` field that `check_live` confirms against the live
+manager (same invocation, cgroup, PID and start time). Any other change to
+nonce, operation, mode, invocation, phase, boot, source or contract, or a
+`service` that does not match the live manager, refuses before `execve`. The
+sibling `unit-run`/`unit-ready` state sections wait up to 10 seconds for the
+state lock instead of failing on instantaneous contention; all other callers
+still refuse immediately. Executed behavior is covered only by the mocked
+interleaving fixtures in `test_vlab_core.py` until a separately scoped native
+scheduling fixture is run.
+
 The bounded input JSON is mode0600, with no symlink components, duplicate keys,
 unknown fields or ambient credential lookup. Its exact fields are:
 
