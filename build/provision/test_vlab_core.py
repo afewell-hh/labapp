@@ -1049,6 +1049,25 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(value['deadline'] - value['started'], 900)
         self.assertEqual(self.call('unit-gate', '--mode', 'resume'), 1)
 
+    def test_direct_boot_resume_preserves_deadline_at_clock_precision_boundary(self):
+        self.resumable()
+        self.phase['resume'] = 'activating'
+        self.invocation['resume'] = 'a' * 32
+        now = float.fromhex('0x1.0000000000003p+7')
+        end = now + 900
+        self.assertNotEqual(end - now, 900)
+        with patch.object(core.time, 'monotonic', return_value=now):
+            self.assertEqual(self.call('unit-gate', '--mode', 'resume'), 0,
+                             self.stderr.getvalue())
+            value = core.state()
+            self.assertEqual(value['phase'], 'starting')
+            self.assertEqual(value['mode'], 'resume')
+            self.assertEqual(value['deadline'], end)
+            self.assertEqual(value['started'], end - 900)
+            self.assertEqual(value['deadline'] - value['started'], 900)
+            self.assertEqual(self.call('unit-gate', '--mode', 'resume'), 1)
+            self.assertEqual(core.state(), value)
+
 
 class FormatAndSourceTests(unittest.TestCase):
     def setUp(self):

@@ -941,8 +941,9 @@ def unit_gate(mode):
             now = time.monotonic()
             require(system_show('fresh', now + 5)['ActiveState'] in ('inactive', 'failed'),
                     'conflicting fresh unit refused')
+            end = now + START_SECONDS[mode]
             value.update(phase='starting', mode=mode, operation=uuid.uuid4().hex, boot=boot(),
-                         started=now, deadline=now + START_SECONDS[mode])
+                         started=end - START_SECONDS[mode], deadline=end)
             value.pop('service', None)
             value.pop('invocation', None)
             value.pop('stopping', None)
