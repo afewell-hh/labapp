@@ -610,3 +610,32 @@ deletion proof. Close/reap original local transports and remove private files
 before final own-key absence evidence; uncertainty withholds that receipt and
 blocks FREE. The existing terminal operation, immutable VM/boot404 and access
 archive checks still decide release.
+
+For an already physically disposed failed trial with a genuine intent but a
+missing import receipt, keep normal cleanup strict. The separate library-only
+[failed-import disposal](../../build/gcp/README.md#explicit-failed-import-disposal)
+can release capacity only under an independently reviewed, exact-proof-bound
+lead decision. It records FAILED_DISPOSED/import UNKNOWN, never successful access
+or trial passage, and writes no fabricated import/removal receipt. No normal
+workflow or CLI selects this route.
+
+Before separately authorizing execution, review the full captured slot/generation,
+original intent/ref observations and private evidence of the actual owner
+coordinator/SSH/IAP/children termination, original source/registration identity,
+and private-file absence. The source delegates that local assessment to the
+trusted lead; unsigned JSON, booleans and private digest strings are not process
+attestation. Execution uses the fixed existing owner without impersonation on
+an exclusive trusted host and a clean reviewed source checkout. Its proof must
+match the approval callback's exact canonical digest.
+
+Require fresh actual intended-key absence and unchanged canonical wire-key
+baseline strictly after the immutable key TTL, terminal original INSERT and
+exact VM DELETE, actual VM/boot GET404 and complete successful census with no
+pending operations. Revalidate current facts before one exact-generation FREE
+CAS. The original work and VM deadlines are retained, not renewed; waiting for
+them is optional conservative quarantine after every other gate passes. Late
+remote POST completion remains historically uncertain and could expose an
+already-expired permanently retired key. Keep occupied quarantine if that risk
+is unacceptable. Existing bucket-wide WIF objectUser grants provide no proof
+prefix isolation. Network/protected-resource cleanup and acceptance remain
+independent mandatory gates; this recovery authorizes no new trial.
