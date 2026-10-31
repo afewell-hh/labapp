@@ -389,6 +389,32 @@ def locked():
         os.close(fd)
 
 
+@contextmanager
+def stop_controller():
+    """Exclusive owner of outstanding unit-name stops, separate from state.
+
+    Never wait for this lock. ExecStopPost needs only locked(), so the manager
+    can finish while this controller retains ownership through containment.
+    Start reservations briefly take this lock before their short state commit.
+    """
+    no_links(ROOT)
+    require(ROOT.is_dir() and ROOT.stat().st_uid == ROOT_UID
+            and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'controller root refused')
+    fd = os.open(ROOT / 'stop-controller.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        observed = os.fstat(fd)
+        require(stat.S_ISREG(observed.st_mode) and observed.st_uid == ROOT_UID
+                and stat.S_IMODE(observed.st_mode) == 0o600 and observed.st_nlink == 1,
+                'stop controller identity refused')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Failure('another stop controller is active') from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def state():
     value = json_data(read(ROOT / 'state.json', 8 * LIMIT, private=True))
     require(value.get('schema') == 1 and re.fullmatch(r'[0-9a-f]{32}', value.get('nonce', '')),
@@ -866,7 +892,7 @@ def verify_readonly_mounts():
 
 
 def reserve(mode, deadline=None):
-    with locked():
+    with stop_controller(), locked():
         value = state()
         phase = 'prepared' if mode == 'fresh' else 'resumable'
         require(value['phase'] == phase, 'startup phase refused')
@@ -883,7 +909,7 @@ def reserve(mode, deadline=None):
         require(critical_snapshot(end) == value['critical'], 'resume critical state changed')
     else:
         fresh_preflight(value)
-    with locked():
+    with stop_controller(), locked():
         require(state() == value, 'competing operation changed state')
         started = end - START_SECONDS[mode]
         value.update(phase='starting', mode=mode, operation=uuid.uuid4().hex,
@@ -906,7 +932,7 @@ def unit_gate(mode):
     invocation = invocation_env()
     # Enabled resume starts at boot without a coordinator. It may reserve only
     # a sealed resumable state; never revive failed/partial fresh state.
-    with locked():
+    with stop_controller(), locked():
         value = state()
         if mode == 'resume' and value['phase'] == 'resumable':
             require(value.get('stop_verified') == {'operation': value['operation'],
@@ -1168,6 +1194,16 @@ def verify_inactive(mode, invocation, observed, deadline):
 
 
 def stop_owned(value, deadline):
+    with stop_controller():
+        return _stop_owned_locked(value, deadline)
+
+
+def _stop_owned_locked(value, deadline):
+    """Only called while stop_controller owns every outstanding manager stop."""
+    with locked():
+        current = state()
+        require(current['operation'] == value['operation'] and current['mode'] == value['mode']
+                and current.get('invocation') == value.get('invocation'), 'stop controller operation changed')
     fields = system_show(value['mode'], deadline)
     require(fields.get('InvocationID') in ('', value.get('invocation', '')),
             'stop invocation differs')
@@ -1209,6 +1245,42 @@ def stop_owned(value, deadline):
     return True
 
 
+def cleanup_start(value, deadline):
+    """Keep failed startup reserved until all manager calls and receipts finish."""
+    mode = value['mode']
+    with stop_controller():
+        with locked():
+            current = state()
+            require(current['operation'] == value['operation'] and current['mode'] == mode,
+                    'cleanup operation changed')
+        if 'invocation' not in current:
+            fields = system_show(mode, deadline)
+            with locked():
+                current = state()
+                require(current['operation'] == value['operation'] and current['mode'] == mode,
+                        'cleanup operation changed')
+            if 'invocation' in current:
+                _stop_owned_locked(current, deadline)
+            else:
+                require(fields.get('InvocationID', '') == '' and fields.get('MainPID') == '0',
+                        'ungated service identity uncertain')
+                execute([SYSTEMCTL, 'stop', UNIT[mode]], deadline, 30)
+                with locked():
+                    current = state()
+                    require(current['operation'] == value['operation'] and current['mode'] == mode,
+                            'cleanup operation changed')
+                verify_inactive(mode, current.get('invocation'), current.get('service'), deadline)
+        else:
+            _stop_owned_locked(current, deadline)
+        with locked():
+            current = state()
+            require(current['operation'] == value['operation'] and current['mode'] == mode,
+                    'cleanup operation changed')
+            current['phase'] = 'failed'
+            current['containment'] = 'verified'
+            save(current)
+
+
 def start(mode):
     end = time.monotonic() + START_SECONDS[mode]
     value = reserve(mode, end)
@@ -1223,36 +1295,7 @@ def start(mode):
     except BaseException:
         # Preserve primary return/signal/timeout if exact cleanup cannot be verified.
         try:
-            cleanup_deadline = time.monotonic() + 35
-            with locked():
-                current = state()
-                require(current['operation'] == value['operation'], 'operation changed')
-            # A queued activation before gate still needs explicit cancellation.
-            if 'invocation' not in current:
-                fields = system_show(mode, cleanup_deadline)
-                with locked():
-                    current = state()
-                    require(current['operation'] == value['operation'], 'cleanup operation changed')
-                if 'invocation' in current:
-                    stop_owned(current, cleanup_deadline)
-                else:
-                    require(fields.get('InvocationID', '') == '' and fields.get('MainPID') == '0',
-                            'ungated service identity uncertain')
-                    execute([SYSTEMCTL, 'stop', UNIT[mode]], cleanup_deadline, 30)
-                    # Gate can race after the pre-stop observation. Bind only
-                    # its recorded invocation in this same reserved operation.
-                    with locked():
-                        current = state()
-                        require(current['operation'] == value['operation'], 'cleanup operation changed')
-                    verify_inactive(mode, current.get('invocation'), current.get('service'), cleanup_deadline)
-            else:
-                stop_owned(current, cleanup_deadline)
-            with locked():
-                current = state()
-                require(current['operation'] == value['operation'], 'cleanup operation changed')
-                current['phase'] = 'failed'
-                current['containment'] = 'verified'
-                save(current)
+            cleanup_start(value, time.monotonic() + 35)
         except BaseException:
             print('vlab-core: owned containment unverified', file=sys.stderr)
         raise

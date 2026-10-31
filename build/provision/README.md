@@ -1209,6 +1209,11 @@ or 900-second resume clock. Short private operation locks are released before
 waiting on systemctl. Enabled boot resume begins its clock at the gate; its
 pre-gate dependency queue remains nonready and is bounded only by the outer
 trial lifecycle, since TimeoutStartSec does not bound queued dependencies.
+A separate nonblocking private stop-controller lock covers every outstanding
+manager stop through positive containment and the final state commit. Competing
+stops and startup reservations refuse while it is held; a delayed controller
+must still match its original operation, mode and invocation before stopping.
+ExecStopPost takes only the short state lock, so it can finish during the stop.
 The root run wrapper uses systemd `!` to retain its filesystem namespace,
 reads root-private state and checks actual resume mounts,
 then initializes ubuntu groups/gid/uid and execs only fixed hhfab. No `Conflicts`

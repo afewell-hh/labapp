@@ -488,6 +488,60 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(observed, ['stop-observed'])
         self.assertEqual(core.state()['phase'], 'resumable')
 
+    def test_overlapping_and_delayed_stop_cannot_kill_new_invocation(self):
+        self.resumable()
+        self.assertEqual(self.call('start-resume'), 0)
+        old = core.state()
+        actual = self.command
+        actual_stop = core._stop_owned_locked
+        refusals = []
+        def competing():
+            refusals.extend([self.call('stop'), self.call('start-resume')])
+            with self.assertRaises(core.Failure):
+                core.unit_gate('resume')
+        def during_manager(argv, *args, **kwargs):
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['resume']]:
+                # The manager can acquire state, but a second controller cannot
+                # issue a unit-name stop, even before the first returns.
+                with core.locked():
+                    self.assertEqual(core.state()['operation'], old['operation'])
+                competing()
+            return actual(argv, *args, **kwargs)
+        def after_commit(*args, **kwargs):
+            result = actual_stop(*args, **kwargs)
+            self.assertEqual(core.state()['phase'], 'resumable')
+            competing()  # Still excluded after resumable is committed.
+            return result
+        with patch.object(core, 'execute', side_effect=during_manager), \
+             patch.object(core, '_stop_owned_locked', side_effect=after_commit):
+            self.assertEqual(self.call('stop'), 0, self.stderr.getvalue())
+        self.assertEqual(refusals, [1, 1, 1, 1])
+        stops = [c for c in self.calls if c[0][:2] == [core.SYSTEMCTL, 'stop']]
+        with patch.dict(os.environ, {'INVOCATION_ID': 'c' * 32}):
+            self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+        newer = core.state()
+        self.assertNotEqual(newer['operation'], old['operation'])
+        with self.assertRaises(core.Failure):
+            core.stop_owned(old, core.time.monotonic() + 35)
+        self.assertEqual(stops, [c for c in self.calls if c[0][:2] == [core.SYSTEMCTL, 'stop']])
+        self.assertEqual(core.state(), newer)
+        self.assertEqual(self.phase['resume'], 'active')
+
+    def test_stop_controller_path_refuses_symlink_and_hardlink(self):
+        self.fresh()
+        target = core.ROOT / 'stop-controller.lock'
+        target.unlink()
+        other = core.ROOT / 'other'
+        other.write_bytes(b'')
+        other.chmod(0o600)
+        before = len(self.calls)
+        target.symlink_to(other)
+        self.assertEqual(self.call('stop'), 1)
+        target.unlink()
+        os.link(other, target)
+        self.assertEqual(self.call('stop'), 1)
+        self.assertFalse(any(c[0][:2] == [core.SYSTEMCTL, 'stop'] for c in self.calls[before:]))
+
     def test_stale_stop_intent_does_not_approve_unexpected_exit(self):
         self.fresh()
         value = core.state()
@@ -541,14 +595,32 @@ class GuestFixture(unittest.TestCase):
         self.activation = False
         actual = self.command
         def raced_gate(argv, *args, **kwargs):
-            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['fresh']]:
+            if argv[:3] == [core.SYSTEMCTL, 'start', core.UNIT['fresh']]:
                 self.phase['fresh'] = 'activating'
                 self.invocation['fresh'] = 'a' * 32
                 core.unit_gate('fresh')
+                raise core.Failure('synthetic activation timeout after gate', 124)
             return actual(argv, *args, **kwargs)
         with patch.object(core, 'execute', side_effect=raced_gate):
             self.assertEqual(self.call('start-fresh'), 124)
         self.assertEqual(core.state()['invocation'], 'a' * 32)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_pregate_cleanup_excludes_competing_controllers_and_gate(self):
+        self.prepared()
+        self.activation = False
+        actual = self.command
+        observed = []
+        def during_stop(argv, *args, **kwargs):
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['fresh']]:
+                observed.extend([self.call('stop'), self.call('start-fresh')])
+                with self.assertRaises(core.Failure):
+                    core.unit_gate('fresh')
+            return actual(argv, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=during_stop):
+            self.assertEqual(self.call('start-fresh'), 124)
+        self.assertEqual(observed, [1, 1])
         self.assertEqual(core.state()['phase'], 'failed')
         self.assertEqual(core.state()['containment'], 'verified')
 
@@ -634,11 +706,11 @@ class GuestFixture(unittest.TestCase):
             self.assertIn('containment unverified', self.stderr.getvalue())
         self.assertNotIn('PUBLIC_SYNTHETIC', self.stdout.getvalue() + self.stderr.getvalue())
 
-    def test_old_cleanup_cannot_overwrite_new_reserved_operation(self):
+    def test_failed_start_retains_controller_through_final_failure_commit(self):
         self.resumable()
         actual = self.command
-        actual_stop = core.stop_owned
-        new_operation = []
+        actual_stop = core._stop_owned_locked
+        blocked = []
         def interleave(argv, *args, **kwargs):
             raw = actual(argv, *args, **kwargs)
             if argv[:3] == [core.SYSTEMCTL, 'start', core.UNIT['resume']]:
@@ -646,15 +718,16 @@ class GuestFixture(unittest.TestCase):
             return raw
         def after_verified_stop(*args, **kwargs):
             result = actual_stop(*args, **kwargs)
-            new_operation.append(core.reserve('resume')['operation'])
+            with self.assertRaises(core.Failure):
+                core.reserve('resume')
+            blocked.append(True)
             return result
         with patch.object(core, 'execute', side_effect=interleave), \
-             patch.object(core, 'stop_owned', side_effect=after_verified_stop):
+             patch.object(core, '_stop_owned_locked', side_effect=after_verified_stop):
             self.assertEqual(self.call('start-resume'), 17)
-        self.assertEqual(len(new_operation), 1)
-        self.assertEqual(core.state()['operation'], new_operation[0])
-        self.assertEqual(core.state()['phase'], 'starting')
-        self.assertNotEqual(core.state().get('containment'), 'verified')
+        self.assertEqual(blocked, [True])
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(core.state()['containment'], 'verified')
 
     def test_missing_each_critical_artifact_prevents_resume_up(self):
         saved = self.resumable()
