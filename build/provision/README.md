@@ -1181,6 +1181,12 @@ The declared source digest is retained with this trusted private input; it does
 not independently authenticate a provisioning run or package provenance. TEST
 QEMU `.18` is rejected. Noninteractive sudo, KVM/TUN availability, resource fit,
 package acquisition and access isolation are external prerequisites/trial gates.
+This is a separate explicit component input, not the JSON output of
+`install-qemu.py --selection baseline-20260114`. That historical selection
+pins only the two QEMU packages; it does not produce this full selected-tool
+receipt or establish auxiliary/firmware versions. Assemble the component input
+from independently checked installed facts after separately scoped package
+provisioning; do not infer successful installation from source support.
 
 Prepare reserves an absent `/home/ubuntu/hhfab`, imports without `--dev`/force,
 validates twice and requires exact FAB/wiring/registry preservation. Failed
@@ -1193,12 +1199,11 @@ Unused gateway/external size settings do not create additional VMs.
 
 Public activation includes dependency waiting inside a fixed2700-second fresh
 or900-second resume clock. Short private operation locks are released before
-waiting on systemctl. The root run wrapper uses systemd `!` to retain its
-filesystem namespace. Enabled boot resume begins its clock at the gate; its
+waiting on systemctl. Enabled boot resume begins its clock at the gate; its
 pre-gate dependency queue remains nonready and is bounded only by the outer
 trial lifecycle, since TimeoutStartSec does not bound queued dependencies.
-The wrapper retains its
-filesystem namespace, reads root-private state and checks actual resume mounts,
+The root run wrapper uses systemd `!` to retain its filesystem namespace,
+reads root-private state and checks actual resume mounts,
 then initializes ubuntu groups/gid/uid and execs only fixed hhfab. No `Conflicts`
 auto-stop is used. Competing starts refuse without disrupting the running unit.
 Root-private state is under `/var/lib/labapp-vlab-core` with0700/0600 permissions.
@@ -1208,6 +1213,12 @@ sets32M persistent/16M runtime storage policies and disables forwarding to syslo
 kmsg, console and wall. These rotation policies are not an exact hard byte cap;
 actual ACL/forwarding/effective configuration remain dedicated-guest checks.
 No raw private output, certificates, keys or FAB are exported in public receipts.
+Short-command failures retain at most1MiB in the root-private0600
+`/var/lib/labapp-vlab-core/last-command-output`, overwriting only the observed
+owned regular0600 path; unknown/replaced/symlinked diagnostic paths are refused.
+It is the last failed command's diagnostic, not a transcript or archive. Failure
+to retain it never replaces the original operation result. Do not attach this
+file to public issues/artifacts: it may include private configuration or keys.
 
 Readiness requires the actual private kubeconfig, trusted embedded credentials
 and loopback HTTPS API, `/readyz`, one Ready control, exact canonical Fabric,
@@ -1217,6 +1228,10 @@ the same invocation/PID/start identity/cgroup runs. Server metadata/status field
 are explicitly excluded from spec comparison; admission/defaulting differences
 must be reviewed if an actual mismatch occurs. Logs and service-active status do
 not establish readiness. Child output is bounded and not echoed publicly.
+Only the pinned kubectl formatter's exact localhost connection-refused message
+or bounded single-line ServiceUnavailable response is discovery-pollable; opaque,
+authentication, certificate and structural failures stop immediately. Timeout124
+and cancellation130/143 are never converted to transient startup conditions.
 
 Only after fresh readiness and a bounded owned stop may `activate-resume` seal
 and enable resume. The manifest covers exact static inputs/tools/units, cached

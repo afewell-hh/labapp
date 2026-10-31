@@ -83,9 +83,10 @@ DEV_KEY = 'AAAAC3NzaC1lZDI1NTE5AAAAIGpF2+9I1Nj4BcN7y6DjzTbq1VcUYIRGyfzId5ZoBEFj'
 
 class Failure(Exception):
     """Only fixed nonsecret diagnostics; never interpolate private inputs."""
-    def __init__(self, message='operation refused', code=1):
+    def __init__(self, message='operation refused', code=1, private_output=b''):
         super().__init__(message)
         self.code = code
+        self.private_output = private_output
 
 
 class Parser(argparse.ArgumentParser):
@@ -243,6 +244,39 @@ def remaining(deadline):
     return value
 
 
+def retain_failure_output(raw):
+    """One bounded last-failure diagnostic, private to this owned component.
+
+    No forwarding or append/rotation subsystem. Before prepare reserves ROOT,
+    no diagnostics file is created. Unknown/replaced existing paths are refused.
+    """
+    if not ROOT.exists():
+        return
+    no_links(ROOT)
+    require(ROOT.is_dir() and ROOT.stat().st_uid == ROOT_UID
+            and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'diagnostic root refused')
+    target = ROOT / 'last-command-output'
+    before = None
+    if target.exists() or target.is_symlink():
+        before = target.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == ROOT_UID
+                and stat.S_IMODE(before.st_mode) == 0o600, 'diagnostic path refused')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+    if before is None:
+        flags |= os.O_EXCL
+    fd = os.open(target, flags, 0o600)
+    try:
+        observed = os.fstat(fd)
+        require(before is None or stable_stat(observed) == stable_stat(before), 'diagnostic identity changed')
+        require(observed.st_uid == ROOT_UID and stat.S_IMODE(observed.st_mode) == 0o600,
+                'diagnostic ownership refused')
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, 'wb', closefd=False) as stream:
+            stream.write(raw[:LIMIT])
+    finally:
+        os.close(fd)
+
+
 def execute(argv, deadline, cap=30, user=False):
     """Bounded capture, never forward raw output. Only direct children are reaped.
 
@@ -276,10 +310,14 @@ def execute(argv, deadline, cap=30, user=False):
         except subprocess.TimeoutExpired:
             raise Failure('child deadline exceeded', 124) from None
         if code:
-            raise Failure('child command failed', code if 0 < code < 256 else 1)
+            raise Failure('child command failed', code if 0 < code < 256 else 1, bytes(raw))
         return bytes(raw)
     except BaseException as exc:
         primary = exc
+        try:
+            retain_failure_output(bytes(raw))
+        except BaseException:
+            print('vlab-core: private diagnostics unverified', file=sys.stderr)
         raise
     finally:
         try:
@@ -885,7 +923,13 @@ def kubectl(args, deadline):
         return execute([KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
                         '--request-timeout=10s', *args], deadline, 10, user=True)
     except Failure as error:
-        if error.code == 1 and str(error) == 'child command failed':
+        # v1.35.0 kubectl cmd/util/helpers.go formats these known cases. Never
+        # treat arbitrary exit1/authentication/x509 failures as startup pending.
+        raw = error.private_output
+        refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
+                   b'did you specify the right host or port?\n')
+        unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
+        if error.code == 1 and str(error) == 'child command failed' and (raw == refused or unavailable):
             raise Pending('API discovery pending') from None
         raise
 

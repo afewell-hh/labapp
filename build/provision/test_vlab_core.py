@@ -95,6 +95,7 @@ class GuestFixture(unittest.TestCase):
         self.activation = True
         self.cluster_uid = 'public-cluster-uid'
         self.api_mutation = None
+        self.up_error = None
         self.tools = {'synthetic': 'tools'}
         self.fab = public_fab()
         self.fab_path = self.base / 'private-fab.yaml'
@@ -223,7 +224,7 @@ class GuestFixture(unittest.TestCase):
                          patch.object(core.os, 'getuid', return_value=self.user.pw_uid), \
                          patch.object(core.os, 'geteuid', return_value=self.user.pw_uid), \
                          patch.object(core.os, 'chdir'), \
-                         patch.object(core.os, 'execve', side_effect=ExecWitness) as replace:
+                         patch.object(core.os, 'execve', side_effect=self.up_error or ExecWitness) as replace:
                         with self.assertRaises(ExecWitness):
                             core.unit_run(mode)
                         groups.assert_called_once_with('ubuntu', self.user.pw_gid)
@@ -381,6 +382,15 @@ class GuestFixture(unittest.TestCase):
         self.assertNotEqual(self.phase['fresh'], 'active')
         self.assertNotIn('critical', core.state())
 
+    def test_foreground_build_failure_never_seals_or_retries(self):
+        self.prepared()
+        self.up_error = core.Failure('synthetic foreground build failure', 17)
+        self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotIn('critical', core.state())
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(len([c for c in self.calls if c[0][:2] == [core.SYSTEMCTL, 'start']]), 1)
+
     def test_activation_timeout_cancels_queued_owned_job(self):
         self.prepared()
         self.activation = False
@@ -503,7 +513,9 @@ class GuestFixture(unittest.TestCase):
                 attempts.append(deadline)
                 if pending[0]:
                     pending[0] -= 1
-                    raise core.Failure('child command failed', 1)
+                    raise core.Failure('child command failed', 1,
+                        b'The connection to the server 127.0.0.1:6443 was refused - '
+                        b'did you specify the right host or port?\n')
             return actual(argv, deadline, *args, **kwargs)
         with patch.object(core, 'execute', side_effect=discovering), \
              patch.object(core.time, 'sleep') as pause:
@@ -512,6 +524,26 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(len(set(attempts)), 1)
         self.assertEqual(attempts[0], core.state()['deadline'])
         self.assertEqual(core.state()['deadline'] - core.state()['started'], 900)
+
+    def test_api_permanent_auth_tls_and_unknown_error_are_terminal(self):
+        self.resumable()
+        initial = core.state()
+        actual = self.command
+        for output in (b'error: You must be logged in to the server (Unauthorized)\n',
+                       b'Unable to connect to the server: tls: failed to verify certificate: x509\n',
+                       b'Error from server (Forbidden): public synthetic denial\n',
+                       b'unknown failure\n'):
+            core.save(copy.deepcopy(initial))
+            def denied(argv, *args, **kwargs):
+                if argv[0] == core.KUBECTL:
+                    raise core.Failure('child command failed', 1, output)
+                return actual(argv, *args, **kwargs)
+            with self.subTest(output=output), patch.object(core, 'execute', side_effect=denied), \
+                 patch.object(core.time, 'sleep') as pause:
+                self.assertEqual(self.call('start-resume'), 1)
+                pause.assert_not_called()
+            self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotIn('synthetic denial', self.stdout.getvalue() + self.stderr.getvalue())
 
     def test_changed_ca_refuses_resume_readiness(self):
         self.resumable()
@@ -636,6 +668,39 @@ class GuestFixture(unittest.TestCase):
 
 
 class FormatAndSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='labapp-vlab-executor-')
+        self.addCleanup(self.temp.cleanup)
+        self.root_patch = patch.object(core, 'ROOT', Path(self.temp.name) / 'state')
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def test_executor_retains_one_bounded_private_failure_output(self):
+        core.ROOT.mkdir(mode=0o700)
+        with patch.object(core, 'ROOT_UID', os.getuid()), self.assertRaises(core.Failure) as raised:
+            core.execute([sys.executable, '-I', '-B', '-c',
+                          'import sys; print("PUBLIC_SYNTHETIC_DIAGNOSTIC"); sys.exit(19)'],
+                         core.time.monotonic() + 3)
+        self.assertEqual(raised.exception.code, 19)
+        self.assertEqual(raised.exception.private_output, b'PUBLIC_SYNTHETIC_DIAGNOSTIC\n')
+        path = core.ROOT / 'last-command-output'
+        self.assertEqual(path.read_bytes(), raised.exception.private_output)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_unknown_private_diagnostic_path_is_retained_without_replacing_primary(self):
+        core.ROOT.mkdir(mode=0o700)
+        foreign = Path(self.temp.name) / 'foreign'
+        foreign.write_bytes(b'public foreign data')
+        (core.ROOT / 'last-command-output').symlink_to(foreign)
+        with patch.object(core, 'ROOT_UID', os.getuid()), patch('sys.stderr', new_callable=io.StringIO) as errors:
+            with self.assertRaises(core.Failure) as raised:
+                core.execute([sys.executable, '-I', '-B', '-c', 'raise SystemExit(19)'],
+                             core.time.monotonic() + 3)
+        self.assertEqual(raised.exception.code, 19)
+        self.assertIn('private diagnostics unverified', errors.getvalue())
+        self.assertEqual(foreign.read_bytes(), b'public foreign data')
+        self.assertTrue((core.ROOT / 'last-command-output').is_symlink())
+
     def test_read_and_hash_allow_access_time_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'public'
@@ -701,6 +766,19 @@ class FormatAndSourceTests(unittest.TestCase):
                                 'import json,os; print(json.dumps(dict(os.environ)))'],
                                core.time.monotonic() + 3)
         self.assertEqual(json.loads(raw), core.SAFE_ENV)
+
+    def test_actual_kubectl_classifier_preserves_deadline_and_only_known_transients(self):
+        known = b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n'
+        with patch.object(core, 'execute', side_effect=core.Failure('child command failed', 1, known)):
+            with self.assertRaises(core.Pending):
+                core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5)
+        for code in (124, 130, 143):
+            with self.subTest(code=code), patch.object(core, 'execute',
+                    side_effect=core.Failure('child command failed', code, known)):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5)
+                self.assertNotIsInstance(raised.exception, core.Pending)
+                self.assertEqual(raised.exception.code, code)
 
     def test_parent_signal_preserves_primary_and_reaps_known_child(self):
         with tempfile.TemporaryDirectory() as directory:
