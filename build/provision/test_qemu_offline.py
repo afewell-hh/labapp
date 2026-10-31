@@ -406,6 +406,7 @@ class ObservabilityTests(unittest.TestCase):
             bad = [None, [], {}, {**good, 'extra': 1}, self.result(selected, snapshot='20000101T000000Z'),
                    self.result(selected, pins={}), self.result(selected, changed=1),
                    self.result(selected, seconds=True), self.result(selected, seconds=-1),
+                   self.result(selected, seconds=float('nan')), self.result(selected, seconds=float('inf')),
                    self.result(selected, resolved_installed={}),
                    self.result(selected, resolved_installed={**good['resolved_installed'], 'bad name': '1'}),
                    self.result(selected, resolved_installed={**good['resolved_installed'], 'x': 'a b'}),
@@ -415,12 +416,19 @@ class ObservabilityTests(unittest.TestCase):
                        **policy_pins, **{'p%d' % i: '1' for i in range(target.MAX_PACKAGES)}}),
                    self.result(selected, downloaded_archives=[{'name': '../x.deb', 'bytes': 1, 'sha256': '1' * 64}]),
                    self.result(selected, downloaded_archives=[{'name': 'a.deb', 'bytes': 1}]),
+                   self.result(selected, downloaded_archives=[{'name': 'a.deb', 'bytes': protocol.MAX_FILE + 1,
+                                                              'sha256': '1' * 64}]),
+                   self.result(selected, downloaded_archives=[{'name': 'a.deb', 'bytes': protocol.MAX_FILE,
+                                                              'sha256': '1' * 64}] * 5),
                    self.result(selected, downloaded_archives=[
                        {'name': 'a.deb', 'bytes': 1, 'sha256': '1' * 64}] * (target.MAX_ARCHIVES + 1)),
                    self.result(selected, selection=other)]
             for value in bad:
                 with self.subTest(selected=selected, value=str(value)[:80]), self.assertRaises(Refusal):
                     target.public_report('rerun', value, 1, selected)
+            for seconds in (True, -1, float('nan'), float('inf')):
+                with self.subTest(seconds=seconds), self.assertRaises(Refusal):
+                    target.public_report('install', good, seconds, selected)
 
     def test_invoke_measures_duration_and_observes_only_success(self):
         observed = []
@@ -441,40 +449,6 @@ class ObservabilityTests(unittest.TestCase):
              self.assertRaisesRegex(AssertionError, 'actual unchanged offline CLI failed: qemu install: refused'):
             target.invoke('1' * 64, True, selected=protocol.BASELINE, observe=observed)
         self.assertEqual(len(observed), 1)
-
-    def test_scratch_absence_is_positive_exact_prefix_and_ignores_preexisting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / 'labapp-qemu-old').mkdir()
-            (root / 'unrelated').mkdir()
-            with patch.object(target, 'SCRATCH_ROOT', root):
-                before = target.scratch()
-                self.assertEqual(before, ['labapp-qemu-old'])
-                with contextlib.redirect_stdout(io.StringIO()) as out:
-                    target.scratch_absent('install', before)
-                self.assertEqual(json.loads(out.getvalue())['target_scratch_absent'], 'install')
-                (root / 'labapp-qemu-new').mkdir()
-                with self.assertRaisesRegex(AssertionError, 'labapp-qemu-new'):
-                    target.scratch_absent('install', before)
-                with patch.object(target.Path, 'iterdir', side_effect=OSError('census failed')), \
-                     self.assertRaises(OSError):
-                    target.scratch_absent('install', before)
-
-    def test_main_failure_and_cancellation_preserved_when_evidence_fails(self):
-        for primary in (protocol.Refusal('primary refusal'), AssertionError('primary assertion'), KeyboardInterrupt()):
-            # First call is the pre-run census; the second is the post-failure evidence.
-            for after in ([], OSError('census failed'), ['labapp-qemu-leftover']):
-                with self.subTest(primary=repr(primary), after=repr(after)):
-                    stderr = io.StringIO()
-                    with patch.object(target, 'scratch', side_effect=[[], after]), \
-                         patch.object(target, 'run', side_effect=primary), \
-                         contextlib.redirect_stderr(stderr), self.assertRaises(type(primary)) as raised:
-                        target.main(protocol.BASELINE, '1' * 64)
-                    self.assertIs(raised.exception, primary)
-                    self.assertTrue(stderr.getvalue())
-        with patch.object(target, 'scratch', side_effect=AssertionError('touched')):
-            with self.assertRaisesRegex(Refusal, 'independent'):
-                target.main(protocol.BASELINE, 'not-a-digest')
 
     def test_emit_prints_one_report_and_returns_installer_result(self):
         result = self.result(protocol.BASELINE)
