@@ -550,6 +550,87 @@ def observe_guest(master, nonce, status, process_uncertain):
     return status, detail, service
 
 
+# Fixed one-shot private first-failure export (#368). The remote command has no path or
+# selector argument. Budget: ONE absolute `until` over both control checks, transport and
+# nested cleanup, with an explicit reserve left for the existing master close (TERM grace +
+# reap) inside the unchanged immutable cleanup window.
+EXPORT_CAP_SECONDS = 15
+EXPORT_TEARDOWN_RESERVE = 12
+EXPORT_MIN_SECONDS = 6
+EXPORT_READ_LIMIT = guest.FAILURE_LIMIT + 1024
+ZERO_BOOT = '00000000-0000-0000-0000-000000000000'  # initial contract placeholder: boot unknown
+PRIVATE_DIAGNOSTIC = ('captured', 'absent', 'invalid', 'unavailable', 'skipped')
+
+
+def export_command(nonce):
+    return ['/usr/bin/sudo', '-n', '/usr/bin/python3', str(guest.ROOT / 'vlab_trial.py'),
+            'export-failure', '--nonce', nonce]
+
+
+def accept_failure(raw, source_sha, nonce, boot):
+    """-> ('absent'|'invalid'|'captured', bundle). Expected values are HOST-held.
+
+    The envelope (live guest state + contract + live boot) and the bundle header are two
+    independent guest records; both must match the host's own source/nonce/fixed mode/boot.
+    A self-consistent but foreign, stale or replaced bundle fails here. Mandatory, never optional.
+    """
+    if raw == b'absent':
+        return 'absent', None
+    try:
+        guest.require(type(boot) is str and re.fullmatch(guest.UUID, boot) and boot != ZERO_BOOT)
+        guest.require(type(raw) is bytes and 0 < len(raw) <= EXPORT_READ_LIMIT and raw != b'invalid')
+        first, separator, rest = raw.partition(b'\n')
+        guest.require(separator == b'\n')
+        envelope = guest.data(first)
+        guest.require(type(envelope) is dict and set(envelope) == {'schema', 'source_sha', 'nonce', 'mode',
+                      'operation', 'invocation', 'boot'} and envelope['schema'] == 1
+                      and type(envelope['schema']) is int)
+        guest.require(envelope['source_sha'] == source_sha and envelope['nonce'] == nonce
+                      and envelope['mode'] == 'fresh' and envelope['boot'] == boot)
+        for key in ('operation', 'invocation'):
+            guest.require(envelope[key] is None or type(envelope[key]) is str
+                          and re.fullmatch(guest.HEX32, envelope[key]))
+        bundle = guest.first_failure_bundle(rest)
+        guest.require(bundle['nonce'] == nonce and bundle['mode'] == 'fresh' and bundle['boot'] == boot)
+        guest.require(bundle['operation'] == envelope['operation']
+                      and bundle['invocation'] == envelope['invocation'])
+        return 'captured', raw
+    except Exception:
+        return 'invalid', None
+
+
+def retain_private(directory, lease, raw):
+    """Exclusive 0600 file in the owner-private directory outside ``output``; no overwrite."""
+    guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', lease))
+    guest.exclusive(directory / ('first-failure-' + lease + '.bin'), raw)
+
+
+def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, process_uncertain):
+    """Diagnostic-only; returns a closed status. Owner-local cleanup uncertainty is NEVER swallowed."""
+    try:
+        try:
+            left = clock.cleanup_remaining() - EXPORT_TEARDOWN_RESERVE
+        except guest.Failure:
+            return 'skipped'
+        if left < EXPORT_MIN_SECONDS:
+            return 'skipped'
+        until = owned_process.monotonic() + min(EXPORT_CAP_SECONDS, left)
+        raw = master.remote(export_command(nonce), 'persistence', cap=EXPORT_CAP_SECONDS, cleanup=True,
+                            until=until, limit=EXPORT_READ_LIMIT)
+        state, kept = accept_failure(raw, snapshot['source_sha'], nonce, boot)
+        if state != 'captured':
+            return state
+        retain_private(directory, lease, kept)
+        # A guest query child whose cleanup was not confirmed is contained by the guardian and
+        # VM disposal (a different process namespace); the capture must not look clean.
+        return 'invalid' if guest.first_failure_bundle(kept.partition(b'\n')[2])['query_cleanup'] != 'confirmed' \
+            else 'captured'
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+        return 'unavailable'
+
+
 def cleanup_dispatch(snapshot):
     # Cancel ONLY this captured trusted creator. Its completed workflow_run is
     # checked against the lease by the independent cleanup workflow. The API
@@ -567,7 +648,7 @@ def cleanup_dispatch(snapshot):
     # 202 means accepted cancellation, never observed resource cleanup/FREE.
 
 
-def trial(snapshot, payloads, output, *, registration, records, login):
+def trial(snapshot, payloads, output, *, registration, records, login, private=None):
     expected_snapshot(snapshot)
     rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
     nonce = secrets.token_hex(16)
@@ -583,6 +664,7 @@ def trial(snapshot, payloads, output, *, registration, records, login):
     phase, failure_category = 'preflight', 'none'
     # Public guest diagnostic: `unavailable` until a bounded read or observation says otherwise.
     guest_status, guest_detail, guest_service = 'unavailable', None, None
+    private_diagnostic = 'skipped'
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -679,8 +761,9 @@ def trial(snapshot, payloads, output, *, registration, records, login):
             registration.current()
             trusted_source(snapshot)
             clock.remaining('persistence')
-            # No private guest diagnostics/FAB/kubeconfigs are pulled. One fixed
-            # sanitized result is read after the guardian has contained services.
+            # No FAB/kubeconfigs are pulled; the only private pull is the ONE fixed
+            # first-failure export in `finally` (#368). One fixed sanitized result
+            # is read after the guardian has contained services.
             raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
             state, record = guest_result(raw, nonce)
             if state == 'absent':
@@ -751,6 +834,12 @@ def trial(snapshot, payloads, output, *, registration, records, login):
                 except BaseException as error:
                     if getattr(error, 'cleanup_uncertain', False):
                         process_uncertain.set()
+            if private is not None and result != 0 and heartbeat_absent and initial['boot_uuid'] != ZERO_BOOT:
+                # After the joined heartbeat and the fixed stop, before the original master
+                # closes: no reconnect, reauthentication or retry. Diagnostic only; it
+                # cannot change `result`, `contained` or the stop above.
+                private_diagnostic = extract_failure(master, clock, nonce, snapshot, initial['boot_uuid'],
+                                                     private, rec['request_id'], process_uncertain)
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:
@@ -794,7 +883,9 @@ def trial(snapshot, payloads, output, *, registration, records, login):
                    'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id'],
                    # Closed values only; never text, argv, paths or raw manager output.
                    'guest_diagnostic_status': guest_status, 'guest_diagnostic': guest_detail,
-                   'guest_service': guest_service}
+                   'guest_service': guest_service,
+                   # Closed status of the fixed owner-private first-failure capture; never a path or bytes.
+                   'private_diagnostic': private_diagnostic}
         # Publicly safe fixed statuses only; cloud deletion/FREE still require
         # independent immutable404/terminal-operation/access-archive receipts.
         print(json.dumps(receipt, sort_keys=True))
@@ -806,17 +897,30 @@ def main(argv=None):
     parser.add_argument('--snapshot', type=Path, required=True)
     parser.add_argument('--payloads', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    # Optional lead-owned retention directory for the fixed private first-failure capture.
+    # Without it the capture is `skipped`. It must be outside `output` (which stays empty).
+    parser.add_argument('--private-diagnostics', type=Path)
     args = parser.parse_args(argv)
     os.umask(0o077)
     snapshot = guest.data(guest.regular(args.snapshot, MAX_JSON, os.geteuid()))
     output = private_directory(args.output)
+    private = None
+    if args.private_diagnostics is not None:
+        private = guest.no_links(args.private_diagnostics)
+        info = private.lstat()
+        guest.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+                      and stat.S_IMODE(info.st_mode) == 0o700, 'private diagnostic directory required')
+        guest.require(re.fullmatch('/[A-Za-z0-9_./-]+', str(private)) and private != output
+                      and output not in private.parents and private not in output.parents,
+                      'private diagnostic directory must be outside output')
     expected_snapshot(snapshot)
     token = gcloud_token  # existing owner identity only; never impersonates
     records = GcsAccessRecords(BUCKET, token_provider=token)
     registration = OwnerRegistration(GcsSlotStore(BUCKET, token_provider=token),
                      PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
-    return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login)
+    return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
+                 private=private)
 
 
 if __name__ == '__main__':

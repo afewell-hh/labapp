@@ -353,6 +353,19 @@ authenticated auxiliary packages, including socat. Those inputs and direct
 service behavior are explicit candidate differences, not recovery of missing
 original secrets/helpers or full production/course equivalence.
 
+If a trial fails, `start-fresh` preserves its outer status and, before cleanup, writes a
+bounded root-private first-failure bundle in the guest; the owner may retrieve it once
+through the original SSH master into a lead-owned private directory (receipt field
+`private_diagnostic`). Treat it as untrusted, possibly credential-bearing data: never
+attach it to issues, CI artifacts or images. See the
+[core](../../build/provision/README.md#root-private-first-failure-bundle-issue-368) and
+[owner](../../build/gcp/README.md#fixed-owner-local-canonical-trial) contracts. This does
+not diagnose historical run 41242950882/1.
+Capture is fully skipped after the original start work cutoff. Its separately
+labeled last-command context is an observation before manager-wrapper/cleanup
+overwrite, not proof of the first inner failure or of hhfab execution. The original
+primary status and containment/disposal requirements remain authoritative.
+
 The outer VM stays RUNNING through inner public stop/resume. Absolute admission
 cutoffs reserve the final fifteen of120minutes for cleanup. The500GiB disk is
 an unmeasured sparse-capacity hypothesis with fixed free-memory/disk stops;

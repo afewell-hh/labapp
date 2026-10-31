@@ -10,6 +10,7 @@ required siblings. Importing this module performs no IO or privileged action.
 from __future__ import annotations
 
 import argparse
+import base64
 import grp
 from datetime import datetime, timezone
 import hashlib
@@ -41,7 +42,7 @@ PHASES = {'access': 15, 'stage': 35, 'fresh': 70, 'strict': 80,
           'resume': 95, 'persistence': 105}
 SOURCES = {
     name: 'build/provision/' + name for name in (
-        'vlab_trial.py', 'labapp-vlab-trial.service', 'vlab_core.py',
+        'vlab_trial.py', 'labapp-vlab-trial.service', 'vlab_core.py', 'owned_process.py',
         'ensure-bridge-ipv4.py', 'journald@labapp-vlab.conf',
         'labapp-vlab-fresh.service', 'hhfab-vlab-resume.service',
         'install-qemu.py', 'qemu_offline.py', 'qemu_acquire.py',
@@ -297,13 +298,14 @@ def guardian_processes():
     return set(raw.split())
 
 
-def regular(path, limit, uid=None):
+def regular(path, limit, uid=None, mode=None):
     path = no_links(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-                and info.st_size <= limit and (uid is None or info.st_uid == uid),
+                and info.st_size <= limit and (uid is None or info.st_uid == uid)
+                and (mode is None or stat.S_IMODE(info.st_mode) == mode),
                 'file type/owner/size refused')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             raw = stream.read(limit + 1)
@@ -510,6 +512,103 @@ def bootstrap(incoming, expected_manifest):
         except BaseException:
             pass
         raise
+
+
+# Root-private first-failure bundle (#368). The fixed core writer lives in vlab_core;
+# this strict reader is shared by guest export and the owner host. Raw sections are
+# untrusted text: only structure, sizes, enums and bindings are validated here.
+FAILURE_LIMIT = 32 * 1024
+FAILURE_SECTIONS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
+FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
+FAILURE_STATUS = ('ok', 'truncated', 'unavailable', 'invalid')
+FAILURE_STAGES = ('reserve', 'manager', 'unit', 'final')
+HEX32 = '[0-9a-f]{32}'
+UUID = '[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}'
+
+
+def first_failure_bundle(raw):
+    """Strictly validate and return the bundle; raises Failure on anything else."""
+    require(type(raw) is bytes and 0 < len(raw) <= FAILURE_LIMIT, 'failure bundle size refused')
+    try:
+        value = data(raw)
+    except (ValueError, RecursionError):
+        raise Failure('failure bundle JSON refused') from None
+    fields = {'schema', 'source', 'nonce', 'mode', 'operation', 'invocation', 'boot', 'stage',
+              'query_cleanup', 'state', 'primary', 'command_context', 'manager', 'journal'}
+    require(type(value) is dict and set(value) == fields and value['schema'] == 1
+            and type(value['schema']) is int and value['source'] == 'vlab_core'
+            and value['mode'] in ('fresh', 'resume') and value['stage'] in FAILURE_STAGES
+            and value['query_cleanup'] in ('confirmed', 'uncertain'))
+    require(type(value['nonce']) is str and re.fullmatch(HEX32, value['nonce']))
+    for key in ('operation', 'invocation'):
+        require(value[key] is None or type(value[key]) is str and re.fullmatch(HEX32, value[key]))
+    require(value['boot'] is None or type(value['boot']) is str and re.fullmatch(UUID, value['boot']))
+    require((value['operation'] is None) == (value['stage'] == 'reserve')
+            and (value['invocation'] is None or value['operation'] is not None))
+    state = value['state']
+    require(type(state) is dict and set(state) == {'status', 'phase', 'containment', 'service_result'}
+            and state['status'] in ('ok', 'unavailable', 'invalid')
+            and all(state[k] is None or type(state[k]) is str and re.fullmatch('[a-z0-9-]{1,32}', state[k])
+                    for k in ('phase', 'containment', 'service_result')))
+    for name, cap in FAILURE_SECTIONS.items():
+        section = value[name]
+        extra = {'message', 'code'} if name == 'primary' else {'label'} if name == 'command_context' else set()
+        require(type(section) is dict and set(section) == {'status', 'output'} | extra
+                and section['status'] in FAILURE_STATUS and type(section['output']) is str)
+        try:
+            raw_output = base64.b64decode(section['output'], validate=True)
+        except (ValueError, TypeError):
+            raise Failure('failure section encoding refused') from None
+        require(len(raw_output) <= cap and (section['status'] in ('ok', 'truncated') or not raw_output)
+                and (section['status'] != 'ok' or raw_output))
+        if name == 'primary':
+            require(section['message'] is None or type(section['message']) is str
+                    and re.fullmatch('[ -~]{1,128}', section['message']))
+            require(section['code'] is None or type(section['code']) is int and 0 <= section['code'] < 256)
+        if name == 'command_context':
+            require(section['label'] == FAILURE_CONTEXT)
+    # Output can exist only for an exact bound identity.
+    require(value['manager']['status'] == 'unavailable' or value['invocation'] is not None)
+    require(value['command_context']['status'] == 'unavailable' or value['operation'] is not None)
+    require(value['journal']['status'] in ('unavailable',) or value['invocation'] is not None)
+    return value
+
+
+def export_failure(nonce):
+    """Fixed one-shot read for the owner: no path argument, ``absent`` or exact bytes.
+
+    Output is ``<envelope JSON>\\n<bundle bytes>``. The envelope is read from the
+    contract, the LIVE core state and the live boot id, independent of the bundle
+    header, so a stale/foreign/replaced bundle cannot vouch for itself.
+    """
+    value = contract(data(regular(ROOT / 'contract.json', MAX_SOURCE, 0)))
+    require(type(nonce) is str and nonce == value['nonce'])
+    boot = kernel_boot()
+    require(boot == value['boot_uuid'])
+    core = load_sibling('vlab_core')
+    root = core.ROOT.lstat()
+    require(stat.S_ISDIR(root.st_mode) and root.st_uid == os.geteuid()
+            and stat.S_IMODE(root.st_mode) == 0o700)  # main() already requires euid 0
+    try:
+        raw = regular(core.ROOT / core.FIRST_FAILURE, FAILURE_LIMIT, os.geteuid(), 0o600)
+    except FileNotFoundError:
+        return b'absent'
+    bundle = first_failure_bundle(raw)
+    current = core.state()
+    require(current['nonce'] == nonce == bundle['nonce'] and bundle['mode'] == 'fresh'
+            and bundle['boot'] == boot)
+    operation, invocation = current.get('operation'), current.get('invocation')
+    for item in (operation, invocation):
+        require(item is None or type(item) is str and re.fullmatch(HEX32, item))
+    require(operation == bundle['operation'] and invocation == bundle['invocation'])
+    if operation is None:
+        require(current.get('phase') == 'prepared'
+                and all(key not in current for key in ('mode', 'operation', 'invocation')))
+    else:
+        require(current.get('mode') == 'fresh')
+    envelope = {'schema': 1, 'source_sha': value['source_sha'], 'nonce': nonce, 'mode': 'fresh',
+                'operation': operation, 'invocation': invocation, 'boot': boot}
+    return encoded(envelope) + b'\n' + raw
 
 
 def heartbeat(nonce, sequence):
@@ -1294,7 +1393,7 @@ class Nonce:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument('action', choices=('bootstrap', 'guardian', 'worker', 'heartbeat', 'contain'))
+    parser.add_argument('action', choices=('bootstrap', 'guardian', 'worker', 'heartbeat', 'contain', 'export-failure'))
     parser.add_argument('--incoming', type=Path)
     parser.add_argument('--manifest-sha256')
     parser.add_argument('--nonce')
@@ -1309,6 +1408,14 @@ def main(argv=None):
     elif args.action == 'heartbeat':
         require(args.incoming is None and args.manifest_sha256 is None)
         heartbeat(args.nonce, args.sequence)
+    elif args.action == 'export-failure':
+        require(args.incoming is None and args.manifest_sha256 is None and args.sequence is None)
+        try:
+            out = export_failure(args.nonce)
+        except Exception:
+            out = b'invalid'  # fixed token; never text from the failure or any path
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
     else:
         require(all(v is None for v in (args.incoming, args.manifest_sha256, args.nonce, args.sequence)))
         return {'guardian': guardian, 'worker': worker, 'contain': containment}[args.action]() or 0

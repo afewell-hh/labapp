@@ -1464,7 +1464,7 @@ genuine result yet, the owner makes ONE bounded observation through that same ma
 the same fixed reader plus `systemctl show` for exactly `ActiveState`, `Result`,
 `ExecMainCode` and `ExecMainStatus` with closed values (systemd255 service
 documentation). It never reconnects, retries, refreshes a key, pulls a private
-artifact or adds work after a deadline; a gone master leaves `unavailable`.
+artifact (the one fixed #368 export below is the only exception) or adds work after a deadline; a gone master leaves `unavailable`.
 While polling an absent result, the same fixed manager observation runs within
 the unchanged work deadline. Active or unknown service states remain pending.
 A positively `inactive` or `failed` service triggers one bounded fixed-reader
@@ -1475,6 +1475,41 @@ cannot produce a result, `contained=true` or any cleanup receipt. Every observer
 exception's process-cleanup uncertainty remains sticky through original-master
 close: unresolved groups withhold file deletion and own-key removal even if
 close itself succeeds. Independent correlated cleanup is still attempted.
+
+**Owner contract change (issue #368).** The earlier "no private guest artifact is
+pulled" contract is amended for exactly ONE fixed pathway. After a failed trial, once
+the heartbeat thread is joined and the fixed `systemctl stop` has been attempted, and
+BEFORE the original master closes, the owner runs the fixed remote command
+`sudo -n python3 /var/lib/labapp-vlab-trial/vlab_trial.py export-failure --nonce N`
+through that same master (`cleanup=True`, no new SSH, reauthentication, reconnect or
+retry). It takes no path or selector. The host mandatorily compares the returned
+envelope and bundle header with its OWN source SHA, nonce, fixed mode `fresh` and
+initial boot UUID, and the envelope with the bundle's operation/invocation
+(including null equality; a reservation export requires prepared guest state with
+no mode/operation/invocation)
+(see the [core bundle](../provision/README.md#root-private-first-failure-bundle-issue-368));
+`absent`, `invalid`, transport loss or timeout, and an exhausted budget are explicit
+statuses, never a cleanup exemption.
+
+* One absolute `until` covers both master checks, transport and nested cleanup, and
+  `EXPORT_TEARDOWN_RESERVE` (12 s) is held back for the existing master close; with
+  less than reserve plus 6 s the capture is `skipped`. The 15 s cap is never extended.
+* The optional `--private-diagnostics DIR` names an existing owner-private (euid, 0700)
+  directory OUTSIDE `--output`, which must remain empty (`local_files_absent` is
+  unchanged). The validated bytes are written once with `O_EXCL` 0600 as
+  `first-failure-<lease>.bin` and retained until authorized disposal by the lead.
+  Without the option the capture is `skipped`. The bytes are never uploaded, imaged,
+  posted to GitHub/CI artifacts, printed, or given to a worker; treat them as untrusted
+  and possibly credential-bearing.
+* The receipt gains one closed `private_diagnostic` in `captured | absent | invalid |
+  unavailable | skipped`; never a path or raw data. `invalid` also covers a bundle
+  whose guest-side query child was not positively reaped (the retained file says so):
+  that guest-namespace uncertainty is contained by the guardian and VM disposal, and is
+  not host process absence. Diagnostic failures change only this value. Owner-local
+  process-cleanup uncertainty raised during extraction (#365) stays sticky through a
+  successful master close and withholds `process_absent`, file deletion and own-key
+  removal like any other owned-process uncertainty. The primary result, `contained`
+  and the existing stop are never changed by it.
 
 Owned process cleanup is one shared primitive, `owned_process.OwnedGroup`, used
 by `command()` and every `Master` start/check/close path. The exact returned

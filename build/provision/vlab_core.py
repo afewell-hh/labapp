@@ -28,6 +28,8 @@ import sys
 import time
 import uuid
 
+import owned_process
+
 ROOT = Path('/var/lib/labapp-vlab-core')
 WORK = Path('/home/ubuntu/hhfab')
 CACHE = Path('/home/ubuntu/.cache/hhfab')
@@ -43,6 +45,7 @@ HHFAB = '/usr/local/bin/hhfab'
 KUBECTL = '/usr/local/bin/kubectl'
 PYTHON = '/usr/bin/python3'
 SYSTEMCTL = '/usr/bin/systemctl'
+JOURNALCTL = '/usr/bin/journalctl'
 DPKG = '/usr/bin/dpkg-query'
 BRIDGE = LIB / 'ensure-bridge-ipv4.py'
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -75,6 +78,17 @@ AUX = {'/usr/bin/sudo': 'sudo', '/usr/bin/qemu-img': 'qemu-utils',
        '/usr/sbin/ip': 'iproute2', SYSTEMCTL: 'systemd',
        '/usr/sbin/modprobe': 'kmod', '/usr/sbin/sysctl': 'procps',
        PYTHON: 'python3-minimal'}
+# #368 first-failure bundle: fixed root-private diagnostic, never readiness authority.
+FIRST_FAILURE = 'first-failure.json'
+FIRST_FAILURE_LIMIT = 32 * 1024  # SERIALIZED bytes, enforced after JSON/base64 encoding
+FAILURE_CAPS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
+FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
+SNAPSHOT_SECONDS = 10      # one shared absolute budget for BOTH queries incl. their reaping
+SNAPSHOT_REAP = 1.0        # held back inside each query's end to kill/reap its child
+MANAGER_SECONDS, JOURNAL_SECONDS = 2, 8
+JOURNAL_NAMESPACE = 'labapp-vlab'
+JOURNAL_LINES = 64
+MANAGER_PROPERTIES = 'ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,ExecMainPID'
 NETFILTER = ('bridge-nf-call-iptables', 'bridge-nf-call-ip6tables', 'bridge-nf-call-arptables')
 RESULT = 'control--control-1--install'
 DEV_PASSWORD = '$5$8nAYPGcl4l6G7Av1$Qi4/gnM0yPtGv9kjpMh78NuNSfQWy7vR1rulHpurL36'
@@ -280,7 +294,7 @@ def retain_failure_output(raw):
         os.close(fd)
 
 
-def execute(argv, deadline, cap=30, user=False):
+def execute(argv, deadline, cap=30, user=False, *, retain=True):
     """Bounded capture, never forward raw output. Only direct children are reaped.
 
     systemd owns long-lived VLAB descendants; short private CLI queries get their
@@ -317,10 +331,11 @@ def execute(argv, deadline, cap=30, user=False):
         return bytes(raw)
     except BaseException as exc:
         primary = exc
-        try:
-            retain_failure_output(bytes(raw))
-        except BaseException:
-            print('vlab-core: private diagnostics unverified', file=sys.stderr)
+        if retain:
+            try:
+                retain_failure_output(bytes(raw))
+            except BaseException:
+                print('vlab-core: private diagnostics unverified', file=sys.stderr)
         raise
     finally:
         try:
@@ -346,6 +361,253 @@ def execute(argv, deadline, cap=30, user=False):
             print('vlab-core: child group containment unverified', file=sys.stderr)
         finally:
             child.stdout.close()
+
+
+def diagnostic_run(argv, end, keep):
+    """Fixed bounded diagnostic query -> (status, tail bytes, truncated, cleanup).
+
+    ``end`` is one absolute monotonic deadline for spawn, I/O AND kill/reap; the
+    last SNAPSHOT_REAP seconds are held back for containment. Output beyond
+    ``keep`` bytes drops the oldest bytes (a tail). ``cleanup`` is ``confirmed``
+    only after the direct child was reaped and its process group is positively
+    gone (ESRCH); anything else is ``uncertain`` and is never reported as clean.
+    This is the guest's process namespace and says nothing about owner-host processes.
+    """
+    work_end = end - SNAPSHOT_REAP
+    if time.monotonic() >= work_end:
+        return 'unavailable', b'', False, 'confirmed'
+    child = group = None
+    cleanup = 'confirmed'
+    status, tail, truncated = 'unavailable', bytearray(), False
+    try:
+        try:
+            child = subprocess.Popen(argv, cwd='/', env=SAFE_ENV, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        except OSError:
+            return 'unavailable', b'', False, ('confirmed' if time.monotonic() < end else 'uncertain')
+        cleanup = 'uncertain'
+        group = owned_process.OwnedGroup(child)
+        # Popen cannot be interrupted by this helper. A late return is uncertain,
+        # never permission to renew the absolute budget or send a late signal.
+        if time.monotonic() >= work_end:
+            raise Failure('diagnostic work deadline exhausted')
+        complete = False
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                left = work_end - time.monotonic()
+                if left <= 0 or not selector.select(left):
+                    break
+                if time.monotonic() >= work_end:
+                    break
+                chunk = os.read(child.stdout.fileno(), 65536)
+                if not chunk:
+                    complete = True
+                    break
+                tail.extend(chunk)
+                if len(tail) > keep:
+                    truncated = True
+                    del tail[:-keep]
+        if complete and time.monotonic() < work_end:
+            # Observation only: retain the unreaped leader anchor through KILL.
+            code = group.status()
+            while code is None and time.monotonic() < work_end:
+                left = work_end - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(.01, left))
+                code = group.status()
+            if code == 0 and time.monotonic() < work_end:
+                status = 'truncated' if truncated else 'ok'
+    except BaseException:
+        status, tail, truncated = 'unavailable', bytearray(), False
+        cleanup = 'uncertain'
+    finally:
+        if child is not None:
+            if group is not None:
+                try:
+                    cleanup = 'confirmed' if group.close(0, until=end) else 'uncertain'
+                except BaseException:
+                    cleanup = 'uncertain'
+            try:
+                child.stdout.close()
+            except BaseException:
+                cleanup = 'uncertain'
+            if time.monotonic() >= end:
+                cleanup = 'uncertain'
+                status = 'unavailable'
+    if status == 'unavailable':
+        tail = bytearray()
+    return status, bytes(tail), truncated, cleanup
+
+
+def render_failure(header, parts):
+    """Fixed-key JSON; ``parts`` = {section: (status, raw bytes)}. Size is measured on the result."""
+    body = dict(header)
+    for name, (status, raw) in parts.items():
+        body[name] = {**header[name], 'status': status, 'output': base64.b64encode(raw).decode()}
+    return json.dumps(body, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def last_failure_context():
+    """One fixed descriptor-checked tail; observed context, never inner provenance."""
+    fd = None
+    try:
+        no_links(ROOT)
+        root = ROOT.lstat()
+        require(stat.S_ISDIR(root.st_mode) and root.st_uid == ROOT_UID
+                and stat.S_IMODE(root.st_mode) == 0o700)
+        path = ROOT / 'last-command-output'
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == ROOT_UID
+                and stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+                and 0 <= before.st_size <= LIMIT)
+        cap = FAILURE_CAPS['command_context']
+        os.lseek(fd, max(0, before.st_size - cap), os.SEEK_SET)
+        raw = os.read(fd, cap + 1)
+        require(len(raw) == min(cap, before.st_size)
+                and stable_stat(os.fstat(fd)) == stable_stat(before)
+                and stable_stat(path.lstat()) == stable_stat(before))
+        return ('truncated' if before.st_size > cap else 'ok', raw) if raw else ('unavailable', b'')
+    except BaseException:
+        return 'unavailable', b''
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def write_first_failure(raw):
+    """First failure wins: link() fails if a bundle already exists, so nothing is overwritten."""
+    no_links(ROOT)
+    require(ROOT.is_dir() and ROOT.stat().st_uid == ROOT_UID
+            and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'diagnostic root refused')
+    temp, target = ROOT / (FIRST_FAILURE + '.new'), ROOT / FIRST_FAILURE
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temp, target)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def capture_first_failure(mode, value, primary, deadline):
+    """One root-private diagnostic bundle BEFORE cleanup_start; diagnostic only.
+
+    It never changes the primary exception, grants readiness/containment or
+    extends any deadline. ``value`` is None for a reservation refusal (this call
+    committed no operation): operation/invocation are then null, and no older
+    state operation or unbound manager/journal history is ever selected.
+    """
+    if time.monotonic() >= deadline:
+        return  # FULL skip: no file-only exception after the original work cutoff.
+    target = ROOT / FIRST_FAILURE
+    if target.exists() or target.is_symlink():
+        return
+    end = min(deadline, time.monotonic() + SNAPSHOT_SECONDS)
+    try:
+        current = state()
+        current_ok = True
+    except BaseException:
+        current, current_ok = None, False
+    nonce = value['nonce'] if value is not None else (current or {}).get('nonce')
+    if not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce):
+        return
+    operation = value['operation'] if value is not None else None
+    state_status = 'ok' if current_ok else 'unavailable'
+    if current_ok and (current['nonce'] != nonce or (value is not None and (
+            current.get('operation') != operation or current.get('mode') != mode))):
+        current, state_status = None, 'invalid'
+    if value is None and (current is None or current.get('phase') != 'prepared'
+                          or any(key in current for key in ('mode', 'operation', 'invocation'))):
+        return  # A null reservation must never mask an older live binding.
+    invocation = None
+    if value is not None and current is not None \
+            and re.fullmatch(r'[0-9a-f]{32}', str(current.get('invocation', ''))):
+        invocation = current['invocation']
+    try:
+        boot_id = boot()
+    except BaseException:
+        boot_id = None
+    phase = (current or {}).get('phase')
+    if value is None:
+        stage = 'reserve'
+    elif invocation is None:
+        stage = 'manager'
+    elif phase == 'ready':
+        stage = 'final'
+    else:
+        stage = 'unit'
+
+    def token(key):
+        text = (current or {}).get(key)
+        return text if isinstance(text, str) and re.fullmatch(r'[a-z0-9-]{1,32}', text) else None
+    message = code = None
+    out = b''
+    if isinstance(primary, Failure):
+        text = str(primary)
+        message = text if re.fullmatch(r'[ -~]{1,128}', text) else None
+        code = primary.code if type(primary.code) is int and 0 <= primary.code < 256 else None
+        out = primary.private_output if isinstance(primary.private_output, (bytes, bytearray)) else b''
+    out = bytes(out)
+    primary_status = 'unavailable' if not out else ('truncated' if len(out) > FAILURE_CAPS['primary'] else 'ok')
+    parts = {'primary': (primary_status, out[-FAILURE_CAPS['primary']:]),
+             'command_context': last_failure_context() if operation is not None else ('unavailable', b''),
+             'manager': ('unavailable', b''), 'journal': ('unavailable', b'')}
+    cleanup = 'confirmed'
+    unit = UNIT[mode]
+    if invocation is not None:
+        status, raw, _, result = diagnostic_run(
+            [SYSTEMCTL, 'show', unit, '--no-pager', '--property=' + MANAGER_PROPERTIES],
+            min(end, time.monotonic() + MANAGER_SECONDS), FAILURE_CAPS['manager'])
+        cleanup = 'uncertain' if result == 'uncertain' else cleanup
+        if status in ('ok', 'truncated'):
+            reported = None
+            for line in raw.decode('ascii', 'replace').splitlines():
+                if line.startswith('InvocationID='):
+                    reported = line[len('InvocationID='):]
+            if reported == '':
+                status, raw = 'unavailable', b''      # manager forgot the unit
+            elif reported != invocation:
+                status, raw = 'invalid', b''          # different/absent identity: untrusted
+        parts['manager'] = (status, raw)
+    if invocation is not None and boot_id is not None:
+        # Exact frozen original boot + invocation + unit in the existing namespace.
+        # journald stores _BOOT_ID as 32 hex without dashes. No unit-only fallback.
+        status, raw, _, result = diagnostic_run(
+            [JOURNALCTL, '--no-pager', '--namespace=' + JOURNAL_NAMESPACE, '--lines=%d' % JOURNAL_LINES,
+             '--output=short-monotonic', '_BOOT_ID=' + boot_id.replace('-', ''),
+             '_SYSTEMD_INVOCATION_ID=' + invocation, '_SYSTEMD_UNIT=' + unit],
+            min(end, time.monotonic() + JOURNAL_SECONDS), FAILURE_CAPS['journal'])
+        cleanup = 'uncertain' if result == 'uncertain' else cleanup
+        parts['journal'] = (status, raw)
+    header = {'schema': 1, 'source': 'vlab_core', 'nonce': nonce, 'mode': mode, 'operation': operation,
+              'invocation': invocation, 'boot': boot_id, 'stage': stage, 'query_cleanup': cleanup,
+              'state': {'status': state_status, 'phase': token('phase'),
+                        'containment': token('containment'), 'service_result': token('service_result')},
+              'primary': {'message': message, 'code': code},
+              'command_context': {'label': FAILURE_CONTEXT}, 'manager': {}, 'journal': {}}
+    rendered = render_failure(header, parts)
+    for name in ('journal', 'primary', 'command_context', 'manager'):
+        # Serialized (not raw) bound: shed the oldest output until it fits.
+        while len(rendered) > FIRST_FAILURE_LIMIT and parts[name][1]:
+            parts[name] = ('truncated', parts[name][1][len(parts[name][1]) // 2 + 1:])
+            rendered = render_failure(header, parts)
+    if len(rendered) > FIRST_FAILURE_LIMIT:
+        return
+    if time.monotonic() >= end:
+        return
+    write_first_failure(rendered)
 
 
 def hhfab(command, deadline, extra=(), cap=30):
@@ -428,7 +690,7 @@ def save(value):
 
 def source_snapshot(directory):
     records = {name: identity(directory / name, True, limit=STATIC_LIMIT)
-               for name in ('vlab_core.py', 'ensure-bridge-ipv4.py',
+               for name in ('vlab_core.py', 'owned_process.py', 'ensure-bridge-ipv4.py',
                             'journald@labapp-vlab.conf', *UNIT.values())}
     require(all(r['uid'] == ROOT_UID and stat.S_IMODE(r['mode']) == 0o644
                 and r['links'] == 1 for r in records.values()),
@@ -657,7 +919,8 @@ def prepare(input_path):
                     and stat.S_IMODE(directory.stat().st_mode) == 0o755,
                     'installation directory refused')
         source = Path(__file__).resolve().parent
-        for name in ('vlab_core.py', 'ensure-bridge-ipv4.py', 'journald@labapp-vlab.conf', *UNIT.values()):
+        for name in ('vlab_core.py', 'owned_process.py', 'ensure-bridge-ipv4.py',
+                     'journald@labapp-vlab.conf', *UNIT.values()):
             raw = read(source / name)
             target = LIB / name
             if target.exists():
@@ -1284,21 +1547,34 @@ def cleanup_start(value, deadline):
 
 def start(mode):
     end = time.monotonic() + START_SECONDS[mode]
-    value = reserve(mode, end)
+    value = None
     try:
+        # Reservation is inside the capture-first path: a refusal here has no
+        # operation of its own, so the bundle binds null operation/invocation.
+        value = reserve(mode, end)
         # The lock is RELEASED before synchronous manager/dependency waiting.
-        execute([SYSTEMCTL, 'start', UNIT[mode]], end, START_SECONDS[mode])
+        # Preserve the fixed last failed command before the generic manager wrapper
+        # could overwrite it. The primary Failure still carries that wrapper's bytes.
+        execute([SYSTEMCTL, 'start', UNIT[mode]], end, START_SECONDS[mode], retain=False)
         with locked():
             current = state()
             require(current['operation'] == value['operation'] and current['phase'] == 'ready',
                     'service did not establish readiness')
             check_live(current, end)
-    except BaseException:
-        # Preserve primary return/signal/timeout if exact cleanup cannot be verified.
+    except BaseException as primary:
+        # First evidence is frozen BEFORE cleanup can overwrite last-command-output
+        # or stop the unit. Diagnostic only: any failure here is swallowed and
+        # cleanup below always runs with its own unchanged 35s budget.
         try:
-            cleanup_start(value, time.monotonic() + 35)
+            capture_first_failure(mode, value, primary, end)
         except BaseException:
-            print('vlab-core: owned containment unverified', file=sys.stderr)
+            print('vlab-core: first-failure capture unverified', file=sys.stderr)
+        # Preserve primary return/signal/timeout if exact cleanup cannot be verified.
+        if value is not None:
+            try:
+                cleanup_start(value, time.monotonic() + 35)
+            except BaseException:
+                print('vlab-core: owned containment unverified', file=sys.stderr)
         raise
 
 

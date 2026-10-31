@@ -5,7 +5,7 @@ bounded executor tests create inspected Python stdlib children (no network).
 Fakes prove source sequencing/refusal, not systemd namespaces/cgroups or VLAB.
 """
 import base64
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import copy
 import io
 import json
@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -23,6 +24,9 @@ from unittest.mock import patch
 import yaml
 import vlab_core as core
 VERIFY_PREREQUISITES = core.verify_prerequisites
+DIAGNOSTIC_RUN = core.diagnostic_run
+EXECUTE = core.execute
+SENTINEL = 'PRIVATE-SENTINEL-' + 'z' * 8
 
 
 class ExecWitness(BaseException):
@@ -83,6 +87,10 @@ class GuestFixture(unittest.TestCase):
         self.stack.enter_context(patch.object(core.os, 'chown'))
         self.stack.enter_context(patch.object(core.os, 'geteuid', return_value=0))
         self.stack.enter_context(patch.object(core, 'execute', side_effect=self.command))
+        # No native systemctl/journalctl: the first-failure queries are fakes in every test.
+        self.diagnostics = []
+        self.diag = None
+        self.stack.enter_context(patch.object(core, 'diagnostic_run', side_effect=self.diagnostic))
         self.stack.enter_context(patch.dict(os.environ, {'INVOCATION_ID': 'a' * 32, 'SERVICE_RESULT': 'success'}))
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
@@ -189,7 +197,16 @@ class GuestFixture(unittest.TestCase):
             f'{i} 0 0:1 / {p} ro - ext4 /dev/public rw'
             for i, p in enumerate(core.readonly_paths(), 1)))
 
-    def command(self, argv, deadline, cap=30, user=False):
+    def diagnostic(self, argv, end, keep):
+        self.diagnostics.append((list(argv), end, keep))
+        if self.diag is not None:
+            return self.diag(argv)
+        if argv[0] == core.SYSTEMCTL:
+            invocation = core.state().get('invocation', '')
+            return 'ok', ('ActiveState=failed\nInvocationID=' + invocation + '\n').encode(), False, 'confirmed'
+        return 'ok', b'JOURNAL-TAIL ' + SENTINEL.encode(), False, 'confirmed'
+
+    def command(self, argv, deadline, cap=30, user=False, *, retain=True):
         self.calls.append((list(argv), deadline, cap, user))
         core.remaining(deadline)
         if self.failure and self.failure(argv):
@@ -335,6 +352,15 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(self.call('start-fresh'), 1)
         self.assertFalse(self.execs)
         self.assertTrue((self.base / 'retained-result').is_dir())
+
+    def test_prepared_source_pins_include_deployed_owned_process_sibling(self):
+        self.prepared()
+        self.assertIn('owned_process.py', core.state()['source'])
+        self.assertEqual((core.LIB / 'owned_process.py').read_bytes(),
+                         (Path(core.__file__).parent / 'owned_process.py').read_bytes())
+        (core.LIB / 'owned_process.py').write_bytes(b'public changed component')
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse(self.execs)
 
     def test_fresh_gate_and_run_recheck_before_exec_without_adoption(self):
         self.prepared()
@@ -688,6 +714,353 @@ class GuestFixture(unittest.TestCase):
         self.failure = lambda args: args[:2] == [core.SYSTEMCTL, 'stop']
         self.assertEqual(self.call('start-fresh'), 124)
         self.assertIn('containment unverified', self.stderr.getvalue())
+
+    # -- #368 first-failure bundle: offline orchestration fakes only. They do not show
+    #    native systemd scheduling, real journald namespace retention or VLAB readiness.
+    def bundle(self):
+        return json.loads((core.ROOT / core.FIRST_FAILURE).read_bytes())
+
+    def raw_section(self, name):
+        return base64.b64decode(self.bundle()[name]['output'], validate=True)
+
+    def ready_failure(self):
+        return patch.object(core, 'unit_ready', side_effect=core.Failure('synthetic ready failure', 17))
+
+    def journal_argv(self, invocation):
+        unit = core.UNIT['fresh']
+        return [core.JOURNALCTL, '--no-pager', '--namespace=labapp-vlab', '--lines=64',
+                '--output=short-monotonic', '_BOOT_ID=' + core.boot().replace('-', ''),
+                '_SYSTEMD_INVOCATION_ID=' + invocation, '_SYSTEMD_UNIT=' + unit]
+
+    def test_unit_failure_binds_original_invocation_with_exact_fixed_queries(self):
+        self.prepared()
+        before = time.monotonic()
+        with self.ready_failure():
+            self.assertEqual(self.call('start-fresh'), 17)  # primary outer status unchanged
+        value, bundle = core.state(), self.bundle()
+        self.assertEqual((bundle['stage'], bundle['mode'], bundle['nonce'], bundle['operation'],
+                          bundle['invocation'], bundle['boot'], bundle['query_cleanup']),
+                         ('unit', 'fresh', 'b' * 32, value['operation'], 'a' * 32, core.boot(), 'confirmed'))
+        self.assertEqual(bundle['primary'], {'message': 'synthetic ready failure', 'code': 17,
+                                             'status': 'unavailable', 'output': ''})
+        self.assertEqual([d[0] for d in self.diagnostics], [
+            [core.SYSTEMCTL, 'show', core.UNIT['fresh'], '--no-pager', '--property=' + core.MANAGER_PROPERTIES],
+            self.journal_argv('a' * 32)])
+        self.assertEqual([d[2] for d in self.diagnostics], [2048, 8192])
+        self.assertTrue(all(d[1] <= before + core.SNAPSHOT_SECONDS + 1 for d in self.diagnostics))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertIn(SENTINEL.encode(), self.raw_section('journal'))
+        self.assertEqual(stat.S_IMODE((core.ROOT / core.FIRST_FAILURE).stat().st_mode), 0o600)
+        self.assertEqual(core.state()['containment'], 'verified')
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_bundle_precedes_cleanup_and_survives_overwrite_or_cleanup_failure(self):
+        self.prepared()
+        actual, seen = core.cleanup_start, []
+        def spy(value, deadline):
+            seen.append((core.ROOT / core.FIRST_FAILURE).read_bytes())
+            core.retain_failure_output(b'CLEANUP-OVERWRITE')  # what a later command failure would do
+            raise core.Failure('synthetic cleanup failure', 29)
+        with self.ready_failure(), patch.object(core, 'cleanup_start', side_effect=spy):
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual((core.ROOT / core.FIRST_FAILURE).read_bytes(), seen[0])
+        self.assertEqual((core.ROOT / 'last-command-output').read_bytes(), b'CLEANUP-OVERWRITE')
+        self.assertIn('containment unverified', self.stderr.getvalue())
+
+    def test_manager_wrapper_preserves_observed_inner_context_then_cleanup_cannot_overwrite_bundle(self):
+        self.prepared()
+        actual = self.command
+        inner = ('OBSERVED-INNER-' + SENTINEL).encode()
+        wrapper = b'generic manager failed'
+        class Selector:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def register(self, *_): pass
+            def select(self, *_): return [True]
+        child = SimpleNamespace(pid=4242, stdout=SimpleNamespace(fileno=lambda: 123, close=lambda: None),
+                                wait=lambda **_: 1, poll=lambda: 1)
+        def command(argv, deadline, cap=30, user=False, *, retain=True):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                self.assertFalse(retain)  # actual start consumer disables only wrapper retention
+                core.retain_failure_output(inner)
+                with patch.object(core.subprocess, 'Popen', return_value=child), \
+                     patch.object(core.selectors, 'DefaultSelector', Selector), \
+                     patch.object(core.os, 'read', side_effect=[wrapper, b'']), \
+                     patch.object(core.os, 'killpg', side_effect=ProcessLookupError):
+                    return EXECUTE(argv, deadline, cap, user, retain=retain)
+            return actual(argv, deadline, cap, user, retain=retain)
+        def cleanup(*_):
+            self.assertEqual(self.raw_section('command_context'), inner)
+            core.retain_failure_output(b'CLEANUP-OVERWRITE')
+            raise core.Failure('synthetic cleanup failure', 29)
+        with patch.object(core, 'execute', side_effect=command), \
+             patch.object(core, 'cleanup_start', side_effect=cleanup):
+            self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(self.raw_section('primary'), wrapper)
+        self.assertEqual(self.raw_section('command_context'), inner)
+        self.assertEqual(self.bundle()['command_context']['label'], core.FAILURE_CONTEXT)
+        self.assertEqual((core.ROOT / 'last-command-output').read_bytes(), b'CLEANUP-OVERWRITE')
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_command_context_fixed_reader_refuses_missing_foreign_links_and_replacement(self):
+        self.prepared()
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path = core.ROOT / 'last-command-output'
+        core.retain_failure_output(b'x' * 4096 + b'TAIL')
+        status, raw = core.last_failure_context()
+        self.assertEqual((status, len(raw), raw[-4:]), ('truncated', 2048, b'TAIL'))
+        path.chmod(0o640)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path.chmod(0o600)
+        alias = self.base / 'alias'
+        os.link(path, alias)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        alias.unlink()
+        with patch.object(core, 'stable_stat', side_effect=[1, 2]):
+            self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+        path.unlink()
+        path.symlink_to(self.fab_path)
+        self.assertEqual(core.last_failure_context(), ('unavailable', b''))
+
+    def test_manager_primary_output_survives_without_adopting_stale_unbound_manager_evidence(self):
+        self.prepared()
+        actual = self.command
+        self.diag = lambda argv: ('ok', b'InvocationID=' + b'e' * 32 +
+                                  b'\nExecMainStatus=29\nResult=' + SENTINEL.encode(), False, 'confirmed')
+        def wrapped(argv, *args, **kwargs):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                raise core.Failure('child command failed', 1, b'Job for unit failed\n' + SENTINEL.encode())
+            return actual(argv, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=wrapped):
+            self.assertEqual(self.call('start-fresh'), 1)
+        bundle = self.bundle()
+        self.assertIsNotNone(bundle['operation'])  # reservation committed, but no proven invocation
+        self.assertEqual((bundle['stage'], bundle['invocation'], bundle['journal']['status'],
+                          bundle['primary']['status']), ('manager', None, 'unavailable', 'ok'))
+        self.assertEqual(self.raw_section('primary'), b'Job for unit failed\n' + SENTINEL.encode())
+        self.assertEqual(bundle['manager'], {'status': 'unavailable', 'output': ''})
+        self.assertEqual(self.diagnostics, [])  # neither stale manager nor journal history is queried
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_reservation_refusal_cannot_capture_an_older_operation(self):
+        self.prepared()
+        stale = core.state()
+        stale.update(phase='failed', mode='fresh', operation='c' * 32, invocation='d' * 32)
+        core.save(stale)
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
+        self.assertEqual(self.diagnostics, [])
+        self.assertEqual(core.state(), stale)
+        self.assertFalse(any(c[0][:2] in ([core.SYSTEMCTL, 'start'], [core.SYSTEMCTL, 'stop']) for c in self.calls))
+
+    def test_manager_identity_mismatch_or_gc_never_selects_other_history(self):
+        for reported, status in (('e' * 32, 'invalid'), ('', 'unavailable')):
+            with self.subTest(reported=reported):
+                self.setUp()
+                self.prepared()
+                self.diag = lambda argv, r=reported: (
+                    ('ok', ('InvocationID=' + r + '\nResult=' + SENTINEL + '\n').encode(), False, 'confirmed')
+                    if argv[0] == core.SYSTEMCTL else ('ok', b'ORIGINAL-INVOCATION-LINES', False, 'confirmed'))
+                with self.ready_failure():
+                    self.assertEqual(self.call('start-fresh'), 17)
+                bundle = self.bundle()
+                self.assertEqual((bundle['manager']['status'], bundle['manager']['output']), (status, ''))
+                # Journal still keyed only by the frozen original boot + invocation + unit.
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual(bundle['journal']['status'], 'ok')
+
+    def test_capture_failure_or_query_uncertainty_never_changes_primary_or_skips_cleanup(self):
+        for name in ('query raises', 'write fails', 'uncertain'):
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                patches = []
+                if name == 'query raises':
+                    self.diag = lambda argv: (_ for _ in ()).throw(RuntimeError(SENTINEL))
+                elif name == 'write fails':
+                    patches.append(patch.object(core, 'write_first_failure', side_effect=OSError(SENTINEL)))
+                else:
+                    self.diag = lambda argv: ('unavailable', b'', False, 'uncertain')
+                with ExitStack() as local:
+                    for item in patches:
+                        local.enter_context(item)
+                    local.enter_context(self.ready_failure())
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+                if name == 'uncertain':
+                    self.assertEqual(self.bundle()['query_cleanup'], 'uncertain')
+                else:
+                    self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
+                    self.assertIn('first-failure capture unverified', self.stderr.getvalue())
+                self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_first_failure_wins_and_later_reservation_refusal_cannot_overwrite_it(self):
+        self.prepared()
+        with self.ready_failure():
+            self.assertEqual(self.call('start-fresh'), 17)
+        first = (core.ROOT / core.FIRST_FAILURE).read_bytes()
+        self.assertEqual(self.call('start-fresh'), 1)  # later reservation refusal
+        self.assertEqual((core.ROOT / core.FIRST_FAILURE).read_bytes(), first)
+        self.assertFalse((core.ROOT / (core.FIRST_FAILURE + '.new')).exists())
+
+    def test_preplaced_first_failure_symlink_is_not_followed_or_overwritten(self):
+        self.prepared()
+        # A pre-placed symlink (replacement) is neither followed nor overwritten.
+        foreign = self.base / 'foreign'
+        foreign.write_bytes(b'FOREIGN')
+        (core.ROOT / core.FIRST_FAILURE).symlink_to(foreign)
+        self.diagnostics.clear()
+        with self.ready_failure():
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(foreign.read_bytes(), b'FOREIGN')
+        self.assertTrue((core.ROOT / core.FIRST_FAILURE).is_symlink())
+        self.assertEqual(self.diagnostics, [])
+
+    def test_serialized_bundle_is_bounded_for_hostile_bytes_and_escapes(self):
+        self.prepared()
+        actual = self.command
+        def wrapped(argv, *args, **kwargs):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                raise core.Failure('child command failed "\\ \\u0000"', 1, b'\xff"\\\x00' * (1 << 18))
+            return actual(argv, *args, **kwargs)
+        self.diag = lambda argv: ('ok', b'\xff"\\\x00' * 50000, False, 'confirmed')
+        with patch.object(core, 'execute', side_effect=wrapped):
+            self.assertEqual(self.call('start-fresh'), 1)
+        raw = (core.ROOT / core.FIRST_FAILURE).read_bytes()
+        self.assertLessEqual(len(raw), core.FIRST_FAILURE_LIMIT)
+        bundle = json.loads(raw)
+        self.assertEqual((bundle['primary']['status'], bundle['manager']['status']), ('truncated', 'unavailable'))
+        for name, cap in core.FAILURE_CAPS.items():
+            self.assertLessEqual(len(base64.b64decode(bundle[name]['output'], validate=True)), cap)
+
+    @contextmanager
+    def diagnostic_fixture(self, *, late=None, code=0, ownership='owned', persistent=False,
+                           hold_pipe=False, signal_error=None, wait_timeout=False, spawn_error=False):
+        """Actual runner + actual OwnedGroup, entirely mocked kernel/process/clock/I/O."""
+        late = late or {}
+        now, events, chunks = [0.0], [], [b'a' * 1000 + b'TAIL', b'']
+        proc = SimpleNamespace(pid=4242, returncode=None, reaped=False)
+        def tick():
+            now[0] += .001
+            return now[0]
+        def advance(point):
+            now[0] += late.get(point, 0)
+        def waitid(kind, pid, options):
+            self.assertEqual((kind, pid, options), (os.P_PID, 4242, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+            self.assertFalse(proc.reaped)
+            events.append(('observe',))
+            if ownership == 'lost':
+                raise ChildProcessError
+            return SimpleNamespace(si_pid=4243 if ownership == 'foreign' else 4242,
+                                   si_code=os.CLD_EXITED, si_status=code)
+        def killpg(pid, number):
+            self.assertEqual(pid, 4242)
+            self.assertTrue(number == 0 or not proc.reaped, 'destructive signal after reap')
+            events.append(('signal', number))
+            advance('probe' if number == 0 else 'signal')
+            if number == 0:
+                if not persistent:
+                    raise ProcessLookupError
+            elif signal_error is not None:
+                raise signal_error
+        def wait(timeout):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 8 - now[0])
+            self.assertFalse(proc.reaped)
+            events.append(('reap',))
+            advance('reap')
+            if wait_timeout:
+                raise subprocess.TimeoutExpired('fixed fixture', timeout)
+            proc.reaped, proc.returncode = True, code
+            return code
+        def close():
+            events.append(('pipe-close',))
+            advance('pipe-close')
+        proc.stdout = SimpleNamespace(fileno=lambda: 123, close=close)
+        proc.wait = wait
+        def popen(argv, **kwargs):
+            self.assertEqual(argv, [core.JOURNALCTL, '--fixed-fixture'])
+            self.assertEqual(kwargs, dict(cwd='/', env=core.SAFE_ENV, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True))
+            events.append(('spawn',))
+            advance('spawn')
+            if spawn_error:
+                raise OSError
+            return proc
+        class Selector:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def register(self, stream, event):
+                self_test.assertIs(stream, proc.stdout)
+                self_test.assertEqual(event, core.selectors.EVENT_READ)
+            def select(self, timeout):
+                self_test.assertGreater(timeout, 0)
+                if hold_pipe:
+                    now[0] += timeout
+                    return []
+                advance('select')
+                return [True]
+        self_test = self
+        with ExitStack() as stack:
+            for target, name, value in ((core.subprocess, 'Popen', popen),
+                                        (core.selectors, 'DefaultSelector', Selector),
+                                        (core.os, 'read', lambda *_: chunks.pop(0)),
+                                        (core.os, 'waitid', waitid), (core.os, 'killpg', killpg),
+                                        (core.time, 'monotonic', tick),
+                                        (core.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds)),
+                                        (core.owned_process, 'monotonic', tick),
+                                        (core.owned_process, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))):
+                stack.enter_context(patch.object(target, name, value))
+            yield events, lambda end=8: DIAGNOSTIC_RUN([core.JOURNALCTL, '--fixed-fixture'], end, 100)
+
+    def test_diagnostic_runner_anchors_leader_until_kill_then_sole_reap_and_esrch(self):
+        with self.diagnostic_fixture() as (events, run):
+            status, raw, truncated, cleanup = run()
+        self.assertEqual((status, truncated, cleanup, len(raw)), ('truncated', True, 'confirmed', 100))
+        self.assertTrue(raw.endswith(b'TAIL'))
+        reap = events.index(('reap',))
+        self.assertIn(('signal', signal.SIGKILL), events[:reap])
+        self.assertEqual(events[reap + 1:], [('signal', 0), ('pipe-close',)])
+        self.assertEqual(events.count(('reap',)), 1)
+
+    def test_diagnostic_runner_requires_positive_reap_and_group_absence(self):
+        for changes, expected in ((dict(code=3), ('unavailable', 'confirmed')),
+                                  (dict(hold_pipe=True), ('unavailable', 'confirmed')),
+                                  (dict(persistent=True), ('truncated', 'uncertain')),
+                                  (dict(wait_timeout=True), ('truncated', 'uncertain')),
+                                  (dict(signal_error=ProcessLookupError()), ('truncated', 'uncertain')),
+                                  (dict(signal_error=PermissionError()), ('truncated', 'uncertain'))):
+            with self.subTest(changes=changes), self.diagnostic_fixture(**changes) as (_, run):
+                result = run()
+                self.assertEqual((result[0], result[3]), expected)
+
+    def test_diagnostic_runner_refuses_signals_after_ownership_loss(self):
+        for ownership in ('lost', 'foreign'):
+            with self.subTest(ownership=ownership), self.diagnostic_fixture(ownership=ownership) as (events, run):
+                self.assertEqual(run()[3], 'uncertain')
+                self.assertFalse(any(event[0] == 'signal' for event in events))
+
+    def test_diagnostic_runner_never_renews_budget_and_late_steps_are_uncertain(self):
+        for point in ('spawn', 'select', 'signal', 'reap', 'probe', 'pipe-close'):
+            with self.subTest(point=point), self.diagnostic_fixture(late={point: 9}) as (events, run):
+                self.assertEqual(run(), ('unavailable', b'', point not in ('spawn', 'select'), 'uncertain'))
+                if point == 'spawn':
+                    self.assertEqual(events, [('spawn',), ('pipe-close',)])
+                if point == 'signal':
+                    self.assertNotIn(('reap',), events)
+        with self.diagnostic_fixture(spawn_error=True, late={'spawn': 9}) as (_, run):
+            self.assertEqual(run()[3], 'uncertain')
+        with self.diagnostic_fixture() as (events, run):
+            self.assertEqual(run(end=.5), ('unavailable', b'', False, 'confirmed'))
+            self.assertEqual(events, [])
+
+    def test_capture_fully_skips_after_original_work_deadline(self):
+        self.prepared()
+        with patch.object(core, 'state', side_effect=AssertionError('no read after cutoff')), \
+             patch.object(core, 'write_first_failure', side_effect=AssertionError('no write after cutoff')):
+            core.capture_first_failure('fresh', None, core.Failure(), time.monotonic() - 1)
+        self.assertEqual(self.diagnostics, [])
 
     def test_public_start_preserves_int_and_term_over_cleanup_failure(self):
         self.prepared()
