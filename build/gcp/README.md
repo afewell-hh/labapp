@@ -1442,6 +1442,67 @@ fields; core.prepare retains semantic authority and exact byte preservation.
 No original secret is reconstructed and no development credential is selected.
 Private keys/password/FAB/diagnostics stay out of stdout and public artifacts.
 
+Owned process cleanup is one shared primitive, `owned_process.OwnedGroup`, used
+by `command()` and every `Master` start/check/close path. The exact returned
+`Popen` leader (`start_new_session=True`) stays an unreaped child, so its numeric
+group ID cannot be reused, until every destructive group signal is sent; leader
+status is only a non-reaping `waitid(WNOWAIT)` observation (never `poll()`, never
+written to `returncode`) and the one final `Popen.wait` is the sole reaper. This
+requires the separately trusted launch to establish normal child-wait semantics
+(no `SIGCHLD` ignore/`SA_NOCLDWAIT`, custom reaper or foreign waiter; WNOWAIT
+alone cannot exclude one). ECHILD or any ownership loss refuses further signals and
+reports uncertainty. `Master.close` sends TERM, waits the fixed 5s grace, then KILLs
+the SAME group even if the SSH leader already exited (leader exit never proves the
+proxy group is gone, and a zombie leader keeps signal0 answering), then shares one
+3s budget for the reap and positive group ESRCH, clipped to the original trial
+cleanup deadline. After the reap only signal0 probes
+run; a still-present (possibly reused) group, EPERM, other errors or a deadline are
+uncertainty, never a destructive retry. Repeated close returns the stored outcome.
+`command()` keeps its immediate KILL (no TERM delay); its `seconds` is the TOTAL cap:
+`min(3s, seconds/2)` is reserved for KILL, reap, ESRCH convergence and pipe closure.
+One absolute finish is captured before spawn and clipped to any supplied shared
+end; neither setup, signal handling nor exception cleanup renews it. Pipe I/O is
+unbuffered and nonblocking, input is at most 4096 bytes, partial/would-block writes
+use the same work deadline, and close performs no buffered input flush. Exhaustion
+before/after reap, probe (including late ESRCH) or final pipe close is uncertainty.
+Python cannot preempt OS spawn/scheduling/close delays; an overrun fails rather
+than becoming a claim of a hard real-time bound. Spawn/wrapper handoff failures
+close available pipes but never signal an unproven PID; missing wrapper after a
+spawn attempt is always uncertain. The primary result (including annotated
+KeyboardInterrupt/130, nonzero guest code and 124 timeout) is preserved. A heartbeat remote
+has one monotonic 22s budget for both control checks (5s each), transport (8s) and
+all nested cleanup, preserving the 25s join and 30s guest heartbeat-loss bound
+(5+8+5=18<=22; 22+3=25<30). These are total caps: check work has at most 2.5s,
+transport work at most 5s, with cleanup inside each cap. The original shared end
+also covers the checks and all pipe cleanup, and phase/trial ends can only shorten
+it. Sticky uncertainty from worker, KeyboardInterrupt or containment cleanup
+withholds file deletion and the removed access receipt even when `Master.close`
+later succeeds. A still-live heartbeat forbids any further containment channel.
+Escaped sessions and unknown IAP/OpenSSH shutdown timing are outside this boundary.
+`process_group_fixture.py` is a SOURCE-ONLY disposable local kernel fixture for the
+primitive (leader-first exit, TERM-ignoring child, unrelated sentinel); it is not run
+by CI and needs separate lead authorization. Before running, root must independently
+qualify an outer OS boundary covering all descendants/new sessions and verify its
+original cgroup empty afterwards; a shell timeout is insufficient. No such wrapper
+is supplied or qualified by this source. Failed own cleanup remains FAIL even if
+outer containment disposes it. Root must freeze the exact launcher/runtime/source
+hashes and authority guard before source import, pin absolute CPython 3.12.16 with
+`-I -S -B`, env-i/unusable PATH/umask077, private 0700 empty HOME/TMP/output, explicit
+`--runtime`, `--outer-boundary` (identity claim only), and `--nproc` chosen for its
+isolated identity. Bounds are wall 90s including cleanup reserve 15s, CPU 30s,
+AS 1GiB, NOFILE 64, CORE 0, FSIZE 1MiB and the explicit NPROC limit. No native execution command is
+authorized here. The fixture-only prctl subreaper adapter needs separate review.
+Pipe REGISTER/ACK establishes exact fork provenance before normal leader exit;
+the reaper waits only registered children, treats ECHILD as pending, and requires
+positive exact-PID wait returns, no thread errors and a completed registry after
+join. PASS also requires every leader/sentinel closure/reap/ESRCH, closed pipes,
+unchanged source/runtime hashes, fixed child-code hashes and no extra output files.
+All partial setup/readiness/closure/signal/timeout failures remain FAIL. The exact
+registered-group signal ledger checks the untouched live sentinel until deliberate
+cleanup; it is instrumentation, not a syscall audit or sandbox. Fresh exec children
+rely on their hashed fixed code, not inherited Python hooks. Mocks/this fixture
+cannot prove live IAP behavior, native PID reuse or arbitrary escaped descendants.
+
 Finally the owner closes/reaps its original master/IAP group, positively removes
 the fixed private table, and obtains exact own-key absence evidence. Unresolved
 local process/file cleanup withholds the removed access receipt, so the ledger
