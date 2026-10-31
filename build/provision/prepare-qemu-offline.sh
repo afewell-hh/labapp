@@ -38,9 +38,14 @@ finish() {
   trap - EXIT
   cleanup || { if ((result == 0)); then result=1; fi; }
   if ((result && output_owned)); then
-    rm -rf -- "$output" || echo 'QEMU acquisition: owned output cleanup failed' >&2
+    rm -rf -- "$output" || { echo 'QEMU acquisition: owned output cleanup failed' >&2 || :; }
+    if [[ -e "$output" || -L "$output" ]]; then
+      echo 'QEMU acquisition: owned output still present' >&2 || :
+    else
+      echo 'QEMU acquisition: owned output absent' >&2 || :
+    fi
   fi
-  if ((result)); then echo 'QEMU acquisition failed; output is not trusted' >&2; fi
+  if ((result)); then echo 'QEMU acquisition failed; output is not trusted' >&2 || :; fi
   exit "$result"
 }
 trap finish EXIT

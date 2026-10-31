@@ -1,0 +1,37 @@
+---
+name: qemu baseline-20260114 offline proof
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-baseline-offline-proof
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    if: >-
+      github.repository_id == '1089062808' &&
+      github.repository_owner_id == '193945001' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record public source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          git show -s --format='Source commit %H tree %T' HEAD
+          printf 'Runner image %s %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+      - name: One bounded baseline capture, acquisition, install and rerun
+        shell: bash
+        run: timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh --selection baseline-20260114
