@@ -171,6 +171,8 @@ def identity(path, hashed=False, deadline=None, limit=TREE_BYTES):
     require(stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode), 'critical type refused')
     record = {'dev': before.st_dev, 'ino': before.st_ino, 'mode': before.st_mode,
               'uid': before.st_uid, 'gid': before.st_gid}
+    if stat.S_ISREG(before.st_mode):
+        record['links'] = before.st_nlink
     if hashed:
         require(stat.S_ISREG(before.st_mode) and before.st_size <= limit, 'hash input refused')
         h = hashlib.sha256()
@@ -260,7 +262,8 @@ def retain_failure_output(raw):
     if target.exists() or target.is_symlink():
         before = target.lstat()
         require(stat.S_ISREG(before.st_mode) and before.st_uid == ROOT_UID
-                and stat.S_IMODE(before.st_mode) == 0o600, 'diagnostic path refused')
+                and stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1,
+                'diagnostic path refused')
     flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
     if before is None:
         flags |= os.O_EXCL
@@ -373,7 +376,8 @@ def locked():
             and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'state root refused')
     fd = os.open(ROOT / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        require(stat.S_ISREG(os.fstat(fd).st_mode) and os.fstat(fd).st_uid == ROOT_UID,
+        require(stat.S_ISREG(os.fstat(fd).st_mode) and os.fstat(fd).st_uid == ROOT_UID
+                and stat.S_IMODE(os.fstat(fd).st_mode) == 0o600 and os.fstat(fd).st_nlink == 1,
                 'lock identity refused')
         # No unbounded flock wait. Competing operation must return a refusal.
         try:
@@ -400,7 +404,8 @@ def source_snapshot(directory):
     records = {name: identity(directory / name, True, limit=STATIC_LIMIT)
                for name in ('vlab_core.py', 'ensure-bridge-ipv4.py',
                             'journald@labapp-vlab.conf', *UNIT.values())}
-    require(all(r['uid'] == ROOT_UID and stat.S_IMODE(r['mode']) == 0o644 for r in records.values()),
+    require(all(r['uid'] == ROOT_UID and stat.S_IMODE(r['mode']) == 0o644
+                and r['links'] == 1 for r in records.values()),
             'component ownership refused')
     return records
 
@@ -409,7 +414,13 @@ def verify_sources(value):
     require(source_snapshot(LIB) == value['source'], 'installed component changed')
     for name in UNIT.values():
         require(read(UNITS / name) == read(LIB / name), 'installed unit changed')
+        record = identity(UNITS / name)
+        require(record['uid'] == ROOT_UID and stat.S_IMODE(record['mode']) == 0o644
+                and record['links'] == 1, 'installed unit ownership refused')
     require(read(JOURNAL) == read(LIB / JOURNAL.name), 'journal configuration changed')
+    record = identity(JOURNAL)
+    require(record['uid'] == ROOT_UID and stat.S_IMODE(record['mode']) == 0o644
+            and record['links'] == 1, 'journal configuration ownership refused')
     for directory in JOURNAL_DROPINS:
         require(not directory.exists() or not list(directory.iterdir()), 'journal overrides refused')
 
@@ -596,6 +607,7 @@ def prepare(input_path):
     yaml_documents(wiring)
     receipt = json_data(receipt_raw)
     tools = verify_prerequisites(receipt, deadline)
+    cache_preflight()
     no_links(WORK)
     require(not WORK.exists() and not ROOT.exists(), 'existing state refused')
     ROOT.mkdir(mode=0o700)
@@ -661,6 +673,7 @@ def prepare(input_path):
                     and yaml_documents(read(WORK / '.registry.yaml')) ==
                     [{'repo': 'ghcr.io', 'prefix': 'githedgehog'}], 'import preservation refused')
         value['static'] = prepared_snapshot(deadline)
+        fresh_preflight(value)
         execute([SYSTEMCTL, 'daemon-reload'], deadline, 10)
         for mode in UNIT:
             require(system_show(mode, deadline)['ActiveState'] in ('inactive', 'failed'),
@@ -680,7 +693,7 @@ def prepare(input_path):
 
 def prepared_snapshot(deadline):
     paths = ('fab.yaml', '.registry.yaml', 'fab-input.yaml', 'wiring-input.yaml',
-             'include', 'include/wiring-input.yaml')
+             'include', 'include/wiring-input.yaml', 'result')
     require({p.name for p in (WORK / 'include').iterdir()} == {'wiring-input.yaml'},
             'unexpected include entries')
     return {name: identity(WORK / name, not (WORK / name).is_dir(), deadline,
@@ -692,6 +705,46 @@ def verify_contract(value, deadline):
     require(prepared_snapshot(deadline) == value['static'], 'static inputs changed')
     verify_sources(value)
     require(verify_prerequisites(value['packages'], deadline) == value['tools'], 'tools changed')
+    cache_preflight()
+
+
+def cache_preflight():
+    no_links(CACHE)
+    for directory in (CACHE.parent, CACHE):
+        if directory.exists():
+            observed = directory.lstat()
+            require(stat.S_ISDIR(observed.st_mode) and observed.st_uid == ubuntu().pw_uid
+                    and not observed.st_mode & 0o022, 'cache directory refused')
+
+
+def fresh_preflight(value):
+    require(identity(WORK / 'result') == value['static']['result'], 'fresh result identity differs')
+    require({p.name for p in WORK.iterdir()} == {'fab.yaml', '.registry.yaml', 'fab-input.yaml',
+            'wiring-input.yaml', 'include', 'result'} and not list((WORK / 'result').iterdir()),
+            'fresh state adoption refused')
+
+
+def optional_runtime_paths():
+    """Mutable outputs may be recreated, but cannot redirect privileged writes."""
+    user = ubuntu().pw_uid
+    for name, private in (('kubeconfig', True), ('sshkey.pub', False)):
+        path = WORK / 'vlab' / name
+        if path.exists() or path.is_symlink():
+            observed = no_links(path).lstat()
+            require(stat.S_ISREG(observed.st_mode) and observed.st_uid == user
+                    and observed.st_nlink == 1 and not observed.st_mode & (0o077 if private else 0o022),
+                    'generated runtime file refused')
+    for name in VMS:
+        directory = WORK / 'vlab/vms' / name
+        for filename in ('serial.log', 'serial.sock', 'mon.sock', 'qmp.sock'):
+            path = directory / filename
+            if path.exists() or path.is_symlink():
+                observed = no_links(path).lstat()
+                valid_type = stat.S_ISREG(observed.st_mode) if filename == 'serial.log' else stat.S_ISSOCK(observed.st_mode)
+                require(valid_type and observed.st_uid in (ROOT_UID, user)
+                        and not observed.st_mode & 0o022
+                        and (filename != 'serial.log' or observed.st_nlink == 1),
+                        'mutable runtime path refused')
 
 
 def up_argv():
@@ -733,6 +786,7 @@ def vm_config():
 def critical_snapshot(deadline):
     """Complete no-rebuild inputs; mutable disk bytes/size/times are intentionally omitted."""
     vm_config()
+    optional_runtime_paths()
     require({p.name for p in WORK.iterdir()} == {'fab.yaml', '.registry.yaml', 'fab-input.yaml',
             'wiring-input.yaml', 'include', 'result', 'vlab'}, 'unexpected work entries')
     require({p.name for p in (WORK / 'vlab').iterdir()} <=
@@ -782,6 +836,7 @@ def critical_snapshot(deadline):
     result = {name: identity(WORK / name, hashed, deadline) for name, hashed in sorted(paths.items())}
     require(all(record['uid'] == ubuntu().pw_uid and not record['mode'] & 0o022
                 for record in result.values()), 'critical ownership refused')
+    require(all(record.get('links', 1) == 1 for record in result.values()), 'critical hardlink refused')
     require(sum(record.get('size', 0) for record in result.values()) <= TREE_BYTES,
             'critical hash bytes overflow')
     return result
@@ -826,6 +881,8 @@ def reserve(mode, deadline=None):
     verify_contract(value, end)
     if mode == 'resume':
         require(critical_snapshot(end) == value['critical'], 'resume critical state changed')
+    else:
+        fresh_preflight(value)
     with locked():
         require(state() == value, 'competing operation changed state')
         started = end - START_SECONDS[mode]
@@ -872,6 +929,8 @@ def unit_gate(mode):
     verify_contract(value, deadline)
     if mode == 'resume':
         require(critical_snapshot(deadline) == value['critical'], 'resume critical state changed')
+    else:
+        fresh_preflight(value)
     execute(['/usr/sbin/modprobe', 'br_netfilter'], deadline, 5)
     execute(['/usr/sbin/sysctl', '-w', *[f'net.bridge.{key}=0' for key in NETFILTER]], deadline, 5)
     verify_netfilter()
@@ -892,6 +951,8 @@ def unit_run(mode):
     if mode == 'resume':
         require(critical_snapshot(deadline) == value['critical'], 'resume critical state changed')
         verify_readonly_mounts()
+    else:
+        fresh_preflight(value)
     with locked():
         require(state() == value, 'run operation changed')
     user = ubuntu()

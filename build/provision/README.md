@@ -1194,6 +1194,10 @@ Prepare reserves an absent `/home/ubuntu/hhfab`, imports without `--dev`/force,
 validates twice and requires exact FAB/wiring/registry preservation. Failed
 preparation retains owned state for diagnosis and cannot retry/reset/adopt it.
 Fresh startup is one-shot. It runs the pinned `hhfab vlab up` foreground as ubuntu
+only while the sealed result directory is the same owned empty directory,
+the prepared work entries match exactly and VLAB state is absent. These checks
+run at reservation, gate and immediately before exec; preexisting state is never
+adopted, repaired or deleted during fresh startup. It runs
 with fixed ISO/restriction/sizing flags, no automatic upgrade, kill-stale, setup
 VPCs or retry. Recovered sizes are control 6 CPUs/6144 MB/100 GB,
 switch 4 CPUs/5120 MB/50 GB and server 2 CPUs/768 MB/10 GB, with exactly one
@@ -1241,7 +1245,14 @@ and enable resume. The manifest covers exact static inputs/tools/units, cached
 result tree/hash/ISO, config/SSH key and all 18 OS/EFI artifacts, plus cluster UID
 and CA identity. Mutable OS and EFI-vars preserve device/inode/type/owner/mode;
 ordinary disk writes, sizes and timestamps may change. Missing/replaced/changed
-critical files fail before up. Result/static inputs are read-only in the actual
+critical files fail before up. Critical regular files must have one link.
+Optional recreated logs and
+sockets still require no-symlink/type/owner/write-permission checks; root-written
+serial logs and private diagnostics also reject hardlinks. Generated kubeconfig
+and SSH public-key paths may refresh but cannot be redirected through links.
+The fixed cache and its .cache parent reject links, wrong owners and group/world
+write permission; absent cache paths are allowed, without a recursive cache census.
+Result/static inputs are read-only in the actual
 resume run namespace; if upstream wants a rebuild, the kernel denies it. This
 is not proven by fakes and excludes hostile root/remount/concurrent mutation.
 Generated kubeconfig may refresh; CA and cluster identity must persist.

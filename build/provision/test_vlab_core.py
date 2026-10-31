@@ -89,6 +89,7 @@ class GuestFixture(unittest.TestCase):
         self.stack.enter_context(patch('sys.stdout', self.stdout))
         self.stack.enter_context(patch('sys.stderr', self.stderr))
         self.calls = []
+        self.execs = []
         self.phase = {'fresh': 'inactive', 'resume': 'inactive'}
         self.invocation = {'fresh': '', 'resume': ''}
         self.failure = None
@@ -218,8 +219,6 @@ class GuestFixture(unittest.TestCase):
                 self.invocation[mode] = os.environ['INVOCATION_ID']
                 try:
                     core.unit_gate(mode)
-                    if mode == 'fresh':
-                        self.runtime_files()
                     with patch.object(core.os, 'initgroups') as groups, \
                          patch.object(core.os, 'setgid') as gid, patch.object(core.os, 'setuid') as uid, \
                          patch.object(core.os, 'getuid', return_value=self.user.pw_uid), \
@@ -232,6 +231,9 @@ class GuestFixture(unittest.TestCase):
                         gid.assert_called_once_with(self.user.pw_gid)
                         uid.assert_called_once_with(self.user.pw_uid)
                         replace.assert_called_once_with(core.HHFAB, core.up_argv(), core.SAFE_ENV)
+                        self.execs.append(core.up_argv())
+                    if mode == 'fresh':
+                        self.runtime_files()
                     core.unit_ready(mode)
                     self.phase[mode] = 'active'
                 except BaseException:
@@ -309,6 +311,88 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
         self.assertFalse(core.ROOT.exists())
         self.assertFalse(self.calls)
+
+    def test_fresh_refuses_existing_vlab_or_populated_result_before_up(self):
+        self.prepared()
+        for directory in (core.WORK / 'vlab', core.WORK / 'result'):
+            created = not directory.exists()
+            if created:
+                directory.mkdir(mode=0o700)
+            target = directory / 'foreign'
+            target.write_bytes(b'preserve foreign data')
+            self.assertEqual(self.call('start-fresh'), 1)
+            self.assertFalse(self.execs)
+            self.assertEqual(target.read_bytes(), b'preserve foreign data')
+            target.unlink()
+            if created:
+                directory.rmdir()
+        self.assertEqual(core.state()['phase'], 'prepared')
+
+    def test_fresh_refuses_replaced_empty_result_directory(self):
+        self.prepared()
+        (core.WORK / 'result').rename(self.base / 'retained-result')
+        (core.WORK / 'result').mkdir(mode=0o700)
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse(self.execs)
+        self.assertTrue((self.base / 'retained-result').is_dir())
+
+    def test_fresh_gate_and_run_recheck_before_exec_without_adoption(self):
+        self.prepared()
+        actual_run = core.unit_run
+        def altered_run(mode):
+            target = core.WORK / 'result/foreign'
+            target.write_bytes(b'preserve foreign data')
+            return actual_run(mode)
+        with patch.object(core, 'unit_run', side_effect=altered_run):
+            self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse(self.execs)
+        self.assertEqual((core.WORK / 'result/foreign').read_bytes(), b'preserve foreign data')
+
+    def test_fresh_gate_refuses_state_created_after_reservation(self):
+        self.prepared()
+        actual = self.command
+        def altered_gate(argv, *args, **kwargs):
+            if argv[:3] == [core.SYSTEMCTL, 'start', core.UNIT['fresh']]:
+                (core.WORK / 'vlab').mkdir(mode=0o700)
+            return actual(argv, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=altered_gate):
+            self.assertEqual(self.call('start-fresh'), 1)
+        self.assertFalse(self.execs)
+        self.assertTrue((core.WORK / 'vlab').is_dir())
+
+    def test_cache_preexisting_symlink_nondirectory_and_writable_directory_refused(self):
+        foreign = self.base / 'foreign-cache'
+        foreign.mkdir()
+        core.CACHE.symlink_to(foreign)
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        core.CACHE.unlink()
+        core.CACHE.write_text('foreign')
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        core.CACHE.unlink()
+        core.CACHE.mkdir(mode=0o700)
+        core.CACHE.chmod(0o777)
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        self.assertFalse(core.ROOT.exists())
+
+    def test_cache_symlink_ancestor_and_wrong_owner_refused(self):
+        foreign = self.base / 'foreign-cache'
+        foreign.mkdir()
+        ancestor = self.base / 'cache-link'
+        ancestor.symlink_to(foreign)
+        with patch.object(core, 'CACHE', ancestor / 'cache'):
+            self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        core.CACHE.mkdir(mode=0o700)
+        original = Path.lstat
+        def different_owner(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            if path == core.CACHE:
+                fields = list(value)
+                fields[4] = self.user.pw_uid + 1
+                return os.stat_result(fields)
+            return value
+        with patch.object(Path, 'lstat', autospec=True, side_effect=different_owner):
+            self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        self.assertFalse(core.ROOT.exists())
 
     def test_failed_import_is_terminal_and_retained(self):
         self.failure = lambda args: args[:2] == [core.HHFAB, 'init']
@@ -607,6 +691,100 @@ class GuestFixture(unittest.TestCase):
         key.symlink_to(key.with_name('saved-key'))
         self.assertEqual(self.call('start-resume'), 1)
 
+    def test_optional_mutable_and_generated_symlinks_refused_before_up(self):
+        self.resumable()
+        foreign = self.base / 'foreign-output'
+        foreign.write_bytes(b'foreign data')
+        for relative in ('vlab/vms/server-01/serial.log', 'vlab/vms/server-01/serial.sock',
+                         'vlab/vms/server-01/mon.sock', 'vlab/vms/server-01/qmp.sock',
+                         'vlab/kubeconfig', 'vlab/sshkey.pub'):
+            target = core.WORK / relative
+            retained = self.base / 'retained-output'
+            existed = target.exists()
+            if existed:
+                target.rename(retained)
+            target.symlink_to(foreign)
+            before = len(self.execs)
+            self.assertEqual(self.call('start-resume'), 1)
+            self.assertEqual(len(self.execs), before)
+            self.assertEqual(foreign.read_bytes(), b'foreign data')
+            target.unlink()
+            if existed:
+                retained.rename(target)
+
+    def test_optional_log_and_mutable_disk_hardlinks_refused_before_up(self):
+        self.resumable()
+        foreign = self.base / 'foreign-log'
+        foreign.write_bytes(b'preserve external data')
+        log = core.WORK / 'vlab/vms/server-01/serial.log'
+        os.link(foreign, log)
+        before = len(self.execs)
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(len(self.execs), before)
+        self.assertEqual(foreign.read_bytes(), b'preserve external data')
+        log.unlink()
+        os.link(core.WORK / 'vlab/vms/server-01/os.img', self.base / 'external-disk-alias')
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(len(self.execs), before)
+
+    def test_optional_runtime_wrong_type_owner_and_write_permissions_refused(self):
+        self.resumable()
+        log = core.WORK / 'vlab/vms/server-01/serial.log'
+        log.mkdir()
+        self.assertEqual(self.call('start-resume'), 1)
+        log.rmdir()
+        log.write_text('mutable public log')
+        log.chmod(0o666)
+        self.assertEqual(self.call('start-resume'), 1)
+        log.chmod(0o600)
+        original = Path.lstat
+        def different_owner(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            if path == log:
+                fields = list(value)
+                fields[4] = self.user.pw_uid + 1
+                return os.stat_result(fields)
+            return value
+        with patch.object(Path, 'lstat', autospec=True, side_effect=different_owner):
+            self.assertEqual(self.call('start-resume'), 1)
+        log.unlink()
+        socket_path = core.WORK / 'vlab/vms/server-01/mon.sock'
+        socket_path.write_bytes(b'not a socket')
+        socket_path.chmod(0o600)
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_optional_owned_log_and_recreated_socket_observations_are_allowed(self):
+        self.resumable()
+        log = core.WORK / 'vlab/vms/server-01/serial.log'
+        log.write_text('public mutable log')
+        log.chmod(0o600)
+        socket_path = core.WORK / 'vlab/vms/server-01/mon.sock'
+        socket_path.write_bytes(b'public synthetic socket observation')
+        socket_path.chmod(0o600)
+        original = Path.lstat
+        def socket_observation(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            if path == socket_path:
+                fields = list(value)
+                fields[0] = stat.S_IFSOCK | 0o700
+                return os.stat_result(fields)
+            return value
+        with patch.object(Path, 'lstat', autospec=True, side_effect=socket_observation):
+            core.optional_runtime_paths()
+        socket_path.unlink()
+        self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+
+    def test_generated_kubeconfig_private_permissions_and_unit_modes_are_checked(self):
+        self.resumable()
+        (core.WORK / 'vlab/kubeconfig').chmod(0o644)
+        self.assertEqual(self.call('start-resume'), 1)
+        (core.WORK / 'vlab/kubeconfig').chmod(0o600)
+        (core.UNITS / core.UNIT['resume']).chmod(0o666)
+        self.assertEqual(self.call('start-resume'), 1)
+        (core.UNITS / core.UNIT['resume']).chmod(0o644)
+        core.JOURNAL.chmod(0o666)
+        self.assertEqual(self.call('start-resume'), 1)
+
     def test_changed_cached_input_hash_refused(self):
         self.resumable()
         target = core.WORK / ('result/' + core.RESULT + '.inhash')
@@ -832,6 +1010,19 @@ class FormatAndSourceTests(unittest.TestCase):
         self.assertIn('private diagnostics unverified', errors.getvalue())
         self.assertEqual(foreign.read_bytes(), b'public foreign data')
         self.assertTrue((core.ROOT / 'last-command-output').is_symlink())
+
+    def test_private_diagnostic_hardlink_cannot_redirect_a_truncate(self):
+        core.ROOT.mkdir(mode=0o700)
+        foreign = Path(self.temp.name) / 'foreign'
+        foreign.write_bytes(b'preserve foreign data')
+        foreign.chmod(0o600)
+        os.link(foreign, core.ROOT / 'last-command-output')
+        with patch.object(core, 'ROOT_UID', os.getuid()), patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(core.Failure) as raised:
+                core.execute([sys.executable, '-I', '-B', '-c', 'raise SystemExit(19)'],
+                             core.time.monotonic() + 3)
+        self.assertEqual(raised.exception.code, 19)
+        self.assertEqual(foreign.read_bytes(), b'preserve foreign data')
 
     def test_read_and_hash_allow_access_time_updates(self):
         with tempfile.TemporaryDirectory() as directory:
