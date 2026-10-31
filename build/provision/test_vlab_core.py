@@ -823,9 +823,11 @@ class GuestFixture(unittest.TestCase):
         path.symlink_to(self.fab_path)
         self.assertEqual(core.last_failure_context(), ('unavailable', b''))
 
-    def test_manager_primary_output_is_taken_directly_and_no_invocation_means_no_journal(self):
+    def test_manager_primary_output_survives_without_adopting_stale_unbound_manager_evidence(self):
         self.prepared()
         actual = self.command
+        self.diag = lambda argv: ('ok', b'InvocationID=' + b'e' * 32 +
+                                  b'\nExecMainStatus=29\nResult=' + SENTINEL.encode(), False, 'confirmed')
         def wrapped(argv, *args, **kwargs):
             if argv[:2] == [core.SYSTEMCTL, 'start']:
                 raise core.Failure('child command failed', 1, b'Job for unit failed\n' + SENTINEL.encode())
@@ -833,10 +835,12 @@ class GuestFixture(unittest.TestCase):
         with patch.object(core, 'execute', side_effect=wrapped):
             self.assertEqual(self.call('start-fresh'), 1)
         bundle = self.bundle()
+        self.assertIsNotNone(bundle['operation'])  # reservation committed, but no proven invocation
         self.assertEqual((bundle['stage'], bundle['invocation'], bundle['journal']['status'],
                           bundle['primary']['status']), ('manager', None, 'unavailable', 'ok'))
         self.assertEqual(self.raw_section('primary'), b'Job for unit failed\n' + SENTINEL.encode())
-        self.assertEqual([d[0][0] for d in self.diagnostics], [core.SYSTEMCTL])  # no journalctl, no history
+        self.assertEqual(bundle['manager'], {'status': 'unavailable', 'output': ''})
+        self.assertEqual(self.diagnostics, [])  # neither stale manager nor journal history is queried
         self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
 
     def test_reservation_refusal_cannot_capture_an_older_operation(self):
@@ -927,7 +931,7 @@ class GuestFixture(unittest.TestCase):
         raw = (core.ROOT / core.FIRST_FAILURE).read_bytes()
         self.assertLessEqual(len(raw), core.FIRST_FAILURE_LIMIT)
         bundle = json.loads(raw)
-        self.assertEqual((bundle['primary']['status'], bundle['manager']['status']), ('truncated', 'truncated'))
+        self.assertEqual((bundle['primary']['status'], bundle['manager']['status']), ('truncated', 'unavailable'))
         for name, cap in core.FAILURE_CAPS.items():
             self.assertLessEqual(len(base64.b64decode(bundle[name]['output'], validate=True)), cap)
 

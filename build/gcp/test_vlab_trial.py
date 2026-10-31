@@ -1488,6 +1488,9 @@ class GuestDiagnostics(unittest.TestCase):
             'envelope invocation differs': self.export_bytes(invocation='9' * 32),
             'null bundle invocation conflicts': self.export_bytes(self.failure_bundle(invocation=None)),
             'null envelope invocation conflicts': self.export_bytes(invocation=None),
+            'stale manager with matching null invocation': self.export_bytes(
+                self.failure_bundle(invocation=None, stage='manager',
+                                    journal={'status': 'unavailable', 'output': ''}), invocation=None),
             'bundle nonce': self.export_bytes(self.failure_bundle(nonce=other)),
             'bundle boot': self.export_bytes(self.failure_bundle(boot='3' * 8 + self.boot_uuid[8:])),
             'bundle mode': self.export_bytes(self.failure_bundle(mode='resume')),

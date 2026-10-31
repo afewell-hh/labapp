@@ -148,6 +148,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Verify shared owned-process deployment bytes
+        run: cmp build/gcp/owned_process.py build/provision/owned_process.py
       - name: Run required lifecycle tests
         run: |
           test -f build/gcp/lifecycle/test_lifecycle.py
@@ -269,6 +271,8 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
+      - name: Verify shared owned-process deployment bytes
+        run: cmp build/gcp/owned_process.py build/provision/owned_process.py
       - name: Install distribution fixture-parser dependency
         run: |
           sudo apt-get update

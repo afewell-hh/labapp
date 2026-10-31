@@ -566,7 +566,7 @@ def capture_first_failure(mode, value, primary, deadline):
              'manager': ('unavailable', b''), 'journal': ('unavailable', b'')}
     cleanup = 'confirmed'
     unit = UNIT[mode]
-    if operation is not None:
+    if invocation is not None:
         status, raw, _, result = diagnostic_run(
             [SYSTEMCTL, 'show', unit, '--no-pager', '--property=' + MANAGER_PROPERTIES],
             min(end, time.monotonic() + MANAGER_SECONDS), FAILURE_CAPS['manager'])
@@ -576,9 +576,9 @@ def capture_first_failure(mode, value, primary, deadline):
             for line in raw.decode('ascii', 'replace').splitlines():
                 if line.startswith('InvocationID='):
                     reported = line[len('InvocationID='):]
-            if invocation is not None and reported == '':
+            if reported == '':
                 status, raw = 'unavailable', b''      # manager forgot the unit
-            elif invocation is not None and reported != invocation:
+            elif reported != invocation:
                 status, raw = 'invalid', b''          # different/absent identity: untrusted
         parts['manager'] = (status, raw)
     if invocation is not None and boot_id is not None:

@@ -1487,7 +1487,9 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   The outer `systemctl start` alone uses `retain=False` so its generic output
   cannot overwrite that context; its actual bytes still belong to `primary`.
   This does not identify the first inner failure, prove hhfab executed or grant
-  readiness/containment authority. `state` is a fixed token subset. `manager` is one
+  readiness/containment authority. `state` is a fixed token subset. Without a
+  proven frozen invocation, manager execution evidence stays `unavailable` with
+  empty output and no query, even if this call has a reserved operation. `manager` is one
   `systemctl show` of the fixed unit for `ActiveState,SubState,Result,InvocationID,
   ExecMainCode,ExecMainStatus,ExecMainPID` (at most 2 KiB, 2 s). A different
   `InvocationID` makes it `invalid` (output dropped); a forgotten unit makes it

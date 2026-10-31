@@ -1232,6 +1232,8 @@ class FirstFailureExport(unittest.TestCase):
                                      output=base64.b64encode(b'x' * 8193).decode())),
             'output with unavailable': dict(good, manager=dict(good['manager'], status='unavailable')),
             'journal without invocation': dict(good, invocation=None),
+            'stale manager without invocation': dict(good, invocation=None, stage='manager',
+                                                     journal={'status': 'unavailable', 'output': ''}),
             'control char message': dict(good, primary=dict(good['primary'], message='bad\nline')),
             'code out of range': dict(good, primary=dict(good['primary'], code=256)),
             'context label': dict(good, command_context=dict(good['command_context'], label='first inner failure')),

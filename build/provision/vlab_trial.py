@@ -568,7 +568,7 @@ def first_failure_bundle(raw):
         if name == 'command_context':
             require(section['label'] == FAILURE_CONTEXT)
     # Output can exist only for an exact bound identity.
-    require(value['manager']['status'] == 'unavailable' or value['operation'] is not None)
+    require(value['manager']['status'] == 'unavailable' or value['invocation'] is not None)
     require(value['command_context']['status'] == 'unavailable' or value['operation'] is not None)
     require(value['journal']['status'] in ('unavailable',) or value['invocation'] is not None)
     return value
