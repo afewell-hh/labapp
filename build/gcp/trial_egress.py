@@ -499,8 +499,9 @@ def cleanup(state, api):
         if nat_op is not None:
             terminal(api, nat_op, captured['id'], 'patch', nat_request)
         empty = api.router()
-        require(empty is not None and router_base(empty, pending) == captured
-                and not empty.get('nats'), 'NAT absence not confirmed')
+        require(empty is not None and router_base(empty, pending) == captured, 'router identity/config changed')
+        valid_nat(empty.get('nats', []))
+        require(not empty.get('nats'), 'NAT absence not confirmed')
         if delete_op is None:
             require(state.read('delete-attempt.json', optional=True) is None, 'router attempt outcome unresolved')
             require(api.router() == empty, 'router changed before delete')

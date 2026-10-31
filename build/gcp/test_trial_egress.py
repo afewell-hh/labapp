@@ -162,6 +162,28 @@ class Egress(unittest.TestCase):
                                  'nat-attempt.json', 'delete-attempt.json'):
                     self.assertIsNone(self.state.read(filename, optional=True))
 
+    def test_malformed_postpatch_nat_configuration_refuses_before_router_delete(self):
+        for malformed in (None, {}, '', False, 0):
+            with self.subTest(nats=malformed), tempfile.TemporaryDirectory(dir=self.directory) as directory:
+                Path(directory).chmod(0o700)
+                with e.State(directory) as state:
+                    state.write('intent.json', pending())
+                    state.write('router.json', router())
+                    state.write('create-operation.json', op())
+                    api = FakeAPI()
+                    remove = api.remove_nat
+                    def malformed_readback(request_id):
+                        result = remove(request_id)
+                        api.value['nats'] = malformed
+                        return result
+                    api.remove_nat = malformed_readback
+                    with self.assertRaises(e.Failure):
+                        e.cleanup(state, api)
+                    self.assertEqual(api.calls.count('PATCH'), 1)
+                    self.assertNotIn('DELETE', api.calls)
+                    self.assertIsNotNone(state.read('nat-operation.json'))
+                    self.assertIsNone(state.read('delete-attempt.json', optional=True))
+
     def test_pending_lost_capture_never_adopts_even_when_router404(self):
         self.state.write('intent.json', pending())
         for value in (router(), None):
