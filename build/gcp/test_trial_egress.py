@@ -161,6 +161,46 @@ class Egress(unittest.TestCase):
         self.assertEqual(self.state.read('initial-allocations.json')[0]['id'], '456')
         e.cleanup(self.state, api)
 
+    def test_observed_false_encrypted_interconnect_field_survives_capture_and_cleanup(self):
+        self.state.write('intent.json', pending())
+        self.state.write('create-operation.json', op())
+        api = FakeAPI(False)
+        api.value.update(encryptedInterconnectRouter=False,
+                         bgp={'asn': 64514, 'advertiseMode': 'DEFAULT', 'keepaliveInterval': 20})
+        e.capture(self.state, api)
+        self.assertEqual(self.state.read('router.json'), api.value)
+        self.assertIs(self.state.read('router.json')['encryptedInterconnectRouter'], False)
+        api.value['nats'] = router(True)['nats']
+        api.allocated = True
+        e.capture_nat(self.state, api)
+        result = e.cleanup(self.state, api)
+        self.assertTrue(result['router_absent'] and result['allocations_absent'])
+        self.assertEqual([c for c in api.calls if c in ('PATCH', 'DELETE')], ['PATCH', 'DELETE'])
+        self.assertIn('address', api.calls)
+        self.assertIs(self.state.read('router.json')['encryptedInterconnectRouter'], False)
+
+    def test_encrypted_interconnect_true_malformed_foreign_or_changed_field_refuses(self):
+        self.state.write('intent.json', pending())
+        self.state.write('create-operation.json', op())
+        changes = [{'encryptedInterconnectRouter': value} for value in
+                   (True, 0, 1, None, 'false', '', [], {})]
+        changes.append({'encryptedInterconnectRouter': False, 'foreignField': False})
+        for change in changes:
+            with self.subTest(phase='capture', change=change):
+                api = FakeAPI(False); api.value.update(change)
+                with self.assertRaises(e.Failure): e.capture(self.state, api)
+                self.assertIsNone(self.state.read('router.json', optional=True))
+                self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+        captured = FakeAPI(False)
+        captured.value['encryptedInterconnectRouter'] = False
+        e.capture(self.state, captured)
+        # Even omission on a later read differs from the actual captured shape.
+        for change in [*changes, {}]:
+            with self.subTest(phase='cleanup', change=change):
+                api = FakeAPI(False); api.value.update(change)
+                with self.assertRaises(e.Failure): e.cleanup(self.state, api)
+                self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+
     def test_changed_captured_nat_refuses(self):
         self.owned()
         api = FakeAPI()

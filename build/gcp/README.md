@@ -1166,7 +1166,12 @@ commands, in order, are:
    server creation time, description, exact network, no peers/interfaces/NAT,
    and persist `router.json` BEFORE creating the sole approved NAT. Optional
    router BGP defaults are limited to ASN64514, DEFAULT advertisement and
-   keepalive20; unexpected API fields/configuration fail closed for review.
+   keepalive20. The optional
+   [encryptedInterconnectRouter](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers)
+   field is accepted only as the boolean `false` and preserved in captured
+   evidence for exact reread comparison (Router v1 schema checked2026-10-31).
+   `true`, malformed values and unexpected API fields/configuration fail closed
+   for review; encrypted VLAN router support is not enabled.
 4. After separately approved NAT setup, `capture-nat` records its exact closed
    configuration and initial allocation identities. Partial NAT setup remains
    cleanable from the previously captured router identity even if this step

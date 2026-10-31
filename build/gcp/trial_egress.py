@@ -189,7 +189,9 @@ def intent(value):
 
 def router_base(router, pending):
     require(type(router) is dict and set(router) <= {'kind', 'id', 'creationTimestamp',
-            'name', 'description', 'region', 'network', 'selfLink', 'interfaces', 'bgpPeers', 'bgp', 'nats'})
+            'name', 'description', 'region', 'network', 'selfLink', 'interfaces', 'bgpPeers', 'bgp', 'nats',
+            'encryptedInterconnectRouter'})
+    require('encryptedInterconnectRouter' not in router or router['encryptedInterconnectRouter'] is False)
     identifier(router['id'])
     require(router.get('kind') == 'compute#router' and router.get('selfLink') == ROUTER
             and router.get('name') == ROUTER.rsplit('/', 1)[1]
