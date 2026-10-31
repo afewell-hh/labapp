@@ -895,21 +895,21 @@ class GuestFixture(unittest.TestCase):
                     self.assertIn('first-failure capture unverified', self.stderr.getvalue())
                 self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
 
-    def test_first_failure_wins_and_foreign_or_replaced_paths_are_not_written(self):
+    def test_first_failure_wins_and_later_reservation_refusal_cannot_overwrite_it(self):
         self.prepared()
-        prepared = core.state()
         with self.ready_failure():
             self.assertEqual(self.call('start-fresh'), 17)
         first = (core.ROOT / core.FIRST_FAILURE).read_bytes()
         self.assertEqual(self.call('start-fresh'), 1)  # later reservation refusal
         self.assertEqual((core.ROOT / core.FIRST_FAILURE).read_bytes(), first)
         self.assertFalse((core.ROOT / (core.FIRST_FAILURE + '.new')).exists())
+
+    def test_preplaced_first_failure_symlink_is_not_followed_or_overwritten(self):
+        self.prepared()
         # A pre-placed symlink (replacement) is neither followed nor overwritten.
-        (core.ROOT / core.FIRST_FAILURE).unlink()
         foreign = self.base / 'foreign'
         foreign.write_bytes(b'FOREIGN')
         (core.ROOT / core.FIRST_FAILURE).symlink_to(foreign)
-        core.save(prepared)
         self.diagnostics.clear()
         with self.ready_failure():
             self.assertEqual(self.call('start-fresh'), 17)
