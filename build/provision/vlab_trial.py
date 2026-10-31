@@ -785,10 +785,15 @@ def guest_devices():
 
 def strict_checks(core, clock, phase):
     end = time.monotonic() + clock.remaining(phase)
-    core.hhfab(['vlab', 'inspect-switches'], end, ['--strict=true', '--wait-applied-for', '30'], cap=600)
-    # Real fixed SSH operation, with no interactive shell or arbitrary command.
-    core.hhfab(['vlab', 'ssh'], end, ['-n', 'server-01', '--', 'true'], cap=30)
-    return core.api_ready(end)
+    try:
+        core.hhfab(['vlab', 'inspect-switches'], end, ['--strict=true', '--wait-applied-for', '30'], cap=600)
+        # Real fixed SSH operation, with no interactive shell or arbitrary command.
+        core.hhfab(['vlab', 'ssh'], end, ['-n', 'server-01', '--', 'true'], cap=30)
+        return core.api_ready(end)
+    except core.Failure as error:
+        failure = Failure('core strict check refused', error.code)
+        failure.cleanup_uncertain = bool(getattr(error, 'cleanup_uncertain', False))
+        raise failure from None
 
 
 class Nonce:
@@ -800,7 +805,12 @@ class Nonce:
         self.objects = []
 
     def call(self, args, phase):
-        return self.core.kubectl(args, time.monotonic() + self.clock.remaining(phase))
+        try:
+            return self.core.kubectl(args, time.monotonic() + self.clock.remaining(phase))
+        except self.core.Failure as error:
+            failure = Failure('nonce API operation refused', error.code)
+            failure.cleanup_uncertain = bool(getattr(error, 'cleanup_uncertain', False))
+            raise failure from None
 
     def current(self, resource, phase):
         raw = self.call(['get', resource, self.name, '-n', 'default', '--ignore-not-found', '-o', 'json'], phase)
@@ -833,20 +843,29 @@ class Nonce:
             os.chown(target, user.pw_uid, user.pw_gid)
             try:
                 result = data(self.call(['create', '-f', str(target), '-o', 'json'], 'strict'))
+                require(result['metadata']['name'] == self.name and result['metadata']['namespace'] == 'default'
+                        and result['kind'] == kind and result['apiVersion'] == doc['apiVersion']
+                        and type(result['metadata']['uid']) is str and result['metadata']['uid'])
+                if kind == 'VPC':
+                    observed = result['spec']
+                    require(observed.get('ipv4Namespace') == 'default' and observed.get('vlanNamespace') == 'default'
+                            and observed['subnets']['trial']['subnet'] == '10.0.254.0/24'
+                            and observed['subnets']['trial']['vlan'] == 2998, 'nonce admission changed fixed fields')
+                else:
+                    require(all(result['spec'].get(k) == v for k, v in spec.items()), 'attachment admission changed fixed fields')
+                self.objects.append({'resource': resource, 'uid': result['metadata']['uid'], 'spec': result['spec']})
+                atomic(ROOT / 'nonce-receipt.json', self.objects)
             finally:
-                target.unlink()
-            require(result['metadata']['name'] == self.name and result['metadata']['namespace'] == 'default'
-                    and result['kind'] == kind and result['apiVersion'] == doc['apiVersion']
-                    and type(result['metadata']['uid']) is str and result['metadata']['uid'])
-            if kind == 'VPC':
-                observed = result['spec']
-                require(observed.get('ipv4Namespace') == 'default' and observed.get('vlanNamespace') == 'default'
-                        and observed['subnets']['trial']['subnet'] == '10.0.254.0/24'
-                        and observed['subnets']['trial']['vlan'] == 2998, 'nonce admission changed fixed fields')
-            else:
-                require(all(result['spec'].get(k) == v for k, v in spec.items()), 'attachment admission changed fixed fields')
-            self.objects.append({'resource': resource, 'uid': result['metadata']['uid'], 'spec': result['spec']})
-            atomic(ROOT / 'nonce-receipt.json', self.objects)
+                primary = sys.exc_info()[1]
+                try:
+                    target.unlink()
+                except BaseException:
+                    if primary is not None:
+                        primary.cleanup_uncertain = True
+                    else:
+                        error = Failure('nonce input cleanup uncertain')
+                        error.cleanup_uncertain = True
+                        raise error
 
     def verify(self):
         for obj in self.objects:
@@ -867,7 +886,16 @@ class Nonce:
                 self.call(['delete', '--raw=/apis/vpc.githedgehog.com/v1beta1/namespaces/default/' + plural + '/' + self.name,
                            '-f', str(target)], 'persistence')
             finally:
-                target.unlink()
+                primary = sys.exc_info()[1]
+                try:
+                    target.unlink()
+                except BaseException:
+                    if primary is not None:
+                        primary.cleanup_uncertain = True
+                    else:
+                        error = Failure('nonce input cleanup uncertain')
+                        error.cleanup_uncertain = True
+                        raise error
             while True:
                 current = self.current(obj['resource'], 'persistence')
                 if current is None:

@@ -171,6 +171,32 @@ class SharedTrial(unittest.TestCase):
         with self.assertRaisesRegex(trial.Failure, 'collision'): nonce.create()
         self.assertFalse(any('create' in args.args[0] for args in core.kubectl.call_args_list))
 
+    def test_nonce_cleanup_preserves_core_primary_for_create_and_remove(self):
+        class CoreFailure(Exception):
+            code = 143
+        clock = Mock()
+        clock.remaining.return_value = 20
+        work = self.base / 'nonce-work'
+        work.mkdir()
+        self.root.mkdir()
+        user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        for action in ('create', 'remove'):
+            core = SimpleNamespace(WORK=work, Failure=CoreFailure, kubectl=Mock(side_effect=CoreFailure()))
+            nonce = trial.Nonce(core, clock, ('a' if action == 'create' else 'b')*32)
+            nonce.objects = [{'resource': 'vpcs.vpc.githedgehog.com', 'uid': 'public', 'spec': {}}]
+            with patch.object(nonce, 'current', return_value=None), \
+                 patch.object(nonce, 'verify'), patch.object(trial.os, 'chown'), \
+                 patch.object(trial.pwd, 'getpwnam', return_value=user), \
+                 patch.object(Path, 'unlink', side_effect=OSError('fixture cleanup failure')):
+                if action == 'create':
+                    core.kubectl.side_effect = [b'{"items":[]}', CoreFailure()]
+                with self.assertRaises(trial.Failure) as caught: getattr(nonce, action)()
+            self.assertEqual(caught.exception.code, 143)
+            self.assertTrue(caught.exception.cleanup_uncertain)
+        core = SimpleNamespace(Failure=CoreFailure, hhfab=Mock(side_effect=CoreFailure()))
+        with self.assertRaises(trial.Failure) as caught: trial.strict_checks(core, clock, 'strict')
+        self.assertEqual(caught.exception.code, 143)
+
     def test_nonce_uid_or_spec_replacement_blocks_deletion(self):
         core, clock = Mock(), Mock()
         clock.remaining.return_value = 20

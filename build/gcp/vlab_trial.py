@@ -317,7 +317,16 @@ class Master:
                      min(600, self.clock.remaining(phase)), failed=self.failed)
             self.check()
         finally:
-            batch.unlink()
+            primary = sys.exc_info()[1]
+            try:
+                batch.unlink()
+            except BaseException:
+                if primary is not None:
+                    primary.cleanup_uncertain = True
+                else:
+                    error = guest.Failure('transfer input cleanup uncertain')
+                    error.cleanup_uncertain = True
+                    raise error
 
     def close(self):
         if self.proc is None:

@@ -129,6 +129,15 @@ class OwnerTrial(unittest.TestCase):
         master.started = True
         with self.assertRaisesRegex(guest.Failure, 'replacement'): master.start()
 
+    def test_transfer_cleanup_failure_preserves_primary(self):
+        master = self.master()
+        with patch.object(host, 'command', side_effect=guest.Failure('terminated', 143)), \
+             patch.object(Path, 'unlink', side_effect=OSError('fixture cleanup failure')):
+            with self.assertRaises(guest.Failure) as caught:
+                master.transfer('/tmp/labapp-vlab-'+'a'*32, ['marker'])
+        self.assertEqual(caught.exception.code, 143)
+        self.assertTrue(caught.exception.cleanup_uncertain)
+
     def test_cleanup_cancels_only_captured_run_no_manual_dispatch(self):
         value = snapshot()
         with patch.object(host, 'github', return_value=run_record(value)), patch.object(host, 'command') as run:
