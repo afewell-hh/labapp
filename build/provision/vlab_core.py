@@ -358,6 +358,7 @@ def execute(argv, deadline, cap=30, user=False, *, retain=True):
         except (OSError, subprocess.TimeoutExpired):
             if primary is None:
                 raise Failure('child containment unverified') from None
+            primary.cleanup_uncertain = True
             print('vlab-core: child group containment unverified', file=sys.stderr)
         finally:
             child.stdout.close()
@@ -1425,8 +1426,10 @@ def bridge_link(raw):
     require(type(output) is list and len(output) == 1, 'bridge query refused')
     link = output[0]
     require(type(link) is dict and link.get('ifname') == 'hhbr' and type(link.get('ifindex')) is int
-            and link['ifindex'] > 0 and link.get('linkinfo', {}).get('info_kind') == 'bridge',
+            and link['ifindex'] > 0 and type(link.get('linkinfo')) is dict
+            and link['linkinfo'].get('info_kind') == 'bridge',
             'bridge identity refused')
+    require(type(link['linkinfo'].get('info_data', {})) is dict, 'bridge data refused')
     return link
 
 
@@ -1439,21 +1442,25 @@ def bridge_live(value, deadline):
 
 def bridge_probe(deadline):
     """One read-only query. Only the exact ordinary missing-device failure is Pending."""
+    raw = b''
     try:
         raw = execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'],
                       deadline, 3, retain=False)
+        return bridge_link(raw)['ifindex']
     except Failure as exc:
-        if exc.code == 1 and str(exc) == 'child command failed' and exc.private_output == BRIDGE_ABSENT:
+        if (exc.code == 1 and str(exc) == 'child command failed'
+                and exc.private_output == BRIDGE_ABSENT
+                and not getattr(exc, 'cleanup_uncertain', False)):
             return None
         # Genuine failure: keep its own private bytes and the original error. Timeout and
         # overflow paths carry no private_output, so the previous diagnostic remains.
-        if exc.private_output:
+        evidence = exc.private_output or raw
+        if evidence:
             try:
-                retain_failure_output(bytes(exc.private_output))
+                retain_failure_output(bytes(evidence))
             except BaseException:
                 print('vlab-core: private diagnostics unverified', file=sys.stderr)
         raise
-    return bridge_link(raw)['ifindex']
 
 
 def bridge_prerequisite(value, deadline):
