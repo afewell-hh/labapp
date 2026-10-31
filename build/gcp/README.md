@@ -1449,9 +1449,10 @@ mode0600 regular file, at most 4096 bytes and a stable descriptor, and prints
 those bytes or the fixed token `absent`/`invalid`; SSH output is capped again
 at 4224 bytes. The host then strictly validates schema2 (exact fields, no
 duplicate/nonfinite/bool-as-int values, closed enums and phase/operation pairs,
-nonce, success coherence) before copying any value. Schema1 or any mismatch
+nonce, success coherence and observed child exit/signal normalization) before
+copying any value. Schema1 or any mismatch
 fails closed. The public receipt adds fixed `guest_diagnostic_status`
-(`unavailable`, `pending`, `invalid`, `valid`), the closed `guest_diagnostic`
+(`unavailable`, `pending`, `missing`, `invalid`, `valid`), the closed `guest_diagnostic`
 object (or null) and `guest_service` (or null); none contains text, argv, paths,
 raw manager output or secrets. They add to, and never replace, `phase`,
 `failure_category` and the primary code; `absent` is pending evidence, never
@@ -1464,10 +1465,17 @@ the same fixed reader plus `systemctl show` for exactly `ActiveState`, `Result`,
 `ExecMainCode` and `ExecMainStatus` with closed values (systemd255 service
 documentation). It never reconnects, retries, refreshes a key, pulls a private
 artifact or adds work after a deadline; a gone master leaves `unavailable`.
+While polling an absent result, the same fixed manager observation runs within
+the unchanged work deadline. Active or unknown service states remain pending.
+A positively `inactive` or `failed` service triggers one bounded fixed-reader
+recheck: a genuine validated result is consumed normally; continued absence is
+reported as `missing` and fails promptly, while malformed data is `invalid`.
 Manager values are diagnostic only: signal 9 is not an OOM attribution, and they
-cannot produce a result, `contained=true` or any cleanup receipt. There is no
-poll-time early exit on a terminal service. Process cleanup remains as before
-(#365 owns any redesign).
+cannot produce a result, `contained=true` or any cleanup receipt. Every observer
+exception's process-cleanup uncertainty remains sticky through original-master
+close: unresolved groups withhold file deletion and own-key removal even if
+close itself succeeds. Independent correlated cleanup is still attempted.
+This retains the existing process closure interface (#365 owns its redesign).
 
 Finally the owner closes/reaps its original master/IAP group, positively removes
 the fixed private table, and obtains exact own-key absence evidence. Unresolved

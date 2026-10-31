@@ -1417,7 +1417,8 @@ infers an OOM cause. The final file is at most 4096 bytes.
   without a usable terminal status; phase/operation are then only the last valid
   checkpoint seen, context and not proof of cause).
 * The worker takes sole ownership of root-0600 `worker-status.json` by exclusive
-  create, only after its contract/lease/boot/original-guardian-pid check, and
+  create, only after its contract/lease/boot/original-guardian-pid and current
+  guardian-cgroup checks, and
   commits the next fixed `(phase, operation)` BEFORE each operation. A checkpoint
   write failure stops that operation. A claim collision or earlier binding
   failure writes nothing. The guardian is the sole writer of `result.json`, and
@@ -1435,15 +1436,19 @@ infers an OOM cause. The final file is at most 4096 bytes.
   timeout is `child-timeout` (null status); an ordinary child exit124 stays
   `child-exit`. Only the two fixed `hhfab_release` messages are classified.
   In-process core failures are reduced by the core's fixed message literals only;
-  the core folds a signal-killed child into 1, so status is reported only when
-  it is 2..255.
+  the core folds a signal-killed child into 1, so code1 is `core-refusal` with
+  null status. Only positively proved exits2..255 retain `child-exit` and that
+  exact status. Both worker-status and final-result validators enforce observed
+  exit E -> code E and signal -N -> code128+N; null remains unobserved and
+  `status-invalid` carries context rather than child provenance.
 * The primary code and diagnostic are captured before containment. Reap,
   containment, status and result-write trouble can only clear `contained` or
   degrade the diagnostic; `code0 + contained false` stays an operational failure.
   Watchdog order is unchanged: what the guardian observed first is reported.
 * Not covered: a syntax or import error of the guest module, exec failure,
   SIGKILL of the guardian, disk exhaustion or an unwritable private directory
-  can leave no result; the host then reports `unavailable`/`pending`.
+  can leave no result; the host reports `unavailable`/`pending`, or `missing`
+  after a terminal manager observation and bounded reader recheck.
   The historical failed trial's guest cause is unknown and this does not diagnose it.
 
 Required offline command, in its own interpreter (CI refuses zero discovery):
@@ -1453,7 +1458,12 @@ python3 -B -m unittest discover -s build/provision -p test_vlab_trial.py -v
 ```
 
 Fixtures patch every package/systemd/hhfab/network/privileged process path and
-mutate only public owned temporary files. They establish no live guest/session,
+mutate only public owned temporary files. Persisted-checkpoint fault cases cover
+each auxiliary phase, parser/prerequisites, strict inspect/SSH/API, nonce
+create/verify/remove and resume start through terminal and guardian publication
+and the host byte validator. Startup no-writer, wrong-cgroup, contradictory
+child evidence and last-valid-then-corrupt status cases preserve fail-closed
+ownership and provenance. They establish no live guest/session,
 package solvability, peak fit, firmware completeness or functional/course proof.
 Primary text read2026-10-31: [Docker group and fresh credentials](https://docs.docker.com/engine/install/linux-postinstall/),
 [v0.43.1 image preparation](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabrunner.go),

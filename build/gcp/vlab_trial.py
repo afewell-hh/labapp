@@ -453,7 +453,7 @@ def service_observation(raw):
         return None
 
 
-def observe_guest(master, nonce, status):
+def observe_guest(master, nonce, status, process_uncertain):
     """One best-effort bounded observation through the SAME original master.
 
     Called BEFORE the fixed stop (a stop makes the guardian publish its own SIGTERM
@@ -466,12 +466,14 @@ def observe_guest(master, nonce, status):
         state, record = guest_result(raw, nonce)
         status = 'pending' if state == 'absent' else state
         detail = record['diagnostic'] if state == 'valid' else None
-    except BaseException:
-        pass
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
     try:
         service = service_observation(master.remote(SERVICE_COMMAND, 'persistence', cap=8, cleanup=True, limit=1024))
-    except BaseException:
-        pass
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
     return status, detail, service
 
 
@@ -609,8 +611,26 @@ def trial(snapshot, payloads, output, *, registration, records, login):
             state, record = guest_result(raw, nonce)
             if state == 'absent':
                 guest_status = 'pending'
-                stop.wait(5)
-                continue
+                # A simple service may have failed exec/import before it could
+                # publish anything. Observe only the original channel, within the
+                # existing work clock; manager data never supplies a result.
+                try:
+                    guest_service = service_observation(master.remote(
+                        SERVICE_COMMAND, 'persistence', cap=8, limit=1024))
+                except BaseException as error:
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
+                    raise
+                if guest_service is None or guest_service['active_state'] not in ('failed', 'inactive'):
+                    stop.wait(5)
+                    continue
+                # Bounded recheck closes the normal result-publication race.
+                # A terminal service without a genuine record fails promptly.
+                raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
+                state, record = guest_result(raw, nonce)
+                if state == 'absent':
+                    guest_status = 'missing'
+                    raise guest.Failure('terminal guest service without result')
             guest_status = state
             guest.require(state == 'valid', 'guest result invalid')
             result, contained = record['code'], record['contained']
@@ -623,9 +643,11 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         failure_category = 'guest'
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as error:
         result = 130
         failure_category = 'interrupted'
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
     except Exception as error:
         result = 1
         failure_category = 'access' if isinstance(error, AccessError) else 'unknown'
@@ -642,14 +664,15 @@ def trial(snapshot, payloads, output, *, registration, records, login):
             if not contained:
                 if guest_status in ('unavailable', 'pending'):
                     # Before the stop below; the primary failure above is retained.
-                    guest_status, guest_detail, guest_service = observe_guest(master, nonce, guest_status)
+                    guest_status, guest_detail, guest_service = observe_guest(master, nonce, guest_status, process_uncertain)
                 try:
                     master.remote(['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'stop', guest.UNIT],
                                   'persistence', cap=120, cleanup=True)
                     # Stop success alone cannot attest ExecStopPost result;
                     # preserve uncertainty unless guardian already reported it.
-                except BaseException:
-                    pass
+                except BaseException as error:
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

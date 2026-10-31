@@ -135,6 +135,19 @@ def operation_ok(origin, phase, operation):
     return operation == 'worker-supervision' or operation in OPERATIONS[phase]
 
 
+def outcome_code_ok(code, detail):
+    """Observed inner child evidence must agree with the normalized primary code.
+
+    Null is unobserved; status-invalid carries context, not child provenance.
+    """
+    status = detail['child_status']
+    if status is not None and detail['category'] == 'child-exit':
+        return code == status
+    if status is not None and detail['category'] == 'child-signal':
+        return code == 128 - status
+    return True
+
+
 def diagnostic(value):
     """Strict closed validator; returns a fresh copy built only from vetted values."""
     require(type(value) is dict and set(value) == DIAGNOSTIC_FIELDS, 'diagnostic refused')
@@ -157,7 +170,7 @@ def result_record(value, nonce):
     require(type(value['schema']) is int and value['schema'] == 2 and type(code) is int and 0 <= code <= 255
             and type(contained) is bool and type(value['nonce']) is str and value['nonce'] == nonce, 'result refused')
     detail = diagnostic(value['diagnostic'])
-    require((code == 0) == (detail['category'] == 'none'), 'result refused')
+    require((code == 0) == (detail['category'] == 'none') and outcome_code_ok(code, detail), 'result refused')
     return {'schema': 2, 'code': code, 'contained': contained, 'nonce': nonce, 'diagnostic': detail}
 
 
@@ -180,7 +193,8 @@ def worker_status(value, nonce):
         if state == 'succeeded':
             require(code == 0 and detail == SUCCESS, 'status refused')
         else:
-            require(1 <= code <= 255 and detail['category'] != 'none', 'status refused')
+            require(1 <= code <= 255 and detail['category'] != 'none'
+                    and outcome_code_ok(code, detail), 'status refused')
     return {'schema': 1, 'nonce': nonce, 'seq': seq, 'state': state, 'phase': phase,
             'operation': operation, 'code': code, 'diagnostic': detail}
 
@@ -990,6 +1004,7 @@ def worker():
     require(started['lease'] == value['lease'] and started['nonce'] == value['nonce']
             and started['boot'] == value['boot_uuid'] and started['guardian_pid'] == os.getppid(),
             'worker requires original active guardian')
+    require(own_cgroup() == '0::/system.slice/' + UNIT, 'worker requires original active guardian cgroup')
     status = WorkerStatus(value['nonce'])
     status.claim()
     _WORKER = status
@@ -1140,8 +1155,8 @@ def core_failure(error, message):
     code = getattr(error, 'code', 1)
     status = None
     if text == 'child command failed':
-        category = 'child-exit'
         status = code if type(code) is int and 2 <= code <= 255 else None
+        category = 'child-exit' if status is not None else 'core-refusal'
     elif text == 'child deadline exceeded':
         category = 'child-timeout'
     elif text == 'deadline exceeded':

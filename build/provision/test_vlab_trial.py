@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 import stat
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -493,6 +494,10 @@ class SharedTrial(unittest.TestCase):
              unknown('install-docker', 17), True),
             ('exit 17 conflicting terminal code', 17, worker_state(code=18, child=18), 17, unknown('install-docker', 17), True),
             ('exit 17 matching terminal', 17, worker_state(code=17, child=17), 17, worker(child=17), True),
+            ('exit 17 contradicts inner exit', 17, worker_state(code=17, child=18), 17,
+             unknown('worker-supervision', 17), True),
+            ('exit 17 contradicts inner signal', 17, worker_state(code=17, category='child-signal', child=-9), 17,
+             unknown('worker-supervision', 17), True),
         )
         for name, poll, status, code, detail, contained in cases:
             with self.subTest(name):
@@ -547,6 +552,35 @@ class SharedTrial(unittest.TestCase):
             self.assertEqual(json.loads((self.root / 'result.json').read_text())['diagnostic'],
                              {'origin': 'guardian', 'phase': 'startup', 'operation': 'guardian-init',
                               'category': 'heartbeat-loss', 'child_status': None})
+
+    def test_initial_clock_and_boot_failures_never_claim_a_writer(self):
+        for source in ('Clock', 'kernel_boot'):
+            with self.subTest(source=source):
+                if self.root.exists(): shutil.rmtree(self.root)
+                self.guardian_fixture()
+                incumbent = b'PUBLIC-INCUMBENT-RESULT'
+                (self.root / 'result.json').write_bytes(incumbent)
+                with patch.object(trial, source, side_effect=RuntimeError(SENTINEL)), \
+                     patch.object(trial, 'containment') as contain, patch.object(trial.subprocess, 'Popen') as spawn:
+                    with self.assertRaises(RuntimeError):
+                        trial.main(['guardian'])
+                contain.assert_not_called()
+                spawn.assert_not_called()
+                self.assertFalse((self.root / 'started.json').exists())
+                self.assertFalse((self.root / 'worker-status.json').exists())
+                self.assertEqual((self.root / 'result.json').read_bytes(), incumbent)
+
+    def test_guardian_keeps_last_valid_context_after_status_corruption(self):
+        child = Mock(pid=999999)
+        child.poll.side_effect = [None, 17]
+        def corrupt(_seconds):
+            (self.root / 'worker-status.json').write_bytes(SENTINEL.encode())
+        with patch.object(trial.time, 'sleep', side_effect=corrupt):
+            code, result, _ = self.guardian_fault(spawn={'return_value': child}, status=worker_state('running'))
+        self.assertEqual(code, 17)
+        self.assertEqual(result['diagnostic'], {'origin': 'unknown', 'phase': 'stage',
+                         'operation': 'install-docker', 'category': 'status-invalid', 'child_status': 17})
+        self.assertNotIn(SENTINEL, json.dumps(result))
 
     def test_guardian_cleanup_trouble_never_overwrites_primary_or_success_truth(self):
         # uncertain containment after genuine worker success: code 0, contained false, operational failure
@@ -654,11 +688,11 @@ class SharedTrial(unittest.TestCase):
                                                         'guardian_pid': os.getppid()})}.items():
             (self.root / name).write_bytes(raw)
 
-    def run_worker(self, bounded, atomic=None):
+    def run_worker(self, bounded, atomic=None, *, real=(), core=None):
         """Actual worker orchestration; native actions patched. -> (raised|None, final status|None)."""
         self.worker_inputs()
         user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=1000, pw_dir='/home/ubuntu', pw_shell='/bin/bash')
-        core = SimpleNamespace(WIRING_SHA='b' * 64, validate_fab=Mock())
+        core = core or SimpleNamespace(WIRING_SHA='b' * 64, validate_fab=Mock())
         receipt = {'schema': 1, 'source_sha256': 'a' * 64, 'packages': {}, 'commands': {}}
         def packages(clock, selected):
             trial.exclusive(self.root / 'packages.json', trial.encoded(receipt))
@@ -666,20 +700,22 @@ class SharedTrial(unittest.TestCase):
         nonce = Mock()
         nonce.objects = []
         error = None
+        actions = {'provision_aux': {}, 'docker_account': {}, 'guest_devices': {},
+                   'load_sibling': {'return_value': core}, 'package_receipt': {'side_effect': packages},
+                   'resources': {}, 'offline_observations': {},
+                   'strict_checks': {'return_value': {'ca_sha256': 'c' * 64}}, 'Nonce': {'return_value': nonce}}
+        for name in real:
+            del actions[name]
         with ExitStack() as local:
             for item in (patch.object(trial.os, 'geteuid', return_value=0),
                          patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)),
                          patch.object(trial, 'own_cgroup', return_value='0::/system.slice/' + trial.UNIT),
                          patch.object(trial.pwd, 'getpwnam', return_value=user),
                          patch.object(trial.grp, 'getgrnam', side_effect=KeyError),
-                         patch.object(hhfab_release, 'bounded', side_effect=bounded),
-                         patch.object(trial, 'provision_aux'), patch.object(trial, 'docker_account'),
-                         patch.object(trial, 'guest_devices'), patch.object(trial, 'load_sibling', return_value=core),
-                         patch.object(trial, 'package_receipt', side_effect=packages), patch.object(trial, 'resources'),
-                         patch.object(trial, 'offline_observations'),
-                         patch.object(trial, 'strict_checks', return_value={'ca_sha256': 'c' * 64}),
-                         patch.object(trial, 'Nonce', return_value=nonce)):
+                         patch.object(hhfab_release, 'bounded', side_effect=bounded)):
                 local.enter_context(item)
+            for name, kwargs in actions.items():
+                local.enter_context(patch.object(trial, name, **kwargs))
             if atomic is not None:
                 local.enter_context(patch.object(trial, 'atomic', side_effect=atomic))
             try:
@@ -729,6 +765,7 @@ class SharedTrial(unittest.TestCase):
             ('core-start-fresh', (124, b''), 124, 'fresh', 'child-exit', 124),   # ordinary exit 124 is NOT a timeout
             ('core-stop', overflow, 1, 'resume', 'output-overflow', None),
             ('core-activate-resume', hhfab_release.Refusal(SENTINEL), 1, 'resume', 'exception', None),
+            ('core-start-resume', (-15, b'PRIVATE'), 143, 'resume', 'child-signal', -15),
             ('core-final-stop', (143, b''), 143, 'persistence', 'child-exit', 143),
         )
         for operation, fault, code, phase, category, child in cases:
@@ -744,6 +781,8 @@ class SharedTrial(unittest.TestCase):
                 valid = trial.worker_status(status, NONCE)
                 # worker -> guardian hand-off: the observed exit equals the terminal code
                 self.assertEqual(trial.judge_worker(code, valid, valid, phase), (code, detail))
+                if operation == 'core-start-resume':
+                    self.serialized_failure(error, status, operation, category, code, child)
         with self.subTest('arbitrary exception text'):
             error, status = self.run_worker(self.fake_bounded({'daemon-start': RuntimeError(SENTINEL)}, []))
             self.assertIsInstance(error, RuntimeError)
@@ -778,6 +817,7 @@ class SharedTrial(unittest.TestCase):
         (self.root / 'worker-status.json').write_bytes(incumbent)
         with patch.object(trial.os, 'geteuid', return_value=0), \
              patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)), \
+             patch.object(trial, 'own_cgroup', return_value='0::/system.slice/' + trial.UNIT), \
              patch.object(trial, 'provision') as provision:
             with self.assertRaises(FileExistsError):
                 trial.main(['worker'])
@@ -791,6 +831,157 @@ class SharedTrial(unittest.TestCase):
                 trial.main(['worker'])
             provision.assert_not_called()
             self.assertFalse((self.root / 'worker-status.json').exists())
+
+    def test_worker_wrong_cgroup_writes_nothing_with_or_without_incumbent(self):
+        for incumbent in (None, trial.encoded(worker_state('running', seq=9))):
+            with self.subTest(incumbent=incumbent is not None):
+                self.worker_inputs()
+                target = self.root / 'worker-status.json'
+                if incumbent is not None: target.write_bytes(incumbent)
+                with patch.object(trial.os, 'geteuid', return_value=0), \
+                     patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)), \
+                     patch.object(trial, 'own_cgroup', return_value='0::/unowned.service'), \
+                     patch.object(trial, 'provision') as provision:
+                    with self.assertRaises(trial.Failure):
+                        trial.main(['worker'])
+                provision.assert_not_called()
+                self.assertEqual(target.read_bytes() if target.exists() else None, incumbent)
+
+    def persisted_operation(self, operation):
+        """Read the committed file at a side-effect boundary, never just mark calls."""
+        status = trial.worker_status(json.loads((self.root / 'worker-status.json').read_text()), NONCE)
+        self.assertEqual((status['state'], status['operation']), ('running', operation))
+        return status
+
+    def serialized_failure(self, error, status, operation, category, code=17, child=17):
+        """Actual terminal -> actual guardian -> host's independent byte validator."""
+        self.assertIsNotNone(error)
+        expected = {'origin': 'worker', 'phase': status['phase'], 'operation': operation,
+                    'category': category, 'child_status': child}
+        self.assertEqual((status['state'], status['code'], status['diagnostic']), ('failed', code, expected))
+        self.assertNotIn(SENTINEL, json.dumps(status))
+        observed, result, _ = self.guardian_fault(spawn=self.exiting_child(code), status=status)
+        self.assertEqual((observed, result['diagnostic']), (code, expected))
+        # The host imports its own guest module; validate serialized bytes again.
+        from build.gcp.vlab_trial import guest_result
+        state, accepted = guest_result(trial.encoded(result), NONCE)
+        self.assertEqual((state, accepted['code'], accepted['diagnostic']), ('valid', code, expected))
+        self.assertNotIn(SENTINEL, json.dumps(accepted))
+
+    def test_real_auxiliary_checkpoints_precede_each_effect_and_faults_survive_serialization(self):
+        import qemu_offline
+        original_setup, original_inventory, original_remove = qemu_offline.setup, qemu_offline.inventory, shutil.rmtree
+        before = {name: '1' for name in trial.AUX if name != 'socat'}
+        after = dict(before, socat='1.8.0.0-4ubuntu0.1')
+        operations = ('aux-inventory', 'aux-audit', 'aux-holds', 'aux-setup', 'aux-update', 'aux-check',
+                      'aux-simulate', 'aux-simulate-exact', 'aux-download', 'aux-files', 'aux-install',
+                      'aux-postcheck', 'aux-cleanup')
+        for target in operations:
+            seen = []
+            def checkpoint(expected=None):
+                status = json.loads((self.root / 'worker-status.json').read_text())
+                operation = status['operation']
+                self.persisted_operation(expected or operation)
+                seen.append(operation)
+                if operation == target:
+                    raise trial.Failure(SENTINEL, 17, 'child-exit', 17)
+                return operation
+            def installed(clock):
+                op = checkpoint()
+                self.assertIn(op, ('aux-inventory', 'aux-postcheck'))
+                return after if op == 'aux-postcheck' else before
+            def setup(directory, snapshot):
+                checkpoint('aux-setup')
+                return original_setup(directory, snapshot)
+            def inventory(directory):
+                checkpoint('aux-files')
+                return original_inventory(directory)
+            def remove(path, *args, **kwargs):
+                if Path(path).name.startswith('labapp-vlab-aux-'):
+                    # During an existing failure, cleanup intentionally retains
+                    # that failure's checkpoint; success must commit aux-cleanup.
+                    checkpoint()
+                return original_remove(path, *args, **kwargs)
+            def bounded(args, seconds, **kwargs):
+                if 'LoadState' in args: return 1, b'LoadState=not-found\n'
+                op = checkpoint()
+                self.assertIn(op, operations)
+                if '--simulate' in args:
+                    return 0, b'Inst socat (1.8.0.0-4ubuntu0.1 Ubuntu:24.04/noble [amd64])\n'
+                return 0, b''
+            with self.subTest(target=target), patch.object(trial, 'APT_TMP', self.base), \
+                 patch.object(trial, 'installed', side_effect=installed), \
+                 patch.object(qemu_offline, 'setup', side_effect=setup), \
+                 patch.object(qemu_offline, 'inventory', side_effect=inventory), \
+                 patch.object(shutil, 'rmtree', side_effect=remove):
+                error, status = self.run_worker(bounded, real=('provision_aux',))
+            self.assertIn(target, seen)
+            # The auxiliary cleanup wrapper keeps earlier failures; its own
+            # failure is a fixed policy refusal with no invented child status.
+            category, code, child = ('policy', 1, None) if target == 'aux-cleanup' else ('child-exit', 17, 17)
+            self.serialized_failure(error, status, target, category, code, child)
+            # Failed cleanup deliberately leaves only this PUBLIC fake APT tree.
+            apt = self.base / ('labapp-vlab-aux-' + str(os.getpid()))
+            if apt.exists(): original_remove(apt)
+
+    def test_real_parser_and_prerequisite_faults_have_persisted_checkpoints(self):
+        test = self
+        class BrokenParser:
+            @property
+            def __version__(self):
+                test.persisted_operation('parser-check')
+                raise RuntimeError(SENTINEL)
+        with patch.dict(sys.modules, yaml=BrokenParser()):
+            error, status = self.run_worker(self.fake_bounded({}, []))
+        self.serialized_failure(error, status, 'parser-check', 'exception', 1, None)
+        core = SimpleNamespace(WIRING_SHA='b' * 64, validate_fab=Mock(), PACKAGE_PINS={}, AUX={}, TOOL_PINS={})
+        def prerequisite(receipt, deadline):
+            self.persisted_operation('package-receipt')
+            raise trial.Failure(SENTINEL, 1, 'policy')
+        core.verify_prerequisites = prerequisite
+        with patch.object(trial, 'installed', side_effect=lambda clock: self.persisted_operation('package-receipt') and {}):
+            error, status = self.run_worker(self.fake_bounded({}, []), real=('package_receipt',), core=core)
+        self.serialized_failure(error, status, 'package-receipt', 'policy', 1, None)
+
+    def test_real_strict_api_and_nonce_faults_keep_checkpoint_and_ambiguous_core_provenance(self):
+        for target in ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-create', 'nonce-verify', 'nonce-remove'):
+            work = self.base / ('work-' + target)
+            work.mkdir(mode=0o700)
+            objects = {}
+            def effect(operation):
+                self.persisted_operation(operation)
+                if operation == target:
+                    error = CoreFailure('child command failed', 1, True)
+                    error.__cause__ = RuntimeError(SENTINEL)
+                    raise error
+            def hhfab(args, *unused, **kwargs):
+                effect('strict-inspect' if 'inspect-switches' in args else 'strict-ssh')
+            def api_ready(deadline):
+                effect('api-ready')
+                return {'ca_sha256': 'c' * 64}
+            def kubectl(args, deadline):
+                operation = json.loads((self.root / 'worker-status.json').read_text())['operation']
+                effect(operation)
+                if args[0] == 'get':
+                    if '-A' in args: return b'{"items":[]}'
+                    doc = objects.get(args[1])
+                    return trial.encoded(doc) if doc is not None else b''
+                if args[0] == 'create':
+                    doc = json.loads(Path(args[args.index('-f') + 1]).read_text())
+                    doc['metadata']['uid'] = 'public-' + doc['kind']
+                    resource = ('vpcs' if doc['kind'] == 'VPC' else 'vpcattachments') + '.vpc.githedgehog.com'
+                    objects[resource] = doc
+                    return trial.encoded(doc)
+                self.assertEqual(args[0], 'delete')
+                resource = ('vpcattachments' if '/vpcattachments/' in args[1] else 'vpcs') + '.vpc.githedgehog.com'
+                del objects[resource]
+                return b'{}'
+            core = SimpleNamespace(WIRING_SHA='b' * 64, WORK=work, Failure=CoreFailure,
+                                   validate_fab=Mock(), hhfab=hhfab, api_ready=api_ready, kubectl=kubectl)
+            with self.subTest(target=target), patch.object(trial.os, 'chown'):
+                error, status = self.run_worker(self.fake_bounded({}, []), real=('strict_checks', 'Nonce'), core=core)
+            self.assertTrue(error.cleanup_uncertain)
+            self.serialized_failure(error, status, target, 'core-refusal', 1, None)
 
     def recorded(self, operations):
         return patch.object(trial, 'mark', side_effect=lambda *args: operations.append(args))
@@ -840,7 +1031,7 @@ class SharedTrial(unittest.TestCase):
         self.assertEqual(operations, [('persistence', 'strict-inspect'), ('persistence', 'strict-ssh'),
                                       ('persistence', 'api-ready')])
         for text, code, category, child in (('child command failed', 137, 'child-exit', 137),
-                                            ('child command failed', 1, 'child-exit', None),  # core folds signals into 1
+                                            ('child command failed', 1, 'core-refusal', None),  # exit1/signal ambiguous
                                             ('child deadline exceeded', 124, 'child-timeout', None),
                                             ('deadline exceeded', 124, 'phase-cutoff', None),
                                             (SENTINEL, 143, 'core-refusal', None)):
