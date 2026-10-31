@@ -313,3 +313,21 @@ recorded in #136 and #137). If it is revisited once the image is stable:
 2. Set up Cloud Marketplace Partner account
 3. Create product listing with VM image
 4. Submit for review
+
+## Candidate VLAB core guest integration
+
+The fixed [`vlab_core.py` contract](../../build/provision/README.md#dedicated-guest-vlab-core-assembly-and-preserved-state-resume)
+provides fresh import, foreground systemd startup, canonical readiness and
+preserved-state resume in a dedicated appliance guest. It consumes explicit
+private FAB plus already provisioned baseline tools/packages, including QEMU
+`.11`; it does not install packages or launch a provider VM. Its source tests do
+not authorize or prove an actual eighteen-node trial. The existing small builder
+fixture is insufficient for this profile.
+
+This candidate intentionally records unknown original FAB/helper/startup values
+and direct service versus historical tmux as differences. It uses the generated
+private VLAB kubeconfig explicitly and does not merge student contexts or claim
+desktop/EMC/GitOps/telemetry/course equivalence. Preserve the published source image
+and existing student procedures until a separately reviewed candidate passes
+runtime/persistence and owner acceptance. A bounded service stop contains owned
+processes; it is not evidence of graceful guest OS shutdown or disk quiescence.

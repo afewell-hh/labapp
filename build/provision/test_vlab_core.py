@@ -1,0 +1,852 @@
+"""Actual entrypoint tests with public ephemeral files and a fail-closed command spy.
+
+No real hhfab/kubectl/systemd/network/package/sysctl/sudo execution. Only the
+bounded executor tests create inspected Python stdlib children (no network).
+Fakes prove source sequencing/refusal, not systemd namespaces/cgroups or VLAB.
+"""
+import base64
+from contextlib import ExitStack
+import copy
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import yaml
+import vlab_core as core
+VERIFY_PREREQUISITES = core.verify_prerequisites
+
+
+class ExecWitness(BaseException):
+    pass
+
+
+def dump(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_bytes(yaml.safe_dump(value, sort_keys=False).encode())
+    path.chmod(0o600)
+
+
+def public_fab():
+    control = {'managementSubnet': '172.30.0.0/21', 'controlVIP': '172.30.0.1/32',
+               'kubeClusterSubnet': '172.28.0.0/16', 'kubeServiceSubnet': '172.29.0.0/16',
+               'kubeClusterDNS': '172.29.0.10', 'dummySubnet': '172.30.90.0/24',
+               'joinToken': 'PUBLIC-SYNTHETIC-NONDEPLOYABLE-TOKEN-000000',
+               'defaultUser': {'password': '$5$synthetic$NOT_A_REAL_PASSWORD',
+                               'authorizedKeys': ['ssh-ed25519 PUBLIC_SYNTHETIC_KEY']}}
+    fabric = {'mode': 'spine-leaf', 'managementDHCPStart': '172.30.4.0',
+              'managementDHCPEnd': '172.30.7.254', 'spineASN': 65100,
+              'leafASNStart': 65101, 'leafASNEnd': 65533, 'protocolSubnet': '172.30.8.0/22',
+              'vtepSubnet': '172.30.12.0/22', 'fabricSubnet': '172.30.128.0/17',
+              'mclagSessionSubnet': '172.30.95.0/31', 'vpcWorkaroundSubnet': '172.30.96.0/19',
+              'defaultSwitchUsers': {'admin': {'role': 'admin', **copy.deepcopy(control['defaultUser'])}}}
+    return [{'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'Fabricator',
+             'metadata': {'name': 'default', 'namespace': 'fab'}, 'spec': {'config': {
+                 'control': control, 'fabric': fabric, 'registry': {'mode': 'airgap'},
+                 'observability': {'defaults': ''}}}},
+            {'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'ControlNode',
+             'metadata': {'name': 'control-1', 'namespace': 'fab'}, 'spec': {
+                 'bootstrap': {'disk': '/dev/sda'}, 'external': {'interface': 'enp2s0', 'ip': 'dhcp'},
+                 'management': {'interface': 'enp2s1'}}}]
+
+
+class GuestFixture(unittest.TestCase):
+    """All fixed production paths are patched to one owned ephemeral fixture."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='labapp-vlab-core-')
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.patch('ROOT', self.base / 'state')
+        self.patch('WORK', self.base / 'work')
+        self.patch('CACHE', self.base / 'cache')
+        self.patch('LIB', self.base / 'lib')
+        self.patch('UNITS', self.base / 'units')
+        self.patch('JOURNAL', self.base / 'journald@labapp-vlab.conf')
+        self.patch('JOURNAL_DROPINS', (self.base / 'journal.d',))
+        self.patch('MOUNTINFO', self.base / 'mountinfo')
+        self.patch('CGROUP', self.base / 'cgroup')
+        self.patch('ROOT_UID', os.getuid())
+        self.user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir='/home/ubuntu')
+        self.stack.enter_context(patch.object(core, 'ubuntu', return_value=self.user))
+        self.stack.enter_context(patch.object(core, 'verify_prerequisites', return_value={'synthetic': 'tools'}))
+        self.stack.enter_context(patch.object(core, 'verify_netfilter'))
+        self.stack.enter_context(patch.object(core.os, 'chown'))
+        self.stack.enter_context(patch.object(core.os, 'geteuid', return_value=0))
+        self.stack.enter_context(patch.object(core, 'execute', side_effect=self.command))
+        self.stack.enter_context(patch.dict(os.environ, {'INVOCATION_ID': 'a' * 32, 'SERVICE_RESULT': 'success'}))
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        self.stack.enter_context(patch('sys.stdout', self.stdout))
+        self.stack.enter_context(patch('sys.stderr', self.stderr))
+        self.calls = []
+        self.phase = {'fresh': 'inactive', 'resume': 'inactive'}
+        self.invocation = {'fresh': '', 'resume': ''}
+        self.failure = None
+        self.activation = True
+        self.cluster_uid = 'public-cluster-uid'
+        self.api_mutation = None
+        self.tools = {'synthetic': 'tools'}
+        self.fab = public_fab()
+        self.fab_path = self.base / 'private-fab.yaml'
+        self.fab_path.write_bytes(yaml.safe_dump_all(self.fab, sort_keys=False).encode())
+        self.fab_path.chmod(0o600)
+        self.wiring = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
+        self.receipt = self.base / 'packages.json'
+        self.receipt.write_text('{"public":"synthetic-only"}')
+        self.receipt.chmod(0o600)
+        self.input = self.base / 'input.json'
+        self.contract = {'schema': 1, 'dedicated_guest': True, 'nonce': 'b' * 32,
+                         'fab': str(self.fab_path), 'fab_sha256': core.digest(self.fab_path.read_bytes()),
+                         'wiring': str(self.wiring), 'wiring_sha256': core.WIRING_SHA,
+                         'package_receipt': str(self.receipt),
+                         'package_receipt_sha256': core.digest(self.receipt.read_bytes()),
+                         'candidate_policy': {'bridge': '172.30.0.2/21', 'netfilter': 'all-three-off',
+                             'forwarded_ports': '0.0.0.0-isolated-by-route', 'build': 'iso',
+                             'controls_restricted': True, 'servers_restricted': True}}
+        self.write_contract()
+
+    def patch(self, name, value):
+        self.stack.enter_context(patch.object(core, name, value))
+
+    def write_contract(self):
+        self.input.write_text(json.dumps(self.contract))
+        self.input.chmod(0o600)
+
+    def call(self, *args):
+        return core.main(list(args))
+
+    def prepared(self):
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 0, self.stderr.getvalue())
+        return core.state()
+
+    def fresh(self):
+        self.prepared()
+        self.assertEqual(self.call('start-fresh'), 0, self.stderr.getvalue())
+        return core.state()
+
+    def resumable(self):
+        self.fresh()
+        self.assertEqual(self.call('activate-resume'), 0, self.stderr.getvalue())
+        return core.state()
+
+    def runtime_files(self):
+        work = core.WORK
+        nics = core.canonical_nics()
+        dump(work / 'vlab/config.yaml', {'sizes': core.SIZES,
+             'vms': {name: {'type': kind, 'nics': nics[name]} for name, kind in core.VMS.items()},
+             'externals': {'nics': {}, 'vrfs': {}}})
+        for filename in ('sshkey', 'sshkey.pub'):
+            target = work / 'vlab' / filename
+            target.write_bytes(b'PUBLIC_SYNTHETIC_KEY')
+            target.chmod(0o600)
+        for name, kind in core.VMS.items():
+            directory = work / 'vlab/vms' / name
+            directory.mkdir(parents=True, mode=0o700)
+            files = ['os.img', 'efi_code.fd', 'efi_vars.fd']
+            files += ['usb.iso'] if kind == 'control' else []
+            files += ['ignition.json', 'butane.yaml'] if kind == 'server' else []
+            for filename in files:
+                target = directory / filename
+                target.write_bytes(('public-' + filename).encode())
+                target.chmod(0o600)
+        result = work / 'result'
+        installer = result / core.RESULT
+        installer.mkdir(mode=0o700)
+        target = result / (core.RESULT + '.inhash')
+        target.write_bytes(b'A' * 43 + b'=')
+        target.chmod(0o600)
+        target = result / (core.RESULT + '-usb.iso')
+        target.write_bytes(b'PUBLIC_ISO')
+        target.chmod(0o600)
+        target = installer / 'hhfab-recipe'
+        target.write_bytes(b'PUBLIC_NOT_EXECUTABLE')
+        target.chmod(0o600)
+        (installer / 'fab.yaml').write_bytes(self.fab_path.read_bytes())
+        (installer / 'fab.yaml').chmod(0o600)
+        (installer / 'include.yaml').write_bytes(self.wiring.read_bytes())
+        (installer / 'include.yaml').chmod(0o600)
+        b64 = lambda raw: base64.b64encode(raw).decode()
+        dump(work / 'vlab/kubeconfig', {'apiVersion': 'v1', 'kind': 'Config',
+             'clusters': [{'name': 'default', 'cluster': {'server': 'https://127.0.0.1:6443',
+                 'certificate-authority-data': b64(b'-----BEGIN CERTIFICATE-----PUBLIC_SYNTHETIC')}}],
+             'contexts': [{'name': 'default', 'context': {'cluster': 'default', 'user': 'default'}}],
+             'current-context': 'default', 'users': [{'name': 'default', 'user': {
+                 'client-certificate-data': b64(b'PUBLIC_CERT'), 'client-key-data': b64(b'PUBLIC_KEY')}}]})
+        core.MOUNTINFO.write_text('\n'.join(
+            f'{i} 0 0:1 / {p} ro - ext4 /dev/public rw'
+            for i, p in enumerate(core.readonly_paths(), 1)))
+
+    def command(self, argv, deadline, cap=30, user=False):
+        self.calls.append((list(argv), deadline, cap, user))
+        core.remaining(deadline)
+        if self.failure and self.failure(argv):
+            raise core.Failure('synthetic command failure', 17)
+        if argv[0] == core.SYSTEMCTL:
+            action = argv[1]
+            if action == 'daemon-reload' or action == 'enable':
+                return b''
+            mode = next(k for k, v in core.UNIT.items() if v == argv[2])
+            if action == 'show':
+                active = self.phase[mode]
+                fields = {'Id': core.UNIT[mode], 'LoadState': 'loaded', 'ActiveState': active,
+                          'SubState': 'running' if active == 'active' else 'dead',
+                          'InvocationID': self.invocation[mode],
+                          'MainPID': str(os.getpid()) if active in ('active', 'activating') else '0',
+                          'ControlGroup': '/system.slice/' + core.UNIT[mode],
+                          'FragmentPath': str(core.UNITS / core.UNIT[mode]),
+                          'DropInPaths': '', 'NeedDaemonReload': 'no'}
+                return '\n'.join(k + '=' + v for k, v in fields.items()).encode()
+            if action == 'start':
+                # Actual shared flock must be free across the synchronous manager call.
+                with core.locked():
+                    self.assertEqual(core.state()['phase'], 'starting')
+                if not self.activation:
+                    raise core.Failure('synthetic activation timeout', 124)
+                self.phase[mode] = 'activating'
+                self.invocation[mode] = os.environ['INVOCATION_ID']
+                try:
+                    core.unit_gate(mode)
+                    if mode == 'fresh':
+                        self.runtime_files()
+                    with patch.object(core.os, 'initgroups') as groups, \
+                         patch.object(core.os, 'setgid') as gid, patch.object(core.os, 'setuid') as uid, \
+                         patch.object(core.os, 'getuid', return_value=self.user.pw_uid), \
+                         patch.object(core.os, 'geteuid', return_value=self.user.pw_uid), \
+                         patch.object(core.os, 'chdir'), \
+                         patch.object(core.os, 'execve', side_effect=ExecWitness) as replace:
+                        with self.assertRaises(ExecWitness):
+                            core.unit_run(mode)
+                        groups.assert_called_once_with('ubuntu', self.user.pw_gid)
+                        gid.assert_called_once_with(self.user.pw_gid)
+                        uid.assert_called_once_with(self.user.pw_uid)
+                        replace.assert_called_once_with(core.HHFAB, core.up_argv(), core.SAFE_ENV)
+                    core.unit_ready(mode)
+                    self.phase[mode] = 'active'
+                except BaseException:
+                    self.phase[mode] = 'failed'
+                    core.unit_finished(mode)
+                    raise
+                return b''
+            if action == 'stop':
+                self.phase[mode] = 'inactive'
+                if core.state().get('invocation'):
+                    core.unit_finished(mode)
+                return b''
+        if argv[:2] == [core.HHFAB, 'init']:
+            source = Path(argv[argv.index('--config') + 1])
+            wiring = Path(argv[argv.index('--wiring') + 1])
+            (core.WORK / 'fab.yaml').write_bytes(source.read_bytes())
+            (core.WORK / 'fab.yaml').chmod(0o600)
+            dump(core.WORK / '.registry.yaml', {'repo': 'ghcr.io', 'prefix': 'githedgehog'})
+            (core.WORK / 'include').mkdir(mode=0o700)
+            (core.WORK / 'include/wiring-input.yaml').write_bytes(wiring.read_bytes())
+            (core.WORK / 'include/wiring-input.yaml').chmod(0o600)
+            (core.WORK / 'result').mkdir(mode=0o700)
+            return b''
+        if argv[:2] == [core.HHFAB, 'validate'] or argv[:2] == [core.HHFAB, 'vlab']:
+            return b''
+        if argv[0] == core.KUBECTL:
+            if '--raw=/readyz' in argv:
+                return b'ok'
+            resource = argv[argv.index('get') + 1]
+            if resource == 'namespace':
+                return json.dumps({'metadata': {'uid': self.cluster_uid}}).encode()
+            if resource == 'nodes':
+                items = [{'metadata': {'name': 'control-1'}, 'status': {
+                    'conditions': [{'type': 'Ready', 'status': 'True'}]}}]
+            else:
+                kinds = {'fabricators': 'Fabricator', 'controlnodes': 'ControlNode', 'fabnodes': 'FabNode',
+                         'switches': 'Switch', 'servers': 'Server', 'connections': 'Connection',
+                         'switchgroups': 'SwitchGroup', 'vlannamespaces': 'VLANNamespace',
+                         'ipv4namespaces': 'IPv4Namespace'}
+                all_docs = self.fab + core.yaml_documents(self.wiring.read_bytes())
+                items = copy.deepcopy([d for d in all_docs if d['kind'] == kinds[resource.split('.')[0]]])
+                if self.api_mutation:
+                    self.api_mutation(items)
+            return json.dumps({'items': items}).encode()
+        if argv[0] == core.PYTHON and argv[1] == str(core.BRIDGE):
+            return b''
+        if argv[:2] == ['/usr/sbin/ip', '-j']:
+            return json.dumps([{'ifname': 'hhbr', 'ifindex': 42,
+                'linkinfo': {'info_kind': 'bridge', 'info_data': {
+                    'nf_call_iptables': 0, 'nf_call_ip6tables': 0, 'nf_call_arptables': 0}}}]).encode()
+        if argv[0] in ('/usr/sbin/modprobe', '/usr/sbin/sysctl'):
+            return b''
+        raise AssertionError('UNINSPECTED CHILD PATH ' + repr(argv))
+
+    def test_actual_entrypoint_full_fresh_stop_activate_resume_twice(self):
+        initial = self.resumable()
+        self.assertEqual(initial['phase'], 'resumable')
+        for _ in range(2):
+            self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+            self.assertEqual(core.state()['cluster'], initial['cluster'])
+            self.assertEqual(core.state()['critical'], initial['critical'])
+            self.assertEqual(self.call('stop'), 0, self.stderr.getvalue())
+            self.assertEqual(core.state()['phase'], 'resumable')
+        init_calls = [c for c in self.calls if c[0][:2] == [core.HHFAB, 'init']]
+        self.assertEqual(len(init_calls), 1)
+        inspections = [c for c in self.calls if c[0][:3] == [core.HHFAB, 'vlab', 'inspect-switches']]
+        self.assertEqual(len(inspections), 3)
+        self.assertTrue(all('--wait-applied-for' in c[0] and c[0][-1] == '30' for c in inspections))
+        self.assertTrue(all(c[3] for c in self.calls if c[0][0] in (core.HHFAB, core.KUBECTL)))
+        self.assertNotIn('PUBLIC_SYNTHETIC', self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_existing_work_is_never_adopted(self):
+        core.WORK.mkdir(mode=0o700)
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        self.assertFalse(core.ROOT.exists())
+        self.assertFalse(self.calls)
+
+    def test_failed_import_is_terminal_and_retained(self):
+        self.failure = lambda args: args[:2] == [core.HHFAB, 'init']
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 17)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(core.state()['stage'], 'import')
+        self.assertTrue(core.WORK.exists())
+        self.assertEqual(self.call('start-fresh'), 1)
+
+    def test_failed_validate_is_terminal(self):
+        self.failure = lambda args: args[:2] == [core.HHFAB, 'validate']
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 17)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(core.state()['stage'], 'validate')
+
+    def test_prepare_failure_recording_cannot_replace_primary(self):
+        actual_save = core.save
+        def fail_record(value):
+            if value['phase'] == 'failed':
+                raise core.Failure('synthetic secondary recording failure', 29)
+            return actual_save(value)
+        self.failure = lambda args: args[:2] == [core.HHFAB, 'init']
+        with patch.object(core, 'save', side_effect=fail_record):
+            self.assertEqual(self.call('prepare', '--input', str(self.input)), 17)
+        self.assertIn('failure recording unverified', self.stderr.getvalue())
+
+    def test_import_mutation_refused(self):
+        real = self.command
+        def changed(args, *a, **kw):
+            out = real(args, *a, **kw)
+            if args[:2] == [core.HHFAB, 'validate']:
+                with (core.WORK / 'fab.yaml').open('ab') as stream:
+                    stream.write(b'\n# changed')
+            return out
+        with patch.object(core, 'execute', side_effect=changed):
+            self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+
+    def test_competing_start_refuses_without_stop(self):
+        self.fresh()
+        before = len(self.calls)
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(self.phase['fresh'], 'active')
+        self.assertFalse(any(c[0][1] == 'stop' for c in self.calls[before:] if c[0][0] == core.SYSTEMCTL))
+
+    def test_conflicting_active_resume_refuses_without_auto_stop(self):
+        self.prepared()
+        self.phase['resume'] = 'active'
+        before = len(self.calls)
+        self.assertEqual(self.call('start-fresh'), 1)
+        self.assertEqual(self.phase['resume'], 'active')
+        self.assertFalse(any(c[0][1] in ('start', 'stop') for c in self.calls[before:] if c[0][0] == core.SYSTEMCTL))
+
+    def test_gate_failure_marks_direct_partial_start_failed(self):
+        self.prepared()
+        self.failure = lambda args: args[0] == '/usr/sbin/modprobe'
+        self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(self.phase['fresh'], 'failed')
+
+    def test_unexpected_runtime_unit_failure_is_not_resumable(self):
+        self.fresh()
+        with patch.dict(os.environ, {'SERVICE_RESULT': 'exit-code'}):
+            self.assertEqual(self.call('unit-finished', '--mode', 'fresh'), 0)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertEqual(self.call('activate-resume'), 1)
+
+    def test_readiness_failure_stops_owned_invocation(self):
+        self.prepared()
+        self.failure = lambda args: args[:3] == [core.HHFAB, 'vlab', 'inspect-switches']
+        self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(core.state()['phase'], 'failed')
+        self.assertNotEqual(self.phase['fresh'], 'active')
+        self.assertNotIn('critical', core.state())
+
+    def test_activation_timeout_cancels_queued_owned_job(self):
+        self.prepared()
+        self.activation = False
+        self.assertEqual(self.call('start-fresh'), 124)
+        self.assertEqual(core.state()['containment'], 'verified')
+        self.assertTrue(any(c[0][:2] == [core.SYSTEMCTL, 'stop'] for c in self.calls))
+
+    def test_primary_timeout_survives_cleanup_failure(self):
+        self.prepared()
+        self.activation = False
+        self.failure = lambda args: args[:2] == [core.SYSTEMCTL, 'stop']
+        self.assertEqual(self.call('start-fresh'), 124)
+        self.assertIn('containment unverified', self.stderr.getvalue())
+
+    def test_public_start_preserves_int_and_term_over_cleanup_failure(self):
+        self.prepared()
+        prepared = core.state()
+        actual = self.command
+        for error, code in ((KeyboardInterrupt(), 130), (core.Failure('terminated', 143), 143)):
+            core.save(copy.deepcopy(prepared))
+            def interrupted(argv, *args, **kwargs):
+                if argv[:2] == [core.SYSTEMCTL, 'start']:
+                    raise error
+                if argv[:2] == [core.SYSTEMCTL, 'stop']:
+                    raise core.Failure('synthetic secondary stop failure', 29)
+                return actual(argv, *args, **kwargs)
+            with self.subTest(code=code), patch.object(core, 'execute', side_effect=interrupted):
+                self.assertEqual(self.call('start-fresh'), code)
+            self.assertIn('containment unverified', self.stderr.getvalue())
+        self.assertNotIn('PUBLIC_SYNTHETIC', self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_old_cleanup_cannot_overwrite_new_reserved_operation(self):
+        self.resumable()
+        actual = self.command
+        new_operation = []
+        def interleave(argv, *args, **kwargs):
+            raw = actual(argv, *args, **kwargs)
+            if argv[:3] == [core.SYSTEMCTL, 'start', core.UNIT['resume']]:
+                raise core.Failure('synthetic late client failure', 17)
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['resume']]:
+                new_operation.append(core.reserve('resume')['operation'])
+            return raw
+        with patch.object(core, 'execute', side_effect=interleave):
+            self.assertEqual(self.call('start-resume'), 17)
+        self.assertEqual(len(new_operation), 1)
+        self.assertEqual(core.state()['operation'], new_operation[0])
+        self.assertEqual(core.state()['phase'], 'starting')
+        self.assertNotEqual(core.state().get('containment'), 'verified')
+
+    def test_missing_each_critical_artifact_prevents_resume_up(self):
+        saved = self.resumable()
+        paths = [name for name, rec in saved['critical'].items() if stat.S_ISREG(rec['mode'])]
+        for name in paths:
+            with self.subTest(path=name):
+                target = core.WORK / name
+                moved = target.with_name(target.name + '.held')
+                target.rename(moved)
+                before = len(self.calls)
+                self.assertNotEqual(self.call('start-resume'), 0)
+                self.assertFalse(any(c[0][:2] == [core.SYSTEMCTL, 'start'] for c in self.calls[before:]))
+                moved.rename(target)
+        self.assertEqual(core.state()['phase'], 'resumable')
+
+    def test_replaced_disk_identity_refused_but_disk_writes_allowed(self):
+        self.resumable()
+        disk = core.WORK / 'vlab/vms/server-01/os.img'
+        with disk.open('ab') as stream:
+            stream.write(b'ordinary guest write')
+        self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+        self.assertEqual(self.call('stop'), 0)
+        held = disk.with_name('old-disk')
+        disk.rename(held)
+        disk.write_bytes(held.read_bytes())
+        disk.chmod(0o600)
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(core.state()['phase'], 'resumable')
+
+    def test_symlinked_critical_file_refused(self):
+        self.resumable()
+        key = core.WORK / 'vlab/sshkey'
+        key.rename(key.with_name('saved-key'))
+        key.symlink_to(key.with_name('saved-key'))
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_changed_cached_input_hash_refused(self):
+        self.resumable()
+        target = core.WORK / ('result/' + core.RESULT + '.inhash')
+        target.write_bytes(b'B' * 43 + b'=')
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_unknown_result_entry_is_preserved_and_refused(self):
+        self.resumable()
+        target = core.WORK / 'result/foreign'
+        target.write_text('foreign')
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(target.read_text(), 'foreign')
+
+    def test_bad_canonical_nic_reciprocity_refused(self):
+        self.resumable()
+        cfg = core.yaml_documents((core.WORK / 'vlab/config.yaml').read_bytes())[0]
+        cfg['vms']['server-01']['nics']['enp2s1'] = 'direct:leaf-03/E1/1'
+        dump(core.WORK / 'vlab/config.yaml', cfg)
+        with self.assertRaises(core.Failure):
+            core.vm_config()
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_changed_cluster_uid_refuses_resume_readiness(self):
+        self.resumable()
+        self.cluster_uid = 'different-cluster'
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+
+    def test_resume_pending_api_transport_then_healthy_keeps_original_deadline(self):
+        self.resumable()
+        actual = self.command
+        attempts = []
+        pending = [2]
+        def discovering(argv, deadline, *args, **kwargs):
+            if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                attempts.append(deadline)
+                if pending[0]:
+                    pending[0] -= 1
+                    raise core.Failure('child command failed', 1)
+            return actual(argv, deadline, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=discovering), \
+             patch.object(core.time, 'sleep') as pause:
+            self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+        self.assertEqual(pause.call_count, 2)
+        self.assertEqual(len(set(attempts)), 1)
+        self.assertEqual(attempts[0], core.state()['deadline'])
+        self.assertEqual(core.state()['deadline'] - core.state()['started'], 900)
+
+    def test_changed_ca_refuses_resume_readiness(self):
+        self.resumable()
+        path = core.WORK / 'vlab/kubeconfig'
+        cfg = core.yaml_documents(path.read_bytes())[0]
+        cfg['clusters'][0]['cluster']['certificate-authority-data'] = base64.b64encode(
+            b'-----BEGIN CERTIFICATE-----DIFFERENT_PUBLIC_CA').decode()
+        dump(path, cfg)
+        self.assertEqual(self.call('start-resume'), 1)
+
+    def test_api_canonical_count_and_spec_refusal(self):
+        self.fresh()
+        for mutation in (lambda items: items.pop() if items else None,
+                         lambda items: items[0].setdefault('spec', {}).update({'foreign': True}) if items else None):
+            with self.subTest(mutation=mutation):
+                self.api_mutation = mutation
+                with self.assertRaises(core.Failure):
+                    core.api_ready(core.time.monotonic() + 10)
+
+    def test_kubeconfig_executable_or_insecure_fields_refused(self):
+        self.fresh()
+        original = core.yaml_documents((core.WORK / 'vlab/kubeconfig').read_bytes())[0]
+        for key, value in (('exec', {'command': '/bad'}), ('auth-provider', {}), ('token', 'public')):
+            cfg = copy.deepcopy(original)
+            cfg['users'][0]['user'][key] = value
+            dump(core.WORK / 'vlab/kubeconfig', cfg)
+            with self.assertRaises(core.Failure):
+                core.kubeconfig()
+        cfg = copy.deepcopy(original)
+        cfg['clusters'][0]['cluster']['insecure-skip-tls-verify'] = True
+        dump(core.WORK / 'vlab/kubeconfig', cfg)
+        with self.assertRaises(core.Failure):
+            core.kubeconfig()
+
+    def test_resume_readonly_mount_is_checked_before_exec(self):
+        self.resumable()
+        core.MOUNTINFO.write_text('1 0 0:1 / / rw - ext4 /dev/public rw\n')
+        self.assertEqual(self.call('start-resume'), 1)
+        self.assertEqual(core.state()['phase'], 'failed')
+
+    def test_unit_source_change_or_journal_override_refused(self):
+        self.prepared()
+        (core.UNITS / core.UNIT['fresh']).write_text('[Service]\nExecStart=/bad\n')
+        self.assertEqual(self.call('start-fresh'), 1)
+        (core.UNITS / core.UNIT['fresh']).write_bytes((core.LIB / core.UNIT['fresh']).read_bytes())
+        core.JOURNAL_DROPINS[0].mkdir()
+        (core.JOURNAL_DROPINS[0] / 'foreign.conf').write_text('[Journal]\nForwardToConsole=yes\n')
+        self.assertEqual(self.call('start-fresh'), 1)
+
+    def test_loaded_dropin_or_stale_manager_refused(self):
+        self.prepared()
+        real = self.command
+        for replacement in (b'DropInPaths=/foreign.conf', b'NeedDaemonReload=yes'):
+            def altered(argv, *a, **kw):
+                raw = real(argv, *a, **kw)
+                if argv[:2] == [core.SYSTEMCTL, 'show']:
+                    raw = raw.replace(b'DropInPaths=', replacement) if replacement.startswith(b'DropIn') else raw.replace(b'NeedDaemonReload=no', replacement)
+                return raw
+            with patch.object(core, 'execute', side_effect=altered):
+                self.assertEqual(self.call('start-fresh'), 1)
+
+    def test_fixed_deadline_never_renews(self):
+        self.prepared()
+        value = core.reserve('fresh')
+        self.assertEqual(value['deadline'] - value['started'], 2700)
+        value['deadline'] = core.time.monotonic() - 1
+        value['started'] = value['deadline'] - 2700
+        core.save(value)
+        with self.assertRaises(core.Failure) as raised:
+            core.unit_gate('fresh')
+        self.assertEqual(raised.exception.code, 124)
+
+    def test_private_input_hash_unknown_keys_and_permissions(self):
+        for mutation in (lambda c: c.update(extra='unexpected'),
+                         lambda c: c.update(fab_sha256='0' * 64),
+                         lambda c: c.update(dedicated_guest=False)):
+            original = copy.deepcopy(self.contract)
+            mutation(self.contract)
+            self.write_contract()
+            self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+            self.assertFalse(core.ROOT.exists())
+            self.contract = original
+        self.write_contract()
+        self.input.chmod(0o644)
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+
+    def test_original_development_credentials_and_wrong_candidates_refused(self):
+        for mutate in (lambda docs: docs[0]['spec']['config']['control'].update(joinToken=''),
+                       lambda docs: docs[0]['spec']['config']['control']['defaultUser'].update(password=core.DEV_PASSWORD),
+                       lambda docs: docs[0]['spec']['config']['registry'].update(mode='upstream'),
+                       lambda docs: docs[0]['spec']['config']['control'].update(controlVIP='10.0.0.1/32')):
+            docs = copy.deepcopy(self.fab)
+            mutate(docs)
+            with self.assertRaises(core.Failure):
+                core.validate_fab(yaml.safe_dump_all(docs).encode())
+
+    def test_conflicting_invocation_not_stopped(self):
+        self.fresh()
+        self.invocation['fresh'] = 'c' * 32
+        before = len(self.calls)
+        self.assertEqual(self.call('stop'), 1)
+        self.assertFalse(any(c[0][:2] == [core.SYSTEMCTL, 'stop'] for c in self.calls[before:]))
+
+    def test_populated_exact_cgroup_is_uncertain(self):
+        self.fresh()
+        group = core.CGROUP / 'system.slice' / core.UNIT['fresh']
+        group.mkdir(parents=True)
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+        self.assertEqual(self.call('stop'), 1)
+        self.assertTrue((group / 'cgroup.events').exists())
+
+    def test_direct_boot_resume_only_uses_sealed_resumable_state(self):
+        self.resumable()
+        self.phase['resume'] = 'activating'
+        self.invocation['resume'] = 'a' * 32
+        self.assertEqual(self.call('unit-gate', '--mode', 'resume'), 0)
+        value = core.state()
+        self.assertEqual(value['phase'], 'starting')
+        self.assertEqual(value['mode'], 'resume')
+        self.assertEqual(value['deadline'] - value['started'], 900)
+        self.assertEqual(self.call('unit-gate', '--mode', 'resume'), 1)
+
+
+class FormatAndSourceTests(unittest.TestCase):
+    def test_read_and_hash_allow_access_time_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'public'
+            target.write_bytes(b'public data')
+            os.utime(target, (1, 1))
+            self.assertEqual(core.read(target), b'public data')
+            self.assertEqual(core.identity(target, True)['sha256'], core.digest(b'public data'))
+
+    def test_strict_json_and_yaml_reject_duplicates_aliases_deep_and_unsafe(self):
+        for raw in (b'{"a":1,"a":2}', b'{"a":NaN}'):
+            with self.assertRaises(core.Failure):
+                core.json_data(raw)
+        for raw in (b'a: 1\na: 2\n', b'a: &a []\nb: *a\n', b'a: !!python/object:os.system {}',
+                    b'a: ' + b'[' * 34 + b'0' + b']' * 34):
+            with self.assertRaises(core.Failure):
+                core.yaml_documents(raw)
+        self.assertEqual(core.yaml_documents(b'ip:\tdhcp\n'), [{'ip': 'dhcp'}])
+
+    def test_units_actual_namespace_privilege_logging_stop_and_no_conflicts(self):
+        root = Path(__file__).parent
+        for mode, name in core.UNIT.items():
+            raw = (root / name).read_text()
+            self.assertIn('ExecStart=!/usr/bin/python3 ', raw)
+            self.assertNotIn('ExecStart=+', raw)
+            self.assertNotIn('Conflicts=', raw)
+            self.assertIn('KillMode=control-group', raw)
+            self.assertIn('TimeoutStopSec=20', raw)
+            self.assertIn('Restart=no', raw)
+            self.assertIn('ExecStopPost=+', raw)
+            self.assertIn('LogNamespace=labapp-vlab', raw)
+            self.assertIn('StandardOutput=journal', raw)
+            self.assertIn('TimeoutStartSec=' + str(core.START_SECONDS[mode]), raw)
+            if mode == 'resume':
+                for path in ('result', 'fab.yaml', '.registry.yaml', 'include', 'vlab/config.yaml', 'vlab/sshkey'):
+                    self.assertIn('/home/ubuntu/hhfab/' + path, raw)
+        journal = (root / 'journald@labapp-vlab.conf').read_text()
+        for name in ('Syslog', 'KMsg', 'Console', 'Wall'):
+            self.assertIn('ForwardTo' + name + '=no', journal)
+        self.assertIn('SystemMaxUse=32M', journal)
+        self.assertIn('RuntimeMaxUse=16M', journal)
+
+    def test_fixed_up_has_no_destructive_fallback_flags(self):
+        argv = core.up_argv()
+        self.assertEqual(argv[:3], [core.HHFAB, 'vlab', 'up'])
+        for flag in ('--force', '--recreate', '--dev', '--no-create', '--attempts'):
+            self.assertNotIn(flag, argv)
+        self.assertIn('--kill-stale=false', argv)
+        self.assertIn('--auto-upgrade=false', argv)
+        self.assertEqual(core.PACKAGE_PINS['qemu-system-x86'], '1:8.2.2+ds-0ubuntu1.11')
+
+    def test_bounded_executor_real_inspected_children(self):
+        # No fake installed binaries and no network. Both children are stdlib only.
+        for code, cap, expected in [('import time; time.sleep(10)', .03, 124),
+                                    ('import os; os.write(1,b"x"*1100000)', 2, 1),
+                                    ('raise SystemExit(19)', 2, 19)]:
+            with self.subTest(code=code), self.assertRaises(core.Failure) as raised:
+                core.execute([sys.executable, '-I', '-B', '-c', code], core.time.monotonic() + 3, cap)
+            self.assertEqual(raised.exception.code, expected)
+
+    def test_bounded_executor_sanitizes_environment(self):
+        with patch.dict(os.environ, {'HHFAB_JOIN_TOKEN': 'DO_NOT_FORWARD', 'KUBECONFIG': '/bad'}):
+            raw = core.execute([sys.executable, '-I', '-B', '-c',
+                                'import json,os; print(json.dumps(dict(os.environ)))'],
+                               core.time.monotonic() + 3)
+        self.assertEqual(json.loads(raw), core.SAFE_ENV)
+
+    def test_parent_signal_preserves_primary_and_reaps_known_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / 'pid'
+            program = ('import os,signal,time; from pathlib import Path; '
+                       'Path(' + repr(str(pidfile)) + ').write_text(str(os.getpid())); '
+                       'os.kill(os.getppid(),signal.SIGINT); time.sleep(10)')
+            with self.assertRaises(KeyboardInterrupt):
+                core.execute([sys.executable, '-I', '-B', '-c', program], core.time.monotonic() + 3)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pidfile.read_text()), 0)
+
+    def test_exited_direct_child_does_not_leave_pipe_holding_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / 'descendant'
+            descendant = 'import time; time.sleep(10)'
+            program = ('import subprocess,sys; from pathlib import Path; '
+                       'p=subprocess.Popen([sys.executable,"-I","-B","-c",' + repr(descendant) + ']); '
+                       'Path(' + repr(str(pidfile)) + ').write_text(str(p.pid))')
+            with self.assertRaises(core.Failure) as raised:
+                core.execute([sys.executable, '-I', '-B', '-c', program], core.time.monotonic() + .2)
+            self.assertEqual(raised.exception.code, 124)
+            pid = int(pidfile.read_text())
+            end = core.time.monotonic() + 2
+            while True:
+                try:
+                    state = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+                except FileNotFoundError:
+                    break
+                # Nonchild zombie reaping belongs to its parent/subreaper. Only
+                # termination is asserted here; no daemon/process census claim.
+                if state == 'Z':
+                    break
+                self.assertLess(core.time.monotonic(), end, 'owned descendant remains running')
+                core.time.sleep(.01)
+
+
+class PrerequisiteContractTests(unittest.TestCase):
+    """Unmocked prerequisite verifier, injected filesystem/package observations.
+
+    No actual package query or binary access. Exact fixed command/pin maps stay
+    in place; only their OS observations are synthetic.
+    """
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.packages = {**{name: '1.0' for name in core.AUX.values()}, **core.PACKAGE_PINS}
+        self.records = {}
+        for name in set(core.AUX) | set(core.TOOL_PINS):
+            size, sha = core.TOOL_PINS.get(name, (4, 'f' * 64))
+            self.records[name] = {'dev': 1, 'ino': len(self.records) + 1,
+                'uid': 0, 'gid': 0, 'mode': stat.S_IFREG | (0o4755 if name == '/usr/bin/sudo' else 0o755),
+                'size': size, 'sha256': sha}
+        self.receipt = {'schema': 1, 'source_sha256': 'c' * 64, 'packages': self.packages,
+                        'commands': {name: {'resolved': name, 'sha256': record['sha256']}
+                                     for name, record in self.records.items()}}
+        self.os_release = b'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n'
+        self.arch = 'amd64'
+        self.status = 'installed'
+        self.installed = copy.deepcopy(self.packages)
+        self.machine = 'x86_64'
+        self.calls = []
+        self.stack.enter_context(patch.object(core, 'read', side_effect=self.read))
+        self.stack.enter_context(patch.object(core, 'identity', side_effect=self.identity))
+        self.stack.enter_context(patch.object(core, 'execute', side_effect=self.execute))
+        self.stack.enter_context(patch.object(core.os, 'uname', side_effect=lambda: SimpleNamespace(machine=self.machine)))
+        self.stack.enter_context(patch.object(Path, 'resolve', autospec=True, side_effect=lambda path, **_: path))
+
+    def read(self, path, *args, **kwargs):
+        self.assertEqual(path, Path('/usr/lib/os-release'))
+        return self.os_release
+
+    def identity(self, path, *args, **kwargs):
+        self.assertIn(str(path), self.records)
+        return copy.deepcopy(self.records[str(path)])
+
+    def execute(self, argv, *args, **kwargs):
+        self.assertEqual(argv[:3], [core.DPKG, '-W', '-f=${db:Status-Status}\t${Architecture}\t${Version}\n'])
+        self.assertIn(argv[3], self.packages)
+        self.calls.append(argv[3])
+        return f'{self.status}\t{self.arch}\t{self.installed[argv[3]]}\n'.encode()
+
+    def verify(self):
+        return VERIFY_PREREQUISITES(self.receipt, core.time.monotonic() + 5)
+
+    def test_exact_actual_fixed_pins_and_selected_auxiliary_receipt_pass(self):
+        records = self.verify()
+        self.assertEqual(set(records), set(core.AUX) | set(core.TOOL_PINS))
+        self.assertEqual(set(self.calls), set(self.packages))
+        self.assertEqual(records['/usr/bin/sudo']['mode'], stat.S_IFREG | 0o4755)
+
+    def test_test_qemu_point18_refused_before_package_command(self):
+        self.packages['qemu-system-x86'] = '1:8.2.2+ds-0ubuntu1.18'
+        with self.assertRaisesRegex(core.Failure, 'baseline package pin'):
+            self.verify()
+        self.assertFalse(self.calls)
+
+    def test_installed_version_architecture_and_state_must_match(self):
+        for field, value in (('arch', 'arm64'), ('status', 'config-files')):
+            original = getattr(self, field)
+            setattr(self, field, value)
+            with self.subTest(field=field), self.assertRaisesRegex(core.Failure, 'installed package differs'):
+                self.verify()
+            setattr(self, field, original)
+        self.installed['qemu-utils'] = 'different'
+        with self.assertRaisesRegex(core.Failure, 'installed package differs'):
+            self.verify()
+
+    def test_receipt_cannot_select_different_pinned_tool(self):
+        self.records[core.HHFAB]['sha256'] = 'e' * 64
+        self.receipt['commands'][core.HHFAB]['sha256'] = 'e' * 64
+        with self.assertRaisesRegex(core.Failure, 'tool pin'):
+            self.verify()
+
+    def test_command_owner_mode_hash_and_resolved_path_are_bound(self):
+        for field, value in (('uid', 1000), ('mode', stat.S_IFREG | 0o777), ('sha256', 'e' * 64)):
+            original = self.records[core.KUBECTL][field]
+            self.records[core.KUBECTL][field] = value
+            with self.subTest(field=field), self.assertRaises(core.Failure):
+                self.verify()
+            self.records[core.KUBECTL][field] = original
+        self.receipt['commands'][core.KUBECTL]['resolved'] = '/foreign'
+        with self.assertRaisesRegex(core.Failure, 'command receipt mismatch'):
+            self.verify()
+
+    def test_unknown_package_or_command_refused(self):
+        self.packages['unexpected'] = '1'
+        with self.assertRaisesRegex(core.Failure, 'package set'):
+            self.verify()
+        del self.packages['unexpected']
+        self.receipt['commands']['/bad'] = {'resolved': '/bad', 'sha256': 'f' * 64}
+        with self.assertRaisesRegex(core.Failure, 'command receipt set'):
+            self.verify()
+
+    def test_os_release_architecture_and_source_receipt_are_explicit(self):
+        self.machine = 'aarch64'
+        with self.assertRaisesRegex(core.Failure, 'guest architecture'):
+            self.verify()
+        self.machine = 'x86_64'
+        self.os_release = self.os_release.replace(b'24.04', b'22.04')
+        with self.assertRaisesRegex(core.Failure, 'Ubuntu baseline'):
+            self.verify()
+        self.receipt['source_sha256'] = 'unbound'
+        with self.assertRaisesRegex(core.Failure, 'provisioning receipt'):
+            self.verify()
+
+
+if __name__ == '__main__':
+    unittest.main()

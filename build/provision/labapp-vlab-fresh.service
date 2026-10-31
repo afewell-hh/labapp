@@ -1,0 +1,26 @@
+[Unit]
+Description=Labapp canonical VLAB fresh startup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/hhfab
+UMask=0077
+StandardInput=null
+LogNamespace=labapp-vlab
+StandardOutput=journal
+StandardError=journal
+Restart=no
+ExecStartPre=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-gate --mode fresh
+ExecStart=!/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-run --mode fresh
+ExecStartPost=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-ready --mode fresh
+ExecStopPost=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-finished --mode fresh
+TimeoutStartSec=2700
+TimeoutStopSec=20
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL

@@ -206,6 +206,72 @@ jobs:
         run: |
           test -f build/provision/test_hhfab_offline.py
           python3 -m unittest discover -s build/provision -p test_hhfab_offline.py -v
+      - name: Required VLAB core offline entrypoint regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/provision/test_vlab_core.py
+          test_root=$(mktemp -d /tmp/labapp-vlab-core-tests.XXXXXX)
+          root_identity=$(stat -c %d:%i:%u:%a -- "$test_root")
+          home_identity=uncreated
+          tmp_identity=uncreated
+          cleanup_vlab_tests() {
+            local primary=$? cleanup=0 owned expected
+            trap - EXIT
+            trap '' INT TERM
+            if [[ ! -d "$test_root" || -L "$test_root" || $(stat -c %d:%i:%u:%a -- "$test_root") != "$root_identity" ]]; then
+              echo 'VLAB core: host root identity changed; paths retained' >&2
+              cleanup=1
+            else
+              for owned in "$test_root/tmp" "$test_root/home" "$test_root"; do
+                case "$owned" in
+                  "$test_root") expected=$root_identity ;;
+                  "$test_root/home") expected=$home_identity ;;
+                  "$test_root/tmp") expected=$tmp_identity ;;
+                esac
+                if [[ -d "$owned" && ! -L "$owned" && $(stat -c %d:%i:%u:%a -- "$owned") == "$expected" ]]; then
+                  rmdir -- "$owned" || cleanup=1
+                else
+                  cleanup=1
+                fi
+                if [[ -e "$owned" || -L "$owned" ]]; then
+                  cleanup=1
+                else
+                  printf 'VLAB core host cleanup absent: %s\n' "$owned"
+                fi
+              done
+            fi
+            if (( primary != 0 )); then exit "$primary"; fi
+            exit "$cleanup"
+          }
+          trap cleanup_vlab_tests EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          mkdir -m 700 "$test_root/home" "$test_root/tmp"
+          home_identity=$(stat -c %d:%i:%u:%a -- "$test_root/home")
+          tmp_identity=$(stat -c %d:%i:%u:%a -- "$test_root/tmp")
+          umask 022
+          env -i HOME="$test_root/home" TMPDIR="$test_root/tmp" PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 timeout --kill-after=10s 180s python3 -I -B - <<'PY'
+          import os
+          import stat
+          import sys
+          import unittest
+          def audit(event, args):
+              if event.startswith('socket.'):
+                  raise RuntimeError('offline suite socket operation denied')
+          sys.addaudithook(audit)
+          print({'python': sys.version, 'uid': os.getuid(),
+                 'home_mode': oct(stat.S_IMODE(os.stat(os.environ['HOME']).st_mode)),
+                 'tmp_mode': oct(stat.S_IMODE(os.stat(os.environ['TMPDIR']).st_mode))}, flush=True)
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_vlab_core.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required VLAB core suite discovered no tests')
+          print(f'Required VLAB core tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
       - name: Run actual official CLI in isolated Ubuntu containers
         run: timeout --kill-after=30s 10m bash build/provision/test-hhfab-offline.sh
 
