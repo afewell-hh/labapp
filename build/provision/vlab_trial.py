@@ -99,7 +99,9 @@ def candidate_fab(public_key, password_hash, token):
              'metadata': {'name': 'default', 'namespace': 'fab'}, 'spec': {'config': config}},
             {'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'ControlNode',
              'metadata': {'name': 'control-1', 'namespace': 'fab'}, 'spec': {'bootstrap': {'disk': '/dev/sda'},
-              'external': {'interface': 'enp2s0', 'ip': 'dhcp'}, 'management': {'interface': 'enp2s1', 'ip': '172.30.0.5/21'}}}]
+              # Leave both management/dummy allocation to official if-not-present
+              # hydration, like the v0.43.1 template; a lone IP is partial state.
+              'external': {'interface': 'enp2s0', 'ip': 'dhcp'}, 'management': {'interface': 'enp2s1'}}}]
     return b'\n---\n'.join(encoded(d) for d in docs) + b'\n'
 
 

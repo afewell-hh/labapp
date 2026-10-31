@@ -153,8 +153,9 @@ def no_switch_smoke(cli, init, validate, case):
     return summary
 
 
-def config_import_smoke(cli, validate, source, case, wiring, binary):
+def config_import_smoke(cli, validate, source, case, wiring, binary, *, fixture='generated-reference'):
     """Import only the generated public 0.43.1 candidate, never original inputs."""
+    require(fixture in ('generated-reference', 'rendered-candidate'), 'unknown public import fixture')
     require(case.is_dir() and not case.is_symlink() and not list(case.iterdir())
             and case != source, "config import requires fresh owned empty case")
     pin = PINS["0.43.1"]
@@ -178,7 +179,7 @@ def config_import_smoke(cli, validate, source, case, wiring, binary):
     require(before["include/wiringd.yaml"] == WIRING_SHA, "config import source wiring mismatch")
     require(cli("init", case, ["--config", str(source / "fab.yaml"),
                               "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog",
-                              "--wiring", str(wiring)])[0] == 0, "official config import refused")
+                              "--wiring", str(wiring)])[0] == 0, f"{fixture}: official config import refused")
 
     def preserved():
         require(fixture_identity(source) == before, "config import changed source fixture")
@@ -187,9 +188,9 @@ def config_import_smoke(cli, validate, source, case, wiring, binary):
         tool_identity()
 
     preserved()
-    require(validate(case)[0] == 0, "official validate refused imported config")
+    require(validate(case)[0] == 0, f"{fixture}: official validate refused imported config")
     preserved()
-    require(validate(case)[0] == 0, "official imported config validation rerun refused")
+    require(validate(case)[0] == 0, f"{fixture}: official imported config validation rerun refused")
     preserved()
     return {"scope": "generated-public-candidate-only", "tree_sha256": before}
 
@@ -206,7 +207,7 @@ def rendered_config_smoke(cli, validate, reference, source, case, wiring, binary
     (source / 'result').mkdir(mode=0o700)
     shutil.copyfile(reference / '.registry.yaml', source / '.registry.yaml')
     shutil.copyfile(wiring, source / 'include/wiringd.yaml')
-    result = config_import_smoke(cli, validate, source, case, wiring, binary)
+    result = config_import_smoke(cli, validate, source, case, wiring, binary, fixture='rendered-candidate')
     return dict(result, renderer_sha256=hashlib.sha256(raw).hexdigest(), public_fixture=True)
 
 

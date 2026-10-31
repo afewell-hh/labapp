@@ -158,6 +158,14 @@ real candidate secret enters this container. The report's `trial_renderer_import
 contains only public fixture/source hashes and status. The ordinary generated
 public FAB check alone does not validate this additional recipe. All existing
 network-none/nonroot/no-capability/resource/owned-cleanup bounds remain active.
+Native import/first-validation/rerun refusals identify the finite public fixture
+(`generated-reference` or `rendered-candidate`) without printing CLI output.
+The trial renderer leaves control management/dummy IPs unallocated, matching
+the [v0.43.1 template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml).
+Official [if-not-present hydration](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/hydrate.go)
+requires wholly unhydrated inputs and assigns the sole control `172.30.0.5/21`
+and dummy `172.30.90.0/31` in memory. Core candidate validation retains the
+explicit management-address policy; import and validation retain exact bytes.
 
 ```bash
 # Host: Docker daemon, curl, timeout and Python 3.10+ stdlib; network for preparation.

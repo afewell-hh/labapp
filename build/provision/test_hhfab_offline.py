@@ -317,6 +317,7 @@ class ConfigImportTests(unittest.TestCase):
                 result, calls, *_ = self.run_import(failure=stage)
                 self.assertIsInstance(result, subject.Refusal)
                 self.assertEqual(len(calls), count)
+                self.assertTrue(str(result).startswith('generated-reference: '))
                 self.assertNotIn("private diagnostic", str(result))
 
     def test_shared_trial_renderer_reuses_exact_import_and_two_validations(self):
@@ -330,6 +331,32 @@ class ConfigImportTests(unittest.TestCase):
             failed, events, *_ = self.run_import(renderer=True, failure=stage)
             self.assertIsInstance(failed, subject.Refusal)
             self.assertEqual(len(events), count)
+            self.assertTrue(str(failed).startswith('rendered-candidate: '))
+            self.assertNotIn('private diagnostic', str(failed))
+
+    def test_trial_renderer_leaves_canonical_topology_for_official_hydration(self):
+        import vlab_core as core
+        import yaml
+        raw = subject.candidate_fab('ssh-ed25519 AAAA', '$5$publicfixture$' + 'a'*43, 'f'*64)
+        docs = core.validate_fab(raw)
+        node = docs[1]['spec']
+        self.assertEqual(node['management'], {'interface': 'enp2s1'})
+        self.assertNotIn('dummy', node)
+        wiring = subject.check_wiring(Path(__file__).resolve().parents[2] / 'wiringd.yaml')
+        for doc in wiring:
+            if doc['kind'] == 'Switch':
+                self.assertTrue({'ip', 'protocolIP', 'vtepIP', 'asn'}.isdisjoint(doc['spec']))
+            elif doc['kind'] == 'Connection':
+                for link in doc['spec'].get('fabric', {}).get('links', []):
+                    self.assertEqual(set(link['spine']), {'port'})
+                    self.assertEqual(set(link['leaf']), {'port'})
+        # Retain the accepted effective control address policy; this test does
+        # not implement or simulate the official allocator.
+        node['management']['ip'] = '172.30.0.5/21'
+        core.validate_fab(yaml.safe_dump_all(docs).encode())
+        node['management']['ip'] = '172.30.0.6/21'
+        with self.assertRaisesRegex(core.Failure, 'control candidate policy'):
+            core.validate_fab(yaml.safe_dump_all(docs).encode())
 
     def test_import_byte_object_and_shape_changes_stop_before_validation(self):
         for target, action in (("fab.yaml", "write"), ("include/wiringd.yaml", "write"),
