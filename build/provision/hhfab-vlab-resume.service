@@ -1,0 +1,30 @@
+[Unit]
+Description=Labapp canonical VLAB preserved-state resume
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/hhfab
+UMask=0077
+StandardInput=null
+LogNamespace=labapp-vlab
+StandardOutput=journal
+StandardError=journal
+Restart=no
+ExecStartPre=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-gate --mode resume
+ExecStart=!/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-run --mode resume
+ExecStartPost=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-ready --mode resume
+ExecStopPost=+/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-finished --mode resume
+ReadOnlyPaths=/home/ubuntu/hhfab/result /home/ubuntu/hhfab/fab.yaml /home/ubuntu/hhfab/.registry.yaml /home/ubuntu/hhfab/include /home/ubuntu/hhfab/vlab/config.yaml /home/ubuntu/hhfab/vlab/sshkey
+TimeoutStartSec=900
+TimeoutStopSec=20
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL
+
+[Install]
+WantedBy=multi-user.target
