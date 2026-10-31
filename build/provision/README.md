@@ -1157,6 +1157,53 @@ python3 /usr/local/lib/labapp/vlab_core.py start-resume
 python3 /usr/local/lib/labapp/vlab_core.py stop
 ```
 
+Startup action ordering: each fixed unit runs `unit-gate` (`ExecStartPre`),
+`unit-run` (`ExecStart`, a Python wrapper that drops privilege and `execve`s
+hhfab) and `unit-ready` (`ExecStartPost`). For `Type=exec`, systemd waits for
+execution of the Python interpreter, so readiness can publish `service` while
+the wrapper validates its startup snapshot. Whole-state equality at the final
+run gate would then reject a legitimate same-operation publication. A run
+refusal can leave readiness waiting for the bridge; a later bridge timeout
+does not establish the original cause. Earlier trial causes require their own
+evidence. Neither wrapper exec nor service activation establishes readiness.
+
+The preliminary startup snapshot binds the original boot and operation deadline
+before any sibling lock wait. The locked reread preserves every field except
+an absent `service` becoming exactly the live invocation/cgroup/PID/start pin;
+null, removed or replaced service values refuse. `unit-run` requires the live
+main PID to be its own PID initially and reobserves the original live pin at
+its final gate, including when service is absent or already published. All
+other state fields remain exact, including nonce, operation, mode, invocation,
+phase, boot, deadline, source/static/tool/contract pins and stop ownership.
+`unit-ready` alone publishes service, and its final readiness commit compares
+its full published snapshot before changing phase/critical/cluster itself.
+
+Only the sibling startup actions wait for the state lock: at most 10 seconds,
+capped by the original operation deadline, with expiry checked again after
+acquisition. Other callers retain immediate refusal. The final run lock stays
+held through privilege drop and exec; Python's non-inheritable lock descriptor
+closes on successful exec and the context closes it on failure. A final clock
+check after privilege drop prevents late exec. No new operation time allowance,
+reconnect or readiness retry is introduced.
+
+Primary sources read 2026-10-31: [Ubuntu Noble systemd.service,
+255.4-1ubuntu8.18](https://manpages.ubuntu.com/manpages/noble/man5/systemd.service.5.html)
+and [upstream systemd 255 service manual](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html)
+(`Type=exec`, `ExecStartPre/Post`, main-process semantics);
+[Noble execve, manpages-dev 6.7-2](https://manpages.ubuntu.com/manpages/noble/man2/execve.2.html)
+(process replacement and preserved process attributes); and
+[Python 3.12 os.open / descriptor inheritance](https://docs.python.org/3.12/library/os.html#fd-inheritance)
+(non-inheritable descriptors close at exec on Unix). These document the
+scheduling and descriptor contract, not a native appliance proof.
+
+The mocked fixtures in `test_vlab_core.py` call actual `unit-ready` through its
+publication and pause at the bridge boundary before/between run snapshots,
+for fresh and resume. Separate cases specify immutable/service/live PID/start
+substitutions, full readiness commit consistency, bounded flock contention and
+late acquisition/privilege-drop expiry. These fixtures model source sequencing;
+execution evidence is recorded in CI and issue handoffs. Native systemd scheduling,
+namespace/cgroup enforcement and actual VLAB readiness cannot be proved by mocks.
+
 The bounded input JSON is mode0600, with no symlink components, duplicate keys,
 unknown fields or ambient credential lookup. Its exact fields are:
 
