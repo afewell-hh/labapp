@@ -6,6 +6,7 @@ Invoked explicitly by test-hhfab-offline.sh, independent of caller cwd. No sudo,
 installation fallback, ambient HHFAB_* settings, production output or VLAB launch.
 """
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import tempfile
 import time
 
 from hhfab_release import PINS, Refusal, digest, bounded, extract, download
+from vlab_trial import candidate_fab
 
 WIRING_SHA = "c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a"
 SIZES = {"control": {"cpu": 6, "ram": 6144, "disk": 100},
@@ -34,7 +36,7 @@ def prepare(destination, source, installer=False):
         raise Refusal("public wiring checksum mismatch")
     shutil.copyfile(source / "wiringd.yaml", destination / "wiringd.yaml")
     shutil.copyfile(Path(__file__), destination / "hhfab_test.py")
-    for name in ("hhfab_release.py", "install-hhfab.py", "test_install_hhfab.py"):
+    for name in ("hhfab_release.py", "install-hhfab.py", "test_install_hhfab.py", "vlab_trial.py"):
         shutil.copyfile(Path(__file__).with_name(name), destination / name)
     for version, pin in PINS.items():
         archive = destination / (version + ".tar.gz")
@@ -151,8 +153,9 @@ def no_switch_smoke(cli, init, validate, case):
     return summary
 
 
-def config_import_smoke(cli, validate, source, case, wiring, binary):
+def config_import_smoke(cli, validate, source, case, wiring, binary, *, fixture='generated-reference'):
     """Import only the generated public 0.43.1 candidate, never original inputs."""
+    require(fixture in ('generated-reference', 'rendered-candidate'), 'unknown public import fixture')
     require(case.is_dir() and not case.is_symlink() and not list(case.iterdir())
             and case != source, "config import requires fresh owned empty case")
     pin = PINS["0.43.1"]
@@ -176,7 +179,7 @@ def config_import_smoke(cli, validate, source, case, wiring, binary):
     require(before["include/wiringd.yaml"] == WIRING_SHA, "config import source wiring mismatch")
     require(cli("init", case, ["--config", str(source / "fab.yaml"),
                               "--registry-repo", "ghcr.io", "--registry-prefix", "githedgehog",
-                              "--wiring", str(wiring)])[0] == 0, "official config import refused")
+                              "--wiring", str(wiring)])[0] == 0, f"{fixture}: official config import refused")
 
     def preserved():
         require(fixture_identity(source) == before, "config import changed source fixture")
@@ -185,11 +188,27 @@ def config_import_smoke(cli, validate, source, case, wiring, binary):
         tool_identity()
 
     preserved()
-    require(validate(case)[0] == 0, "official validate refused imported config")
+    require(validate(case)[0] == 0, f"{fixture}: official validate refused imported config")
     preserved()
-    require(validate(case)[0] == 0, "official imported config validation rerun refused")
+    require(validate(case)[0] == 0, f"{fixture}: official imported config validation rerun refused")
     preserved()
     return {"scope": "generated-public-candidate-only", "tree_sha256": before}
+
+
+def rendered_config_smoke(cli, validate, reference, source, case, wiring, binary):
+    """Same trial renderer, public-only values, existing official import proof."""
+    require(source.is_dir() and not source.is_symlink() and not list(source.iterdir()),
+            'renderer fixture requires fresh empty directory')
+    public_key = 'ssh-ed25519 ' + base64.b64encode(b'\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20' + b'\x01'*32).decode()
+    raw = candidate_fab(public_key, '$5$publicfixture$' + 'a'*43, 'f'*64)
+    (source / 'fab.yaml').write_bytes(raw)
+    (source / 'fab.yaml').chmod(0o600)
+    (source / 'include').mkdir(mode=0o700)
+    (source / 'result').mkdir(mode=0o700)
+    shutil.copyfile(reference / '.registry.yaml', source / '.registry.yaml')
+    shutil.copyfile(wiring, source / 'include/wiringd.yaml')
+    result = config_import_smoke(cli, validate, source, case, wiring, binary, fixture='rendered-candidate')
+    return dict(result, renderer_sha256=hashlib.sha256(raw).hexdigest(), public_fixture=True)
 
 
 def lane(version):
@@ -248,11 +267,17 @@ def lane(version):
     good = case
     good_hashes = tree_hashes(good)
     imported = None
+    rendered = None
     if version == "0.43.1":
         imported = config_import_smoke(cli, validate, good,
                                       Path(tempfile.mkdtemp(prefix="import-", dir="/work")),
                                       Path("/suite/wiringd.yaml"), binary)
         checks.append("public-config-import-preserved-and-revalidated")
+        rendered = rendered_config_smoke(cli, validate, good,
+                         Path(tempfile.mkdtemp(prefix='renderer-source-', dir='/work')),
+                         Path(tempfile.mkdtemp(prefix='renderer-import-', dir='/work')),
+                         Path('/suite/wiringd.yaml'), binary)
+        checks.append('trial-renderer-public-config-import-preserved-and-revalidated')
     negatives = {
         "malformed-yaml": b"kind: [\n",
         "unsupported-gvk": b"apiVersion: unsupported.example/v1\nkind: Surprise\nmetadata: {name: bad}\n",
@@ -312,6 +337,7 @@ def lane(version):
               "sizing_scope": "fixture-only; not upstream VLAB validation"}
     if imported is not None:
         report["config_import"] = imported
+        report['trial_renderer_import'] = rendered
     print(json.dumps(report, sort_keys=True))
 
 

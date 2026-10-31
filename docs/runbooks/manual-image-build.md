@@ -344,3 +344,21 @@ Direct `systemctl stop` or OS shutdown without the bound public stop intent leav
 the component failed. Enabled resume after a sealed, stopped state is distinct
 from seamless reboot/cloud stop-start/image acceptance; those transitions remain
 separately gated. Do not repair or reset failed state automatically.
+
+The [fixed disposable GCP trial](../../build/gcp/README.md#fixed-owner-local-canonical-trial)
+composes these shared guest operations with the existing trusted lifecycle and
+owner access. It uses a fresh private candidate FAB, the historical .11 QEMU
+selection, exact baseline Docker/hhfab/kubectl bytes and separately selected
+authenticated auxiliary packages, including socat. Those inputs and direct
+service behavior are explicit candidate differences, not recovery of missing
+original secrets/helpers or full production/course equivalence.
+
+The outer VM stays RUNNING through inner public stop/resume. Absolute admission
+cutoffs reserve the final fifteen of120minutes for cleanup. The500GiB disk is
+an unmeasured sparse-capacity hypothesis with fixed free-memory/disk stops;
+there is no automatic resize or quota change. Complete offline eighteen-image
+inspection occurs after verified public stop, before resume; complete cold
+preboot inspection remains unmet because upstream prepares images inside up.
+Source/fixture acceptance alone supplies no successful VM, persistence,
+boot/reboot or student acceptance evidence. Preserve the original source image,
+eleven preexisting images and existing student/LMS content.

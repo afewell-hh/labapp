@@ -1,5 +1,5 @@
 ---
-name: Labapp bounded Ubuntu component
+name: Labapp bounded canonical VLAB trial
 
 'on':
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 36
+    timeout-minutes: 128
     steps:
       - name: Fetch allowlisted trusted main modules
         env:
@@ -82,9 +82,9 @@ jobs:
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
         with:
           version: '540.0.0'
-      - name: Run fixed Ubuntu component lifecycle
+      - name: Run fixed disposable canonical trial lifecycle
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/labapp-trusted-lifecycle"
-          python3 -m lifecycle.cli component
+          python3 -m lifecycle.cli vlab-core
