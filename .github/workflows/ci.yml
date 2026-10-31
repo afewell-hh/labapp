@@ -152,6 +152,7 @@ jobs:
           test -f build/gcp/lifecycle/test_base_build.py
           test -f build/gcp/lifecycle/test_capture.py
           test -f build/gcp/lifecycle/test_access.py
+          test -f build/gcp/lifecycle/test_access_recovery.py
           PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
           import unittest
           access = unittest.TestLoader().discover(
@@ -159,6 +160,11 @@ jobs:
           if access.countTestCases() == 0:
               raise SystemExit('Required access suite discovered no tests')
           print(f'Required access tests: {access.countTestCases()}', flush=True)
+          recovery = unittest.TestLoader().discover(
+              'build/gcp/lifecycle', pattern='test_access_recovery.py', top_level_dir='build/gcp')
+          if recovery.countTestCases() == 0:
+              raise SystemExit('Required failed-disposal suite discovered no tests')
+          print(f'Required failed-disposal tests: {recovery.countTestCases()}', flush=True)
           suite = unittest.TestLoader().discover('build/gcp/lifecycle', top_level_dir='build/gcp')
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(0 if result.wasSuccessful() else 1)

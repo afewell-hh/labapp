@@ -5,11 +5,13 @@ One persistent slot record (generation-matched writes) moves through
     FREE -> RESERVED -> ACTIVE -> FREE
                  \\-> CLEANUP_FAILED -> FREE      (any occupied state)
 
-Only ``reconcile`` can return a slot to FREE, and only after the VM and all
+Normal release uses ``reconcile``, only after the VM and all
 intended owned disks are confirmed absent (404 after the delete operation is DONE) and
 no create can still land. Normal cleanup and the janitor call the same method.
 Every state change is a compare-and-swap on the slot's generation, so a stale
 actor loses instead of overwriting a newer lease.
+The separate trusted-owner access_recovery library can dispose of a failed
+UNKNOWN import under explicit reviewed evidence; normal cleanup stays strict.
 
 Capacity is never released optimistically: unexpected pending operations,
 identity mismatches, delete failures or an unresolved create keep the slot

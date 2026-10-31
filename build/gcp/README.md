@@ -840,6 +840,77 @@ Sources checked 2026-10-25, GCS JSON API and OS Login v1:
 [key import](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users/importSshPublicKey),
 [public-key fields](https://docs.cloud.google.com/compute/docs/oslogin/rest/Shared.Types/SshPublicKey),
 and [exact key deletion](https://docs.cloud.google.com/compute/docs/oslogin/rest/v1/users.sshPublicKeys/delete).
+
+### Explicit failed-import disposal
+
+`lifecycle.access_recovery.OwnerRecovery` is a separate trusted-owner library
+facade for an already disposed `ubuntu-vlab-core-v1` lease in finalizing
+`CLEANUP_FAILED`, with one genuine intent and absent import/seal/removal records.
+It has no CLI, workflow consumer, automatic expiry trigger or deletion path.
+Normal reconciliation, own-key cleanup and capture still require their genuine
+receipts. This route returns `failed-disposed`: trial **FAILED**, historical
+import **UNKNOWN**, disposition **FAILED_DISPOSED**. Capacity release does not
+claim that the import succeeded, failed definitively or settled normally.
+
+The lead captures `(complete_slot, generation)` and a source-bound decision,
+then calls `prepare(expected_slot, decision)` to collect a reviewable proof.
+`recover_failed_access(expected_slot, proof, decision)` requires a trusted
+in-process approval callback accepting the canonical SHA256 of that complete
+proof. Decision JSON and an issue link alone confer no authority. Composition
+requires the fixed active owner, no impersonation, clean reviewed source and
+the exact original and latest creator first attempt completed with failed or
+cancelled conclusion. A rerun or successor refuses.
+
+The local-review callback is an explicit external evidence boundary on an
+exclusive trusted lead host: it must independently verify original coordinator,
+SSH/IAP/child termination and actual private-key/staging-file absence, and
+retain private evidence linking source/coordinator identity and the original
+ownership, disk provenance and inventory checks. Its sanitized digest references
+are retained; hashes do not validate private contents or attest dead processes.
+The library performs fresh complete strict authenticated SELF reads and canonical
+wire-key baseline comparison after that review and actual cloud disposal. The
+intended key must be absent. This baseline digest cannot prove unchanged unrelated
+key names, fingerprints or TTLs; retain any stronger original comparison privately.
+
+The earliest gate is strictly after the original intent key expiration; original
+work/VM deadlines remain unchanged. TTL alone never releases capacity. Require
+the successful terminal original INSERT, terminal DELETE of the exact immutable
+VM ID, actual VM and every intended disk GET404, complete operation/resource
+census and existing quarantine checks. API errors, synthesized absence, replaced
+names, unresolved operations, changed receipts/baselines or local uncertainty
+refuse at any time. Fresh observations are revalidated before the single exact
+generation FREE CAS; a real conflict requires fresh lead assessment, never rebase.
+
+One bounded (<=64KiB, depth<=32) create-only proof at
+`failed-disposals/slot-1/<lease>/proof.json` embeds the full original slot,
+generation/digest, all receipt observations, sanitized facts and decision.
+Oversize evidence refuses without truncation. Generation-pinned canonical
+readback reconciles a lost proof reply; a lost slot-write reply succeeds only
+on exact equality with that same expected FREE record. No blind CAS replay,
+intermediate recovery phase, import/removal forgery or pruning is provided.
+Retained failed history and proof references consume the existing sixteen-entry
+budget and permanently retire the original key/lease. Late old uploads cannot
+revise UNKNOWN or authorize a successor.
+
+No IAM change accompanies this library. Both existing trusted WIF identities
+have bucket-wide `storage.objectUser`; the proof prefix is **not IAM isolation**.
+Authority rests on reviewed source/composition, verified owner and explicit
+lead approval. A delayed original POST could still later expose an already
+expired retired key: fresh absence is not a permanent remote-completion barrier.
+If that residual uncertainty is unacceptable, retain occupied quarantine.
+Network teardown, protected-image evidence, trial acceptance and any new trial
+remain separate lead gates.
+
+Required CI explicitly discovers the nonempty `test_access_recovery.py` suite
+and runs it in the lifecycle suite. The focused offline command is:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s build/gcp/lifecycle -t build/gcp -p test_access_recovery.py -v
+```
+
+These fake HTTP/CAS tests establish source refusal/recovery behavior only;
+they do not establish live IAM, private local evidence, permanent key absence
+or runtime/trial acceptance.
 The DELETE recovery rule above is an inference about content-bound deletion,
 not a documented general timeout-settlement guarantee.
 
