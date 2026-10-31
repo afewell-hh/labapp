@@ -141,7 +141,9 @@ class Egress(unittest.TestCase):
         self.assertNotIn('DELETE', api.calls)
         api.ops['operation-patch']['status'] = 'DONE'
         count = api.calls.count('ips')
-        result = e.cleanup(self.state, api)
+        with patch.object(e.time, 'sleep', return_value=None) as wait:
+            result = e.cleanup(self.state, api)
+        wait.assert_called_once_with(1)
         self.assertTrue(result['router_absent'] and result['allocations_absent'])
         self.assertEqual(api.calls.count('ips'), count)
         self.assertEqual(api.calls.count('PATCH'), 1)
