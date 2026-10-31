@@ -1329,6 +1329,26 @@ process ran inside GitHub. Component/inspector access remains refused. Cleanup
 composes `ReadOnlyAccessRecords(GcsAccessRecords(...))`: evidence reads only,
 no SELF import/removal or producer object writes.
 
+The fixed owner SELF adapter addresses the existing authenticated email while
+binding records to its configured numeric user ID. Only POST response key names
+may use that exact fixed email prefix; profile identity, key-map fingerprints,
+wire keys, expiry, bounds and unknown-field checks still apply to every entry.
+The raw parsed POST profile and its canonical response digest are preserved.
+After the POST independently proves the intended key and exact requested TTL,
+the owner adapter requires a fresh strict numeric GET with the same key,
+fingerprint and TTL before writing a canonical import receipt. GET failure or
+disagreement leaves import unresolved. A GET cannot repair failed POST proof;
+no retry or adoption follows. Generic/WIF SELF clients retain their original
+strict names and request count; GET and exact deletion remain strict everywhere.
+
+The coordinator's public result includes fixed `phase` and `failure_category`
+statuses. Phases are `preflight`, `access-prepare`, `access-import`, `guest-access`,
+`guest-work` and `guest-result`; categories are `none`, `access`, `guest`,
+`interrupted` and `unknown`. They describe the primary boundary reached and
+survive finally-cleanup without printing exception text or server data.
+Existing cleanup booleans separately report cleanup outcomes; these statuses
+neither attest cloud deletion nor authorize release of an occupied lease.
+
 The owner Cloud SDK pin is575.0.0; workflow SDK remains540.0.0. The fixed IAP
 proxy uses `compute start-iap-tunnel ... 22 --listen-on-stdin`. Local installed
 SDK575 source declares this hidden flag and chooses `IapTunnelStdinHelper`;

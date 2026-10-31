@@ -60,6 +60,7 @@ class SelfLogin:
     def __init__(self, user, *, token_provider, transport=None):
         self.user = self_user(user)
         self._request_user = self.user
+        self._owner_mode = False
         self.token_provider = token_provider
         self.http = transport if transport is not None else HttpTransport()
 
@@ -76,7 +77,12 @@ class SelfLogin:
             raise AccessError('owner requires fixed canonical SELF identity')
         login = cls(user, token_provider=token_provider, transport=transport)
         login._request_user = 'users/art@githedgehog.com'
+        login._owner_mode = True
         return login
+
+    def _fixed_owner(self):
+        return (self._owner_mode and self.user == 'users/110405050082684214272' and
+                self._request_user == 'users/art@githedgehog.com')
 
     def _request(self, method, suffix, payload=None, *, import_clock=None, work_deadline=None):
         url = 'https://oslogin.googleapis.com/v1/' + quote(self._request_user, safe='/') + suffix
@@ -103,7 +109,7 @@ class SelfLogin:
         except Exception:
             raise AccessError('SELF request failed; mutation outcome may be uncertain') from None
 
-    def _profile(self, value):
+    def _profile(self, value, *, import_response=False):
         if (not isinstance(value, dict) or set(value) - {'name', 'posixAccounts', 'sshPublicKeys'} or
                 profile_user(value.get('name')) != self.user):
             raise AccessError('SELF profile identity/schema mismatch')
@@ -113,9 +119,12 @@ class SelfLogin:
             raise AccessError('SELF profile exceeds bounds')
         seen = set()
         for fp, key in keys.items():
+            names = (self.user + '/sshPublicKeys/' + fp,) if isinstance(fp, str) else ()
+            if import_response and self._fixed_owner() and isinstance(fp, str):
+                names += (self._request_user + '/sshPublicKeys/' + fp,)
             if (not isinstance(fp, str) or not re.fullmatch(r'[A-Za-z0-9_+=.-]{1,256}', fp) or
                     not isinstance(key, dict) or set(key) - {'key', 'expirationTimeUsec', 'fingerprint', 'name'} or
-                    key.get('fingerprint') != fp or key.get('name') != self.user + '/sshPublicKeys/' + fp):
+                    key.get('fingerprint') != fp or key.get('name') not in names):
                 raise AccessError('SELF server key identity mismatch')
             wire = _wire(key.get('key'))
             if wire in seen:
@@ -135,8 +144,19 @@ class SelfLogin:
                                import_clock=now, work_deadline=work_deadline)
         if not isinstance(result, dict) or set(result) - {'loginProfile', 'details'}:
             raise AccessError('invalid import response')
-        profile = self._profile(result.get('loginProfile'))
+        profile = self._profile(result.get('loginProfile'), import_response=True)
         return profile, digest(result)
+
+    def _confirm_import(self, entry, intended, expiry):
+        # Called only after the POST independently proves the intended key/TTL.
+        # Never rewrite that response or use a GET to repair failed POST proof.
+        if not self._fixed_owner():
+            return entry
+        confirmed = _match(self.profile(), intended)
+        if (confirmed is None or confirmed['fingerprint'] != entry['fingerprint'] or
+                confirmed.get('expirationTimeUsec') != expiry):
+            raise AccessError('owner import canonical confirmation mismatch')
+        return confirmed
 
     def _delete_exact(self, entry):
         if (entry.get('name') != self.user + '/sshPublicKeys/' + entry.get('fingerprint', '') or
@@ -266,6 +286,7 @@ class OwnKeyImport:
         entry = _match(profile, intent['public_key'])
         if entry is None or entry.get('expirationTimeUsec') != intent['expiration_usec']:
             raise AccessError('import response does not prove exact intended key/TTL')
+        entry = self.login._confirm_import(entry, intent['public_key'], intent['expiration_usec'])
         receipt = {'schema': 1, 'kind': 'import', 'binding': self.context.binding,
                    **_bound_ref(intent, gen), 'server_name': entry['name'],
                    'fingerprint': entry['fingerprint'], 'expiration_usec': intent['expiration_usec'],

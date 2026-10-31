@@ -208,6 +208,147 @@ class Fixture:
         return self.gcs.objects[self.context.path(kind)][0]
 
 
+class OwnerOS:
+    """Public synthetic POST alias shape; GET retains the strict numeric form."""
+    def __init__(self, server):
+        self.server = server
+        self.post_change = lambda value: None
+        self.confirm_change = lambda value: None
+        self.alias = True
+        self.post_result = None
+        self.imported = False
+        self.confirm_error = False
+
+    def request(self, method, url, **kwargs):
+        prefix = 'https://oslogin.googleapis.com/v1/users/art%40githedgehog.com'
+        assert url.startswith(prefix)
+        result = self.server.request(method, 'https://oslogin.googleapis.com/v1/' + SELF + url[len(prefix):], **kwargs)
+        value = json.loads(result.body)
+        if method == 'POST':
+            self.imported = True
+            if self.alias:
+                for fp, entry in value['loginProfile']['sshPublicKeys'].items():
+                    entry['name'] = 'users/art@githedgehog.com/sshPublicKeys/' + fp
+            value['details'] = 'synthetic success'
+            self.post_change(value)
+            self.post_result = copy.deepcopy(value)
+        elif method == 'GET' and self.imported:
+            if self.confirm_error:
+                return response({}, 403)
+            self.confirm_change(value)
+        return response(value, result.status)
+
+
+@patch(__name__ + '.SELF', 'users/110405050082684214272')
+class OwnerImportTests(unittest.TestCase):
+    def fixture(self):
+        f = Fixture()
+        f.os.profile['name'] = SELF.removeprefix('users/')
+        f.os.add(key(2), fingerprint='unrelated')
+        transport = OwnerOS(f.os)
+        f.login = SelfLogin.for_owner(SELF, token_provider=lambda: 'fake-token', transport=transport)
+        return f, transport
+
+    def failed_once(self, f, session, expected_gets):
+        with self.assertRaises(AccessError): session.import_once()
+        self.assertNotIn(f.context.path('import'), f.gcs.objects)
+        with self.assertRaises(AccessError): session.import_once()
+        with self.assertRaises(AccessError): f.session().prepare(key())
+        with self.assertRaises(AccessError): f.clean()
+        self.assertEqual(len(f.posts()), 1)
+        self.assertFalse(any(method == 'DELETE' for method, _, _ in f.os.calls))
+        # Restart's prepare performs one additional strict baseline GET.
+        self.assertEqual(sum(method == 'GET' for method, _, _ in f.os.calls), expected_gets + 1)
+
+    def test_observed_alias_and_numeric_post_confirm_canonical_receipt_cleanup(self):
+        for alias in (True, False):
+            with self.subTest(alias=alias):
+                f, transport = self.fixture(); transport.alias = alias
+                baseline = copy.deepcopy(f.os.profile['sshPublicKeys']['unrelated'])
+                f.imported()
+                self.assertEqual([method for method, _, _ in f.os.calls], ['GET', 'POST', 'GET'])
+                receipt = f.stored('import')
+                self.assertEqual(receipt['server_name'], SELF + '/sshPublicKeys/server_opaque-01')
+                self.assertEqual(receipt['response_sha256'], digest(transport.post_result))
+                prefix = 'users/art@githedgehog.com' if alias else SELF
+                self.assertEqual(transport.post_result['loginProfile']['sshPublicKeys']['server_opaque-01']['name'],
+                                 prefix + '/sshPublicKeys/server_opaque-01')
+                f.clean()
+                self.assertEqual(f.os.profile['sshPublicKeys'], {'unrelated': baseline})
+                self.assertEqual(f.stored('removed')['server_name'], receipt['server_name'])
+                self.assertEqual(len(f.posts()), 1)
+
+    def test_post_profile_and_digest_are_returned_without_rewriting(self):
+        f, transport = self.fixture()
+        expiry = str(int(f.w.clock.now().timestamp()*1_000_000) + 120_000_000)
+        profile, sha = f.login._import_once(key(), expiry, now=f.w.clock.now,
+                                          work_deadline=f.w.clock.now() + timedelta(minutes=3))
+        self.assertEqual(profile, transport.post_result['loginProfile'])
+        self.assertEqual(sha, digest(transport.post_result))
+        self.assertEqual([method for method, _, _ in f.os.calls], ['POST'])
+
+    def test_invalid_post_cannot_be_repaired_by_valid_get(self):
+        def entry(value): return value['loginProfile']['sshPublicKeys']['server_opaque-01']
+        changes = {
+            'foreign-alias': lambda v: entry(v).update(name='users/other@example.com/sshPublicKeys/server_opaque-01'),
+            'profile-id': lambda v: v['loginProfile'].update(name='987654321'),
+            'missing-key': lambda v: v['loginProfile']['sshPublicKeys'].pop('server_opaque-01'),
+            'wrong-wire': lambda v: entry(v).update(key=key(3)),
+            'wrong-ttl': lambda v: entry(v).update(expirationTimeUsec='1'),
+            'wrong-fingerprint': lambda v: entry(v).update(fingerprint='different'),
+            'wrong-suffix': lambda v: entry(v).update(name='users/art@githedgehog.com/sshPublicKeys/different'),
+            'unrelated-alias': lambda v: v['loginProfile']['sshPublicKeys']['unrelated'].update(
+                name='users/other@example.com/sshPublicKeys/unrelated'),
+            'unknown-field': lambda v: entry(v).update(unknown=True),
+            'duplicate-wire': lambda v: v['loginProfile']['sshPublicKeys']['unrelated'].update(key=key()),
+        }
+        for label, change in changes.items():
+            with self.subTest(case=label):
+                f, transport = self.fixture(); transport.post_change = change
+                session = f.session(); session.prepare(key())
+                self.failed_once(f, session, 1)
+
+    def test_failed_strict_confirmation_keeps_import_uncertain_and_one_shot(self):
+        def entry(value): return value['sshPublicKeys']['server_opaque-01']
+        changes = {
+            'absent': lambda v: v['sshPublicKeys'].pop('server_opaque-01'),
+            'wrong-wire': lambda v: entry(v).update(key=key(3)),
+            'wrong-ttl': lambda v: entry(v).update(expirationTimeUsec='1'),
+            'alias-name': lambda v: entry(v).update(name='users/art@githedgehog.com/sshPublicKeys/server_opaque-01'),
+            'profile-id': lambda v: v.update(name='987654321'),
+            'schema': lambda v: v.update(extra=True),
+            'different-fingerprint': lambda v: v['sshPublicKeys'].update(
+                different=dict(v['sshPublicKeys'].pop('server_opaque-01'), fingerprint='different',
+                               name=SELF + '/sshPublicKeys/different')),
+        }
+        for label, change in list(changes.items()) + [('http-error', None)]:
+            with self.subTest(case=label):
+                f, transport = self.fixture()
+                if change is None: transport.confirm_error = True
+                else: transport.confirm_change = change
+                session = f.session(); session.prepare(key())
+                self.failed_once(f, session, 2)
+
+    def test_owner_alias_requires_factory_and_exact_fixed_tuple(self):
+        for mode in ('generic', 'wrong-user', 'wrong-wire'):
+            with self.subTest(mode=mode):
+                f, transport = self.fixture()
+                if mode == 'generic': f.login = SelfLogin(SELF, token_provider=lambda: 'fake-token')
+                if mode == 'wrong-user': f.login.user = 'users/123456789'
+                if mode == 'wrong-wire': f.login._request_user = 'users/other@example.com'
+                value = copy.deepcopy(f.os.profile)
+                value['name'] = f.login.user
+                for fp, item in value['sshPublicKeys'].items():
+                    item['name'] = 'users/art@githedgehog.com/sshPublicKeys/' + fp
+                with self.assertRaises(AccessError): f.login._profile(value, import_response=True)
+
+    def test_owner_receipt_persistence_failure_cannot_repeat_import(self):
+        f, _ = self.fixture()
+        session = f.session(); session.prepare(key())
+        f.gcs.explicit_upload_error = 403
+        self.failed_once(f, session, 2)
+
+
 class AccessSchema(unittest.TestCase):
     def test_four_paths_derived_from_validated_current_lease_only(self):
         f = Fixture()
@@ -398,6 +539,7 @@ class OwnKeyTests(unittest.TestCase):
         f = Fixture()
         f.os.on_import = lambda: self.assertIn(f.context.path('intent'), f.gcs.objects)
         s = f.imported()
+        self.assertEqual([method for method, _, _ in f.os.calls], ['GET', 'POST'])
         self.assertEqual(len(f.posts()), 1)
         self.assertEqual(f.stored('import')['fingerprint'], 'server_opaque-01')
         self.assertNotEqual(f.stored('import')['fingerprint'], f.context.binding['key_sha256'])
