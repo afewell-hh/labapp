@@ -1442,10 +1442,22 @@ staging cap again. No recursive scan or qemu-img probe runs against live disks.
 Strict canonical inspection plus real fixed server SSH/API operations precede
 nonce VPC/attachment creation. Only default-namespace nonce names, unused
 10.0.254.0/24/VLAN2998 and canonical server-01 mclag connection are selected.
-Creation refuses collisions and retains returned UIDs/defaulted specs after
-each create. Same CA/cluster and nonce UID/spec persistence must survive public
-stop/resume. Deletion uses exact UID-preconditioned DeleteOptions through
-kubectl raw DELETE and verifies absence within the unchanged phase cutoff.
+The shared object name is only a locator: `l` plus the first ten hex characters
+of SHA256 of the full nonce (11 characters, lowercase RFC1123), because the
+pinned Fabric v0.96.2 VPC webhook rejects longer VPC names (verified from
+source, not observed live). The locator can collide and is never ownership
+authority. Ownership is the full nonce in annotation
+`labapp.hedgehog.com/trial-nonce` on BOTH the VPC and the attachment, together
+with the receipt UID and expected spec; all must match exactly in each create
+response, persistence verification, pre-delete read and deletion poll.
+Creation is create-only, refuses ANY pre-existing object of either name (even
+one whose annotation matches; nothing is adopted or overwritten) and retains
+returned UIDs/defaulted specs, names and full nonce after each create. Same
+CA/cluster and nonce UID/spec/annotation persistence must survive public
+stop/resume. Deletion removes the attachment first, then the VPC, using exact
+UID-preconditioned DeleteOptions through kubectl raw DELETE, and verifies
+absence within the unchanged phase cutoff. Mocked admission tests model the
+documented contract; they are not native validation of the live webhook.
 
 ### Closed failure diagnostics (issue #364)
 

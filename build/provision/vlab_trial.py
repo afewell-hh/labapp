@@ -1282,12 +1282,28 @@ def strict_checks(core, clock, phase):
 
 
 class Nonce:
-    """Only two nonce-named default-namespace objects; exact UID preconditions."""
+    """Only two locator-named default-namespace objects; exact UID preconditions.
+
+    The name is a deterministic RFC1123 locator of at most 11 characters, which
+    the pinned Fabric VPC webhook admits; it can collide and is NEVER ownership
+    authority. Ownership is the full nonce annotation on both objects plus the
+    receipt UID and expected spec, checked on every read.
+    """
+    ANNOTATION = 'labapp.hedgehog.com/trial-nonce'
+
     def __init__(self, core, clock, nonce):
         require(re.fullmatch('[a-f0-9]{32}', nonce))
         self.core, self.clock = core, clock
-        self.name = 'labapp-trial-' + nonce
+        self.nonce = nonce
+        self.name = 'l' + hashlib.sha256(nonce.encode()).hexdigest()[:10]
         self.objects = []
+
+    def owned(self, doc, obj):
+        """Exact annotation, name/namespace, UID and spec; never adopt by name alone."""
+        meta = doc.get('metadata') if isinstance(doc, dict) else None
+        require(isinstance(meta, dict) and meta.get('name') == self.name and meta.get('namespace') == 'default'
+                and (meta.get('annotations') or {}).get(self.ANNOTATION) == self.nonce
+                and meta.get('uid') == obj['uid'] and doc.get('spec') == obj['spec'], 'nonce ownership differs')
 
     def call(self, args, phase):
         try:
@@ -1316,7 +1332,8 @@ class Nonce:
                   {'connection': 'server-01--mclag--leaf-01--leaf-02', 'subnet': self.name + '/trial'})]
         for resource, kind, spec in specs:
             doc = {'apiVersion': 'vpc.githedgehog.com/v1beta1', 'kind': kind,
-                   'metadata': {'name': self.name, 'namespace': 'default'}, 'spec': spec}
+                   'metadata': {'name': self.name, 'namespace': 'default',
+                                'annotations': {self.ANNOTATION: self.nonce}}, 'spec': spec}
             path = ROOT / (kind + '.json')
             exclusive(path, encoded(doc))
             # kubectl executes as ubuntu; give it a private owner copy via the
@@ -1329,7 +1346,9 @@ class Nonce:
                 result = data(self.call(['create', '-f', str(target), '-o', 'json'], 'strict'))
                 require(result['metadata']['name'] == self.name and result['metadata']['namespace'] == 'default'
                         and result['kind'] == kind and result['apiVersion'] == doc['apiVersion']
-                        and type(result['metadata']['uid']) is str and result['metadata']['uid'])
+                        and type(result['metadata']['uid']) is str and result['metadata']['uid']
+                        and (result['metadata'].get('annotations') or {}).get(self.ANNOTATION) == self.nonce,
+                        'nonce create response not owned')
                 if kind == 'VPC':
                     observed = result['spec']
                     require(observed.get('ipv4Namespace') == 'default' and observed.get('vlanNamespace') == 'default'
@@ -1337,7 +1356,8 @@ class Nonce:
                             and observed['subnets']['trial']['vlan'] == 2998, 'nonce admission changed fixed fields')
                 else:
                     require(all(result['spec'].get(k) == v for k, v in spec.items()), 'attachment admission changed fixed fields')
-                self.objects.append({'resource': resource, 'uid': result['metadata']['uid'], 'spec': result['spec']})
+                self.objects.append({'resource': resource, 'name': self.name, 'nonce': self.nonce,
+                                     'uid': result['metadata']['uid'], 'spec': result['spec']})
                 atomic(ROOT / 'nonce-receipt.json', self.objects)
             finally:
                 primary = sys.exc_info()[1]
@@ -1355,8 +1375,8 @@ class Nonce:
         mark('persistence', 'nonce-verify')
         for obj in self.objects:
             current = self.current(obj['resource'], 'persistence')
-            require(current is not None and current['metadata']['uid'] == obj['uid']
-                    and current['spec'] == obj['spec'], 'nonce persistence differs')
+            require(current is not None, 'nonce persistence differs')
+            self.owned(current, obj)
 
     def remove(self):
         self.verify()
@@ -1386,8 +1406,7 @@ class Nonce:
                 current = self.current(obj['resource'], 'persistence')
                 if current is None:
                     break
-                require(current['metadata']['uid'] == obj['uid'] and current['spec'] == obj['spec'],
-                        'nonce changed while awaiting deletion')
+                self.owned(current, obj)
                 time.sleep(min(1, self.clock.remaining('persistence')))
 
 
