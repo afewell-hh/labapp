@@ -1167,6 +1167,42 @@ refusal can leave readiness waiting for the bridge; a later bridge timeout
 does not establish the original cause. Earlier trial causes require their own
 evidence. Neither wrapper exec nor service activation establishes readiness.
 
+Cold-start bridge ordering (#372, researched 2026-10-31). In fabricator
+[v0.43.1](https://github.com/githedgehog/fabricator/tree/v0.43.1) (`pkg/hhfab/`
+`cmdvlab.go`, `cmdbuild.go`, `vlabrunner.go`, `cmdhelpers.go`, `vlabconfig.go`),
+`vlab up` synchronously builds the control installer (installer payload and
+ISO-root downloads) before `VLABRun`; `VLABRun` then prepares taps, where `hhbr` is
+created, and only afterwards prepares the ONIE/Flatcar VM images. So `hhbr`
+legitimately appears only after the cold installer build, which can exceed 60
+seconds; not every download precedes the bridge. `unit-ready` is an `ExecStartPost` of
+a `Type=exec` unit (see
+[systemd.service(5) v255 source](https://github.com/systemd/systemd/blob/v255/man/systemd.service.xml)),
+so it runs while that build is still in progress. In systemd v255
+[`service.c`](https://github.com/systemd/systemd/blob/v255/src/core/service.c) a
+failed start-post action enters the stop path with SIGTERM to the main process,
+which fits the observed canonical-trial symptom (outer code 1, main
+SIGTERM). This is source-backed inference, not a complete native causal proof; the
+actual cold build duration is private and unverified, and the Ubuntu 24.04 patch
+set was not reviewed.
+
+Before the unchanged helper call, `unit-ready` runs a core-only prerequisite poll
+(`bridge_prerequisite`): one bounded read-only `ip -j -d link show dev hhbr`
+per iteration (`BRIDGE_POLL_SECONDS` apart). Only the exact ordinary child
+failure (code 1, `child command failed`, bytes `Device "hhbr" does not exist.`
+plus newline) is pending; every other result, exit code, timeout, overflow,
+malformed or duplicate JSON, foreign name/kind or non-positive index fails
+closed without retry. Before each probe and again right after a positive
+observation the published state must equal the snapshot exactly, the original
+boot and deadline must validate, and `check_live` must pin the original main
+process. Probes and sleeps are capped at the ORIGINAL operation deadline (no
+renewal, restart or longer allowance). Pending probes run with `retain=False`
+so they never overwrite `last-command-output`; a genuine probe failure retains
+its own non-empty private bytes without changing the original code. Timeout and
+output-limit failures carry no partial bytes, so the previous diagnostic remains.
+The observed ifindex must equal the one the unchanged helper (wait 60, cap 60)
+then verifies. The final post-inspection `bridge_ready` adds no prerequisite poll and
+keeps the helper's existing hard failure; it is not a single-probe claim.
+
 The preliminary startup snapshot binds the original boot and operation deadline
 before any sibling lock wait. The locked reread preserves every field except
 an absent `service` becoming exactly the live invocation/cgroup/PID/start pin;

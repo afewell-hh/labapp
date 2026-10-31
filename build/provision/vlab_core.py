@@ -1416,19 +1416,66 @@ def api_ready(deadline):
     return {'ca_sha256': ca, 'cluster_uid': cluster_uid}
 
 
-def bridge_ready(deadline):
-    execute([PYTHON, str(BRIDGE), '--bridge', 'hhbr', '--cidr', '172.30.0.2/21',
-             '--wait-seconds', '60', '--poll-ms', '250'], deadline, 60)
-    output = json_data(execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'], deadline, 3))
+BRIDGE_POLL_SECONDS = 2
+BRIDGE_ABSENT = b'Device "hhbr" does not exist.\n'
+
+
+def bridge_link(raw):
+    output = json_data(raw)
     require(type(output) is list and len(output) == 1, 'bridge query refused')
     link = output[0]
-    require(link.get('ifname') == 'hhbr' and type(link.get('ifindex')) is int
+    require(type(link) is dict and link.get('ifname') == 'hhbr' and type(link.get('ifindex')) is int
             and link['ifindex'] > 0 and link.get('linkinfo', {}).get('info_kind') == 'bridge',
             'bridge identity refused')
+    return link
+
+
+def bridge_live(value, deadline):
+    """Every poll step rereads the exact published snapshot, clock and main pin."""
+    require(state() == value, 'readiness state changed')
+    require(operation_deadline(value) == deadline, 'operation clock refused')
+    check_live(value, deadline)
+
+
+def bridge_probe(deadline):
+    """One read-only query. Only the exact ordinary missing-device failure is Pending."""
+    try:
+        raw = execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'],
+                      deadline, 3, retain=False)
+    except Failure as exc:
+        if exc.code == 1 and str(exc) == 'child command failed' and exc.private_output == BRIDGE_ABSENT:
+            return None
+        # Genuine failure: keep its own private bytes and the original error. Timeout and
+        # overflow paths carry no private_output, so the previous diagnostic remains.
+        if exc.private_output:
+            try:
+                retain_failure_output(bytes(exc.private_output))
+            except BaseException:
+                print('vlab-core: private diagnostics unverified', file=sys.stderr)
+        raise
+    return bridge_link(raw)['ifindex']
+
+
+def bridge_prerequisite(value, deadline):
+    """Wait only for genuine hhbr absence, inside the ORIGINAL operation deadline."""
+    while True:
+        bridge_live(value, deadline)
+        index = bridge_probe(deadline)
+        if index is not None:
+            bridge_live(value, deadline)
+            return index
+        time.sleep(min(BRIDGE_POLL_SECONDS, remaining(deadline)))
+
+
+def bridge_ready(deadline, expected=None):
+    execute([PYTHON, str(BRIDGE), '--bridge', 'hhbr', '--cidr', '172.30.0.2/21',
+             '--wait-seconds', '60', '--poll-ms', '250'], deadline, 60)
+    link = bridge_link(execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'], deadline, 3))
     info = link['linkinfo'].get('info_data', {})
     require(all(info.get(key) == 0 for key in ('nf_call_iptables', 'nf_call_ip6tables', 'nf_call_arptables')),
             'bridge filtering differs')
     verify_netfilter()
+    require(expected is None or link['ifindex'] == expected, 'bridge identity changed')
     return link['ifindex']
 
 
@@ -1440,7 +1487,7 @@ def unit_ready(mode):
         same_start(value, original, pin)
         value['service'] = pin
         save(value)
-    bridge_index = bridge_ready(deadline)
+    bridge_index = bridge_ready(deadline, bridge_prerequisite(value, deadline))
     # Only file/API-discovery refusal may poll; strict inspection never retries.
     while True:
         remaining(deadline)
