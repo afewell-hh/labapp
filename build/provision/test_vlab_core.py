@@ -374,64 +374,207 @@ class GuestFixture(unittest.TestCase):
         self.assertFalse(self.execs)
         self.assertEqual((core.WORK / 'result/foreign').read_bytes(), b'preserve foreign data')
 
-    def start_with_ready_publication(self, mode, mutate=None):
-        """Force unit-ready's service publication between unit-run's snapshot and final gate.
+    def start_with_ready_publication(self, mode, timing='between', mutate=None, live=None,
+                                     initial_live=None, contention=False, expire_drop=False,
+                                     snapshot_mutation=None):
+        """Interleave actual unit_ready at its mocked bridge boundary, without children.
 
-        Mocks only: Type=exec ExecStartPost is simulated by running the real
-        check_live/save writer inside the window; no native child or systemd.
+        The readiness writer runs its real snapshot/lock/check_live/save code;
+        bridge work cannot complete before hhfab exec, so pause at that boundary.
         """
+        class ReadyPaused(BaseException):
+            pass
         actual_run = core.unit_run
         actual_contract = core.verify_contract
+        actual_snapshot = core.startup_snapshot
         window = []
+        live_identity = {}
+        clock = [100.0]
+        lock_calls = []
+        actual_flock = core.fcntl.flock
+        def identity(fields):
+            return {'invocation': fields['InvocationID'], 'group': fields['ControlGroup'],
+                    'pid': int(fields['MainPID']), 'start': '12345', **live_identity}
+        def publish():
+            with patch.object(core, 'bridge_ready', side_effect=ReadyPaused):
+                with self.assertRaises(ReadyPaused):
+                    core.unit_ready(mode)
+            self.assertIn('service', core.state())
+        def change():
+            if mutate:
+                current = core.state()
+                mutate(current)
+                core.save(current)
+            if live:
+                live_identity.update(live)
         def in_run(run_mode):
+            if initial_live:
+                live_identity.update(initial_live)
+            if timing == 'before':
+                publish()
             window.append(True)
+            def flock(fd, flags):
+                lock_calls.append(True)
+                if contention and len(lock_calls) <= 2:
+                    raise BlockingIOError()
+                return actual_flock(fd, flags)
+            def sleep(seconds):
+                clock[0] += seconds
+            actual_groups = core.os.initgroups
+            def groups(*args):
+                # The final gate must exclude state writers through privilege drop.
+                with self.assertRaisesRegex(core.Failure, 'another operation owns the lock'):
+                    with core.locked():
+                        self.fail('final startup lock was released before privilege drop')
+                actual_groups(*args)
+                if expire_drop:
+                    clock[0] = core.state()['deadline']
             try:
-                return actual_run(run_mode)
+                with patch.object(core.fcntl, 'flock', side_effect=flock), \
+                     patch.object(core.time, 'sleep', side_effect=sleep), \
+                     patch.object(core.os, 'initgroups', side_effect=groups):
+                    return actual_run(run_mode)
             finally:
                 window.pop()
-        def publish(value, deadline):
+        def snapshot(run_mode):
+            value, deadline = actual_snapshot(run_mode)
+            if window and snapshot_mutation:
+                current = core.state()
+                snapshot_mutation(current)
+                core.save(current)
+            return value, deadline
+        def validate(value, deadline):
             result = actual_contract(value, deadline)
-            if window and 'service' not in core.state():
-                with core.locked():
-                    current = core.state()
-                    current['service'] = core.check_live(current, deadline)
-                    if mutate:
-                        mutate(current)
-                    core.save(current)
+            if window:
+                if timing == 'between':
+                    publish()
+                change()
             return result
-        with patch.object(core, 'unit_run', side_effect=in_run), \
-             patch.object(core, 'verify_contract', side_effect=publish):
-            return self.call('start-fresh' if mode == 'fresh' else 'start-resume')
+        with patch.object(core, 'service_identity', side_effect=identity), \
+             patch.object(core, 'boot', return_value='12345678-1234-1234-1234-123456789abc'), \
+             patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]):
+            self.prepared() if mode == 'fresh' else self.resumable()
+            before = len(self.execs)
+            with patch.object(core, 'unit_run', side_effect=in_run), \
+                 patch.object(core, 'startup_snapshot', side_effect=snapshot), \
+                 patch.object(core, 'verify_contract', side_effect=validate):
+                result = self.call('start-fresh' if mode == 'fresh' else 'start-resume')
+            if contention:
+                self.assertGreaterEqual(len(lock_calls), 4)
+                self.assertAlmostEqual(clock[0], 100.02)
+            return result, len(self.execs) - before
 
-    def test_fresh_ready_publication_before_run_gate_survives(self):
-        self.prepared()
-        self.assertEqual(self.start_with_ready_publication('fresh'), 0, self.stderr.getvalue())
-        self.assertEqual(len(self.execs), 1)
-        self.assertEqual(core.state()['phase'], 'ready')
+    def test_fresh_actual_run_waits_for_sibling_lock_then_execs(self):
+        result, delta = self.start_with_ready_publication('fresh', 'before', contention=True)
+        self.assertEqual(result, 0, self.stderr.getvalue())
+        self.assertEqual(delta, 1)
 
-    def test_resume_ready_publication_before_run_gate_survives(self):
-        self.resumable()
-        self.assertEqual(self.start_with_ready_publication('resume'), 0, self.stderr.getvalue())
-        self.assertEqual(len(self.execs), 1)
-        self.assertEqual(core.state()['phase'], 'ready')
+    def test_resume_actual_run_waits_for_sibling_lock_then_execs(self):
+        result, delta = self.start_with_ready_publication('resume', 'before', contention=True)
+        self.assertEqual(result, 0, self.stderr.getvalue())
+        self.assertEqual(delta, 1)
 
-    def test_ready_publication_substitutions_still_refuse_exec(self):
-        def foreign_pid(v): v['service']['pid'] += 1
-        def foreign_invocation(v): v['service']['invocation'] = 'f' * 32
-        def foreign_group(v): v['service']['group'] = '/system.slice/other.service'
-        def other_operation(v): v['operation'] = '0' * 32
-        def other_invocation(v): v['invocation'] = 'e' * 32
-        def other_phase(v): v['phase'] = 'failed'
-        def other_nonce(v): v['nonce'] = 'a' * 32
-        def other_contract(v): v['critical'] = {}
-        for mode in ('fresh', 'resume'):
-            for mutate in (foreign_pid, foreign_invocation, foreign_group, other_operation,
-                           other_invocation, other_phase, other_nonce, other_contract):
-                with self.subTest(mode=mode, mutation=mutate.__name__):
-                    self.setUp()
-                    self.prepared() if mode == 'fresh' else self.resumable()
-                    self.assertEqual(self.start_with_ready_publication(mode, mutate), 1)
-                    self.assertFalse(self.execs)
+    def test_fresh_refuses_initial_live_other_pid_same_invocation(self):
+        result, delta = self.start_with_ready_publication('fresh', 'none', initial_live={'pid': 999999})
+        self.assertEqual(result, 1)
+        self.assertEqual(delta, 0)
+
+    def test_resume_refuses_initial_live_other_pid_same_invocation(self):
+        result, delta = self.start_with_ready_publication('resume', 'before', initial_live={'pid': 999999})
+        self.assertEqual(result, 1)
+        self.assertEqual(delta, 0)
+
+    def test_fresh_refuses_deadline_expired_during_privilege_drop(self):
+        result, delta = self.start_with_ready_publication('fresh', 'none', expire_drop=True)
+        self.assertEqual(result, 124)
+        self.assertEqual(delta, 0)
+
+    def test_resume_refuses_deadline_expired_during_privilege_drop(self):
+        result, delta = self.start_with_ready_publication('resume', 'before', expire_drop=True)
+        self.assertEqual(result, 124)
+        self.assertEqual(delta, 0)
+
+    def readiness_refuses_changed_snapshot(self, mode, mutation):
+        def identity(fields):
+            return {'invocation': fields['InvocationID'], 'group': fields['ControlGroup'],
+                    'pid': int(fields['MainPID']), 'start': '12345'}
+        with patch.object(core, 'service_identity', side_effect=identity), \
+             patch.object(core, 'boot', return_value='12345678-1234-1234-1234-123456789abc'):
+            self.prepared() if mode == 'fresh' else self.resumable()
+            core.reserve(mode)
+            self.phase[mode] = 'activating'
+            self.invocation[mode] = os.environ['INVOCATION_ID']
+            core.unit_gate(mode)
+            if mode == 'fresh':
+                self.runtime_files()
+            original = core.critical_snapshot
+            def substituted(deadline):
+                critical = original(deadline)
+                current = core.state()
+                mutation(current)
+                core.save(current)
+                return critical
+            before = len(self.execs)
+            with patch.object(core, 'critical_snapshot', side_effect=substituted):
+                with self.assertRaises(core.Failure):
+                    core.unit_ready(mode)
+            self.assertEqual(len(self.execs), before)
+            self.assertNotEqual(core.state()['phase'], 'ready')
+
+    def lock_fixture(self, wait, deadline, attempts, expected=None):
+        """Actual locked loop; deterministic flock contention and virtual time only."""
+        with patch.object(core, 'boot', return_value='12345678-1234-1234-1234-123456789abc'):
+            self.prepared()
+        now, sleeps, calls, entered = [100.0], [], [], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+        def flock(fd, flags):
+            self.assertEqual(flags, core.fcntl.LOCK_EX | core.fcntl.LOCK_NB)
+            self.assertFalse(os.get_inheritable(fd))
+            calls.append(now[0])
+            if attempts == 'late':
+                now[0] = deadline
+                return
+            if len(calls) <= attempts:
+                raise BlockingIOError()
+        with patch.object(core.time, 'monotonic', side_effect=lambda: now[0]), \
+             patch.object(core.time, 'sleep', side_effect=sleep), \
+             patch.object(core.fcntl, 'flock', side_effect=flock):
+            if expected:
+                with self.assertRaises(core.Failure):
+                    with core.locked(wait, deadline=deadline):
+                        entered.append(True)
+            else:
+                with core.locked(wait, deadline=deadline):
+                    entered.append(True)
+        self.assertEqual(bool(entered), not bool(expected))
+        self.assertLessEqual(now[0], min(100 + wait, deadline) if wait else deadline)
+        return calls, sleeps
+
+    def test_sibling_lock_contended_then_acquired_within_original_deadline(self):
+        calls, sleeps = self.lock_fixture(10, 101, 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(sleeps), 2)
+
+    def test_sibling_lock_contention_cannot_renew_short_original_deadline(self):
+        calls, sleeps = self.lock_fixture(10, 100.025, 100, expected=True)
+        self.assertEqual(len(calls), 4)
+        self.assertAlmostEqual(sum(sleeps), 0.025)
+
+    def test_sibling_lock_contention_still_has_ten_second_cap(self):
+        _, sleeps = self.lock_fixture(10, 200, 10000, expected=True)
+        self.assertAlmostEqual(sum(sleeps), 10)
+
+    def test_sibling_lock_acquisition_at_original_deadline_cannot_enter(self):
+        calls, sleeps = self.lock_fixture(10, 101, 'late', expected=True)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(sleeps)
+
+    def test_other_operation_lock_remains_immediate_refusal(self):
+        calls, sleeps = self.lock_fixture(0, 101, 1, expected=True)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(sleeps)
 
     def test_fresh_gate_refuses_state_created_after_reservation(self):
         self.prepared()
@@ -1804,6 +1947,83 @@ class PrerequisiteContractTests(unittest.TestCase):
         self.receipt['source_sha256'] = 'unbound'
         with self.assertRaisesRegex(core.Failure, 'provisioning receipt'):
             self.verify()
+
+
+def startup_race_case(mode, timing, mutation=None, live=None):
+    def test(self):
+        result, delta = self.start_with_ready_publication(mode, timing, mutation, live)
+        expected = 1 if mutation or live else 0
+        self.assertEqual(result, expected, self.stderr.getvalue())
+        self.assertEqual(delta, 0 if expected else 1)
+        if not expected:
+            self.assertEqual(core.state()['phase'], 'ready')
+    return test
+
+
+def replace_start_field(field):
+    def mutate(value):
+        if field == 'service_null':
+            value['service'] = None
+        elif field == 'service_absent':
+            value.pop('service')
+        elif field.startswith('service_'):
+            key = field.removeprefix('service_')
+            value['service'][key] = {'pid': 999999, 'start': '67890',
+                'invocation': 'f' * 32, 'group': '/system.slice/other.service'}[key]
+        elif field in ('source', 'static', 'tools', 'critical', 'contract'):
+            value[field] = {'foreign': True}
+        elif field in ('stopping', 'stop_verified'):
+            value[field] = {'operation': 'f' * 32, 'invocation': 'f' * 32}
+        elif field in ('deadline', 'started'):
+            value[field] += 1
+        else:
+            value[field] = {'phase': 'failed', 'mode': 'foreign', 'boot': 'foreign'}.get(field, 'f' * 32)
+    return mutate
+
+
+def startup_initial_snapshot_case(mode, field):
+    def test(self):
+        result, delta = self.start_with_ready_publication(
+            mode, 'none', snapshot_mutation=replace_start_field(field))
+        self.assertEqual(result, 1, self.stderr.getvalue())
+        self.assertEqual(delta, 0)
+    return test
+
+
+def readiness_race_case(mode, field):
+    def test(self):
+        self.readiness_refuses_changed_snapshot(mode, replace_start_field(field))
+    return test
+
+
+for _mode in ('fresh', 'resume'):
+    for _field in ('operation', 'invocation', 'phase', 'nonce', 'boot', 'deadline', 'stopping'):
+        setattr(GuestFixture, 'test_startup_initial_reread_refuses_' + _mode + '_' + _field,
+                startup_initial_snapshot_case(_mode, _field))
+    for _field in ('operation', 'invocation', 'phase', 'mode', 'nonce', 'boot', 'deadline',
+                   'started', 'source', 'static', 'tools', 'critical', 'contract', 'stopping',
+                   'stop_verified', 'service_null', 'service_pid', 'service_start', 'service_group'):
+        setattr(GuestFixture, 'test_readiness_commit_refuses_' + _mode + '_' + _field,
+                readiness_race_case(_mode, _field))
+    for _timing in ('before', 'between', 'none'):
+        setattr(GuestFixture, 'test_startup_publication_' + _mode + '_' + _timing,
+                startup_race_case(_mode, _timing))
+        for _field in ('service_null', 'service_pid', 'service_start', 'service_invocation',
+                       'service_group', 'operation', 'invocation', 'phase', 'mode', 'nonce',
+                       'boot', 'deadline', 'started', 'source', 'static', 'tools', 'critical',
+                       'contract', 'stopping', 'stop_verified'):
+            if _timing == 'none' and _field.startswith('service_') and _field != 'service_null':
+                continue
+            setattr(GuestFixture, 'test_startup_refuses_' + _mode + '_' + _timing + '_' + _field,
+                    startup_race_case(_mode, _timing, replace_start_field(_field)))
+        if _timing == 'before':
+            setattr(GuestFixture, 'test_startup_refuses_removed_service_' + _mode,
+                    startup_race_case(_mode, _timing, replace_start_field('service_absent')))
+        for _name, _live in (('other_pid_same_invocation', {'pid': 999999}),
+                             ('reused_pid_start', {'start': '67890'}),
+                             ('other_cgroup', {'group': '/system.slice/other.service'})):
+            setattr(GuestFixture, 'test_startup_live_change_' + _mode + '_' + _timing + '_' + _name,
+                    startup_race_case(_mode, _timing, live=_live))
 
 
 if __name__ == '__main__':

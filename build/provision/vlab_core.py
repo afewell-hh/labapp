@@ -632,7 +632,7 @@ def atomic(path, value):
 
 
 @contextmanager
-def locked(wait=0):
+def locked(wait=0, *, deadline=None):
     # wait=0 is the default: a competing operation is an immediate refusal.
     # Only the sibling unit-run/unit-ready actions of one systemd start pass a
     # small bounded wait, because systemd may run them concurrently.
@@ -646,14 +646,21 @@ def locked(wait=0):
                 'lock identity refused')
         # No unbounded flock wait. Competing operation must return a refusal.
         limit = time.monotonic() + wait
+        if deadline is not None:
+            remaining(deadline)
+            limit = min(limit, deadline)
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if deadline is not None:
+                    remaining(deadline)
+                if wait:
+                    remaining(limit)
                 break
             except BlockingIOError:
                 if time.monotonic() >= limit:
                     raise Failure('another operation owns the lock') from None
-                time.sleep(0.01)
+                time.sleep(min(0.01, max(0, limit - time.monotonic())))
         yield
     finally:
         os.close(fd)
@@ -754,7 +761,9 @@ def check_live(value, deadline):
     fields = system_show(value['mode'], deadline)
     require(fields['ActiveState'] in ('activating', 'active'), 'service is not running')
     observed = service_identity(fields)
-    require(observed['invocation'] == value['invocation'], 'service invocation changed')
+    require(observed['invocation'] == value['invocation']
+            and observed['group'] == '/system.slice/' + UNIT[value['mode']],
+            'service invocation or cgroup changed')
     if 'service' in value:
         require(observed == value['service'], 'service identity changed')
     return observed
@@ -1242,41 +1251,57 @@ def verify_netfilter():
 SIBLING_LOCK_SECONDS = 10
 
 
+def startup_snapshot(mode):
+    # Atomic replacement makes this preliminary read coherent, but not authority.
+    # Bind the clock before waiting; the locked reread must retain every field
+    # except a genuine service publication by the concurrent readiness action.
+    value = state()
+    require(value['phase'] == 'starting' and value['mode'] == mode
+            and value['invocation'] == invocation_env(), 'startup invocation refused')
+    deadline = operation_deadline(value)
+    return value, deadline
+
+
+def same_start(current, original, pin):
+    expected = dict(original)
+    if 'service' not in original and 'service' in current:
+        require(current['service'] == pin, 'service publication changed')
+        expected['service'] = pin
+    require(current == expected, 'startup operation changed')
+
+
 def unit_run(mode):
-    with locked(SIBLING_LOCK_SECONDS):
-        value = state()
-        require(value['phase'] == 'starting' and value['mode'] == mode
-                and value['invocation'] == invocation_env(), 'run invocation refused')
-        deadline = operation_deadline(value)
+    value, deadline = startup_snapshot(mode)
+    with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
+        current = state()
+        pin = check_live(value, deadline)
+        require(pin['pid'] == os.getpid(), 'run main process differs')
+        same_start(current, value, pin)
+        value = current
     verify_contract(value, deadline)
     if mode == 'resume':
         require(critical_snapshot(deadline) == value['critical'], 'resume critical state changed')
         verify_readonly_mounts()
     else:
         fresh_preflight(value)
-    # Type=exec runs ExecStartPost concurrently with this wrapper, so unit_ready
-    # may have published the live service identity after the snapshot above.
-    # That single additive field is the only tolerated difference, and only when
-    # it matches the live manager identity of this same invocation (the wrapper
-    # pid and start time survive execve). Anything else is a refusal.
-    with locked(SIBLING_LOCK_SECONDS):
+    with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         current = state()
-        if 'service' in value:
-            require(current == value, 'run operation changed')
-        else:
-            published = current.pop('service', None)
-            require(current == value, 'run operation changed')
-            if published is not None:
-                current['service'] = published
-                check_live(current, deadline)
-    user = ubuntu()
-    os.initgroups('ubuntu', user.pw_gid)
-    os.setgid(user.pw_gid)
-    os.setuid(user.pw_uid)
-    require(os.getuid() == user.pw_uid and os.geteuid() == user.pw_uid, 'privilege drop failed')
-    os.chdir(str(WORK))
-    os.umask(0o077)
-    os.execve(HHFAB, up_argv(), SAFE_ENV)
+        same_start(current, value, pin)
+        # Reobserve every branch, including absent and already published service.
+        # The initial main PID/start pin must survive until this final gate.
+        require(check_live(current, deadline) == pin, 'run main process changed')
+        operation_deadline(current)
+        # Keep state writers excluded until exec closes Python's non-inheritable
+        # lock descriptor (also released by the context on any refusal).
+        user = ubuntu()
+        os.initgroups('ubuntu', user.pw_gid)
+        os.setgid(user.pw_gid)
+        os.setuid(user.pw_uid)
+        require(os.getuid() == user.pw_uid and os.geteuid() == user.pw_uid, 'privilege drop failed')
+        os.chdir(str(WORK))
+        os.umask(0o077)
+        remaining(deadline)
+        os.execve(HHFAB, up_argv(), SAFE_ENV)
 
 
 def kubeconfig():
@@ -1408,12 +1433,12 @@ def bridge_ready(deadline):
 
 
 def unit_ready(mode):
-    with locked(SIBLING_LOCK_SECONDS):
+    original, deadline = startup_snapshot(mode)
+    with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         value = state()
-        require(value['phase'] == 'starting' and value['mode'] == mode
-                and value['invocation'] == invocation_env(), 'readiness invocation refused')
-        deadline = operation_deadline(value)
-        value['service'] = check_live(value, deadline)
+        pin = check_live(original, deadline)
+        same_start(value, original, pin)
+        value['service'] = pin
         save(value)
     bridge_index = bridge_ready(deadline)
     # Only file/API-discovery refusal may poll; strict inspection never retries.
@@ -1436,10 +1461,11 @@ def unit_ready(mode):
     if mode == 'resume':
         require(critical == value['critical'], 'resume changed critical state')
     check_live(value, deadline)
-    with locked():
+    with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         current = state()
-        require(current['operation'] == value['operation'] and current['phase'] == 'starting',
-                'readiness state changed')
+        require(current == value, 'readiness state changed')
+        check_live(current, deadline)
+        operation_deadline(current)
         current.update(phase='ready', critical=critical, cluster=observed)
         save(current)
 
