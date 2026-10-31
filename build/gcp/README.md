@@ -1087,6 +1087,155 @@ are behavior references, not installed Noble payload proof. Offline tests do
 not prove live metadata, systemd ordering, IAM, installed manifests, guest
 access fencing, sealing, capture or boot/reboot behavior.
 
+## Exact owner cleanup for temporary trial egress
+
+`trial_egress.py` is a closed owner-host cleanup path for project `teched-473722`,
+region `us-central1`, existing network/subnet `default`, router
+`labapp-349-trial-router-20261031` and sole NAT
+`labapp-349-trial-nat-20261031`. It cannot create resources, change IAM,
+select another project/network, or delete address objects. The NAT must be
+PUBLIC/AUTO_ONLY/PREMIUM and cover only the subnet's primary range. NAT cannot
+select a single VM; approval for temporary subnet egress remains separate.
+The VM lease stays 120 minutes. Existing VM cleanup does not own this network.
+
+Use only from a frozen, accepted full source checkout installed at
+`/home/ubuntu/.local/share/labapp-trial-egress-349/source` with the existing
+trusted private Python3.12 runtime named in `labapp-trial-egress.service`.
+The service explicitly selects the host CA bundle. Verify `/usr/bin/gcloud`
+is the trusted owner SDK, its existing owner account is usable noninteractively,
+and the complete checkout/runtime and their ancestor paths are trusted before
+activation. No worker or WIF credential receives router authority. The private
+state directory is fixed at `/home/ubuntu/.local/state/labapp-trial-egress-349`;
+prepare it empty, caller-owned mode0700. All evidence files are immutable,
+single-link mode0600 JSON; links, unknown files, wrong owners and malformed
+records refuse operation. A nonblocking exclusive directory lock spans the
+entire command, including terminal/API/child cleanup. Direct invocation and
+the timer cannot run competing controllers against the same state directory.
+Do not replace that directory while armed.
+
+Activation is a separately reviewed owner action. Before any approved router
+creation, manually install the checked-in system service/timer as persistent
+files under `/etc/systemd/system`, using `User=ubuntu`; the user manager and
+linger are not involved. Verify the actual loaded fragment paths, ExecStart,
+User, timeouts, `Persistent`, next elapse and active timer before creation.
+An initial service run with no intent must fail visibly. The timer checks
+every calendar minute, with one-second accuracy and no random delay. Service
+execution is bounded by `TimeoutStartSec=8min`, five-second stop grace and
+`KillMode=control-group`. Source preparation never installs or enables units.
+
+Invoke the fixed module through the trusted runtime, with the checkout explicitly
+inserted into `sys.path` as in the service's isolated `-I -B` ExecStart. Its only
+commands, in order, are:
+
+1. `arm`: require an actually observed router404 and an empty private directory.
+   Persist `intent.json` with random ownership nonce, an intent request UUID,
+   source-file digests, owner and absolute clocks. Cleanup starts at the local
+   precreation time plus140minutes, with a fixed150minute hard target. Restart,
+   recapture or timer activation never renews these clocks. The local start is
+   earlier than server creation; captured server time must prove the hard target
+   is no later than creation+150minutes. The source digests cover the listed
+   helper dependencies, not an independent attestation of the whole checkout.
+2. The separately authorized owner creates the fixed router with description
+   `Disposable issue349 canonical trial; owner nonce=NONCE`, using the nonce
+   from the intent. Preserve the actual terminal successful insert operation
+   response in `create-operation.json`. It must identify the exact router
+   incarnation, owner, region and operation. The intent UUID is not evidence
+   that a CLI sent `requestId`; correlate actual creation separately. `arm`
+   supplies no creation command or permission.
+3. `capture`: re-read the actual operation and router, validate immutable ID,
+   server creation time, description, exact network, no peers/interfaces/NAT,
+   and persist `router.json` BEFORE creating the sole approved NAT. Optional
+   router BGP defaults are limited to ASN64514, DEFAULT advertisement and
+   keepalive20; unexpected API fields/configuration fail closed for review.
+4. After separately approved NAT setup, `capture-nat` records its exact closed
+   configuration and initial allocation identities. Partial NAT setup remains
+   cleanable from the previously captured router identity even if this step
+   was not reached. Unknown or changed captured configuration refuses cleanup.
+5. `cleanup`: run immediately when the network is no longer needed, including
+   trial failure/cancellation. `expire` performs the same cleanup once the
+   original140minute clock expires, independently of the lead/coordinator.
+
+A create success followed by lost/unpersisted operation or router identity is
+an explicit recovery gap: the helper refuses name adoption, reports unresolved
+cleanup and requires manual owner recovery. A router404 alone cannot recover
+missing ownership/allocation evidence. Keep the pending intent and all failures.
+The watchdog depends on owner-host availability, clock, trusted code and valid
+owner authentication; this is not cloud-side expiry or a guarantee during host,
+auth or suspension failure. Late recovery can exceed the hard target and must
+be reported. The early140minute trigger reserves one-minute polling plus the
+eight-minute cleanup budget within150minutes while the host remains available.
+
+Cleanup rechecks exact identity/full configuration immediately before each
+mutation. It refreshes runtime `getNatIpInfo` and correlates each IP with an
+exact regional `NAT_AUTO` address name, immutable ID, purpose and selfLink,
+including list/get agreement. It retains initial and refreshed allocation
+identities. No deletion is selected by address text or numeric IP. Unknown
+allocation identity, pagination, unexpected fields, denial or ambiguous calls
+withhold success. Automatic allocation can change during the trial; matching
+runtime allocations and exact address list/get identities are refreshed on
+every entry before NAT removal. An immutable final union retains earlier and
+current identities, including a new address object reusing the same numeric
+IP. If that final capture already exists and current identities differ, refuse
+mutation for owner recovery. A captured pending PATCH is polled before rereading
+NAT state, without submitting another PATCH.
+
+The only PATCH is `{"nats":[]}` against the verified sole owned NAT. Then
+require the terminal successful operation with matching targetID, exact empty
+router and no runtime NAT associations before deleting the empty router.
+Require terminal router deletion, actual router404 and actual GET404 for every
+captured address identity, followed by another router404. Address release may
+propagate within the fixed budget; a changed address ID, later router, failure
+or uncertainty prevents success. Address DELETE is never available. Unknown
+allocation metadata or nonconverging propagation requires owner recovery.
+Google documents automatic address release when deleting the NAT gateway;
+synthetic tests cannot establish actual API visibility or propagation timing.
+
+Compute v1 routers PATCH and DELETE expose `requestId`, but neither a router
+fingerprint nor an immutable-ID precondition. Immediate reads and operation
+targetID checks **cannot prevent a concurrent edit or name reuse in the
+read/mutation interval**. This path therefore requires exclusive owner mutation
+of this new namespace; other workers and existing WIF identities must have no
+router authority. It cannot provide an atomic delete-by-ID guarantee. The
+helper persists an attempt before each mutation and the returned operation
+before polling. Lost responses stay unresolved and are never blindly retried;
+existing captured operations may be polled again without renewing any deadline.
+
+Each token child uses the existing bounded command/process-group cleanup;
+each HTTP operation has a20second main-thread SIGALRM bound over connect,
+headers and body, with redirects/proxies disabled and bounded response size.
+The total API cleanup budget is eight minutes. Handler restoration and HTTP
+close failures preserve an existing primary timeout/cancellation status and
+mark cleanup unresolved. Diagnostics and tokens are never printed. Success
+receipts contain only fixed absence booleans. Retain the private state and
+journal on failure. After positive cleanup and owner review, remove the system
+units manually (disable/stop timer, remove its persistent timestamp with
+`systemctl clean --what=state`, remove installed fragments, daemon-reload),
+then archive/remove the exact private state and frozen source. Never disable
+the watchdog merely because the coordinator exited or a deletion was requested.
+
+The required CI command is the `Run required exact owner egress cleanup without
+subprocesses or network` step in `.github/workflows/ci.yml`: fresh private
+HOME/TMPDIR, empty environment, isolated Python, an audit hook installed before
+repository imports that denies all subprocess/socket/fork/exec events, nonzero
+test discovery, and a60second outer timeout. Run that exact recipe only in an
+assessed offline environment. Tests use synthetic API/clock/process responses
+and public temporary files; they do not execute the SDK, contact Google,
+install units or prove systemd/credential/real cleanup behavior.
+An EXIT trap removes only the exact empty temporary HOME/TMPDIR with `rmdir`;
+unexpected leftovers fail an otherwise successful run. Primary failure,
+timeout or cancellation status is preserved, and unknown files are retained.
+
+Primary references checked2026-10-31 (Compute v1; upstream systemd timer
+semantics, installed host compatibility separately verified before activation):
+[router schema](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers),
+[router PATCH](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers/patch),
+[router DELETE](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers/delete),
+[runtime NAT IPs](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers/getNatIpInfo),
+[regional address identity/purpose](https://docs.cloud.google.com/compute/docs/reference/rest/v1/addresses),
+[automatic address allocation](https://docs.cloud.google.com/nat/docs/ports-and-addresses),
+[automatic NAT address deletion](https://docs.cloud.google.com/vpc/docs/ip-addresses),
+and [persistent calendar timers](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html).
+
 ## Fixed owner-local canonical trial
 
 `vlab_trial.py` composes the closed profile with the existing access records

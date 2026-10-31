@@ -1,0 +1,22 @@
+[Unit]
+Description=Exact owned canonical trial egress expiry
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+UMask=0077
+WorkingDirectory=/home/ubuntu/.local/share/labapp-trial-egress-349/source
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/bin:/bin
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/.local/opt/labapp-cpython-3.12.16-20261026/python/bin/python3.12 -I -B -c 'import sys; sys.path.insert(0, "/home/ubuntu/.local/share/labapp-trial-egress-349/source"); from build.gcp.trial_egress import main; sys.exit(main(["expire"]))'
+TimeoutStartSec=8min
+TimeoutStopSec=5s
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
