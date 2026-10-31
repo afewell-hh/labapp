@@ -28,6 +28,7 @@ import threading
 import time
 
 from build.provision import vlab_trial as guest
+from . import owned_process
 from .inspection.hostkey import extract_ed25519
 from .lifecycle import spec
 from .lifecycle.access_records import AccessError, GcsAccessRecords, canonical
@@ -43,6 +44,10 @@ OWNER = 'art@githedgehog.com'
 SNAPSHOT_FIELDS = ('profile', 'request_id', 'epoch', 'run_id', 'attempt', 'body_hash',
                    'ids', 'boot_image', 'boot_image_id', 'reserved_at', 'deadline', 'operation')
 MAX_JSON = 256 * 1024
+# Heartbeat remote: ONE monotonic budget covering both control checks (<=5s each),
+# transport (<=8s) and every nested cleanup; 5+8+5=18 <= 22 <= join 25 - 3s margin.
+HEARTBEAT_BUDGET_SECONDS = 22.0
+HEARTBEAT_JOIN_SECONDS = 25
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
@@ -89,11 +94,17 @@ def private_directory(path):
 
 
 def command(argv, seconds, *, input_bytes=None, limit=65536, failed=None, env=None):
-    """Bounded combined output; every exit kills/reaps owned process group."""
+    """Bounded combined output; ``seconds`` is the TOTAL cap including cleanup.
+
+    The leader stays an unreaped owned child until the original group received
+    KILL; ``owned_process`` is the sole reaper and requires positive group ESRCH.
+    """
+    reserve = min(owned_process.CLEANUP_SECONDS, seconds / 2)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             start_new_session=True, env=env)
-    deadline = time.monotonic() + seconds
+    group = owned_process.OwnedGroup(proc)
+    deadline = owned_process.monotonic() + seconds - reserve
     output = bytearray()
     try:
         if input_bytes is not None:
@@ -104,36 +115,35 @@ def command(argv, seconds, *, input_bytes=None, limit=65536, failed=None, env=No
             select.register(proc.stdout, selectors.EVENT_READ)
             while select.get_map():
                 guest.require(not (failed and failed.is_set()), 'heartbeat/master failed')
-                if time.monotonic() >= deadline:
+                if owned_process.monotonic() >= deadline:
                     raise guest.Failure('bounded host child timeout', 124)
-                for key, _ in select.select(min(.2, deadline - time.monotonic())):
+                for key, _ in select.select(max(0, min(.2, deadline - owned_process.monotonic()))):
                     raw = os.read(key.fileobj.fileno(), 65536)
                     if not raw:
                         select.unregister(key.fileobj)
                     else:
                         guest.require(len(output) + len(raw) <= limit, 'host output bound')
                         output.extend(raw)
-        code = proc.wait(timeout=max(.01, deadline - time.monotonic()))
+        while True:  # non-reaping completion observation
+            code = group.status()
+            if code is not None:
+                break
+            guest.require(not (failed and failed.is_set()), 'heartbeat/master failed')
+            if owned_process.monotonic() >= deadline:
+                raise guest.Failure('bounded host child timeout', 124)
+            owned_process.sleep(.01)
         if code:
             raise guest.Failure('host child failed', code if code > 0 else 128 - code)
         return bytes(output)
     finally:
         primary = sys.exc_info()[1]
-        clean = True
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except BaseException:
-            clean = False
-        try:
-            proc.wait(timeout=3)
-        except BaseException:
-            clean = False
-        try:
-            proc.stdout.close()
-        except BaseException:
-            clean = False
+        clean = group.close(0, reserve)
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except BaseException:
+                clean = False
         if not clean:
             if primary is not None:
                 primary.cleanup_uncertain = True
@@ -262,6 +272,7 @@ class Master:
         self.options = ssh_options(directory, snapshot['ids']['instance'], username)
         self.target = 'labapp-trial-' + snapshot['ids']['instance']
         self.proc = None
+        self.group = None
         self.socket_identity = None
         self.started = False
         self.instance = spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE)['instance']
@@ -276,9 +287,10 @@ class Master:
                          '-o', 'ControlMaster=yes', '-o', 'ProxyCommand=' + proxy, self.target],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
+        self.group = owned_process.OwnedGroup(self.proc)
         until = time.monotonic() + min(30, self.clock.remaining('access'))
         while time.monotonic() < until:
-            guest.require(self.proc.poll() is None, 'original master exited')
+            guest.require(self.live(), 'original master exited')
             path = self.directory / 'master.sock'
             if path.exists():
                 info = path.lstat()
@@ -289,21 +301,38 @@ class Master:
             time.sleep(.1)
         raise guest.Failure('master startup timed out', 124)
 
-    def check(self):
-        guest.require(self.proc is not None and self.proc.poll() is None and self.socket_identity is not None,
-                      'original master lost')
+    def live(self):
+        """Non-reaping liveness; lost ownership counts as not live (never as clean)."""
+        try:
+            return self.group is not None and self.group.status() is None
+        except owned_process.OwnershipUncertain:
+            return False
+
+    @staticmethod
+    def slice(cap, until):
+        """Clip a total command cap to the shared monotonic budget; never renews it."""
+        if until is None:
+            return cap
+        left = until - owned_process.monotonic()
+        if left <= .5:
+            raise guest.Failure('bounded heartbeat budget exhausted', 124)
+        return min(cap, left)
+
+    def check(self, until=None):
+        guest.require(self.live() and self.socket_identity is not None, 'original master lost')
         info = (self.directory / 'master.sock').lstat()
         guest.require((info.st_dev, info.st_ino) == self.socket_identity, 'original master socket replaced')
-        command(['/usr/bin/ssh', *self.options, '-o', 'ProxyCommand=/usr/bin/false', '-O', 'check', self.target], 5)
+        command(['/usr/bin/ssh', *self.options, '-o', 'ProxyCommand=/usr/bin/false', '-O', 'check', self.target],
+                self.slice(5, until))
 
-    def remote(self, args, phase, cap=30, cleanup=False):
-        self.check()
+    def remote(self, args, phase, cap=30, cleanup=False, until=None):
+        self.check(until)
         # ControlMaster=no alone reconnects. This deliberately failing transport
         # is mandatory on EVERY subordinate invocation, including cleanup/SFTP.
-        seconds = min(cap, self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase))
+        seconds = self.slice(min(cap, self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase)), until)
         raw = command(['/usr/bin/ssh', *self.options, '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false',
                        self.target, shlex.join(args)], seconds, failed=None if cleanup else self.failed)
-        self.check()
+        self.check(until)
         return raw
 
     def transfer(self, incoming, names, phase='stage'):
@@ -329,23 +358,16 @@ class Master:
                     raise error
 
     def close(self):
-        if self.proc is None:
-            return True
-        try:
-            os.killpg(self.proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-            self.proc.wait(timeout=3)
+        # TERM, bounded 5s grace, then KILL to the SAME still-anchored original
+        # group (leader exit never proves group absence), then one shared 3s
+        # reap/ESRCH convergence. Idempotent: repeats return the stored outcome.
         # Process group absence is separate from remote service containment.
-        try:
-            os.killpg(self.proc.pid, 0)
-        except ProcessLookupError:
+        if self.group is None:
             return True
-        return False
+        try:
+            return self.group.close(owned_process.TERM_GRACE_SECONDS, owned_process.CLEANUP_SECONDS)
+        except BaseException:
+            return False
 
 
 # Minimal root bootstrap authenticates the source bytes BEFORE executing them.
@@ -478,7 +500,8 @@ def trial(snapshot, payloads, output, *, registration, records, login):
                 while not stop.is_set():
                     sequence += 1
                     master.remote(['/usr/bin/sudo', '-n', '/usr/bin/python3', str(guest.ROOT / 'vlab_trial.py'), 'heartbeat',
-                                   '--nonce', nonce, '--sequence', str(sequence)], 'persistence', cap=8)
+                                   '--nonce', nonce, '--sequence', str(sequence)], 'persistence', cap=8,
+                                  until=owned_process.monotonic() + HEARTBEAT_BUDGET_SECONDS)
                     stop.wait(10)
             except BaseException as error:
                 if getattr(error, 'cleanup_uncertain', False):
@@ -523,7 +546,7 @@ def trial(snapshot, payloads, output, *, registration, records, login):
         stop.set()
         heartbeat_absent = True
         if heartbeat_thread:
-            heartbeat_thread.join(timeout=25)
+            heartbeat_thread.join(timeout=HEARTBEAT_JOIN_SECONDS)
             heartbeat_absent = not heartbeat_thread.is_alive()
         process_absent = master is None and heartbeat_absent and not process_uncertain.is_set()
         if master is not None:

@@ -365,7 +365,7 @@ class OwnerTrial(unittest.TestCase):
                 if 'manifest.json' in names:
                     table = guest.manifest(guest.data((output / 'manifest.json').read_bytes()))
                     self_test.assertEqual(set(table['files']), guest.FILES)
-            def remote(self, args, phase, cap=30, cleanup=False):
+            def remote(self, args, phase, cap=30, cleanup=False, until=None):
                 trace.append(('remote', tuple(args), phase))
                 if args[:2] == ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']: return boot.encode()
                 if args[0] == '/usr/bin/cat': return nonce.encode()
@@ -404,3 +404,412 @@ class OwnerTrial(unittest.TestCase):
         receipt = json.loads(printed.call_args.args[0])
         self.assertTrue(all(receipt[k] for k in ('contained','process_absent','own_key_absent','local_files_absent','independent_cleanup_dispatched')))
         self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-result', 'none'))
+
+
+# --- Issue #365: owned original process-group closure (fake kernel, no native child) ---
+import socket
+import subprocess
+
+from build.gcp import owned_process as owned
+
+
+class FakeClock:
+    def __init__(self, step=.001):
+        self.now, self.step = 0.0, step
+
+    def monotonic(self):
+        self.now += self.step
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class Kernel:
+    """Records signal/reap order; refuses foreign groups and any destructive signal after reap."""
+    def __init__(self, clock, *, pgid=4242, leader_exit=0.0, child_term_delay=0.0, persistent=False,
+                 code=0, si_code=None, echild=False, errors=None, esrch=(), wait_timeout=False):
+        self.clock, self.pgid, self.events = clock, pgid, []
+        self.leader_exit, self.child_term_delay, self.persistent = leader_exit, child_term_delay, persistent
+        self.code, self.si_code, self.echild = code, os.CLD_EXITED if si_code is None else si_code, echild
+        self.errors, self.esrch, self.wait_timeout = errors or {}, set(esrch), wait_timeout
+        self.term_at = self.kill_at = None
+        self.reaped = False
+
+    def alive(self):
+        if not self.reaped or self.persistent:
+            return True
+        if self.kill_at is not None:
+            return False
+        return not (self.term_at is not None and self.child_term_delay is not None
+                    and self.clock.now >= self.term_at + self.child_term_delay)
+
+    def killpg(self, pgid, number):
+        self.events.append(('kill', pgid, int(number)))
+        if pgid != self.pgid:
+            raise AssertionError('signal outside captured group')
+        if number in self.errors:
+            raise self.errors[number]
+        if number == 0:
+            if not self.alive():
+                raise ProcessLookupError
+            return
+        if self.reaped:
+            raise AssertionError('destructive signal after reap')
+        if number in self.esrch:
+            raise ProcessLookupError
+        if number == owned.signal.SIGTERM:
+            self.term_at = self.clock.now
+        elif number == owned.signal.SIGKILL:
+            self.kill_at = self.clock.now
+        else:
+            raise AssertionError('unexpected signal')
+
+    def waitid(self, idtype, pid, options):
+        assert idtype == os.P_PID and pid == self.pgid
+        assert options == os.WEXITED | os.WNOHANG | os.WNOWAIT, 'observation must not reap'
+        if self.echild or self.reaped:
+            raise ChildProcessError
+        if self.clock.now < self.leader_exit:
+            return None
+        return SimpleNamespace(si_pid=self.pgid, si_code=self.si_code, si_status=self.code)
+
+    def order(self):
+        return [('reap',) if e[0] == 'reap' else (e[0], e[2]) for e in self.events]
+
+
+class FakeProc:
+    def __init__(self, kernel, data=b'', hold_open=False, stdin=None):
+        self.kernel, self.pid, self.returncode, self.stdin = kernel, kernel.pgid, None, stdin
+        read, write = os.pipe()
+        os.write(write, data)
+        if hold_open:
+            self.writer = write
+        else:
+            os.close(write)
+            self.writer = None
+        self.stdout = os.fdopen(read, 'rb')
+
+    def wait(self, timeout=None):
+        self.kernel.events.append(('reap', timeout))
+        if self.kernel.wait_timeout:
+            raise subprocess.TimeoutExpired('fixture', timeout)
+        self.kernel.reaped = True
+        self.returncode = self.kernel.code
+        return self.returncode
+
+    def release(self):
+        if self.writer is not None:
+            os.close(self.writer)
+            self.writer = None
+        self.stdout.close()
+
+    def poll(self): raise AssertionError('implicit poll may reap')
+    def send_signal(self, *_): raise AssertionError('implicit signal path polls')
+    terminate = kill = send_signal
+
+
+class WriteFails:
+    closed = False
+    def write(self, raw): raise OSError('fixture partial write failure')
+    def close(self): self.closed = True
+
+
+class OwnedProcessGroup(unittest.TestCase):
+    def setUp(self):
+        original_umask = os.umask(0o077)
+        os.umask(original_umask)
+        self.addCleanup(os.umask, original_umask)
+        os.umask(0o077)
+        self.stack = ExitStack()
+        self.addCleanup(lambda: self.stack.close())
+        self.clock = FakeClock()
+        directory = tempfile.TemporaryDirectory(prefix='labapp-owned-offline-')
+        self.addCleanup(directory.cleanup)
+        self.temp = Path(directory.name)
+        self.temp.chmod(0o700)
+
+    def reset(self):
+        self.stack.close()
+        self.stack = ExitStack()
+
+    def kernel(self, clock=None, **kwargs):
+        self.clock = clock or self.clock
+        kernel = Kernel(self.clock, **kwargs)
+        self.stack.enter_context(patch.object(owned.os, 'killpg', kernel.killpg))
+        self.stack.enter_context(patch.object(owned.os, 'waitid', kernel.waitid))
+        self.stack.enter_context(patch.object(owned, 'monotonic', self.clock.monotonic))
+        self.stack.enter_context(patch.object(owned, 'sleep', self.clock.sleep))
+        return kernel
+
+    def popen(self, kernel, **kwargs):
+        proc = FakeProc(kernel, **kwargs)
+        self.addCleanup(proc.release)
+        self.stack.enter_context(patch.object(host.subprocess, 'Popen', return_value=proc))
+        return proc
+
+    def assertSignalsBeforeReapOnly(self, kernel, *, kill=True):
+        order = kernel.order()
+        reap = order.index(('reap',))
+        if kill:
+            self.assertIn(('kill', 9), order[:reap])
+        after = order[reap + 1:]
+        self.assertTrue(all(item == ('kill', 0) for item in after), after)
+        self.assertEqual(order.count(('reap',)), 1)
+        self.assertTrue(all(e[1] == kernel.pgid for e in kernel.events if e[0] == 'kill'))
+
+    # command(): every caller shares the primitive.
+    def test_command_success_kills_group_while_leader_unreaped_then_requires_esrch(self):
+        kernel = self.kernel()
+        self.popen(kernel, data=b'public')
+        self.assertEqual(host.command(['/usr/bin/true'], 10), b'public')
+        self.assertSignalsBeforeReapOnly(kernel)
+        self.assertNotIn(('kill', 15), kernel.order())
+        self.assertEqual(kernel.order()[-1], ('kill', 0))
+
+    def test_command_nonzero_and_signal_exit_keep_primary_code(self):
+        for code, si_code, expected in ((3, None, 3), (9, os.CLD_KILLED, 137)):
+            with self.subTest(code=code):
+                kernel = self.kernel(code=code, si_code=si_code)
+                self.popen(kernel)
+                with self.assertRaises(guest.Failure) as caught:
+                    host.command(['/usr/bin/false'], 10)
+                self.assertEqual(caught.exception.code, expected)
+                self.assertFalse(getattr(caught.exception, 'cleanup_uncertain', False))
+                self.assertSignalsBeforeReapOnly(kernel)
+                self.reset()
+
+    def test_command_timeout_and_overflow_cleanup_group_inside_total_cap(self):
+        kernel = self.kernel(FakeClock(step=1.0), leader_exit=1e9)
+        proc = self.popen(kernel, data=b'x', hold_open=True)
+        with self.assertRaises(guest.Failure) as caught:
+            host.command(['/usr/bin/sleep'], 10)
+        self.assertEqual(caught.exception.code, 124)
+        self.assertSignalsBeforeReapOnly(kernel)
+        self.assertTrue(proc.stdout.closed)
+        # Final wait is only the reserved cleanup budget, never a renewed cap.
+        reap = next(e for e in kernel.events if e[0] == 'reap')
+        self.assertLessEqual(reap[1], owned.CLEANUP_SECONDS)
+        self.reset()
+        kernel = self.kernel(FakeClock())
+        proc = self.popen(kernel, data=b'123456')
+        with self.assertRaisesRegex(guest.Failure, 'output bound'):
+            host.command(['/usr/bin/yes'], 10, limit=4)
+        self.assertSignalsBeforeReapOnly(kernel)
+        self.assertTrue(proc.stdout.closed)
+
+    def test_command_input_write_failure_closes_pipes_and_cleans_group(self):
+        kernel = self.kernel()
+        stdin = WriteFails()
+        proc = self.popen(kernel, stdin=stdin)
+        with self.assertRaises(OSError):
+            host.command(['/usr/bin/openssl'], 10, input_bytes=b'public\n')
+        self.assertTrue(stdin.closed)
+        self.assertTrue(proc.stdout.closed)
+        self.assertSignalsBeforeReapOnly(kernel)
+
+    def test_command_cleanup_failure_marks_primary_uncertain_without_replacing_it(self):
+        kernel = self.kernel(code=3, errors={9: PermissionError()})
+        self.popen(kernel)
+        with self.assertRaises(guest.Failure) as caught:
+            host.command(['/usr/bin/false'], 10)
+        self.assertEqual(caught.exception.code, 3)
+        self.assertTrue(caught.exception.cleanup_uncertain)
+        self.assertSignalsBeforeReapOnly(kernel, kill=False)
+
+    def test_command_success_with_persistent_group_is_uncertain(self):
+        kernel = self.kernel(persistent=True)
+        self.popen(kernel, data=b'public')
+        with self.assertRaises(guest.Failure) as caught:
+            host.command(['/usr/bin/true'], 10)
+        self.assertTrue(caught.exception.cleanup_uncertain)
+        self.assertSignalsBeforeReapOnly(kernel)
+
+    def test_command_lost_child_ownership_sends_no_signal(self):
+        kernel = self.kernel(echild=True)
+        self.popen(kernel)
+        with self.assertRaises(owned.OwnershipUncertain) as caught:
+            host.command(['/usr/bin/true'], 10)
+        self.assertTrue(caught.exception.cleanup_uncertain)
+        self.assertEqual([e for e in kernel.events if e[0] == 'kill'], [])
+
+    # Master.close(): TERM, grace, KILL to the SAME anchored group, then one reap.
+    def closing(self, **kwargs):
+        kernel = self.kernel(**kwargs)
+        proc = FakeProc(kernel)
+        self.addCleanup(proc.release)
+        master = host.Master(self.temp, snapshot(), 'owner', Mock(), threading.Event())
+        master.group = owned.OwnedGroup(proc)
+        return kernel, master
+
+    def test_close_escalates_to_kill_after_leader_first_exit_and_delayed_proxy(self):
+        kernel, master = self.closing(leader_exit=0.0, child_term_delay=2.0)
+        started = self.clock.now
+        self.assertTrue(master.close())
+        self.assertEqual(kernel.order()[:3], [('kill', 15), ('kill', 9), ('reap',)])
+        self.assertSignalsBeforeReapOnly(kernel)
+        self.assertGreaterEqual(self.clock.now - started, owned.TERM_GRACE_SECONDS)
+        self.assertLessEqual(self.clock.now - started, owned.TERM_GRACE_SECONDS + owned.CLEANUP_SECONDS + .5)
+
+    def test_close_kills_term_resistant_child_and_handles_zero_children(self):
+        for name, delay in (('term-resistant', None), ('plain-leader', 0.0)):
+            with self.subTest(name):
+                kernel, master = self.closing(leader_exit=1e9, child_term_delay=delay)
+                self.assertTrue(master.close())
+                self.assertEqual(kernel.order()[:3], [('kill', 15), ('kill', 9), ('reap',)])
+                self.assertSignalsBeforeReapOnly(kernel)
+                self.reset()
+
+    def test_close_is_idempotent_and_never_signals_after_reap(self):
+        kernel, master = self.closing()
+        self.assertTrue(master.close())
+        events = list(kernel.events)
+        self.assertTrue(master.close())
+        self.assertFalse(master.live())  # settled group is not live and never signalled
+        self.assertEqual(kernel.events, events)
+
+    def test_close_esrch_before_reap_is_ownership_anomaly_not_absence(self):
+        for number in (15, 9):
+            with self.subTest(signal=number):
+                kernel, master = self.closing(esrch={number})
+                self.assertFalse(master.close())
+                self.assertSignalsBeforeReapOnly(kernel, kill=False)
+                events = list(kernel.events)
+                self.assertFalse(master.close())
+                self.assertEqual(kernel.events, events)
+                self.reset()
+
+    def test_close_eperm_unexpected_error_and_probe_error_are_uncertain(self):
+        for errors in ({15: PermissionError()}, {9: PermissionError()}, {0: PermissionError()}, {0: OSError(5, 'io')}):
+            with self.subTest(errors=errors):
+                kernel, master = self.closing(errors=errors)
+                self.assertFalse(master.close())
+                self.assertSignalsBeforeReapOnly(kernel, kill=False)
+                self.reset()
+
+    def test_close_reused_or_persistent_group_after_reap_waits_only_and_is_bounded(self):
+        kernel, master = self.closing(persistent=True)
+        started = self.clock.now
+        self.assertFalse(master.close())
+        self.assertSignalsBeforeReapOnly(kernel)
+        self.assertLessEqual(self.clock.now - started, owned.TERM_GRACE_SECONDS + owned.CLEANUP_SECONDS + .5)
+        self.assertGreater(kernel.order().count(('kill', 0)), 1)
+
+    def test_close_reap_timeout_or_lost_ownership_is_false_without_more_signals(self):
+        kernel, master = self.closing(wait_timeout=True)
+        self.assertFalse(master.close())
+        self.assertEqual(kernel.order().count(('kill', 0)), 0)
+        self.reset()
+        kernel, master = self.closing(echild=True)
+        self.assertFalse(master.close())
+        self.assertEqual([e for e in kernel.events if e[0] == 'kill'], [])
+
+    def test_close_without_started_master_and_concurrent_close_refuse_new_signals(self):
+        master = host.Master(self.temp, snapshot(), 'owner', Mock(), threading.Event())
+        self.assertTrue(master.close())
+        kernel, master = self.closing()
+        self.assertTrue(master.group._lock.acquire(blocking=False))
+        try:
+            self.assertFalse(master.close())
+        finally:
+            master.group._lock.release()
+        self.assertEqual(kernel.events, [])
+
+    # Master.start/check: nonreaping observation only.
+    def started(self, **kwargs):
+        kernel = self.kernel(**kwargs)
+        proc = self.popen(kernel)
+        session = Mock()
+        session.remaining.return_value = 30
+        master = host.Master(self.temp, snapshot(), 'owner', session, threading.Event())
+        return kernel, proc, master
+
+    def test_start_and_check_never_poll_and_lost_master_sends_no_signal(self):
+        kernel, proc, master = self.started(leader_exit=1e9)
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        listener.bind(str(self.temp / 'master.sock'))
+        with patch.object(host, 'command') as run:
+            master.start()
+            master.check()
+        self.assertEqual(run.call_count, 2)
+        kernel.leader_exit = 0.0
+        with self.assertRaisesRegex(guest.Failure, 'original master lost'):
+            master.check()
+        self.assertEqual([e for e in kernel.events if e[0] == 'kill'], [])
+        self.assertIsNone(proc.returncode)
+
+    def test_startup_failure_before_socket_is_closed_with_signals_before_reap(self):
+        kernel, proc, master = self.started(leader_exit=0.0, code=255)
+        with self.assertRaisesRegex(guest.Failure, 'original master exited'):
+            master.start()
+        self.assertTrue(master.close())
+        self.assertSignalsBeforeReapOnly(kernel)
+
+    # Heartbeat budget: 5 + 8 + 5 = 18 <= 22 <= join 25 - 3; no deadline renewal.
+    def test_budget_inequality_and_single_end_to_end_heartbeat_deadline(self):
+        self.assertLessEqual(5 + 8 + 5, host.HEARTBEAT_BUDGET_SECONDS)
+        self.assertLessEqual(host.HEARTBEAT_BUDGET_SECONDS + 3, host.HEARTBEAT_JOIN_SECONDS)
+        self.assertEqual(owned.TERM_GRACE_SECONDS + owned.CLEANUP_SECONDS, 8.0)
+        clock = FakeClock(step=0)
+        self.stack.enter_context(patch.object(owned, 'monotonic', clock.monotonic))
+        marker = self.temp / 'master.sock'
+        marker.write_bytes(b'')
+        info = marker.lstat()
+        session = Mock()
+        session.remaining.return_value = 30
+        master = host.Master(self.temp, snapshot(), 'owner', session, threading.Event())
+        master.group = Mock()
+        master.group.status.return_value = None
+        master.socket_identity = (info.st_dev, info.st_ino)
+        granted = []
+        def spend(argv, seconds, **kwargs):
+            granted.append(seconds)
+            clock.now += seconds  # worst case consumes its entire total cap, cleanup included
+            return b''
+        with patch.object(host, 'command', side_effect=spend):
+            master.remote(['/usr/bin/true'], 'persistence', cap=8, until=clock.now + 22.0)
+        self.assertEqual(granted, [5, 8, 5])
+        granted.clear()
+        start = clock.now
+        with patch.object(host, 'command', side_effect=spend):
+            with self.assertRaisesRegex(guest.Failure, 'budget exhausted'):
+                master.remote(['/usr/bin/true'], 'persistence', cap=8, until=start + 9)
+        self.assertEqual(granted, [5, 4])
+        self.assertLessEqual(clock.now - start, 9)  # clipped; second check is not renewed
+
+    # Coordinator: prior uncertain child cleanup is sticky even when Master closes cleanly.
+    def test_uncertain_command_cleanup_withholds_removed_receipt_even_if_master_closes(self):
+        value = snapshot()
+        rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
+        registration = Mock()
+        registration.current.return_value = rec
+        importer = Mock()
+        importer.prepare.return_value = ({'posix': {'username': 'owner'}}, 1)
+        master = Mock()
+        error = guest.Failure('child cleanup uncertain', 124)
+        error.cleanup_uncertain = True
+        master.start.side_effect = error
+        master.close.return_value = True
+        def command(args, *unused, **kwargs):
+            if args[:3] == ['gcloud', 'auth', 'list']: return (host.OWNER + '\n').encode()
+            if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)\n'
+            if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
+                return guest.encoded({'name': value['self_user']})
+            if args[:2] == ['gcloud', 'version']: return b'{"Google Cloud SDK":"575.0.0"}'
+            if args[0] == '/usr/bin/ssh-keygen' and '-q' in args:
+                Path(args[-1]).write_text('PUBLIC_SYNTHETIC_KEY')
+                Path(args[-1] + '.pub').write_text('ssh-ed25519 UEVCTElDX0ZJWFRVUkU=')
+            return b'[]'
+        with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
+             patch.object(host, 'OwnKeyImport', return_value=importer), patch.object(host, 'Master', return_value=master), \
+             patch.object(host, 'extract_ed25519', return_value='ssh-ed25519 UEVCTElDX0ZJWFRVUkU=\n'), \
+             patch.object(host, 'cleanup_own_key') as remove, patch.object(host, 'cleanup_dispatch'), \
+             patch('builtins.print') as printed:
+            code = host.trial(value, self.temp, self.temp, registration=registration, records=Mock(),
+                              login=Mock(user=value['self_user']))
+        self.assertEqual(code, 124)
+        remove.assert_not_called()
+        receipt = json.loads(printed.call_args.args[0])
+        self.assertFalse(receipt['process_absent'])
+        self.assertFalse(receipt['own_key_absent'])

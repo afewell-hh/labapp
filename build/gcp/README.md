@@ -1442,6 +1442,32 @@ fields; core.prepare retains semantic authority and exact byte preservation.
 No original secret is reconstructed and no development credential is selected.
 Private keys/password/FAB/diagnostics stay out of stdout and public artifacts.
 
+Owned process cleanup is one shared primitive, `owned_process.OwnedGroup`, used
+by `command()` and every `Master` start/check/close path. The exact returned
+`Popen` leader (`start_new_session=True`) stays an unreaped child, so its numeric
+group ID cannot be reused, until every destructive group signal is sent; leader
+status is only a non-reaping `waitid(WNOWAIT)` observation (never `poll()`, never
+written to `returncode`) and the one final `Popen.wait` is the sole reaper. This
+assumes normal child-wait semantics (no `SIGCHLD` ignore/`SA_NOCLDWAIT`, custom
+reaper or foreign waiter); ECHILD or any ownership loss refuses further signals and
+reports uncertainty. `Master.close` sends TERM, waits the fixed 5s grace, then KILLs
+the SAME group even if the SSH leader already exited (leader exit never proves the
+proxy group is gone, and a zombie leader keeps signal0 answering), then shares one
+3s budget for the reap and positive group ESRCH. After the reap only signal0 probes
+run; a still-present (possibly reused) group, EPERM, other errors or a deadline are
+uncertainty, never a destructive retry. Repeated close returns the stored outcome.
+`command()` keeps its immediate KILL (no TERM delay); its `seconds` is the TOTAL cap:
+up to 3s is reserved for KILL, reap, ESRCH convergence and pipe closure, and the
+primary result (output, exit code, 124 timeout) is preserved. A heartbeat remote
+has one monotonic 22s budget for both control checks (5s each), transport (8s) and
+all nested cleanup, preserving the 25s join and 30s guest heartbeat-loss bound
+(5+8+5=18<=22; join minus budget leaves 3s). Sticky uncertainty withholds file
+deletion and the removed access receipt even when `Master.close` later succeeds.
+Escaped sessions and unknown IAP/OpenSSH shutdown timing are outside this boundary.
+`process_group_fixture.py` is a SOURCE-ONLY disposable local kernel fixture for the
+primitive (leader-first exit, TERM-ignoring child, unrelated sentinel); it is not run by CI
+and needs separate lead authorization, and mocks/it cannot prove live IAP behavior.
+
 Finally the owner closes/reaps its original master/IAP group, positively removes
 the fixed private table, and obtains exact own-key absence evidence. Unresolved
 local process/file cleanup withholds the removed access receipt, so the ledger
