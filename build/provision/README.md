@@ -1157,8 +1157,8 @@ ControlNode with bootstrap `/dev/sda`, external `enp2s0`/DHCP and management
 managementSubnet `172.30.0.0/21`, controlVIP `172.30.0.1/32`, kubeClusterSubnet
 `172.28.0.0/16`, kubeServiceSubnet `172.29.0.0/16`, kubeClusterDNS `172.29.0.10`,
 dummySubnet `172.30.90.0/24`. Candidate Fabric values are spine-leaf,
-managementDHCPStart `172.30.4.0`, managementDHCPEnd `172.30.7.254`, spineASN65100,
-leafASNStart65101/leafASNEnd65533, protocolSubnet `172.30.8.0/22`, vtepSubnet
+managementDHCPStart `172.30.4.0`, managementDHCPEnd `172.30.7.254`, spineASN 65100,
+leafASNStart 65101/leafASNEnd 65533, protocolSubnet `172.30.8.0/22`, vtepSubnet
 `172.30.12.0/22`, fabricSubnet `172.30.128.0/17`, mclagSessionSubnet
 `172.30.95.0/31` and vpcWorkaroundSubnet `172.30.96.0/19`. Registry is explicitly
 `{"mode":"airgap"}`; host downloads use ghcr.io/githedgehog; no gateway is enabled;
@@ -1172,10 +1172,12 @@ The receipt has exactly `schema:1`, `source_sha256` (declared provisioning-sourc
 SHA256), `packages` and `commands`. Packages include all fixed baseline Docker
 trio and QEMU system-x86/utils `.11` versions listed in the baseline runbook,
 plus the selected full versions of sudo, socat, openssh-client, less, iproute2,
-systemd, kmod, procps and python3-minimal. Installed dpkg status, amd64 and full
-versions must match. `commands` maps every fixed command in `AUX` and `TOOL_PINS`
+systemd, kmod, procps and python3-minimal. Systemd must be in the researched 255
+family; that is an explicit compatibility boundary, not a recovered version pin.
+Installed dpkg status, amd64 and full versions must match. `commands` maps every
+fixed command in `AUX` and `TOOL_PINS`
 to exactly `{"resolved":"/absolute/resolved/path","sha256":"..."}`; those installed
-bytes, owners and executable modes are checked. hhfab0.43.1 and kubectl1.35.0 use
+bytes, owners and executable modes are checked. hhfab 0.43.1 and kubectl 1.35.0 use
 the fixed previously documented binary sizes/digests, never receipt-selected pins.
 The declared source digest is retained with this trusted private input; it does
 not independently authenticate a provisioning run or package provenance. TEST
@@ -1193,12 +1195,13 @@ validates twice and requires exact FAB/wiring/registry preservation. Failed
 preparation retains owned state for diagnosis and cannot retry/reset/adopt it.
 Fresh startup is one-shot. It runs the pinned `hhfab vlab up` foreground as ubuntu
 with fixed ISO/restriction/sizing flags, no automatic upgrade, kill-stale, setup
-VPCs or retry. Recovered sizes are control6/6144MB/100GB, switch4/5120MB/50GB and
-server2/768MB/10GB, with exactly one control, seven switches and ten servers.
+VPCs or retry. Recovered sizes are control 6 CPUs/6144 MB/100 GB,
+switch 4 CPUs/5120 MB/50 GB and server 2 CPUs/768 MB/10 GB, with exactly one
+control, seven switches and ten servers.
 Unused gateway/external size settings do not create additional VMs.
 
-Public activation includes dependency waiting inside a fixed2700-second fresh
-or900-second resume clock. Short private operation locks are released before
+Public activation includes dependency waiting inside a fixed 2700-second fresh
+or 900-second resume clock. Short private operation locks are released before
 waiting on systemctl. Enabled boot resume begins its clock at the gate; its
 pre-gate dependency queue remains nonready and is bounded only by the outer
 trial lifecycle, since TimeoutStartSec does not bound queued dependencies.
@@ -1206,16 +1209,16 @@ The root run wrapper uses systemd `!` to retain its filesystem namespace,
 reads root-private state and checks actual resume mounts,
 then initializes ubuntu groups/gid/uid and execs only fixed hhfab. No `Conflicts`
 auto-stop is used. Competing starts refuse without disrupting the running unit.
-Root-private state is under `/var/lib/labapp-vlab-core` with0700/0600 permissions.
+Root-private state is under `/var/lib/labapp-vlab-core` with 0700/0600 permissions.
 Raw foreground diagnostics remain in the `labapp-vlab` journal namespace for
 local administrators (`journalctl --namespace=labapp-vlab`). Its explicit config
-sets32M persistent/16M runtime storage policies and disables forwarding to syslog,
+sets 32M persistent/16M runtime storage policies and disables forwarding to syslog,
 kmsg, console and wall. These rotation policies are not an exact hard byte cap;
 actual ACL/forwarding/effective configuration remain dedicated-guest checks.
 No raw private output, certificates, keys or FAB are exported in public receipts.
-Short-command failures retain at most1MiB in the root-private0600
+Short-command failures retain at most 1 MiB in the root-private 0600
 `/var/lib/labapp-vlab-core/last-command-output`, overwriting only the observed
-owned regular0600 path; unknown/replaced/symlinked diagnostic paths are refused.
+owned regular 0600 path; unknown/replaced/symlinked diagnostic paths are refused.
 It is the last failed command's diagnostic, not a transcript or archive. Failure
 to retain it never replaces the original operation result. Do not attach this
 file to public issues/artifacts: it may include private configuration or keys.
@@ -1230,12 +1233,12 @@ must be reviewed if an actual mismatch occurs. Logs and service-active status do
 not establish readiness. Child output is bounded and not echoed publicly.
 Only the pinned kubectl formatter's exact localhost connection-refused message
 or bounded single-line ServiceUnavailable response is discovery-pollable; opaque,
-authentication, certificate and structural failures stop immediately. Timeout124
-and cancellation130/143 are never converted to transient startup conditions.
+authentication, certificate and structural failures stop immediately. Timeout 124
+and cancellation 130/143 are never converted to transient startup conditions.
 
 Only after fresh readiness and a bounded owned stop may `activate-resume` seal
 and enable resume. The manifest covers exact static inputs/tools/units, cached
-result tree/hash/ISO, config/SSH key and all18 OS/EFI artifacts, plus cluster UID
+result tree/hash/ISO, config/SSH key and all 18 OS/EFI artifacts, plus cluster UID
 and CA identity. Mutable OS and EFI-vars preserve device/inode/type/owner/mode;
 ordinary disk writes, sizes and timestamps may change. Missing/replaced/changed
 critical files fail before up. Result/static inputs are read-only in the actual
@@ -1243,11 +1246,20 @@ resume run namespace; if upstream wants a rebuild, the kernel denies it. This
 is not proven by fakes and excludes hostile root/remount/concurrent mutation.
 Generated kubeconfig may refresh; CA and cluster identity must persist.
 
-Stop requests only the exact recorded service invocation/cgroup: TERM20seconds,
-then systemd KILL and35seconds of public observation. It verifies inactive/failed,
-PID0 and absent/unpopulated exact cgroup. This is **process termination, not proven
+Stop requests only the exact recorded service invocation/cgroup: TERM for 20 seconds,
+then systemd KILL and 35 seconds of public observation. It verifies inactive/failed,
+PID 0 and absent/unpopulated exact cgroup. This is **process termination, not proven
 guest OS shutdown**. No student-state deletion or broad stale-process cleanup
-occurs. Primary nonzero/INT130/TERM143/deadline124 survives cleanup uncertainty;
+occurs. An explicit stop intent binds the current operation and service invocation;
+expected nonzero upstream cancellation is allowed only through that owned stop.
+ExecStopPost records stop observation first; a new resume cannot reserve until
+the public stop verifies exact cgroup containment. Unexpected service exits
+remain failed. No global exit-code whitelist or automatic restart is installed.
+Run the public `stop` command before an outer guest shutdown/reboot. Direct
+`systemctl stop` or an OS shutdown without that owned stop intent remains failed;
+this component does not establish seamless reboot or cloud stop/start behavior.
+Those outer transitions need separate lifecycle acceptance.
+Primary nonzero/INT 130/TERM 143/deadline 124 survives cleanup uncertainty;
 uncertainty is reported rather than asserting containment. Direct/boot partial
 startup failures are recorded through ExecStopPost. Normal future appliance
 service lifetime has no implicit cap; disposable trials separately require their

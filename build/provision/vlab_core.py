@@ -470,6 +470,9 @@ def verify_prerequisites(receipt, deadline):
             'package set refused')
     for name, version in PACKAGE_PINS.items():
         require(packages[name] == version, 'baseline package pin refused')
+    require(type(packages['systemd']) is str
+            and re.fullmatch(r'255\.[0-9][A-Za-z0-9.+:~_-]{0,127}', packages['systemd']),
+            'systemd compatibility family refused')
     os_release = read(Path('/usr/lib/os-release')).decode()
     for literal in ('ID=ubuntu', 'VERSION_ID="24.04"', 'VERSION_CODENAME=noble'):
         require(literal in os_release.splitlines(), 'Ubuntu baseline refused')
@@ -825,6 +828,7 @@ def reserve(mode, deadline=None):
                      boot=boot(), started=started, deadline=end)
         value.pop('invocation', None)
         value.pop('service', None)
+        value.pop('stopping', None)
         save(value)
         return value
 
@@ -849,6 +853,7 @@ def unit_gate(mode):
                          started=now, deadline=now + START_SECONDS[mode])
             value.pop('service', None)
             value.pop('invocation', None)
+            value.pop('stopping', None)
         require(value['phase'] == 'starting' and value['mode'] == mode
                 and 'invocation' not in value, 'unit startup reservation refused')
         value['invocation'] = invocation
@@ -1062,9 +1067,13 @@ def unit_finished(mode):
                 'finished invocation refused')
         if value['phase'] in ('starting', 'ready'):
             clean = os.environ.get('SERVICE_RESULT') == 'success'
-            value['phase'] = (('resumable' if mode == 'resume' else 'stopped')
-                              if value['phase'] == 'ready' and clean else 'failed')
-            value['service_result'] = 'success' if clean else 'failed-or-unavailable'
+            owned_stop = value.get('stopping') == {'operation': value['operation'],
+                                                  'invocation': value['invocation']}
+            # ExecStopPost observes manager completion, not final cgroup absence.
+            # No new start may reserve until the public exact stop verifies it.
+            value['phase'] = 'stop-observed' if value['phase'] == 'ready' and owned_stop else 'failed'
+            value['service_result'] = ('owned-stop-process-termination' if owned_stop else
+                                       'success' if clean else 'failed-or-unavailable')
             save(value)
 
 
@@ -1078,6 +1087,12 @@ def stop_owned(value, deadline):
                 'unowned service stop refused')
         if observed is not None and fields.get('MainPID') != '0':
             require(service_identity(fields) == observed, 'stop process changed')
+        with locked():
+            current = state()
+            require(current['operation'] == value['operation']
+                    and current.get('invocation') == value['invocation'], 'stop operation changed')
+            current['stopping'] = {'operation': value['operation'], 'invocation': value['invocation']}
+            save(current)
         execute([SYSTEMCTL, 'stop', UNIT[value['mode']]], deadline, 30)
     fields = system_show(value['mode'], deadline)
     require(fields['ActiveState'] in ('inactive', 'failed') and fields.get('MainPID') == '0',
@@ -1087,6 +1102,13 @@ def stop_owned(value, deadline):
     if cgroup.exists():
         events = pairs([line.split() for line in read(cgroup / 'cgroup.events', 4096).decode().splitlines()])
         require(events.get('populated') == '0', 'service cgroup remains populated')
+    with locked():
+        current = state()
+        require(current['operation'] == value['operation']
+                and current.get('invocation') == value.get('invocation'), 'stop commit operation changed')
+        if current['phase'] == 'stop-observed':
+            current['phase'] = 'resumable' if current['mode'] == 'resume' else 'stopped'
+            save(current)
     return True
 
 
@@ -1129,7 +1151,8 @@ def start(mode):
 def stop():
     with locked():
         value = state()
-        require(value['phase'] in ('ready', 'starting', 'stopped', 'failed', 'resumable'), 'stop phase refused')
+        require(value['phase'] in ('ready', 'starting', 'stopped', 'failed', 'resumable', 'stop-observed'),
+                'stop phase refused')
     stop_owned(value, time.monotonic() + 35)
     with locked():
         current = state()

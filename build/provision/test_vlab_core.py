@@ -96,6 +96,7 @@ class GuestFixture(unittest.TestCase):
         self.cluster_uid = 'public-cluster-uid'
         self.api_mutation = None
         self.up_error = None
+        self.stop_result = 'success'
         self.tools = {'synthetic': 'tools'}
         self.fab = public_fab()
         self.fab_path = self.base / 'private-fab.yaml'
@@ -241,7 +242,8 @@ class GuestFixture(unittest.TestCase):
             if action == 'stop':
                 self.phase[mode] = 'inactive'
                 if core.state().get('invocation'):
-                    core.unit_finished(mode)
+                    with patch.dict(os.environ, {'SERVICE_RESULT': self.stop_result}):
+                        core.unit_finished(mode)
                 return b''
         if argv[:2] == [core.HHFAB, 'init']:
             source = Path(argv[argv.index('--config') + 1])
@@ -374,6 +376,43 @@ class GuestFixture(unittest.TestCase):
         self.assertEqual(core.state()['phase'], 'failed')
         self.assertEqual(self.call('activate-resume'), 1)
 
+    def test_explicit_owned_stop_accepts_nonzero_cancellation_then_resumes(self):
+        self.fresh()
+        self.stop_result = 'exit-code'
+        self.assertEqual(self.call('activate-resume'), 0, self.stderr.getvalue())
+        self.assertEqual(core.state()['phase'], 'resumable')
+        self.assertEqual(core.state()['service_result'], 'owned-stop-process-termination')
+        self.assertEqual(self.call('start-resume'), 0, self.stderr.getvalue())
+        self.assertNotIn('stopping', core.state())
+        self.assertEqual(self.call('stop'), 0)
+        self.assertEqual(core.state()['phase'], 'resumable')
+
+    def test_new_start_cannot_reserve_before_stop_containment_is_verified(self):
+        self.resumable()
+        self.assertEqual(self.call('start-resume'), 0)
+        actual = self.command
+        observed = []
+        def during_stop(argv, *args, **kwargs):
+            raw = actual(argv, *args, **kwargs)
+            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['resume']]:
+                observed.append(core.state()['phase'])
+                with self.assertRaises(core.Failure):
+                    core.reserve('resume')
+            return raw
+        with patch.object(core, 'execute', side_effect=during_stop):
+            self.assertEqual(self.call('stop'), 0)
+        self.assertEqual(observed, ['stop-observed'])
+        self.assertEqual(core.state()['phase'], 'resumable')
+
+    def test_stale_stop_intent_does_not_approve_unexpected_exit(self):
+        self.fresh()
+        value = core.state()
+        value['stopping'] = {'operation': 'd' * 32, 'invocation': value['invocation']}
+        core.save(value)
+        with patch.dict(os.environ, {'SERVICE_RESULT': 'exit-code'}):
+            self.assertEqual(self.call('unit-finished', '--mode', 'fresh'), 0)
+        self.assertEqual(core.state()['phase'], 'failed')
+
     def test_readiness_failure_stops_owned_invocation(self):
         self.prepared()
         self.failure = lambda args: args[:3] == [core.HHFAB, 'vlab', 'inspect-switches']
@@ -425,15 +464,19 @@ class GuestFixture(unittest.TestCase):
     def test_old_cleanup_cannot_overwrite_new_reserved_operation(self):
         self.resumable()
         actual = self.command
+        actual_stop = core.stop_owned
         new_operation = []
         def interleave(argv, *args, **kwargs):
             raw = actual(argv, *args, **kwargs)
             if argv[:3] == [core.SYSTEMCTL, 'start', core.UNIT['resume']]:
                 raise core.Failure('synthetic late client failure', 17)
-            if argv[:3] == [core.SYSTEMCTL, 'stop', core.UNIT['resume']]:
-                new_operation.append(core.reserve('resume')['operation'])
             return raw
-        with patch.object(core, 'execute', side_effect=interleave):
+        def after_verified_stop(*args, **kwargs):
+            result = actual_stop(*args, **kwargs)
+            new_operation.append(core.reserve('resume')['operation'])
+            return result
+        with patch.object(core, 'execute', side_effect=interleave), \
+             patch.object(core, 'stop_owned', side_effect=after_verified_stop):
             self.assertEqual(self.call('start-resume'), 17)
         self.assertEqual(len(new_operation), 1)
         self.assertEqual(core.state()['operation'], new_operation[0])
@@ -826,6 +869,7 @@ class PrerequisiteContractTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.packages = {**{name: '1.0' for name in core.AUX.values()}, **core.PACKAGE_PINS}
+        self.packages['systemd'] = '255.4-1ubuntu8.99-synthetic'
         self.records = {}
         for name in set(core.AUX) | set(core.TOOL_PINS):
             size, sha = core.TOOL_PINS.get(name, (4, 'f' * 64))
@@ -873,6 +917,12 @@ class PrerequisiteContractTests(unittest.TestCase):
     def test_test_qemu_point18_refused_before_package_command(self):
         self.packages['qemu-system-x86'] = '1:8.2.2+ds-0ubuntu1.18'
         with self.assertRaisesRegex(core.Failure, 'baseline package pin'):
+            self.verify()
+        self.assertFalse(self.calls)
+
+    def test_unresearched_systemd_major_is_refused_without_selecting_upgrade(self):
+        self.packages['systemd'] = '256.1-1-synthetic'
+        with self.assertRaisesRegex(core.Failure, 'systemd compatibility family'):
             self.verify()
         self.assertFalse(self.calls)
 

@@ -331,3 +331,16 @@ desktop/EMC/GitOps/telemetry/course equivalence. Preserve the published source i
 and existing student procedures until a separately reviewed candidate passes
 runtime/persistence and owner acceptance. A bounded service stop contains owned
 processes; it is not evidence of graceful guest OS shutdown or disk quiescence.
+
+Before a separately authorized outer shutdown/reboot, stop through the public
+entrypoint while still in the appliance:
+
+```bash
+sudo python3 /usr/local/lib/labapp/vlab_core.py stop
+```
+
+Require its successful exact-owned containment result before the outer operation.
+Direct `systemctl stop` or OS shutdown without the bound public stop intent leaves
+the component failed. Enabled resume after a sealed, stopped state is distinct
+from seamless reboot/cloud stop-start/image acceptance; those transitions remain
+separately gated. Do not repair or reset failed state automatically.
