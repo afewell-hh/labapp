@@ -83,11 +83,13 @@ class Config:
     def validate_lease(self) -> None:
         spec.kinds(self.profile)
         maximum = spec.lease_limit(self.profile)
-        if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and self.boot_image != spec.COMPONENT_IMAGE:
+        if self.profile in spec.UBUNTU_PROFILES and self.boot_image != spec.COMPONENT_IMAGE:
             raise ValueError("Ubuntu boot image must match the reviewed pin")
         if (type(self.lease_minutes) is not int or
                 not 1 <= self.lease_minutes <= maximum):
             raise ValueError(f"lease_minutes must be an integer from 1 to {maximum}")
+        if self.profile == spec.UBUNTU_VLAB_CORE and self.lease_minutes != spec.VLAB_LEASE_MINUTES:
+            raise ValueError("canonical trial requires the fixed 120 minute lease")
         if (type(self.min_submit_minutes) is not int or
                 not 0 <= self.min_submit_minutes < self.lease_minutes):
             raise ValueError("submission margin must be shorter than the lease")
@@ -158,7 +160,7 @@ class Controller:
             if "profile" in rec or "children" in rec:
                 if rec.get("profile") != profile or rec.get("children") != expected_children:
                     raise ValueError("mixed child intent")
-            if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and rec.get("boot_image_id") != spec.COMPONENT_IMAGE_ID:
+            if profile in spec.UBUNTU_PROFILES and rec.get("boot_image_id") != spec.COMPONENT_IMAGE_ID:
                 raise ValueError("Ubuntu immutable image pin mismatch")
             if spec.body_hash(body) != rec["body_hash"]:
                 raise ValueError("persisted body hash mismatch")
@@ -166,6 +168,8 @@ class Controller:
             maximum = spec.lease_limit(profile)
             if not 0 < minutes <= maximum:
                 raise ValueError("persisted deadline outside profile")
+            if profile == spec.UBUNTU_VLAB_CORE and minutes != spec.VLAB_LEASE_MINUTES:
+                raise ValueError('persisted trial deadline must be exactly 120 minutes')
             return kinds
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise Refused("invalid persisted profile or child inventory") from exc
@@ -222,7 +226,7 @@ class Controller:
             return "zone"
         if kind == "instance" and proof is not None and res.get("id") != proof:
             return "operation-target-id"
-        if kind == "boot" and rec.get("profile") in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
+        if kind == "boot" and rec.get("profile") in spec.UBUNTU_PROFILES:
             source = res.get("sourceImage", "")
             if (source not in (spec.COMPONENT_IMAGE, "https://www.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE,
                                "https://compute.googleapis.com/compute/v1/" + spec.COMPONENT_IMAGE) or
@@ -419,7 +423,7 @@ class Controller:
             raise Refused(f"slot is {rec['state']}")
         self._quarantines(rec)
         self._census()
-        if cfg.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
+        if cfg.profile in spec.UBUNTU_PROFILES:
             self._check_component_image()
         now = cfg.now()
         deadline = now + timedelta(minutes=cfg.lease_minutes)
@@ -442,7 +446,7 @@ class Controller:
             "operation": None, "ids": {kind: None for kind, _ in spec.kinds(cfg.profile)},
             "reason": None, "evidence": [],
         }
-        if cfg.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
+        if cfg.profile in spec.UBUNTU_PROFILES:
             lease["boot_image_id"] = spec.COMPONENT_IMAGE_ID
         try:
             self._cas(rec, lease, gen)
@@ -459,7 +463,7 @@ class Controller:
                 rec["request_id"] != request_id:
             raise Refused("no RESERVED lease with this request id to submit")
         self._lease_kinds(rec)
-        if rec.get("profile") in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD):
+        if rec.get("profile") in spec.UBUNTU_PROFILES:
             self._check_component_image()
         deadline = _parse(rec["deadline"])
         if cfg.now() + timedelta(minutes=cfg.min_submit_minutes) > deadline:
@@ -713,7 +717,7 @@ class Controller:
 
     # ---------------------------------------------- immutable access evidence
     def register_access(self, request_id, *, producer_run_id, producer_attempt,
-                        self_user, public_key_text):
+                        self_user, public_key_text, expected_trial=None):
         """B registers one A producer/key before access; no runner is enabled.
 
         History is retained and never pruned here. At 16 access leases admission
@@ -723,10 +727,25 @@ class Controller:
         from .access_records import validate_binding
         rec, gen = self.store.read(self.cfg.key)
         if (rec is None or rec.get("state") != ACTIVE or rec["request_id"] != request_id or
-                rec.get("profile") != spec.UBUNTU_BASE_BUILD or "access" in rec or
+                rec.get("profile") not in (spec.UBUNTU_BASE_BUILD, spec.UBUNTU_VLAB_CORE) or "access" in rec or
                 rec.get("capture") or self.access_records is None):
             raise Refused("access requires confirmed current build and record adapter")
         self._lease_kinds(rec)
+        if rec['profile'] == spec.UBUNTU_VLAB_CORE and (producer_run_id, producer_attempt) != (rec['run_id'], rec['attempt']):
+            raise Refused("owner registration requires exact creator correlation")
+        if rec['profile'] == spec.UBUNTU_VLAB_CORE:
+            # Trusted owner-local CAS only. No admission or general controller
+            # selector is exposed by the owner entrypoint. Bind its captured
+            # creator correlation; this is not a GitHub execution attestation.
+            fields = ('profile', 'request_id', 'epoch', 'run_id', 'attempt',
+                      'body_hash', 'ids', 'boot_image', 'boot_image_id',
+                      'reserved_at', 'deadline', 'operation')
+            if expected_trial != {k: rec.get(k) for k in fields}:
+                raise Refused('owner registration snapshot changed')
+            op = self.cloud.call('zoneOperations', 'get', name=rec['operation'])
+            proof, error = self._insert_target_id(rec, [op])
+            if error or proof != rec['ids']['instance'] or op.get('error'):
+                raise Refused('owner registration requires terminal original insert')
         reason, found = self._inspect(rec, rec["ids"]["instance"])
         if reason or set(found) != {"instance", "boot"}:
             raise Refused("access requires current exact VM/boot ownership")

@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
-from lifecycle import spec
-from lifecycle.cloud import ApiError, ForbiddenOperation, NotFound, Uncertain
-from lifecycle.compute import ComputeRestTransport
+from . import spec
+from .cloud import ApiError, ForbiddenOperation, NotFound, Uncertain
+from .compute import ComputeRestTransport
 
 UUID = "9a0da012-1234-4678-8abc-123456789012"
 BOOT = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"

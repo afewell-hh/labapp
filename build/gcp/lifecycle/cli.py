@@ -22,11 +22,13 @@ from .cloud import NotFound, PolicyCloud
 from .compute import ComputeRestTransport
 from .controller import Config, Controller, Refused
 from .gcs import GcsSlotStore
+from .access_records import GcsAccessRecords, ReadOnlyAccessRecords
 
 REPOSITORY = "afewell-hh/labapp"
 REPOSITORY_ID = 1089062808
 OWNER_ID = 193945001
 CREATOR_NAME = "Labapp bounded Ubuntu component"
+VLAB_CREATOR_NAME = "Labapp bounded canonical VLAB trial"
 LEGACY_CREATOR_NAME = "Labapp bounded lifecycle inspection"
 CREATOR_PATH = ".github/workflows/labapp-lifecycle-inspect.yml"
 BUCKET = "labapp-lifecycle-ledger-22685701361"
@@ -38,6 +40,7 @@ CONFIRM_POLL_ATTEMPTS = 72
 POLL_SECONDS = 5
 ABSENCE_GRACE_SECONDS = 120
 ABSENCE_POLL_ATTEMPTS = (PILOT_LEASE_MINUTES * 60 + ABSENCE_GRACE_SECONDS) // POLL_SECONDS + 1
+VLAB_ABSENCE_POLL_ATTEMPTS = (spec.VLAB_LEASE_MINUTES * 60 + ABSENCE_GRACE_SECONDS) // POLL_SECONDS + 1
 COMPONENT_IMAGES = ((spec.COMPONENT_IMAGE, spec.COMPONENT_IMAGE_ID, 10),)
 IMAGES = ((BOOT_IMAGE, "1840322579453583118", 10),
           (spec.SOURCE_IMAGE, "7638370619126112785", 300))
@@ -55,7 +58,7 @@ def trusted_event(mode, env, event):
     if event.get("inputs", {}):
         raise Refused("fixed workflow accepts no inputs")
     kind = env.get("GITHUB_EVENT_NAME")
-    if mode in ("inspect", "component"):
+    if mode in ("inspect", "component", "vlab-core"):
         if kind != "workflow_dispatch" or event.get("inputs", {}):
             raise Refused("creator requires fixed main dispatch without inputs")
         return None
@@ -67,7 +70,7 @@ def trusted_event(mode, env, event):
     head = run.get("head_repository", {})
     if (kind != "workflow_run" or event.get("action") != "completed" or
             run.get("status") != "completed" or
-            run.get("name") not in (CREATOR_NAME, LEGACY_CREATOR_NAME) or run.get("path") != CREATOR_PATH or
+            run.get("name") not in (CREATOR_NAME, LEGACY_CREATOR_NAME, VLAB_CREATOR_NAME) or run.get("path") != CREATOR_PATH or
             run.get("event") != "workflow_dispatch" or
             run.get("head_branch") != "main" or
             head.get("id") != REPOSITORY_ID or head.get("full_name") != REPOSITORY or
@@ -84,7 +87,7 @@ class Preflight:
     def __init__(self, http=None, token_provider=gcloud_token, profile=spec.INSPECTOR):
         spec.kinds(profile)
         self.profile = profile
-        self.images = COMPONENT_IMAGES if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else IMAGES
+        self.images = COMPONENT_IMAGES if profile in spec.UBUNTU_PROFILES else IMAGES
         self.http = http if http is not None else HttpTransport()
         self.token_provider = token_provider
 
@@ -119,11 +122,13 @@ class Preflight:
                       "shutdown-script-url", "user-data", "user-data-encoding"}
         if any(item["key"] in executable for item in metadata):
             raise Refused("inherited project execution metadata blocks pilot")
-        self._quota(project, {"CPUS_ALL_REGIONS": 2})
+        self._quota(project, {"CPUS_ALL_REGIONS": 32 if self.profile == spec.UBUNTU_VLAB_CORE else 2})
         # E2 shares the regional CPUS pool with N1 (not E2_CPUS).
-        self._quota(region, ({"CPUS": 2, "N2_CPUS": 2, "INSTANCES": 1,
+        self._quota(region, ({"N2_CPUS": 32, "INSTANCES": 1, "SSD_TOTAL_GB": 500}
+                             if self.profile == spec.UBUNTU_VLAB_CORE else
+                            {"CPUS": 2, "N2_CPUS": 2, "INSTANCES": 1,
                               "DISKS_TOTAL_GB": spec.COMPONENT_DISK_GB}
-                             if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else
+                             if self.profile in spec.UBUNTU_PROFILES else
                              {"CPUS": 2, "DISKS_TOTAL_GB": 310}))
         for actual, (path, image_id, minimum) in zip(images, self.images):
             if (actual.get("id") != image_id or
@@ -131,7 +136,7 @@ class Preflight:
                     actual.get("status") != "READY" or
                     str(actual.get("diskSizeGb")) != str(minimum)):
                 raise Refused("pinned image identity/status/minimum mismatch")
-            if self.profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and actual.get("architecture") != "X86_64":
+            if self.profile in spec.UBUNTU_PROFILES and actual.get("architecture") != "X86_64":
                 raise Refused("component image architecture mismatch")
 
     @staticmethod
@@ -154,7 +159,7 @@ class Preflight:
 def verify_disk_provenance(controller, record):
     """Check actual cloned image IDs; names alone cannot pin incarnations."""
     profile = record.get("profile", spec.INSPECTOR)
-    images = COMPONENT_IMAGES if profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) else IMAGES
+    images = COMPONENT_IMAGES if profile in spec.UBUNTU_PROFILES else IMAGES
     kinds = [kind for kind, _ in spec.kinds(profile)[1:]]
     if set(record["ids"]) != {"instance", *kinds} or set(record["names"]) != {"instance", *kinds}:
         raise Refused("created disk inventory mismatch")
@@ -162,7 +167,7 @@ def verify_disk_provenance(controller, record):
         disk = controller.cloud.call("disks", "get", name=record["names"][kind])
         if (not record["ids"].get(kind) or disk.get("id") != record["ids"][kind] or
                 disk.get("sourceImageId") != image_id or
-                (profile in (spec.UBUNTU_COMPONENT, spec.UBUNTU_BASE_BUILD) and
+                (profile in spec.UBUNTU_PROFILES and
                  disk.get("sourceImage") not in (path,
                      "https://www.googleapis.com/compute/v1/" + path,
                      "https://compute.googleapis.com/compute/v1/" + path))):
@@ -182,7 +187,8 @@ def wait_for_absence(controller, request_id):
                       "deadline": record["deadline"], "names": record["names"],
                       "request_id": request_id, "profile": record.get("profile", spec.INSPECTOR)}, sort_keys=True), flush=True)
     cutoff = datetime.fromisoformat(record["deadline"].replace("Z", "+00:00")) + timedelta(seconds=ABSENCE_GRACE_SECONDS)
-    for _ in range(ABSENCE_POLL_ATTEMPTS):
+    attempts = VLAB_ABSENCE_POLL_ATTEMPTS if record.get('profile') == spec.UBUNTU_VLAB_CORE else ABSENCE_POLL_ATTEMPTS
+    for _ in range(attempts):
         if controller.cfg.now() >= cutoff:
             break
         try:
@@ -204,12 +210,14 @@ def wait_for_absence(controller, request_id):
 
 def execute(mode, controller, preflight, env, event):
     run = trusted_event(mode, env, event)
-    if mode in ("inspect", "component"):
+    if mode in ("inspect", "component", "vlab-core"):
         # Verify before reserving capacity or issuing any mutation.
         preflight.check()
         run_id, attempt = int(env["GITHUB_RUN_ID"]), int(env["GITHUB_RUN_ATTEMPT"])
         if run_id <= 0 or attempt <= 0:
             raise Refused("invalid run identity")
+        if mode == 'vlab-core' and attempt != 1:
+            raise Refused('canonical creator is first-attempt only; dispatch a new run')
         lease = controller.admit(run_id, attempt, str(uuid.uuid4()))
         submitted = controller.submit(lease["request_id"])
         if submitted.status != "accepted":
@@ -234,20 +242,22 @@ def execute(mode, controller, preflight, env, event):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("inspect", "component", "cleanup"))
+    parser.add_argument("mode", choices=("inspect", "component", "vlab-core", "cleanup"))
     args = parser.parse_args(argv)
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         # Trust validation precedes adapter construction and cloud access.
         trusted_event(args.mode, os.environ, event)
-        profile = spec.UBUNTU_COMPONENT if args.mode == "component" else spec.INSPECTOR
+        profile = {"component": spec.UBUNTU_COMPONENT, "vlab-core": spec.UBUNTU_VLAB_CORE}.get(args.mode, spec.INSPECTOR)
         controller = Controller(GcsSlotStore(BUCKET),
                                 PolicyCloud(ComputeRestTransport(), spec.PROJECT, spec.ZONE),
-                                Config(boot_image=spec.COMPONENT_IMAGE if profile == spec.UBUNTU_COMPONENT else BOOT_IMAGE,
-                                       profile=profile, lease_minutes=PILOT_LEASE_MINUTES,
+                                Config(boot_image=spec.COMPONENT_IMAGE if profile in spec.UBUNTU_PROFILES else BOOT_IMAGE,
+                                       profile=profile, lease_minutes=spec.VLAB_LEASE_MINUTES if profile == spec.UBUNTU_VLAB_CORE else PILOT_LEASE_MINUTES,
                                        min_submit_minutes=1,
-                                       poll_attempts=CONFIRM_POLL_ATTEMPTS if args.mode in ("inspect", "component") else 30,
-                                       poll_seconds=POLL_SECONDS))
+                                       poll_attempts=CONFIRM_POLL_ATTEMPTS if args.mode in ("inspect", "component", "vlab-core") else 30,
+                                       poll_seconds=POLL_SECONDS),
+                                access_records=(ReadOnlyAccessRecords(GcsAccessRecords(BUCKET, token_provider=gcloud_token))
+                                                if args.mode == "cleanup" else None))
         result = execute(args.mode, controller, Preflight(profile=profile), os.environ, event)
         print(json.dumps(result, sort_keys=True))
         return 0

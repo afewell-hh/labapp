@@ -177,6 +177,34 @@ jobs:
           raise SystemExit(0 if result.wasSuccessful() else 1)
           PY
 
+      - name: Run required fixed owner trial entrypoints
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          from pathlib import Path
+          import unittest
+          from build.gcp import vlab_trial
+          assert Path(vlab_trial.__file__).resolve() == Path('build/gcp/vlab_trial.py').resolve()
+          suite = unittest.TestLoader().discover('build/gcp', pattern='test_vlab_trial.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required owner trial suite discovered no tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+
+      - name: Run required fixed shared guest trial entrypoints
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          from pathlib import Path
+          import unittest
+          suite = unittest.TestLoader().discover('build/provision', pattern='test_vlab_trial.py')
+          import vlab_trial
+          assert Path(vlab_trial.__file__).resolve() == Path('build/provision/vlab_trial.py').resolve()
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required guest trial suite discovered no tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+
   bridge-ipv4:
     name: Bridge IPv4 offline and disposable namespace tests
     runs-on: ubuntu-24.04

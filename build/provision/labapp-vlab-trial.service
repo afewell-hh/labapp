@@ -1,0 +1,23 @@
+[Unit]
+Description=Bounded disposable canonical VLAB trial guardian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/labapp-vlab-trial
+Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+UnsetEnvironment=SSH_AUTH_SOCK PYTHONPATH PYTHONHOME HHFAB_LOG_LEVEL
+ExecStart=/usr/bin/python3 /var/lib/labapp-vlab-trial/vlab_trial.py guardian
+ExecStopPost=/usr/bin/python3 /var/lib/labapp-vlab-trial/vlab_trial.py contain
+Restart=no
+RuntimeMaxSec=6300
+TimeoutStartSec=15
+TimeoutStopSec=120
+KillMode=control-group
+SendSIGKILL=yes
+StandardOutput=null
+StandardError=null

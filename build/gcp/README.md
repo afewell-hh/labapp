@@ -595,10 +595,10 @@ insertion. Missing profile/child-intent fields are accepted only as the original
 two-disk inspector schema; mixed or unknown inventories fail closed. All
 profiles share the same serial slot and request/operation/immutable-ID rules.
 
-The trusted creator now selects this profile through fixed CLI mode `component`;
-its legacy workflow filename is retained because WIF pins that path. The old
-inspector library and CLI mode remain compatible, including old-ledger cleanup,
-but the active creator no longer dispatches an inspector. Workflow support is
+The component library and fixed `component` CLI mode remain compatible,
+including old-ledger cleanup. The trusted creator selects the disposable
+canonical profile described below; its legacy filename remains WIF-pinned.
+The active creator dispatches neither component nor inspector. Workflow support is
 not live proof: guest access, transport/dependency delivery and each live task
 still need their own reviewed scope. Offline tests prove request/state-machine
 behavior, not capacity, image boot, systemd, KVM or VLAB operation.
@@ -731,11 +731,12 @@ Sources checked 2026-10-25 (Compute REST v1, documentation 2026-09-01):
 [images.delete](https://docs.cloud.google.com/compute/docs/reference/rest/v1/images/delete)
 (name and request UUID; no immutable-ID precondition).
 
-### Own-key access records (offline library only)
+### Retained own-key access records
 
 `Controller(..., access_records=records).register_access(...)` lets the trusted
 controller register one A producer run/attempt, canonical SELF identity and
-public-key hash against a confirmed retained base build. It reserves the last
+public-key hash against a confirmed retained base build or disposable canonical
+trial. The trial additionally requires its exact captured owner snapshot. It reserves the last
 fifteen minutes for cleanup. It does not enable access or launch a workflow.
 `Context.from_slot` captures that occupied lease; `GcsAccessRecords` exposes only
 an exact slot read and four immutable, <=16KiB versioned records:
@@ -788,7 +789,8 @@ never-created. Access-enabled capture additionally requires seal/removal records
 and currently refuses even syntactically valid seal hashes: trusted pre-login
 ownership provenance and a supported installed sealing manifest have not been
 implemented/accepted. Legacy capture, component and inspector behavior is
-preserved. There is no sealer, executable SSH integration or live entry point.
+preserved. There is no sealer. The separately scoped owner-local disposable
+trial below reuses these access records; workers receive no credentials.
 
 Access objects are retained after release. Late old uploads remain confined to
 the old UUID namespace and cannot authorize or occupy the next lease's paths.
@@ -872,20 +874,21 @@ Mocked tests establish request/response handling, not live bucket/IAM behavior.
 
 ## Fixed lifecycle runner
 
-The creator's display name is **Labapp bounded Ubuntu component**. Its path
+The creator's display name is **Labapp bounded canonical VLAB trial**. Its path
 remains `labapp-lifecycle-inspect.yml` because the existing WIF trust pins that
 path; renaming the file would require a separately reviewed trust migration.
 It accepts only a dispatch on `main`, with no inputs, and invokes the fixed
-`component` CLI mode. It selects the Ubuntu profile above: a thirty-minute
-initial absolute `DELETE` deadline, `n2-standard-2`, and one 20GB standard boot
-disk. It never reads or clones the source appliance. No service account,
+`vlab-core` CLI mode, first attempt only. It selects `ubuntu-vlab-core-v1`:
+a fixed 120-minute initial absolute `DELETE` deadline, `n2-standard-32`, Intel
+Cascade Lake/nested virtualization and one 500GiB pd-balanced autoDelete boot
+disk from the unchanged public Ubuntu pin. It never reads or clones the source appliance. No service account,
 external IP, startup payload, package download, SSH or guest execution is added.
 Initial access-only metadata and the existing serial CAS gate remain unchanged.
 
 Preflight reads only the fixed project, region and public Ubuntu pin. It
 requires exact project/region identity, image name/immutable ID, `READY`,
-`X86_64`, and the 10GB image minimum, then checks global CPU and regional
-`CPUS`, `N2_CPUS`, `INSTANCES` and standard-disk headroom. Inherited execution
+`X86_64`, and the 10GB image minimum, then checks global CPU32 and regional
+`N2_CPUS`32, `INSTANCES`1 and `SSD_TOTAL_GB`500 headroom. Inherited execution
 metadata (startup/shutdown scripts or cloud-init user-data) blocks creation.
 These reads are snapshots, not reservations or zonal capacity guarantees.
 The fixed shape/zone were reviewed separately; the creator does not add
@@ -903,7 +906,7 @@ See [nested creation permissions](https://docs.cloud.google.com/compute/docs/ins
 and [REST insert field permissions](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert),
 checked 2026-10-25 for Compute REST v1.
 
-The thirty-minute fixed window has no duration input or environment override;
+The fixed window has no duration input or environment override;
 normal cleanup can end it early and it never changes an existing lease. Owner
 access and module/runtime checks require their separately reviewed scope.
 Historical two-disk inspectors remain supported by the library and cleanup,
@@ -916,7 +919,7 @@ The runner fetches only the eleven required Python module files through GitHub's
 Contents API at the trusted workflow's `github.sha`, before WIF authentication.
 It does not check out archived gitlinks, execute triggering-run code, download
 artifacts or overwrite auth credentials. The CLI is invoked from that temporary
-module directory as `python3 -m lifecycle.cli component` or `cleanup`; these entry
+module directory as `python3 -m lifecycle.cli vlab-core` or `cleanup`; these entry
 points require trusted GitHub event context and accept no cloud parameters.
 The offline suite executes both actual inline fetchers with synthetic Contents
 API responses, then imports each isolated fetched CLI in a fresh interpreter
@@ -927,8 +930,8 @@ Creator confirmation polls the insert operation for up to six elapsed minutes,
 with at most 72 polls at five-second intervals. Time spent in requests counts
 against that polling budget, and CAS conflicts do not restart it. The budget is
 checked between requests: one in-flight read can finish after it, and subsequent
-ownership/provenance reads take additional time. The creator job has a thirty-six-
-minute timeout, leaving four minutes beyond the thirty-minute lease plus two-minute
+ownership/provenance reads take additional time. The creator job has a 128-minute
+timeout, leaving six minutes beyond the 120-minute lease plus two-minute
 absence grace for setup and preflight; that overhead is allowance, not a
 provisioning-time guarantee. No deadline is extended. Slow or uncertain creation
 still fails closed and independent cleanup retains the occupied lease.
@@ -937,7 +940,7 @@ The controller's optional `confirm_created(..., timeout_seconds=...)` argument
 sets this elapsed polling budget. Calls that omit it and all cleanup operation
 waits retain their existing attempt/interval defaults. Creator uses 72 attempts;
 the cleanup CLI retains 30 attempts at five-second intervals. The absence wait
-also has an iteration ceiling covering the full thirty-minute lease plus two-minute
+also has an iteration ceiling covering the full 120-minute lease plus two-minute
 grace, so early provisioning does not exhaust its observation window first.
 
 Creator and cleanup use distinct fixed WIF pools and service accounts. Creator
@@ -949,7 +952,7 @@ read-only for VM absence, refusing a changed VM ID or absolute deadline,
 until the immutable deadline plus two minutes. That observation does not release
 the ledger or establish disk cleanup. The independent cleanup workflow handles
 completed creator runs, including failure/cancellation, only after validating
-either the new component or historical inspector name with the same fixed
+the canonical trial, component or historical inspector name with the same fixed
 path, original dispatch, repository/owner, main branch, and the
 ledger's run ID and attempt. Late completions cannot force another lease's
 cleanup. Manual cleanup dispatch forces the current lease; scheduled cleanup
@@ -1083,3 +1086,100 @@ plus [default run-directory configuration](https://github.com/GoogleCloudPlatfor
 are behavior references, not installed Noble payload proof. Offline tests do
 not prove live metadata, systemd ordering, IAM, installed manifests, guest
 access fencing, sealing, capture or boot/reboot behavior.
+
+## Fixed owner-local canonical trial
+
+`vlab_trial.py` composes the closed profile with the existing access records
+and shared guest `build/provision/vlab_trial.py`. Execute only after lead source
+acceptance and separate live scope, from a trusted accepted checkout on the
+existing owner host. Creator and janitor remain trusted-main WIF workflows;
+the owner host uses its existing SELF/IAP/OS Admin Login authority. General
+workers receive neither owner nor cloud credentials. This path creates no
+image, network, IAM role, external IP or service account and never touches the
+eleven preexisting images, including source ID `7638370619126112785`.
+
+The private snapshot contains the exact occupied profile/request/epoch,
+creator run/attempt, body hash, immutable VM/boot/image IDs, admission/deadline,
+terminal insert operation, captured accepted source SHA and canonical SELF
+name. It also references fresh lead-reviewed quota/network/protected-image/
+access/egress evidence by SHA256, bound to that lease/VM/source. Those references
+are declarations from the trusted lead, not network or IAM attestation by this
+program. Actual subnet policy, egress/NAT, stock Ubuntu access, machine support,
+input availability and measured fit must be established before use. Unknown
+facts refuse launch; this source supplies no network repair or offline payload
+completeness claim.
+
+```bash
+# Trusted owner only; all paths private, source accepted, live scope separate.
+python3 -m build.gcp.vlab_trial --snapshot /private/trial.json \
+  --payloads /private/pinned-inputs --output /private/empty-trial-directory
+```
+
+`--output` must already be empty, caller-owned mode0700, absolute, without links
+or shell-special characters. `--payloads` contains only the already acquired,
+authenticated `hhfab.tar.gz`0.43.1 and `kubectl`1.35.0 bytes; the unchanged
+installers supply independent size/hash checks. No payload is acquired by this
+coordinator. Source comes from the fixed table at the captured accepted main
+SHA through authenticated, bounded owner `gh api` reads. Initial main/run trust
+is captured once; later unrelated main merges never reselect source or abort
+the trial. Active creator/cancellation/lease/session checks continue.
+
+The one owner mutation beyond own-key records is an explicit registration CAS
+through `Controller.register_access(expected_trial=...)`, with the complete
+captured binding and terminal insert. The owner facade exposes no admission,
+submission, capture, delete, deadline edit or controller method selector. Run/
+attempt correlation names the creator; it does not attest that the owner-local
+process ran inside GitHub. Component/inspector access remains refused. Cleanup
+composes `ReadOnlyAccessRecords(GcsAccessRecords(...))`: evidence reads only,
+no SELF import/removal or producer object writes.
+
+The owner Cloud SDK pin is575.0.0; workflow SDK remains540.0.0. The fixed IAP
+proxy uses `compute start-iap-tunnel ... 22 --listen-on-stdin`. Local installed
+SDK575 source declares this hidden flag and chooses `IapTunnelStdinHelper`;
+the current public CLI reference does not list it. That source observation is
+not a live transport proof. A single explicitly owned SSH master uses stock
+guest-attribute host keys, dedicated known_hosts, explicit ephemeral key, no
+agent/X11 forwarding and no ambient SSH config. Every command/SFTP subordinate
+has `ControlMaster=no` plus `ProxyCommand=/usr/bin/false` and the same socket
+inode/live master process. It cannot authenticate directly, replace the master
+or reimport/refresh the twenty-minute key. IAP internal transport recovery is
+allowed only while that original SSH session remains valid, with unchanged
+phase/heartbeat clocks. No stderr reconnect parser or session-survival claim
+is made. Stock Ubuntu harmless marker transfer precedes appliance code.
+
+The host generates separate candidate-only ED25519 credentials, a random stable
+join token and a fresh SHA256-crypt hash through `openssl passwd -5 -stdin`.
+The fixed candidate FAB follows v0.43.1 template objects and accepted explicit
+fields; core.prepare retains semantic authority and exact byte preservation.
+No original secret is reconstructed and no development credential is selected.
+Private keys/password/FAB/diagnostics stay out of stdout and public artifacts.
+
+Finally the owner closes/reaps its original master/IAP group, positively removes
+the fixed private table, and obtains exact own-key absence evidence. Unresolved
+local process/file cleanup withholds the removed access receipt, so the ledger
+cannot FREE even after cloud deletion. It cancels ONLY the captured first-attempt
+creator run through the GitHub cancellation API, triggering correlated
+`workflow_run` cleanup; it never dispatches force-current manual cleanup. A
+cancel acceptance is not cleanup evidence. Terminal operations, immutable VM/
+boot404 and archived intent/import/removal evidence remain required before FREE.
+Lost/uncertain access evidence remains occupied, never reconstructed from TTL.
+
+Required offline commands run in separate processes to avoid the two
+`test_vlab_trial.py` modules sharing a bare import name. CI rejects zero discovery:
+
+```bash
+python3 -B -m unittest discover -s build/gcp/lifecycle -t build/gcp -v
+python3 -B -m unittest discover -s build/gcp -p test_vlab_trial.py -v
+python3 -B -m unittest discover -s build/provision -p test_vlab_trial.py -v
+```
+
+Tests fake cloud/auth/session/guest commands and use public temporary files.
+They cannot prove live token renewal, OS Login/PAM/session longevity, Ubuntu
+host-key publication, systemd/cgroup behavior, nested KVM, API admission or
+eighteen-node readiness/persistence. Source/CI acceptance is not live activation.
+Current primary text read2026-10-31: [OpenSSH multiplexing](https://man.openbsd.org/ssh_config#ControlMaster),
+[SFTP option meanings](https://man.openbsd.org/sftp),
+[IAP transport limits](https://docs.cloud.google.com/iap/docs/using-tcp-forwarding#known_limitations),
+[GitHub captured run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run),
+[v0.43.1 template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml)
+and [template input](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.go).

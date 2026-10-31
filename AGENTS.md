@@ -75,8 +75,8 @@ Codex does not document an import mechanism, so this file uses plain links;
   protect that image and every preexisting resource. Builder IAM is a separate
   review, and no broad project Compute/storage administration is approved.
 - Use the fixed trusted-main workflows for authorized metadata reads and serial
-  component lifecycle pilots (the WIF-pinned `labapp-lifecycle-inspect.yml` path
-  now selects a fixed Ubuntu VM); see the [GCP access runbook](docs/runbooks/gcp-build-access.md).
+  bounded lifecycle pilots (the WIF-pinned `labapp-lifecycle-inspect.yml` path
+  selects the fixed disposable canonical Ubuntu trial); see the [GCP access runbook](docs/runbooks/gcp-build-access.md).
   Never give general worker jobs cloud credentials. Access setup and lifecycle
   pilots do not authorize routine Packer builds or guest recovery.
 - Never commit secrets. Do not merge or close issues; the lead accepts work.

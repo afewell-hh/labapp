@@ -150,6 +150,15 @@ runs on the exact root `wiringd.yaml` (SHA256
 `c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a`),
 then real CLI rejection checks. No topology normalization or approximation occurs.
 
+The0.43.1 lane also imports the exact shared trial `candidate_fab` renderer with
+public synthetic ED25519/hash/token values, then reuses `config_import_smoke`
+for a fresh official import and two exact-preservation validations. The renderer
+is imported unchanged from the copied `vlab_trial.py`; no GCP/cloud module or
+real candidate secret enters this container. The report's `trial_renderer_import`
+contains only public fixture/source hashes and status. The ordinary generated
+public FAB check alone does not validate this additional recipe. All existing
+network-none/nonroot/no-capability/resource/owned-cleanup bounds remain active.
+
 ```bash
 # Host: Docker daemon, curl, timeout and Python 3.10+ stdlib; network for preparation.
 # Synthetic parser checks additionally need distribution python3-yaml.
@@ -1296,3 +1305,104 @@ No synthetic test establishes actual systemd namespaces/cgroups, networking,
 cluster boot, disk quiescence, nonce persistence or course compatibility. Direct
 service replaces historical tmux behavior; kubeconfig merging/default contexts,
 desktop/EMC/GitOps/telemetry and complete course behavior remain separate gates.
+
+## Fixed disposable trial coordinator and early guardian
+
+`vlab_trial.py` is shared guest logic for one dedicated canonical trial. It
+composes the existing unchanged QEMU, Docker, hhfab and kubectl installers with
+the public VLAB core prepare/start/stop/resume interface. It is Python3.12 on
+Ubuntu24.04 amd64, root-only, fixed paths/argv/environment, independent of cwd;
+there is no arbitrary command, plan, plugin, source URL or user selector.
+GCP lifecycle/owner access belongs in `build/gcp/vlab_trial.py`.
+
+The authenticated owner transfers a fixed flat file table into a fresh owner0700
+directory. A fixed isolated stdlib root primitive validates the exact coordinator
+digest before executing it. Bootstrap validates every manifest path/size/hash,
+regular/no-link/single-link file and total transfer bound before exclusive
+root0700 staging. It installs only one fixed guardian unit. No package download,
+installer, Docker start or core operation precedes its one-shot boot/lease
+reservation and active guardian binding. Root bootstrap failures retain the
+reservation and attempt exact service stop; they never retry or rebaseline.
+
+The guardian monitors its owned worker, immutable boot, ten-second owner
+heartbeats with thirty-second loss bound, and five-second cheap filesystem/
+MemAvailable/OOM samples. Worker admission also verifies the original guardian
+parent and unit cgroup. Public core stop contains its exact services; separately
+owned package-created Docker socket/service and containerd are stopped and
+observed inactive. Worker/group reaping and guardian cgroup membership are
+separate positive gates. ExecStopPost supplies independent containment if the
+SSH-facing process disappears; killing a client alone is insufficient. A lost
+receipt or uncertain containment never becomes clean success. Primary124/130/
+143/nonzero survives secondary cleanup errors.
+
+All cutoffs are absolute from durable admission, with wall AND monotonic bounds:
+
+| Phase | Cutoff in minutes |
+| --- | ---: |
+| Identity/access | 15 |
+| Stage/provision/prepare | 35 |
+| Fresh readiness | 70 |
+| Strict checks and nonce creation | 80 |
+| Public stop/offline image audit/resume | 95 |
+| Persistence/nonce removal/owned stop | 105 |
+| Independent outer cleanup | 120 |
+
+The core2700/900-second caps are maxima; each caller uses the earliest remaining
+phase/work bound. No retry resets, reserve borrowing, outer reboot/stop, resize,
+sealing or capture is implemented. A five-second sample can miss bursts and
+does not prove immunity to disk-full or memory exhaustion.
+
+Auxiliary provisioning reuses `qemu_offline.setup` with the fixed signed Ubuntu
+snapshot20261024, preserving all installed stock versions. It resolves missing
+sudo/socat/SSH/less/iproute2/systemd/kmod/procps/Python/PyYAML/CA/curl/keyring/gpgv
+and the complete simulated dependency closure before mutation, rejects upgrades,
+removals/downgrades/holds/repair, pins the full closure, downloads authenticated
+archives and installs with no-download. Source/index/archive and before/after
+dpkg/audit receipts remain root-private. These auxiliary selections are candidate
+facts, not recovered original pins. In particular historical two-QEMU-pin .11
+proof does not supply socat or the complete prerequisite receipt.
+
+Existing installers run once with their real CLI interfaces: QEMU
+`--selection baseline-20260114`, Docker `--receipt`, hhfab `--version 0.43.1
+--archive`, kubectl `--version 1.35.0 --platform linux/amd64 --binary`. Their
+separate actual receipts/source evidence are retained. The core schema1 package
+map is exactly PACKAGE_PINS|AUX, with fixed resolved command paths/hashes and
+verified root ownership/modes/status/amd64/tool bytes. Parser, systemd255,
+dedicated ubuntu home/sudo, KVM/TUN and daemon checks precede prepare. The fixed
+account adaptation adds only the verified dedicated ubuntu to the new
+package-created docker group, then verifies fresh runuser credentials, daemon
+executables/root identity and the root:docker0660 Unix socket. Unexpected stock
+policy refuses; there is no arbitrary account or chmod repair.
+
+Require >=250GiB free/>=96GiB MemAvailable after stage, staging/cache<=160GiB,
+and runtime stops below64GiB/16GiB or on OOM. Existing input/cache allocation
+observations are bounded before fresh start. Upstream v0.43.1 creates/downloads
+selected images inside `vlab up` and supplies no prepare-only public command;
+there is deliberately no duplicate image-preparation implementation. Complete
+cold preboot eighteen-image audit is therefore **unmet**. After verified public
+stop and before resume, the coordinator records all eighteen offline image
+formats/virtual/physical sizes and refuses backing chains, then checks the
+staging cap again. No recursive scan or qemu-img probe runs against live disks.
+
+Strict canonical inspection plus real fixed server SSH/API operations precede
+nonce VPC/attachment creation. Only default-namespace nonce names, unused
+10.0.254.0/24/VLAN2998 and canonical server-01 mclag connection are selected.
+Creation refuses collisions and retains returned UIDs/defaulted specs after
+each create. Same CA/cluster and nonce UID/spec persistence must survive public
+stop/resume. Deletion uses exact UID-preconditioned DeleteOptions through
+kubectl raw DELETE and verifies absence within the unchanged phase cutoff.
+
+Required offline command, in its own interpreter (CI refuses zero discovery):
+
+```bash
+python3 -B -m unittest discover -s build/provision -p test_vlab_trial.py -v
+```
+
+Fixtures patch every package/systemd/hhfab/network/privileged process path and
+mutate only public owned temporary files. They establish no live guest/session,
+package solvability, peak fit, firmware completeness or functional/course proof.
+Primary text read2026-10-31: [Docker group and fresh credentials](https://docs.docker.com/engine/install/linux-postinstall/),
+[v0.43.1 image preparation](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/vlabrunner.go),
+[v0.43.1 public CLI](https://github.com/githedgehog/fabricator/blob/v0.43.1/cmd/hhfab/main.go),
+[selected Fabric0.96.2 attachment schema](https://github.com/githedgehog/fabric/blob/v0.96.2/api/vpc/v1beta1/vpcattachment_types.go),
+and [kubectl1.35 raw DeleteOptions path](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/delete/delete.go).

@@ -233,7 +233,7 @@ class NoSwitchSmokeTests(unittest.TestCase):
 
 class ConfigImportTests(unittest.TestCase):
     """Run the maintained import helper and CLI binding with a nonexecuting spy."""
-    def run_import(self, failure=None, mutation=None, occupied=False):
+    def run_import(self, failure=None, mutation=None, occupied=False, renderer=False):
         from unittest.mock import patch
         calls = []
         with tempfile.TemporaryDirectory() as name:
@@ -254,6 +254,10 @@ class ConfigImportTests(unittest.TestCase):
                 (case / "foreign").write_bytes(b"preserve")
             env = {"PATH": "/usr/bin:/bin", "HOME": str(root / "home")}
             cache = root / "cache"
+            reference = source
+            if renderer:
+                source = root / 'rendered-public'
+                source.mkdir()
 
             def bounded(argv, seconds, env=None):
                 calls.append((argv, seconds, env))
@@ -286,7 +290,8 @@ class ConfigImportTests(unittest.TestCase):
                     patch.object(subject.time, "monotonic", return_value=10):
                 cli, _, validate = subject.fixture_cli(binary, cache, env, 25)
                 try:
-                    result = subject.config_import_smoke(cli, validate, source, case, wiring, binary)
+                    result = (subject.rendered_config_smoke(cli, validate, reference, source, case, wiring, binary)
+                              if renderer else subject.config_import_smoke(cli, validate, source, case, wiring, binary))
                 except subject.Refusal as error:
                     result = error
             foreign = (case / "foreign").read_bytes() if occupied else None
@@ -313,6 +318,18 @@ class ConfigImportTests(unittest.TestCase):
                 self.assertIsInstance(result, subject.Refusal)
                 self.assertEqual(len(calls), count)
                 self.assertNotIn("private diagnostic", str(result))
+
+    def test_shared_trial_renderer_reuses_exact_import_and_two_validations(self):
+        result, calls, source, case, wiring, binary, cache, env, _ = self.run_import(renderer=True)
+        self.assertEqual([c[0][1] for c in calls], ['init','validate','validate'])
+        self.assertEqual(calls[0][0][-8:], ['--config',str(source/'fab.yaml'),'--registry-repo','ghcr.io',
+                                         '--registry-prefix','githedgehog','--wiring',str(wiring)])
+        self.assertTrue(result['public_fixture'])
+        self.assertEqual(result['renderer_sha256'], result['tree_sha256']['fab.yaml'])
+        for stage, count in (('init',1),('validate',2),('rerun',3)):
+            failed, events, *_ = self.run_import(renderer=True, failure=stage)
+            self.assertIsInstance(failed, subject.Refusal)
+            self.assertEqual(len(events), count)
 
     def test_import_byte_object_and_shape_changes_stop_before_validation(self):
         for target, action in (("fab.yaml", "write"), ("include/wiringd.yaml", "write"),

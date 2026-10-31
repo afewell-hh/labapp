@@ -177,8 +177,8 @@ Use the [GCP access runbook](../runbooks/gcp-build-access.md) for the trusted
 keyless runner boundary. For explicitly authorized scope, the lead may dispatch
 `labapp-cloud.yml` for fixed image metadata reads, or the fixed
 `labapp-lifecycle-inspect.yml` and `labapp-lifecycle-cleanup.yml` for serial
-component lifecycle pilots, all on `main` with no inputs. The creator retains
-its legacy filename for WIF but runs fixed Ubuntu `component` mode; historical
+bounded lifecycle pilots, all on `main` with no inputs. The creator retains
+its legacy filename for WIF but runs fixed Ubuntu `vlab-core` mode; historical
 inspector dispatch is retired and existing inspector leases remain cleanable. The cleanup workflow also handles
 validated completed creator runs and scheduled due-lease reconciliation; see
 [runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner).
@@ -296,6 +296,10 @@ until verified, retain the CI/lead fallback and report denials exactly.
   before freezing and rerun the affected checks against that head.
 - Bring product, scope and budget choices, blockers and meaningful milestones
   to the owner.
+- Routine progress and milestones are updates, not reasons to end active work
+  or wait for a reply. Continue multiple authorized tasks, using bounded local
+  waits and status checks. Ask only for material decisions or required access,
+  and continue independent work while an answer is pending.
 - After a turn or session ends, continuous monitoring requires a separately
   verified scheduled-task or event mechanism. Do not claim a timer or webhook
   exists unless one is configured and verified.

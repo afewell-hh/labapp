@@ -12,7 +12,7 @@ import json
 import re
 import struct
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 
 from . import spec
@@ -124,13 +124,17 @@ class Context:
         try:
             if (type(slot['schema']) is not int or slot['schema'] != 1 or slot['slot'] != SLOT or
                     slot['state'] not in ('ACTIVE', 'CLEANUP_FAILED') or
-                    slot['profile'] != spec.UBUNTU_BASE_BUILD or
+                    slot['profile'] not in (spec.UBUNTU_BASE_BUILD, spec.UBUNTU_VLAB_CORE) or
                     slot['boot_image_id'] != spec.COMPONENT_IMAGE_ID):
                 raise AccessError('access requires occupied confirmed base build')
             a = slot['access']
             _exact(a, ('binding', 'phase', 'archive'))
             b = a['binding']
             validate_binding(b)
+            if slot['profile'] == spec.UBUNTU_VLAB_CORE and (
+                    (b['run_id'], b['attempt']) != (slot['run_id'], slot['attempt']) or
+                    timestamp(b['deadline']) - timestamp(b['work_deadline']) != timedelta(minutes=15)):
+                raise AccessError('trial access correlation/reserve differs')
             if (b['lease'] != slot['request_id'] or b['epoch'] != slot['epoch'] or
                     b['vm_id'] != slot['ids']['instance'] or b['boot_id'] != slot['ids']['boot'] or
                     b['deadline'] != slot['deadline'] or a['phase'] not in
@@ -221,6 +225,18 @@ def validate_record(record, context, kind):
             raise AccessError('missing seal result')
     if len(canonical(record)) > LIMIT:
         raise AccessError('access record exceeds bound')
+
+
+class ReadOnlyAccessRecords:
+    """Cleanup composition exposes evidence reads only, never producer writes.
+
+    No SELF client is constructed by cleanup. Key removal belongs to the owner.
+    """
+    def __init__(self, records):
+        self.__records = records
+
+    def read(self, context, kind):
+        return self.__records.read(context, kind)
 
 
 class GcsAccessRecords:

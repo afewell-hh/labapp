@@ -19,6 +19,11 @@ MACHINE_TYPE = "e2-standard-2"
 INSPECTOR = "inspector-v1"
 UBUNTU_COMPONENT = "ubuntu-component-v1"
 UBUNTU_BASE_BUILD = "ubuntu-base-build-v1"
+UBUNTU_VLAB_CORE = "ubuntu-vlab-core-v1"
+UBUNTU_PROFILES = (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD, UBUNTU_VLAB_CORE)
+VLAB_LEASE_MINUTES = 120
+VLAB_MACHINE = "n2-standard-32"
+VLAB_DISK_GB = 500
 BASE_BUILD_LEASE_MINUTES = 120
 BASE_BUILD_FIRST_LEASE_MINUTES = 45  # explicit first fixture; no runner enabled
 COMPONENT_IMAGE = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261024"
@@ -49,7 +54,7 @@ def is_owned_name(name: str) -> bool:
 def kinds(profile: str = INSPECTOR) -> tuple:
     if profile == INSPECTOR:
         return (("instance", "instances"), ("boot", "disks"), ("data", "disks"))
-    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD):
+    if profile in UBUNTU_PROFILES:
         return (("instance", "instances"), ("boot", "disks"))
     raise ValueError("unknown fixed lifecycle profile")
 
@@ -57,7 +62,7 @@ def kinds(profile: str = INSPECTOR) -> tuple:
 def lease_limit(profile: str) -> int:
     """Absolute minutes from admission; profiles cannot renew a lease."""
     kinds(profile)
-    if profile == UBUNTU_BASE_BUILD:
+    if profile in (UBUNTU_BASE_BUILD, UBUNTU_VLAB_CORE):
         return BASE_BUILD_LEASE_MINUTES
     return COMPONENT_LEASE_MINUTES if profile == UBUNTU_COMPONENT else LEASE_MINUTES
 
@@ -84,7 +89,7 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
     if not _UUID_RE.match(request_id):
         raise ValueError("request_id must be a lowercase UUID")
     kinds(profile)
-    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD) and boot_image != COMPONENT_IMAGE:
+    if profile in UBUNTU_PROFILES and boot_image != COMPONENT_IMAGE:
         raise ValueError("Ubuntu boot image must match the reviewed pin")
     n = names(run_id, attempt)
     labels = {LABEL_OWNER: OWNER_VALUE, LABEL_LEASE: request_id,
@@ -144,7 +149,7 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
             {"key": "labapp-stage", "value": "none"},
         ]},
     }
-    if profile in (UBUNTU_COMPONENT, UBUNTU_BASE_BUILD):
+    if profile in UBUNTU_PROFILES:
         body["machineType"] = f"{zone}/machineTypes/{COMPONENT_MACHINE}"
         body["disks"] = body["disks"][:1]
         body["disks"][0]["autoDelete"] = profile != UBUNTU_BASE_BUILD
@@ -153,6 +158,11 @@ def build_body(*, boot_image: str, request_id: str, run_id: int, attempt: int,
         body["advancedMachineFeatures"] = {"enableNestedVirtualization": True}
         # Stop rather than depending on nested-host migration compatibility.
         body["scheduling"]["onHostMaintenance"] = "TERMINATE"
+        if profile == UBUNTU_VLAB_CORE:
+            body["machineType"] = f"{zone}/machineTypes/{VLAB_MACHINE}"
+            init = body["disks"][0]["initializeParams"]
+            init["diskSizeGb"] = str(VLAB_DISK_GB)
+            init["diskType"] = f"{zone}/diskTypes/pd-balanced"
     return body
 
 
@@ -164,13 +174,14 @@ def validate_body(body: dict) -> None:
             match = re.fullmatch(r"labapp-lc-s1-r([0-9]{1,15})-a([0-9]{1,3})", body["name"])
             if match is None:
                 raise ValueError()
-            expected = build_body(boot_image=COMPONENT_IMAGE,
-                                  request_id=label[LABEL_LEASE],
-                                  run_id=int(match[1]), attempt=int(match[2]),
-                                  deadline=datetime.fromisoformat(body["scheduling"]["terminationTime"].replace("Z", "+00:00")),
-                                  profile=(UBUNTU_BASE_BUILD if body["disks"][0]["autoDelete"] is False
-                                           else UBUNTU_COMPONENT))
-            if body != expected or body_hash(body) != body_hash(expected):
+            # Match a finite table, never infer a profile from one boolean.
+            expected = [build_body(boot_image=COMPONENT_IMAGE,
+                                   request_id=label[LABEL_LEASE],
+                                   run_id=int(match[1]), attempt=int(match[2]),
+                                   deadline=datetime.fromisoformat(body["scheduling"]["terminationTime"].replace("Z", "+00:00")),
+                                   profile=p) for p in UBUNTU_PROFILES]
+            if not any(body == candidate and body_hash(body) == body_hash(candidate)
+                       for candidate in expected):
                 raise ValueError()
         except (KeyError, IndexError, TypeError, ValueError, AttributeError):
             raise ValueError("body outside the fixed Ubuntu profile") from None

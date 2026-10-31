@@ -125,8 +125,8 @@ gh run view RUN_ID --repo afewell-hh/labapp --log
 
 Use this named workflow on `main` for the metadata-only scope described above.
 The separately scoped [fixed lifecycle runner](../../build/gcp/README.md#fixed-lifecycle-runner)
-supports lead-dispatched serial Ubuntu component VMs and independent cleanup.
-Each new component receives a fixed 30-minute cloud deadline and a 36-minute creator job
+supports lead-dispatched serial disposable canonical Ubuntu VMs and independent cleanup.
+Each canonical trial receives a fixed 120-minute cloud deadline and a 128-minute creator job
 budget, with no duration input. Dispatch does not authorize guest access or execution; those require a
 separately reviewed owner-access scope.
 Neither path permits arbitrary workflows/commands or general worker cloud credentials. Record
@@ -146,10 +146,11 @@ dispatch this workflow and is not granted by the script.
 
 The lifecycle library also has a fixed one-disk Ubuntu component profile (see
 [its contract](../../build/gcp/README.md#fixed-ubuntu-component-library-profile)).
-The trusted creator now selects it through fixed `component` CLI mode. Its
-legacy filename `labapp-lifecycle-inspect.yml` remains pinned by WIF; its display
-name is `Labapp bounded Ubuntu component`. Historical inspector dispatch is
-retired, while library/CLI compatibility and old-lease cleanup remain. Its
+The component library/CLI remain compatible. The creator selects the canonical
+trial through fixed `vlab-core` mode. Its legacy filename
+`labapp-lifecycle-inspect.yml` remains pinned by WIF; its display name is
+`Labapp bounded canonical VLAB trial`. Historical component/inspector dispatch is
+retired, while library/CLI compatibility and old-lease cleanup remain. The component's
 30-minute maximum and nested-capable small shape do not authorize a launch,
 change IAM, establish guest egress, or implement full Packer image capture.
 Those are separate reviewed operational scopes.
@@ -569,3 +570,43 @@ termination deadline cannot establish retained disk/image absence. Only exact
 identity checks, terminal operations and verified absence allow a deletion
 receipt. See the library contract for release/retention fencing and the remaining
 API/IAM assumptions.
+
+## Disposable canonical VLAB trial access
+
+The fixed creator selects `ubuntu-vlab-core-v1`, a disposable single-boot
+500GiB pd-balanced/n2-standard-32 Ubuntu trial with immutable120-minute DELETE
+deadline. It keeps the existing WIF path, serial CAS slot and separate cleanup
+identity. Historical component/inspector cleanup stays compatible. This source
+change requires lead acceptance and separate live authorization; dispatch does
+not configure networking or grant owner access. The published appliance and all
+eleven preexisting images remain protected. See the [fixed owner coordinator](../../build/gcp/README.md#fixed-owner-local-canonical-trial)
+for the exact private snapshot/file table and source/session contract.
+
+Only the existing owner SELF performs the explicit current-binding access
+registration CAS, one-shot twenty-minute OS Login import and own-key removal.
+Producer run/attempt is the captured creator correlation, not proof that the
+owner process executed inside GitHub. Cleanup reads retained access evidence
+through a read-only composition and cannot remove SELF keys. Missing import/
+removal evidence keeps capacity occupied after VM/boot deletion.
+
+Refresh actual quota/image/machine/organization-policy/protected-resource and
+effective subnet/ingress/private-reachability/egress facts before live use.
+Neither IAP nor Private Google Access supplies general Internet egress. No
+network, role, public address, quota or disk increase follows from an unknown
+fact. Stock Ubuntu host-key publication and harmless marker transfer must be
+proved before appliance code; historical Debian access is not that proof.
+
+The original owned SSH master is the only authentication session. Subordinate
+SSH/SFTP channels fail direct fallback. Internal IAP recovery is permitted only
+while the same master/session remains valid, with unchanged phase/heartbeat/
+deadline clocks; there is no master replacement, reauthentication, key refresh
+or stderr reconnect parser. Session survival beyond key expiry and long-lived
+owner/WIF credential refresh remain real trial gates, not synthetic evidence.
+
+The owner coordinator cancels only the exact captured first-attempt creator run
+to trigger independent correlated workflow_run cleanup. It never falls back to
+manual force-current cleanup. Cancellation acceptance and cron are not positive
+deletion proof. Close/reap original local transports and remove private files
+before final own-key absence evidence; uncertainty withholds that receipt and
+blocks FREE. The existing terminal operation, immutable VM/boot404 and access
+archive checks still decide release.

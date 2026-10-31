@@ -365,7 +365,7 @@ class ComponentCliTests(unittest.TestCase):
         with self.assertRaises(Refused): cli.trusted_event('component', env, event)
 
     def test_new_and_old_completion_names_all_conclusions_and_no_inputs(self):
-        for name in (cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME):
+        for name in (cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME, cli.VLAB_CREATOR_NAME):
             for conclusion in ('success', 'failure', 'cancelled', 'timed_out'):
                 env, event = event_env('workflow_run')
                 event['workflow_run'].update(name=name, conclusion=conclusion)
@@ -638,7 +638,7 @@ class WorkflowTests(unittest.TestCase):
                        'GITHUB_EVENT_NAME': 'workflow_dispatch'}
                 event = {'repository': {'id': cli.REPOSITORY_ID,
                          'full_name': cli.REPOSITORY, 'owner': {'id': cli.OWNER_ID}}}
-                for mode in ('component', 'cleanup'):
+                for mode in ('component', 'vlab-core', 'cleanup'):
                     assert cli.trusted_event(mode, env, event) is None
                 event['inputs'] = {'command': 'forbidden'}
                 try:
@@ -665,20 +665,20 @@ class WorkflowTests(unittest.TestCase):
 
     def test_workflow_boundary(self):
         inspect, cleanup = self.workflows()
-        self.assertEqual(inspect['name'], cli.CREATOR_NAME)
+        self.assertEqual(inspect['name'], cli.VLAB_CREATOR_NAME)
         self.assertEqual(inspect['on'], {'workflow_dispatch': None})
-        self.assertIn('python3 -m lifecycle.cli component', inspect['jobs']['inspect']['steps'][-1]['run'])
+        self.assertIn('python3 -m lifecycle.cli vlab-core', inspect['jobs']['inspect']['steps'][-1]['run'])
         self.assertNotIn('lifecycle.cli inspect', inspect['jobs']['inspect']['steps'][-1]['run'])
         self.assertEqual(cleanup['on']['schedule'], [{'cron': '7,17,27,37,47,57 * * * *'}])
         self.assertEqual(cleanup['on']['workflow_run'],
-                         {'workflows': [cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME], 'types': ['completed'], 'branches': ['main']})
+                         {'workflows': [cli.VLAB_CREATOR_NAME, cli.CREATOR_NAME, cli.LEGACY_CREATOR_NAME], 'types': ['completed'], 'branches': ['main']})
         for workflow, mode, identity in ((inspect, 'inspect', 'creator'), (cleanup, 'cleanup', 'cleanup')):
             self.assertEqual(workflow['permissions'], {'contents': 'read', 'id-token': 'write'})
             job = workflow['jobs'][mode]
             if mode == 'inspect':
-                self.assertEqual(job['timeout-minutes'], 36)
+                self.assertEqual(job['timeout-minutes'], 128)
                 self.assertGreaterEqual(job['timeout-minutes'] * 60,
-                                        cli.PILOT_LEASE_MINUTES * 60 + cli.ABSENCE_GRACE_SECONDS + 240)
+                                        spec.VLAB_LEASE_MINUTES * 60 + cli.ABSENCE_GRACE_SECONDS + 240)
                 self.assertLessEqual(cli.CONFIRM_TIMEOUT_SECONDS + 240, cli.PILOT_LEASE_MINUTES * 60)
             self.assertIn("github.ref == 'refs/heads/main'", job['if'])
             steps = job['steps']
