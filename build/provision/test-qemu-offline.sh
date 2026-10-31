@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Host-only Docker preparation + network-none nonroot execution; no overrides.
 set -euo pipefail
+selection=test-20261024
+if [[ $# != 0 ]]; then
+  [[ $# == 2 && $1 == --selection && $2 == baseline-20260114 ]] || {
+    echo 'usage: test-qemu-offline.sh [--selection baseline-20260114]' >&2; exit 1;
+  }
+  selection=baseline-20260114
+fi
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 base=ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 IFS= read -r suffix < /proc/sys/kernel/random/uuid
@@ -64,7 +71,7 @@ cleanup() {
 finish() {
   local result=$?
   trap - EXIT
-  cleanup || result=1
+  cleanup || { if ((result == 0)); then result=1; fi; }
   exit "$result"
 }
 trap finish EXIT
@@ -96,8 +103,14 @@ timeout --kill-after=1s 10s docker start "$runtime_id" >/dev/null
 timeout --kill-after=3s 30s docker exec "$runtime_id" python3 /suite/qemu_offline_container.py --prepare-policy
 # Exact actual target state is captured using the same unchanged module CLI.
 timeout --kill-after=3s 30s docker exec "$runtime_id" python3 /suite/install-qemu.py \
-  --capture-state /target-state.json --base-id "$base"
+  --capture-state /target-state.json --base-id "$base" --selection "$selection"
 timeout --kill-after=3s 30s docker cp "$runtime_id:/target-state.json" "$workdir/state.json"
-timeout --kill-after=10s 9m bash "$here/prepare-qemu-offline.sh" "$workdir/state.json" "$workdir/bundle"
+# This digest comes from the trusted acquisition result, independently of the
+# bundle subsequently copied to the disconnected target. Never hash receipt there
+# to invent the expected value.
+acquisition="$(timeout --kill-after=10s 9m bash "$here/prepare-qemu-offline.sh" "$workdir/state.json" "$workdir/bundle")"
+printf '%s\n' "$acquisition"
+expected="$(python3 -c 'import json,re,sys; r=json.loads(sys.argv[1]); s=r["receipt_sha256"]; assert isinstance(s,str) and re.fullmatch("[a-f0-9]{64}",s); print(s)' "$acquisition")"
 timeout --kill-after=3s 30s docker cp "$workdir/bundle" "$runtime_id:/bundle"
-timeout --kill-after=5s 510s docker exec "$runtime_id" python3 /suite/qemu_offline_container.py
+timeout --kill-after=5s 510s docker exec "$runtime_id" python3 /suite/qemu_offline_container.py \
+  --selection "$selection" --receipt-sha256 "$expected"

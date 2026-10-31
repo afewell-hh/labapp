@@ -18,6 +18,8 @@ import qemu_offline as offline
 
 from hhfab_release import Refusal, bounded, digest
 
+# Keep literal public TEST constants: native fixtures mutate this very mapping
+# and source-contract tests inspect the literals without executing the module.
 SNAPSHOT = "20261024T000000Z"
 PINS = {"qemu-system-x86": "1:8.2.2+ds-0ubuntu1.18",
         "qemu-utils": "1:8.2.2+ds-0ubuntu1.18", "socat": "1.8.0.0-4ubuntu0.1",
@@ -51,13 +53,19 @@ def installed():
             if row.split("\t")[2] == "installed"}
 
 
-def verify_tools():
+def selected_policy(selected=None):
+    policy = offline.selection(offline.TEST if selected is None else selected)
+    # The actual TEST native negative fixtures intentionally mutate PINS.
+    if policy['selection'] == offline.TEST:
+        policy['pins'] = PINS
+    return policy
+
+
+def verify_tools(selected=None):
     # dpkg --verify also reports documentation deliberately excluded by minimal
     # Ubuntu images. Verify the mandatory payloads against installed package
     # md5sums instead; origin authenticity is APT's signed SHA256 index chain.
-    for package, relative in [('qemu-system-x86', 'usr/bin/qemu-system-x86_64'),
-                              ('qemu-utils', 'usr/bin/qemu-img'), ('socat', 'usr/bin/socat1'),
-                              ('seabios', 'usr/share/seabios/bios-256k.bin')]:
+    for package, relative in offline.artifacts(selected_policy(selected)['selection']):
         metadata = call(['/usr/bin/dpkg-query', '--control-show', package, 'md5sums']).decode()
         expected = dict(line.split(None, 1)[::-1] for line in metadata.splitlines())
         artifact = Path('/') / relative
@@ -66,12 +74,14 @@ def verify_tools():
         if hashlib.md5(artifact.read_bytes()).hexdigest() != expected[relative]:
             raise Refusal('installed pinned artifact drift: ' + package)
 
-    socat = Path('/usr/bin/socat')
-    if not socat.is_symlink() or os.readlink(socat) != 'socat1':
-        raise Refusal('socat package symlink drift')
+    if selected_policy(selected)['selection'] == offline.TEST:
+        socat = Path('/usr/bin/socat')
+        if not socat.is_symlink() or os.readlink(socat) != 'socat1':
+            raise Refusal('socat package symlink drift')
 
 
-def preflight(network=True):
+def preflight(network=True, selected=None):
+    pins = selected_policy(selected)['pins']
     if os.geteuid() != 0:
         raise Refusal("root required")
     release = Path("/etc/os-release").read_text().splitlines()
@@ -90,34 +100,40 @@ def preflight(network=True):
         if not Path(path).is_file():
             raise Refusal("archive keyring/CA dependency missing")
     before = installed()
-    for name, version in PINS.items():
+    for name, version in pins.items():
         actual = before.get(name)
         if actual is not None and actual != version:
             raise Refusal("installed pinned package drift: " + name)
-    if all(before.get(name) == version for name, version in PINS.items()):
-        verify_tools()
+    if all(before.get(name) == version for name, version in pins.items()):
+        verify_tools() if selected is None else verify_tools(selected)
     return before
 
 
-def install(bundle=None, receipt_sha=None, base=None):
+def install(bundle=None, receipt_sha=None, base=None, selected=None):
+    policy = selected_policy(selected)
     started = time.monotonic()
-    before = preflight() if bundle is None else preflight(network=False)
+    if selected is None:
+        before = preflight() if bundle is None else preflight(network=False)
+    else:
+        before = preflight(network=bundle is None, selected=selected)
     # Lists/cache/sources/preferences isolated. The real dpkg database stays real;
     # APT acquires its normal dpkg locks. No ambient APT_CONFIG or proxy variables.
     with tempfile.TemporaryDirectory(prefix="labapp-qemu-", dir="/var/tmp") as temporary:
         root = Path(temporary)
         root.chmod(0o755)
-        apt, config = offline.setup(root, SNAPSHOT)
+        apt, config = offline.setup(root, policy['snapshot'])
         original_env = dict(ENV)
         ENV['APT_CONFIG'] = config
         try:
-            _transaction(root, apt, started, before, bundle, receipt_sha, base)
+            _transaction(root, apt, started, before, bundle, receipt_sha, base, selected)
         finally:
             ENV.clear()
             ENV.update(original_env)
 
 
-def _transaction(root, apt, started, before, bundle, receipt_sha, base):
+def _transaction(root, apt, started, before, bundle, receipt_sha, base, selected=None):
+    policy = selected_policy(selected)
+    pins, snapshot = policy['pins'], policy['snapshot']
     def run(stage, args):
         remaining = 210 - (time.monotonic() - started)
         if remaining <= 0:
@@ -130,48 +146,50 @@ def _transaction(root, apt, started, before, bundle, receipt_sha, base):
     if bundle is None:
         run('update', [*apt, "-o", "APT::Update::Error-Mode=any", "update"])
     else:
-        expected_state = offline.receive(Path(bundle), receipt_sha, root, base, SNAPSHOT, PINS, call)
+        expected_state = offline.receive(Path(bundle), receipt_sha, root, base, snapshot, pins, call, policy['selection'])
         apt = [*apt, '--no-download']
-        if not all(before.get(name) == version for name, version in PINS.items()):
+        if not all(before.get(name) == version for name, version in pins.items()):
             # capture uses normal target APT config identity, not our temp config.
             saved_config = ENV.pop('APT_CONFIG')
             try:
-                if offline.capture(call, base) != expected_state:
+                if offline.capture(call, base, policy['selection']) != expected_state:
                     raise Refusal('target state drift before transaction')
             finally:
                 ENV['APT_CONFIG'] = saved_config
     # dpkg audit can be clean despite configured-but-unsatisfied dependency
     # relations. Refuse that base before install can implicitly repair it.
     run('pre-check', [*apt, "check"])
-    selected = [name + "=" + version for name, version in PINS.items()]
+    requested = [name + "=" + version for name, version in pins.items()]
     # --no-remove and no downgrade/hold override remain active for simulation
     # and actual transaction. Standard signed Release/index/deb verification.
-    run('simulate', [*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *selected])
-    if bundle is None or not all(before.get(name) == version for name, version in PINS.items()):
+    run('simulate', [*apt, "--simulate", "--no-remove", "--no-install-recommends", "install", *requested])
+    if bundle is None or not all(before.get(name) == version for name, version in pins.items()):
         if expected_state is not None:
             saved_config = ENV.pop('APT_CONFIG')
             try:
-                if offline.capture(call, base) != expected_state:
+                if offline.capture(call, base, policy['selection']) != expected_state:
                     raise Refusal('target state drift immediately before transaction')
             finally:
                 ENV['APT_CONFIG'] = saved_config
-        run('install', [*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *selected])
+        run('install', [*apt, "--yes", "--no-remove", "--no-install-recommends", "install", *requested])
     run('post-check', [*apt, "check"])
     archives = [{"name": p.name, "bytes": p.stat().st_size, "sha256": digest(p)}
                 for p in sorted((root / "archives").glob("*.deb"))]
     after = installed()
-    if any(after.get(name) != version for name, version in PINS.items()):
+    if any(after.get(name) != version for name, version in pins.items()):
         raise Refusal("installed version mismatch")
     if call(["/usr/bin/dpkg", "--audit"]).strip():
         raise Refusal("post-install dpkg audit failed")
-    verify_tools()
-    for path in ("/usr/bin/qemu-system-x86_64", "/usr/bin/qemu-img", "/usr/bin/socat",
-                 "/usr/share/seabios/bios-256k.bin"):
-        if not Path(path).is_file():
+    verify_tools() if selected is None else verify_tools(selected)
+    for _, relative in offline.artifacts(policy['selection']):
+        if not (Path('/') / relative).is_file():
             raise Refusal("installed artifact missing")
-    print(json.dumps({"snapshot": SNAPSHOT, "pins": PINS, "resolved_installed": after,
+    result = {"snapshot": snapshot, "pins": pins, "resolved_installed": after,
                       "downloaded_archives": archives, "changed": before != after,
-                      "seconds": round(time.monotonic() - started, 3)}, sort_keys=True))
+                      "seconds": round(time.monotonic() - started, 3)}
+    if policy['selection'] == offline.BASELINE:
+        result['selection'] = offline.BASELINE
+    print(json.dumps(result, sort_keys=True))
 
 
 def main():
@@ -189,12 +207,14 @@ def main():
         mode.add_argument('--offline', type=Path)
         parser.add_argument('--receipt-sha256')
         parser.add_argument('--base-id')
+        parser.add_argument('--selection')
         args = parser.parse_args()
+        policy = selected_policy(args.selection)
         if args.capture_state:
             if args.receipt_sha256 or not args.base_id:
                 raise Refusal('capture requires base-id only')
-            preflight(network=False)
-            state = offline.capture(call, args.base_id)
+            preflight(network=False, selected=args.selection)
+            state = offline.capture(call, args.base_id, policy['selection'])
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(dir=args.capture_state.parent, prefix='.qemu-state-', delete=False) as output:
@@ -208,11 +228,11 @@ def main():
         elif args.offline:
             if not args.receipt_sha256 or not args.base_id:
                 raise Refusal('offline requires independently expected receipt and base-id')
-            install(args.offline, args.receipt_sha256, args.base_id)
+            install(args.offline, args.receipt_sha256, args.base_id, args.selection)
         else:
             if args.receipt_sha256 or args.base_id:
                 raise Refusal('unexpected online options')
-            install()
+            install() if args.selection is None else install(selected=args.selection)
     finally:
         signal.alarm(0)
 

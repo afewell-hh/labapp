@@ -295,6 +295,16 @@ class CommandDiagnosticTests(unittest.TestCase):
 
 
 class WitnessTests(unittest.TestCase):
+    def test_historical_packages_refuse_unchanged_test_witness_before_qemu(self):
+        module = runpy.run_path(str(INSTALL))
+        historical = offline_protocol.selection(offline_protocol.BASELINE)['pins']
+        with patch.object(witness, 'ARTIFACTS', {}), \
+             patch.object(witness.runpy if hasattr(witness, 'runpy') else runpy, 'run_path',
+                          return_value={'PINS': module['PINS'], 'installed': lambda: historical}), \
+             patch.object(witness, 'bounded', side_effect=AssertionError('QEMU executed')):
+            with self.assertRaisesRegex(Refusal, 'package identity mismatch'):
+                witness.probe(test_tcg=True)
+
     def test_fixture_and_invalid_nonce(self):
         data, expected = witness.fixture('a' * 32)
         self.assertEqual(len(data), 1024 * 1024)
@@ -582,6 +592,155 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
         kill.assert_called_once_with(42, signal.SIGKILL)
         proc.wait.assert_called_once_with(timeout=2)
         proc.stdout.close.assert_called_once_with()
+
+
+class HistoricalInstallTests(unittest.TestCase):
+    setUp = InstallTests.setUp
+    preflight_call = InstallTests.preflight_call
+    def test_default_and_explicit_test_bind_actual_pins_mutations(self):
+        self.assertEqual(self.module['selected_policy'](), offline_protocol.selection())
+        self.module['PINS']['qemu-system-x86'] = '999:0.invalid'
+        for selected in (None, offline_protocol.TEST):
+            self.assertIs(self.module['selected_policy'](selected)['pins'], self.module['PINS'])
+        self.assertEqual(self.module['selected_policy'](offline_protocol.BASELINE)['pins']['qemu-system-x86'],
+                         '1:8.2.2+ds-0ubuntu1.11')
+        calls = []
+        def call(args, seconds=10):
+            calls.append(args)
+            if '--simulate' in args:
+                self.assertIn('qemu-system-x86=999:0.invalid', args)
+                raise Refusal('actual invalid pin reached simulation')
+            return b''
+        with tempfile.TemporaryDirectory() as directory, patch.dict(self.globals, {'call': call}):
+            with self.assertRaisesRegex(Refusal, 'stage=simulate: actual invalid pin'):
+                self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], __import__('time').monotonic(),
+                                            {}, None, None, None)
+        self.assertEqual(len(calls), 3)
+
+    def test_actual_test_transaction_output_passes_unchanged_guest_parser(self):
+        adapter = runpy.run_path(str(INSTALL.parents[1]/'packer-qemu/guest/assert-qemu.py'))
+        for selected in (None, offline_protocol.TEST):
+            output = __import__('io').StringIO()
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); (root/'archives').mkdir()
+                with patch.dict(self.globals, {'call': lambda *a: b'', 'installed': lambda: self.module['PINS'],
+                                              'verify_tools': Mock()}), \
+                     patch.object(Path, 'is_file', return_value=True), contextlib.redirect_stdout(output):
+                    self.module['_transaction'](root, ['/usr/bin/apt-get'], __import__('time').monotonic(),
+                                                {}, None, None, None, selected)
+            report = adapter['install_report'](output.getvalue().encode(), 1)
+            self.assertEqual(set(report), adapter['INSTALL_KEYS'])
+            self.assertTrue(report['changed'])
+            report['selection'] = offline_protocol.TEST
+            with self.assertRaises(adapter['Check']):
+                adapter['install_report'](json.dumps(report).encode(), 1)
+
+    def test_unknown_refuses_before_preflight_or_workspace(self):
+        with patch.dict(self.globals, {'preflight': Mock(side_effect=AssertionError('preflight'))}), \
+             patch.object(tempfile, 'TemporaryDirectory', side_effect=AssertionError('workspace')):
+            with self.assertRaisesRegex(Refusal, 'unknown'):
+                self.module['install'](selected='latest')
+
+    def test_historical_preflight_refuses_test_version(self):
+        for selected, version in ((offline_protocol.BASELINE, '1:8.2.2+ds-0ubuntu1.18'),
+                                  (None, '1:8.2.2+ds-0ubuntu1.11')):
+            with patch('os.geteuid', return_value=0), \
+                 patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"'), \
+                 patch.object(Path, 'is_file', return_value=True), \
+                 patch.dict(self.globals, self.preflight_call(packages={'qemu-system-x86': version})):
+                with self.assertRaisesRegex(Refusal, 'drift'):
+                    self.module['preflight'](selected=selected)
+
+    def test_actual_historical_online_install_uses_selected_source_and_preflight(self):
+        calls = []
+        selected = offline_protocol.BASELINE
+        policy = offline_protocol.selection(selected)
+        def call(args, seconds=10):
+            calls.append(args)
+            source = next((item.split('=',1)[1] for item in args if item.startswith('Dir::Etc::sourcelist=')), None)
+            if source:
+                text = Path(source).read_text()
+                self.assertIn('/20260114T000000Z/', text)
+                self.assertNotIn('20261024', text)
+            return b''
+        preflight = Mock(return_value={})
+        with patch.dict(self.globals, {'preflight': preflight, 'call': call, 'installed': lambda: policy['pins'],
+                                      'verify_tools': Mock()}), \
+             patch.object(Path, 'is_file', return_value=True), contextlib.redirect_stdout(__import__('io').StringIO()):
+            self.module['install'](selected=selected)
+        preflight.assert_called_once_with(network=True, selected=selected)
+        self.assertTrue(any(args[-1] == 'update' for args in calls))
+        self.assertEqual(len([args for args in calls if 'install' in args]), 2)
+
+    def test_selected_payload_verifier_actual_boundaries(self):
+        data = b'synthetic package payload'
+        import hashlib
+        for selected in (offline_protocol.TEST, offline_protocol.BASELINE):
+            calls = []
+            paths = offline_protocol.artifacts(selected)
+            def call(args, seconds=10):
+                calls.append(args)
+                relative = dict(paths)[args[2]]
+                return (hashlib.md5(data).hexdigest()+'  '+relative+'\n').encode()
+            with patch.dict(self.globals, {'call': call}), \
+                 patch.object(Path, 'is_symlink', autospec=True,
+                              side_effect=lambda p: selected == offline_protocol.TEST and str(p) == '/usr/bin/socat'), \
+                 patch.object(Path, 'is_file', return_value=True), \
+                 patch.object(Path, 'read_bytes', return_value=data), \
+                 patch.object(os, 'readlink', return_value='socat1'):
+                self.module['verify_tools'](selected)
+            self.assertEqual([args[2] for args in calls], [p for p,_ in paths])
+            for missing in (True, False):
+                with patch.dict(self.globals, {'call': call}), patch.object(Path, 'is_symlink', return_value=False), \
+                     patch.object(Path, 'is_file', return_value=not missing), \
+                     patch.object(Path, 'read_bytes', return_value=b'drift'):
+                    with self.assertRaisesRegex(Refusal, 'missing' if missing else 'drift'):
+                        self.module['verify_tools'](selected)
+
+    def test_actual_historical_transaction_requests_two_and_preserves_rerun_rule(self):
+        selected = offline_protocol.BASELINE
+        policy = offline_protocol.selection(selected)
+        for rerun in (False, True):
+            calls, captures = [], []
+            def call(args, seconds=10):
+                calls.append(args); return b''
+            def capture(*args):
+                captures.append(args)
+                self.assertEqual(args[-1], selected)
+                return {'expected': True}
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); (root/'archives').mkdir()
+                with patch.dict(self.globals, {'call': call, 'installed': lambda: policy['pins'], 'verify_tools': Mock()}), \
+                     patch.object(offline_protocol, 'receive', return_value={'expected': True}) as receive, \
+                     patch.object(offline_protocol, 'capture', side_effect=capture), \
+                     patch.dict(self.module['ENV'], {'APT_CONFIG': '/fixed'}), \
+                     patch.object(Path, 'is_file', return_value=True), contextlib.redirect_stdout(__import__('io').StringIO()):
+                    self.module['_transaction'](root, ['/usr/bin/apt-get'], __import__('time').monotonic(),
+                                                policy['pins'] if rerun else {}, root, '1'*64, offline_protocol.BASE, selected)
+                self.assertEqual(receive.call_args.args[-1], selected)
+                self.assertEqual(len(captures), 0 if rerun else 2)
+                installs = [args for args in calls if 'install' in args]
+                self.assertEqual(len(installs), 1 if rerun else 2)
+                for args in installs:
+                    self.assertEqual(args[args.index('install')+1:], [k+'='+v for k,v in policy['pins'].items()])
+                self.assertTrue(all('--no-download' in args for args in calls if args[0] == '/usr/bin/apt-get'))
+
+    def test_historical_post_simulation_drift_refuses_before_mutation(self):
+        calls = []
+        def call(args, seconds=10):
+            calls.append(args)
+            if 'install' in args and '--simulate' not in args:
+                self.fail('drifted target mutation')
+            return b''
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(self.globals, {'call': call}), \
+             patch.dict(self.module['ENV'], {'APT_CONFIG': '/fixed'}), \
+             patch.object(offline_protocol, 'receive', return_value={'expected': 1}), \
+             patch.object(offline_protocol, 'capture', side_effect=[{'expected': 1}, {'drifted': 1}]):
+            with self.assertRaisesRegex(Refusal, 'immediately before'):
+                self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], __import__('time').monotonic(),
+                                            {}, Path(directory), '1'*64, offline_protocol.BASE, offline_protocol.BASELINE)
+        self.assertTrue(any('--simulate' in args for args in calls))
 
 
 if __name__ == '__main__':

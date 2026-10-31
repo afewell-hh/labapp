@@ -16,6 +16,35 @@ from hhfab_release import Refusal, digest
 BASE = 'ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac'
 MAX_FILES, MAX_BYTES, MAX_FILE = 256, 256 * 1024**2, 64 * 1024**2
 KEY = Path('/usr/share/keyrings/ubuntu-archive-keyring.gpg')
+TEST = 'test-20261024'
+BASELINE = 'baseline-20260114'
+
+
+def selection(value=TEST):
+    """Fresh source policy for exactly two selections; never receive policy."""
+    if value == TEST:
+        return {'selection': TEST, 'snapshot': '20261024T000000Z', 'pins': {
+            'qemu-system-x86': '1:8.2.2+ds-0ubuntu1.18',
+            'qemu-utils': '1:8.2.2+ds-0ubuntu1.18',
+            'socat': '1.8.0.0-4ubuntu0.1', 'seabios': '1.16.3-2'}}
+    if value == BASELINE:
+        return {'selection': BASELINE, 'snapshot': '20260114T000000Z', 'pins': {
+            'qemu-system-x86': '1:8.2.2+ds-0ubuntu1.11',
+            'qemu-utils': '1:8.2.2+ds-0ubuntu1.11'}}
+    raise Refusal('unknown fixed QEMU selection')
+
+
+def artifacts(value=TEST):
+    selection(value)
+    result = [('qemu-system-x86', 'usr/bin/qemu-system-x86_64'),
+              ('qemu-utils', 'usr/bin/qemu-img')]
+    if value == TEST:
+        result += [('socat', 'usr/bin/socat1'), ('seabios', 'usr/share/seabios/bios-256k.bin')]
+    return result
+
+
+def sha(value):
+    return isinstance(value, str) and re.fullmatch('[a-f0-9]{64}', value) is not None
 
 
 def encoded(value):
@@ -24,11 +53,12 @@ def encoded(value):
 
 def identity():
     here = Path(__file__).parent
-    return {name: digest(here / name) for name in ('install-qemu.py', 'qemu_offline.py', 'hhfab_release.py')}
+    return {name: digest(here / name) for name in ('install-qemu.py', 'qemu_offline.py', 'hhfab_release.py',
+                                                'qemu_acquire.py', 'prepare-qemu-offline.sh')}
 
 
 def base_id(value):
-    if not re.fullmatch(r'(ubuntu@sha256:[a-f0-9]{64}|gce-image:[0-9]{1,20})', value):
+    if not isinstance(value, str) or not re.fullmatch(r'(ubuntu@sha256:[a-f0-9]{64}|gce-image:[0-9]{1,20})', value):
         raise Refusal('explicit immutable base identity required')
     return value
 
@@ -89,7 +119,8 @@ def policy_files():
     return result
 
 
-def capture(call, base):
+def capture(call, base, selected=TEST):
+    descriptor = selection(selected)
     foreign = call(['/usr/bin/dpkg', '--print-foreign-architectures'])
     holds = call(['/usr/bin/apt-mark', 'showhold'])
     audit = call(['/usr/bin/dpkg', '--audit'])
@@ -98,7 +129,7 @@ def capture(call, base):
     if call(['/usr/bin/dpkg', '--print-architecture']).strip() != b'amd64':
         raise Refusal('amd64 required')
     status = regular(Path('/var/lib/dpkg/status'), 8 * 1024**2)
-    return {'format': 'labapp-qemu-state-v1', 'base': base_id(base), 'module': identity(),
+    return {'format': 'labapp-qemu-state-v2', **descriptor, 'base': base_id(base), 'module': identity(),
             'status': base64.b64encode(status).decode(), 'architecture': 'amd64',
             'foreign': '', 'holds': '', 'audit': '',
             'selections_sha256': hashlib.sha256(call(['/usr/bin/dpkg', '--get-selections'])).hexdigest(),
@@ -107,14 +138,23 @@ def capture(call, base):
             'os_release_sha256': digest(Path('/etc/os-release'))}
 
 
-def check_state(state, base):
+def check_state(state, base, selected=TEST):
+    descriptor = selection(selected)
     keys = {'format', 'base', 'module', 'status', 'architecture', 'foreign', 'holds', 'audit',
-            'selections_sha256', 'policy', 'keyring', 'apt_config_sha256', 'os_release_sha256'}
-    if (not isinstance(state, dict) or set(state) != keys or state['format'] != 'labapp-qemu-state-v1'
+            'selections_sha256', 'policy', 'keyring', 'apt_config_sha256', 'os_release_sha256',
+            'selection', 'snapshot', 'pins'}
+    if (not isinstance(state, dict) or set(state) != keys or state['format'] != 'labapp-qemu-state-v2'
+            or any(state[key] != value for key, value in descriptor.items())
             or state['base'] != base_id(base) or state['module'] != identity()
             or state['architecture'] != 'amd64' or any(state[k] != '' for k in ('foreign', 'holds', 'audit'))
             or state['keyring'] != digest(KEY)):
         raise Refusal('target/base/module/trust identity mismatch')
+    if (any(not sha(state[key]) for key in ('selections_sha256', 'keyring', 'apt_config_sha256', 'os_release_sha256'))
+            or not isinstance(state['policy'], dict) or len(state['policy']) > 128
+            or any(not isinstance(key, str) or not key or not sha(value)
+                   for key, value in state['policy'].items())
+            or not isinstance(state['status'], str)):
+        raise Refusal('invalid target state types')
     try:
         status = base64.b64decode(state['status'], validate=True)
     except (ValueError, TypeError):
@@ -179,9 +219,10 @@ def inventory(root):
     return result
 
 
-def signatures(root, call):
+def signatures(root, call, selected=TEST):
+    snapshot = selection(selected)['snapshot']
     releases = sorted((root / 'lists').glob('*_InRelease'))
-    expected = {f'snapshot.ubuntu.com_ubuntu_20261024T000000Z_dists_{suite}_InRelease'
+    expected = {f'snapshot.ubuntu.com_ubuntu_{snapshot}_dists_{suite}_InRelease'
                 for suite in ('noble', 'noble-updates', 'noble-security')}
     if {p.name for p in releases} != expected:
         raise Refusal('fixed snapshot signed release set required')
@@ -189,20 +230,30 @@ def signatures(root, call):
         call(['/usr/bin/gpgv', '--keyring', str(KEY), str(path)])
 
 
-def receive(bundle, expected, root, state_base, snapshot, pins, call):
+def receive(bundle, expected, root, state_base, snapshot, pins, call, selected=TEST):
+    descriptor = selection(selected)
+    if snapshot != descriptor['snapshot'] or pins != descriptor['pins']:
+        raise Refusal('caller fixed selection mismatch')
     if bundle.is_symlink() or not bundle.is_dir():
         raise Refusal('bundle directory required')
     data = regular(bundle / 'receipt.json', 16 * 1024**2)
-    if not re.fullmatch('[a-f0-9]{64}', expected) or hashlib.sha256(data).hexdigest() != expected:
+    if not sha(expected) or hashlib.sha256(data).hexdigest() != expected:
         raise Refusal('trusted expected receipt mismatch')
     receipt = parse(data)
     if set(p.name for p in bundle.iterdir()) != {'receipt.json', 'lists', 'archives'} or bundle.is_symlink():
         raise Refusal('unexpected bundle entry')
-    if (set(receipt) != {'format', 'snapshot', 'pins', 'state', 'files'}
-            or receipt['format'] != 'labapp-qemu-bundle-v1' or receipt['snapshot'] != snapshot
-            or receipt['pins'] != pins):
+    if (not isinstance(receipt, dict) or set(receipt) != {'format', 'selection', 'snapshot', 'pins', 'state', 'files'}
+            or receipt['format'] != 'labapp-qemu-bundle-v2'
+            or any(receipt[key] != value for key, value in descriptor.items())):
         raise Refusal('bundle fixed identity mismatch')
-    check_state(receipt['state'], state_base)
+    check_state(receipt['state'], state_base, selected)
+    files = receipt['files']
+    if (not isinstance(files, dict) or len(files) > MAX_FILES
+            or any(not isinstance(name, str) or not isinstance(row, dict)
+                   or set(row) != {'bytes', 'sha256'} or type(row['bytes']) is not int
+                   or not 0 <= row['bytes'] <= MAX_FILE or not sha(row['sha256'])
+                   for name, row in files.items())):
+        raise Refusal('invalid bundle inventory types')
     actual = inventory(bundle)
     if actual != receipt['files']:
         raise Refusal('bundle complete inventory mismatch')
@@ -212,5 +263,5 @@ def receive(bundle, expected, root, state_base, snapshot, pins, call):
         (root / relative).write_bytes(regular(bundle / relative))
     if inventory(root) != actual:
         raise Refusal('bundle changed during copy')
-    signatures(root, call)
+    signatures(root, call, selected)
     return receipt['state']
