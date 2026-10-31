@@ -1400,6 +1400,52 @@ each create. Same CA/cluster and nonce UID/spec persistence must survive public
 stop/resume. Deletion uses exact UID-preconditioned DeleteOptions through
 kubectl raw DELETE and verifies absence within the unchanged phase cutoff.
 
+### Closed failure diagnostics (issue #364)
+
+The guardian's only result is `result.json` schema2: exactly `schema`, `code`,
+`contained`, `nonce` and `diagnostic`, where `diagnostic` has exactly `origin`,
+`phase`, `operation`, `category`, `child_status`. All values come from reviewed
+source literals (`OPERATIONS`, `CATEGORIES`); there is no argv, path, user,
+exception text, stdout/stderr, FAB, kubeconfig, password or token in it, and
+schema1 is rejected. `child_status` is the raw status of the one positively
+observed child (negative is a signal, nonnegative an exit) or null; it never
+infers an OOM cause. The final file is at most 4096 bytes.
+
+* `origin`: `worker` (a fixed checkpoint failed), `guardian` (the guardian itself
+  observed the failure: heartbeat, OOM counter, resource floor, boot, phase
+  cutoff, spawn, or a direct worker signal) or `unknown` (a nonzero worker exit
+  without a usable terminal status; phase/operation are then only the last valid
+  checkpoint seen, context and not proof of cause).
+* The worker takes sole ownership of root-0600 `worker-status.json` by exclusive
+  create, only after its contract/lease/boot/original-guardian-pid check, and
+  commits the next fixed `(phase, operation)` BEFORE each operation. A checkpoint
+  write failure stops that operation. A claim collision or earlier binding
+  failure writes nothing. The guardian is the sole writer of `result.json`, and
+  only after its exclusive `started.json` reservation: contract, clock, boot and
+  reservation failures (including a collision) publish no result and cannot
+  replace an incumbent's. Status can never set `contained` or any receipt.
+* Truth table, from the ACTUAL worker termination: exit0 plus a nonce-bound
+  `succeeded` terminal at `persistence/complete` is the only success; exit0
+  without it is code1 `status-invalid`. A positive exit with a matching `failed`
+  terminal reports that worker diagnostic; without one it is `unknown`. A
+  negative returncode (direct worker signal) is code `128+N`, origin `guardian`,
+  operation `worker-supervision`, `child-signal`, never an inner operation. An
+  internal child exit137 (`child-exit`, 137) and an internal child signal -9
+  (`child-signal`, -9) both give worker code137 but stay distinct. Helper
+  timeout is `child-timeout` (null status); an ordinary child exit124 stays
+  `child-exit`. Only the two fixed `hhfab_release` messages are classified.
+  In-process core failures are reduced by the core's fixed message literals only;
+  the core folds a signal-killed child into 1, so status is reported only when
+  it is 2..255.
+* The primary code and diagnostic are captured before containment. Reap,
+  containment, status and result-write trouble can only clear `contained` or
+  degrade the diagnostic; `code0 + contained false` stays an operational failure.
+  Watchdog order is unchanged: what the guardian observed first is reported.
+* Not covered: a syntax or import error of the guest module, exec failure,
+  SIGKILL of the guardian, disk exhaustion or an unwritable private directory
+  can leave no result; the host then reports `unavailable`/`pending`.
+  The historical failed trial's guest cause is unknown and this does not diagnose it.
+
 Required offline command, in its own interpreter (CI refuses zero discovery):
 
 ```bash

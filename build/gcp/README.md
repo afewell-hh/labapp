@@ -1442,6 +1442,33 @@ fields; core.prepare retains semantic authority and exact byte preservation.
 No original secret is reconstructed and no development credential is selected.
 Private keys/password/FAB/diagnostics stay out of stdout and public artifacts.
 
+The guest result is read by a fixed stdlib-only reader (`READ_RESULT`) that does
+not import the guest module and has no path/command selector. It checks the
+root-owned private directory chain without links, one single-link root-owned
+mode0600 regular file, at most 4096 bytes and a stable descriptor, and prints
+those bytes or the fixed token `absent`/`invalid`; SSH output is capped again
+at 4224 bytes. The host then strictly validates schema2 (exact fields, no
+duplicate/nonfinite/bool-as-int values, closed enums and phase/operation pairs,
+nonce, success coherence) before copying any value. Schema1 or any mismatch
+fails closed. The public receipt adds fixed `guest_diagnostic_status`
+(`unavailable`, `pending`, `invalid`, `valid`), the closed `guest_diagnostic`
+object (or null) and `guest_service` (or null); none contains text, argv, paths,
+raw manager output or secrets. They add to, and never replace, `phase`,
+`failure_category` and the primary code; `absent` is pending evidence, never
+success, and an uncontained or unverifiable result still fails the trial.
+
+On a failure with the original master still alive and no genuine result yet, the
+owner makes ONE bounded observation through that same master BEFORE the fixed
+`systemctl stop` (the stop makes the guardian publish its own SIGTERM result):
+the same fixed reader plus `systemctl show` for exactly `ActiveState`, `Result`,
+`ExecMainCode` and `ExecMainStatus` with closed values (systemd255 service
+documentation). It never reconnects, retries, refreshes a key, pulls a private
+artifact or adds work after a deadline; a gone master leaves `unavailable`.
+Manager values are diagnostic only: signal 9 is not an OOM attribution, and they
+cannot produce a result, `contained=true` or any cleanup receipt. There is no
+poll-time early exit on a terminal service. Process cleanup remains as before
+(#365 owns any redesign).
+
 Finally the owner closes/reaps its original master/IAP group, positively removes
 the fixed private table, and obtains exact own-key absence evidence. Unresolved
 local process/file cleanup withholds the removed access receipt, so the ledger
