@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from . import cli, spec
 from .access_records import Context, GcsAccessRecords, ReadOnlyAccessRecords
 from .auth_http import HttpResponse
-from .controller import Config, Controller, FREE, Refused
+from .controller import CLEANUP_FAILED, Config, Controller, FREE, Refused
 from .oslogin import OwnKeyImport, SelfLogin, cleanup_own_key
 from .test_access import BUCKET, GCS, OS, SELF, key
 from .test_cli import event_env
@@ -146,7 +146,13 @@ class TrialProfile(unittest.TestCase):
         session = OwnKeyImport(records, context, login, producer_run_id=1, producer_attempt=1, now=w.clock.now)
         session.prepare(key())
         session.import_once()
-        self.assertEqual(cleanup.reconcile(U1).status, 'cleanup-failed')
+        outcome = cleanup.reconcile(U1)
+        self.assertEqual(outcome.status, 'blocked')
+        self.assertEqual(outcome.detail, 'required access receipt missing')
+        self.assertEqual(w.record()['state'], CLEANUP_FAILED)
+        self.assertEqual(w.record()['reason'], 'access-finalizing')
+        self.assertEqual(w.record()['access']['phase'], 'finalizing')
+        self.assertEqual(w.record()['access']['archive'], {})
         self.assertEqual((w.raw.instances, w.raw.disks), ({}, {}))
         self.assertNotEqual(w.record()['state'], FREE)
         cleanup_own_key(records, context, login, now=w.clock.now)
