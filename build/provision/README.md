@@ -1443,9 +1443,22 @@ Strict canonical inspection plus real fixed server SSH/API operations precede
 nonce VPC/attachment creation. Only default-namespace nonce names, unused
 10.0.254.0/24/VLAN2998 and canonical server-01 mclag connection are selected.
 The shared object name is only a locator: `l` plus the first ten hex characters
-of SHA256 of the full nonce (11 characters, lowercase RFC1123), because the
-pinned Fabric v0.96.2 VPC webhook rejects longer VPC names (verified from
-source, not observed live). The locator can collide and is never ownership
+of SHA256 of the full nonce (40 bits, 11 characters, lowercase RFC1123).
+Pinned primary sources, accessed 2026-10-31:
+[fabricator v0.43.1 version defaults](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/versions.go),
+[version calculation](https://github.com/githedgehog/fabricator/blob/v0.43.1/api/fabricator/v1beta1/fabricator_types.go)
+and [Fabric installation](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/comp/fabric/fabric.go)
+select Fabric API/controller v0.96.2 without overrides. That version's
+[VPC validator](https://github.com/githedgehog/fabric/blob/v0.96.2/api/vpc/v1beta1/vpc_types.go)
+limits names to 11 characters; its
+[metadata validator](https://github.com/githedgehog/fabric/blob/v0.96.2/api/meta/validation.go)
+requires lowercase RFC1123 subdomains and namespace `default`. The
+[webhook handler](https://github.com/githedgehog/fabric/blob/v0.96.2/pkg/webhook/vpc/vpc_webhook.go)
+delegates to that validator, with CREATE/UPDATE wiring in the
+[source manifests](https://github.com/githedgehog/fabric/blob/v0.96.2/config/webhook/manifests.yaml).
+This is source inference: published OCI chart bytes and the live effective
+controller/admission behavior have not been inspected or validated here.
+The locator can collide and is never ownership
 authority. Ownership is the full nonce in annotation
 `labapp.hedgehog.com/trial-nonce` on BOTH the VPC and the attachment, together
 with the receipt UID and expected spec; all must match exactly in each create
@@ -1456,7 +1469,11 @@ returned UIDs/defaulted specs, names and full nonce after each create. Same
 CA/cluster and nonce UID/spec/annotation persistence must survive public
 stop/resume. Deletion removes the attachment first, then the VPC, using exact
 UID-preconditioned DeleteOptions through kubectl raw DELETE, and verifies
-absence within the unchanged phase cutoff. Mocked admission tests model the
+absence within the unchanged phase cutoff. Each DELETE has its own fresh
+ownership read, including the VPC after the attachment deletion wait. If a
+later create response fails ownership checks, the receipt retains only the
+earlier verified objects; it does not declare the two-object create complete.
+Mocked admission tests model the
 documented contract; they are not native validation of the live webhook.
 
 ### Closed failure diagnostics (issue #364)

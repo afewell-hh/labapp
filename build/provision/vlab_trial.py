@@ -1301,8 +1301,9 @@ class Nonce:
     def owned(self, doc, obj):
         """Exact annotation, name/namespace, UID and spec; never adopt by name alone."""
         meta = doc.get('metadata') if isinstance(doc, dict) else None
+        annotations = meta.get('annotations') if isinstance(meta, dict) else None
         require(isinstance(meta, dict) and meta.get('name') == self.name and meta.get('namespace') == 'default'
-                and (meta.get('annotations') or {}).get(self.ANNOTATION) == self.nonce
+                and isinstance(annotations, dict) and annotations.get(self.ANNOTATION) == self.nonce
                 and meta.get('uid') == obj['uid'] and doc.get('spec') == obj['spec'], 'nonce ownership differs')
 
     def call(self, args, phase):
@@ -1344,10 +1345,11 @@ class Nonce:
             os.chown(target, user.pw_uid, user.pw_gid)
             try:
                 result = data(self.call(['create', '-f', str(target), '-o', 'json'], 'strict'))
+                annotations = result['metadata'].get('annotations')
                 require(result['metadata']['name'] == self.name and result['metadata']['namespace'] == 'default'
                         and result['kind'] == kind and result['apiVersion'] == doc['apiVersion']
                         and type(result['metadata']['uid']) is str and result['metadata']['uid']
-                        and (result['metadata'].get('annotations') or {}).get(self.ANNOTATION) == self.nonce,
+                        and isinstance(annotations, dict) and annotations.get(self.ANNOTATION) == self.nonce,
                         'nonce create response not owned')
                 if kind == 'VPC':
                     observed = result['spec']
@@ -1389,6 +1391,11 @@ class Nonce:
             user = pwd.getpwnam('ubuntu')
             os.chown(target, user.pw_uid, user.pw_gid)
             try:
+                # Attachment deletion/polling can outlive the initial verify.
+                # Re-read each object immediately before its own DELETE.
+                current = self.current(obj['resource'], 'persistence')
+                require(current is not None, 'nonce persistence differs')
+                self.owned(current, obj)
                 self.call(['delete', '--raw=/apis/vpc.githedgehog.com/v1beta1/namespaces/default/' + plural + '/' + self.name,
                            '-f', str(target)], 'persistence')
             finally:

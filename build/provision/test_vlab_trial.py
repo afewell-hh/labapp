@@ -4,6 +4,7 @@ No real package/systemd/hhfab/QEMU/sudo/network/process invocation. Production
 paths are patched before mutating entrypoints; no credential fixtures exist.
 """
 from contextlib import ExitStack
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -75,13 +76,15 @@ class FakeAdmissionApi:
 
     def __init__(self):
         self.store, self.calls, self.counter = {}, [], 0
-        self.response_annotation = None  # None keep, False drop, str replace (create response only)
+        self.response_annotations = {}  # Per-kind create-response mutations only.
+        self.before_delete = None  # Race after the client's final GET, before UID enforcement.
+        self.deletes = []
 
     def admit(self, doc):
         meta = doc['metadata']
         if doc['kind'] == 'VPC' and len(meta['name']) > 11:
             raise AssertionError('admission denied: VPC name longer than 11 characters')
-        if not re.fullmatch(r'[a-z0-9]([-a-z0-9]*[a-z0-9])?', meta['name']) or meta.get('namespace') != 'default':
+        if not re.fullmatch(r'[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*', meta['name']) or meta.get('namespace') != 'default':
             raise AssertionError('admission denied: metadata')
 
     def seed(self, kind, name, annotations, spec=None):
@@ -106,15 +109,28 @@ class FakeAdmissionApi:
             self.counter += 1
             doc['metadata']['uid'] = 'uid-%d' % self.counter
             self.store[key] = doc
-            response = json.loads(json.dumps(doc))
-            if self.response_annotation is False:
+            response = deepcopy(doc)
+            replacement = self.response_annotations.get(doc['kind'])
+            if replacement is False:
                 response['metadata'].pop('annotations')
-            elif self.response_annotation is not None:
-                response['metadata']['annotations'][trial.Nonce.ANNOTATION] = self.response_annotation
+            elif replacement is not None:
+                response['metadata']['annotations'][trial.Nonce.ANNOTATION] = replacement
             return json.dumps(response).encode()
         if args[0] == 'delete':
+            assert args[1].startswith('--raw=/apis/vpc.githedgehog.com/v1beta1/namespaces/default/')
+            assert args[2] == '-f' and len(args) == 4
             plural, name = args[1].rsplit('/', 2)[-2:]
-            del self.store[(self.KINDS[plural], name)]
+            key = (self.KINDS[plural], name)
+            options = json.loads(Path(args[3]).read_text())
+            assert set(options) == {'apiVersion', 'kind', 'preconditions'}
+            assert options['apiVersion'] == 'v1' and options['kind'] == 'DeleteOptions'
+            assert set(options['preconditions']) == {'uid'}
+            if self.before_delete is not None:
+                self.before_delete(key)
+            if options['preconditions']['uid'] != self.store[key]['metadata']['uid']:
+                raise CoreFailure('UID precondition refused', 1)
+            self.deletes.append((key, deepcopy(options)))
+            del self.store[key]
             return b'{}'
         raise AssertionError('unexpected kubectl ' + repr(args))
 
@@ -164,18 +180,30 @@ class SharedTrial(unittest.TestCase):
         self.assertEqual([c[1].rsplit('/', 2)[-2] for c in deletes], ['vpcattachments', 'vpcs'])
         self.assertTrue(all(c[0] != 'apply' and c[0] != 'replace' for c in api.calls))
 
-    def test_create_response_annotation_missing_changed_or_truncated_fails_without_receipt(self):
-        for replacement in (False, 'b' * 32, 'a' * 31, ''):
-            api, nonce = self.nonce_fixture()
-            api.response_annotation = replacement
-            with self.assertRaisesRegex(trial.Failure, 'not owned'): nonce.create()
-            self.assertEqual(nonce.objects, [])
-            self.assertFalse((self.root / 'nonce-receipt.json').exists())
-            self.assertFalse(any(c[0] == 'delete' for c in api.calls))
+    def test_each_create_response_annotation_failure_retains_only_prior_owned_receipts(self):
+        for kind in ('VPC', 'VPCAttachment'):
+            for replacement in (False, 'b' * 32, 'a' * 31, ''):
+                with self.subTest(kind=kind, replacement=replacement):
+                    api, nonce = self.nonce_fixture()
+                    api.response_annotations[kind] = replacement
+                    with self.assertRaisesRegex(trial.Failure, 'not owned'): nonce.create()
+                    if kind == 'VPC':
+                        self.assertEqual(nonce.objects, [])
+                        self.assertFalse((self.root / 'nonce-receipt.json').exists())
+                    else:
+                        self.assertEqual(len(nonce.objects), 1)
+                        receipt = nonce.objects[0]
+                        self.assertEqual(receipt, {'resource': 'vpcs.vpc.githedgehog.com',
+                            'name': nonce.name, 'nonce': nonce.nonce,
+                            'uid': api.store[('VPC', nonce.name)]['metadata']['uid'],
+                            'spec': api.store[('VPC', nonce.name)]['spec']})
+                        self.assertEqual(json.loads((self.root / 'nonce-receipt.json').read_text()), [receipt])
+                    self.assertFalse(any(c[0] == 'delete' for c in api.calls))
 
     def test_later_reads_fail_on_annotation_uid_or_spec_change_without_deleting(self):
         for mutate in (lambda d: d['metadata']['annotations'].pop(trial.Nonce.ANNOTATION),
                        lambda d: d['metadata']['annotations'].update({trial.Nonce.ANNOTATION: 'b' * 32}),
+                       lambda d: d['metadata'].update({'annotations': ['malformed']}),
                        lambda d: d['metadata'].update({'uid': 'replaced'}),
                        lambda d: d['spec'].update({'extra': True})):
             for kind in ('VPC', 'VPCAttachment'):
@@ -202,15 +230,79 @@ class SharedTrial(unittest.TestCase):
         with self.assertRaisesRegex(trial.Failure, 'ownership'): nonce.remove()
         self.assertEqual(sum(c[0] == 'delete' for c in api.calls), 1)  # VPC delete never reached
 
+    def test_vpc_same_uid_mutation_during_attachment_wait_blocks_vpc_delete(self):
+        for field in ('annotation', 'spec'):
+            with self.subTest(field=field):
+                api, nonce = self.nonce_fixture()
+                nonce.create()
+                real = api.kubectl
+                attachment_key, vpc_key = ('VPCAttachment', nonce.name), ('VPC', nonce.name)
+                original_vpc = deepcopy(api.store[vpc_key])
+                attachment = deepcopy(api.store[attachment_key])
+                def kubectl(args, end):
+                    result = real(args, end)
+                    if args[0] == 'delete' and 'vpcattachments/' in args[1]:
+                        api.store[attachment_key] = deepcopy(attachment)  # finalizer wait
+                    return result
+                def finish_attachment(_seconds):
+                    if field == 'annotation':
+                        api.store[vpc_key]['metadata']['annotations'][trial.Nonce.ANNOTATION] = 'c' * 32
+                    else:
+                        api.store[vpc_key]['spec']['extra'] = True
+                    del api.store[attachment_key]
+                nonce.core.kubectl = kubectl
+                with patch.object(trial.time, 'sleep', side_effect=finish_attachment) as sleep:
+                    with self.assertRaisesRegex(trial.Failure, 'ownership'): nonce.remove()
+                sleep.assert_called_once()
+                self.assertEqual(api.store[vpc_key]['metadata']['uid'], original_vpc['metadata']['uid'])
+                self.assertEqual([key[0] for key, _ in api.deletes], ['VPCAttachment'])
+                self.assertFalse(any(c[0] == 'delete' and '/vpcs/' in c[1] for c in api.calls))
+
+    def test_uid_replacement_after_final_get_is_refused_by_actual_delete_options(self):
+        for kind in ('VPC', 'VPCAttachment'):
+            with self.subTest(kind=kind):
+                api, nonce = self.nonce_fixture()
+                nonce.create()
+                key = (kind, nonce.name)
+                replacement = deepcopy(api.store[key])
+                replacement['metadata']['uid'] = 'replacement-uid'
+                def replace(target):
+                    if target == key:
+                        api.store[key] = deepcopy(replacement)
+                api.before_delete = replace
+                with self.assertRaisesRegex(trial.Failure, 'API operation refused'): nonce.remove()
+                self.assertEqual(api.store[key], replacement)
+                self.assertEqual([k[0] for k, _ in api.deletes],
+                                 ['VPCAttachment'] if kind == 'VPC' else [])
+
+    def test_nonmapping_create_response_annotations_raise_controlled_failure_for_each_object(self):
+        for kind in ('VPC', 'VPCAttachment'):
+            for malformed in (['malformed'], 'malformed', 1):
+                with self.subTest(kind=kind, malformed=malformed):
+                    api, nonce = self.nonce_fixture()
+                    real = api.kubectl
+                    def kubectl(args, end):
+                        raw = real(args, end)
+                        if args[0] == 'create':
+                            response = json.loads(raw)
+                            if response['kind'] == kind:
+                                response['metadata']['annotations'] = malformed
+                                return json.dumps(response).encode()
+                        return raw
+                    nonce.core.kubectl = kubectl
+                    with self.assertRaisesRegex(trial.Failure, 'not owned'): nonce.create()
+                    self.assertEqual(len(nonce.objects), 0 if kind == 'VPC' else 1)
+                    self.assertEqual(api.deletes, [])
+
     def test_forced_locator_collision_between_two_nonces_is_refused_without_mutation(self):
         api, first = self.nonce_fixture('a' * 32)
         second = trial.Nonce(first.core, first.clock, 'b' * 32)
-        second.name = first.name  # force the 44-bit locator collision
+        second.name = first.name  # force the 40-bit (ten hex characters) locator collision
         first.create()
-        before = json.loads(json.dumps(api.store, sort_keys=True))
+        before = deepcopy(api.store)
         calls = len(api.calls)
         with self.assertRaisesRegex(trial.Failure, 'collision'): second.create()
-        self.assertEqual(json.loads(json.dumps(api.store, sort_keys=True)), before)
+        self.assertEqual(api.store, before)
         self.assertFalse(any(c[0] in ('create', 'delete') for c in api.calls[calls:]))
         # The first nonce's objects must not verify as the second nonce's.
         second.objects = [dict(o) for o in first.objects]
@@ -221,9 +313,9 @@ class SharedTrial(unittest.TestCase):
             for annotation in ({trial.Nonce.ANNOTATION: 'a' * 32}, {}):
                 api, nonce = self.nonce_fixture()
                 for kind in seeded: api.seed(kind, nonce.name, dict(annotation))
-                before = json.loads(json.dumps(api.store, sort_keys=True))
+                before = deepcopy(api.store)
                 with self.assertRaisesRegex(trial.Failure, 'collision'): nonce.create()
-                self.assertEqual(json.loads(json.dumps(api.store, sort_keys=True)), before)
+                self.assertEqual(api.store, before)
                 self.assertEqual(nonce.objects, [])
                 self.assertFalse(any(c[0] in ('create', 'delete') for c in api.calls))
 
@@ -387,7 +479,8 @@ class SharedTrial(unittest.TestCase):
             core = SimpleNamespace(WORK=work, Failure=CoreFailure, kubectl=Mock(side_effect=CoreFailure()))
             nonce = trial.Nonce(core, clock, ('a' if action == 'create' else 'b')*32)
             nonce.objects = [{'resource': 'vpcs.vpc.githedgehog.com', 'uid': 'public', 'spec': {}}]
-            with patch.object(nonce, 'current', return_value=None), \
+            current = None if action == 'create' else json.loads(owned_json(nonce, 'public', {}))
+            with patch.object(nonce, 'current', return_value=current), \
                  patch.object(nonce, 'verify'), patch.object(trial.os, 'chown'), \
                  patch.object(trial.pwd, 'getpwnam', return_value=user), \
                  patch.object(Path, 'unlink', side_effect=OSError('fixture cleanup failure')):
