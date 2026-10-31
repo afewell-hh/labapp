@@ -897,6 +897,7 @@ class GuestFixture(unittest.TestCase):
 
     def test_first_failure_wins_and_foreign_or_replaced_paths_are_not_written(self):
         self.prepared()
+        prepared = core.state()
         with self.ready_failure():
             self.assertEqual(self.call('start-fresh'), 17)
         first = (core.ROOT / core.FIRST_FAILURE).read_bytes()
@@ -908,9 +909,7 @@ class GuestFixture(unittest.TestCase):
         foreign = self.base / 'foreign'
         foreign.write_bytes(b'FOREIGN')
         (core.ROOT / core.FIRST_FAILURE).symlink_to(foreign)
-        saved = core.state()
-        saved.update(phase='prepared')
-        core.save(saved)
+        core.save(prepared)
         self.diagnostics.clear()
         with self.ready_failure():
             self.assertEqual(self.call('start-fresh'), 17)
