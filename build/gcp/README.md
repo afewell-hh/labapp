@@ -912,12 +912,16 @@ source mount and private collection gates above remain required if a future
 separately reviewed source-inspection task is authorized; this workflow does
 not dispatch that profile.
 
-The runner fetches only the nine required Python module files through GitHub's
+The runner fetches only the eleven required Python module files through GitHub's
 Contents API at the trusted workflow's `github.sha`, before WIF authentication.
 It does not check out archived gitlinks, execute triggering-run code, download
 artifacts or overwrite auth credentials. The CLI is invoked from that temporary
 module directory as `python3 -m lifecycle.cli component` or `cleanup`; these entry
 points require trusted GitHub event context and accept no cloud parameters.
+The offline suite executes both actual inline fetchers with synthetic Contents
+API responses, then imports each isolated fetched CLI in a fresh interpreter
+and validates a trusted event without constructing cloud clients or acquiring
+credentials. Missing transitive modules therefore fail before live dispatch.
 
 Creator confirmation polls the insert operation for up to six elapsed minutes,
 with at most 72 polls at five-second intervals. Time spent in requests counts

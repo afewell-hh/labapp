@@ -47,7 +47,8 @@ jobs:
           module = root / "lifecycle"
           module.mkdir(mode=0o700)
           files = ("__init__.py", "auth_http.py", "cloud.py", "compute.py",
-                   "controller.py", "gcs.py", "spec.py", "store.py", "cli.py")
+                   "controller.py", "gcs.py", "spec.py", "store.py", "cli.py",
+                   "access_records.py", "oslogin.py")
           for name in files:
               path = "build/gcp/lifecycle/" + name
               url = "https://api.github.com/repos/afewell-hh/labapp/contents/" + path + "?ref=" + sha

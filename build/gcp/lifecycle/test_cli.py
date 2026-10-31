@@ -6,7 +6,10 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -602,6 +605,60 @@ class PilotBudgetTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    @staticmethod
+    def import_fetched_cli(root):
+        # -I excludes the source checkout, user site and Python environment.
+        # Only the actual loader's resulting directory is added to sys.path.
+        script = textwrap.dedent('''\
+            import pathlib
+            import sys
+            from unittest.mock import patch
+
+            root = pathlib.Path(sys.argv[1]).resolve()
+            sys.path.insert(0, str(root))
+
+            def deny_network(event, args):
+                if event.startswith('socket.'):
+                    raise AssertionError('isolated loader import attempted network access')
+
+            def deny_clients(frame, event, arg):
+                module = frame.f_globals.get('__name__', '')
+                if event == 'call' and module.startswith('lifecycle.') and (
+                        frame.f_code.co_name == '__init__' or
+                        frame.f_code.co_name in ('gcloud_token', 'bearer_headers', 'main')):
+                    raise AssertionError('isolated loader import attempted client/auth construction')
+
+            sys.addaudithook(deny_network)
+            sys.setprofile(deny_clients)
+            with patch('subprocess.Popen', side_effect=AssertionError('no child commands')):
+                import lifecycle.cli as cli
+                assert pathlib.Path(cli.__file__).resolve() == root / 'lifecycle/cli.py'
+                env = {'GITHUB_REPOSITORY': cli.REPOSITORY,
+                       'GITHUB_REF': 'refs/heads/main',
+                       'GITHUB_EVENT_NAME': 'workflow_dispatch'}
+                event = {'repository': {'id': cli.REPOSITORY_ID,
+                         'full_name': cli.REPOSITORY, 'owner': {'id': cli.OWNER_ID}}}
+                for mode in ('component', 'cleanup'):
+                    assert cli.trusted_event(mode, env, event) is None
+                event['inputs'] = {'command': 'forbidden'}
+                try:
+                    cli.trusted_event('component', env, event)
+                except cli.Refused:
+                    pass
+                else:
+                    raise AssertionError('fetched CLI accepted command input')
+                for name, module in tuple(sys.modules.items()):
+                    if name == 'lifecycle' or name.startswith('lifecycle.'):
+                        assert pathlib.Path(module.__file__).resolve().parent == root / 'lifecycle'
+            sys.setprofile(None)
+            print('isolated fetched CLI import and trust validation passed')
+        ''')
+        return subprocess.run([sys.executable, '-I', '-B', '-c', script, str(root)],
+                              cwd=root, env={'PATH': '/usr/bin:/bin', 'HOME': str(root),
+                                             'TMPDIR': str(root), 'PYTHONDONTWRITEBYTECODE': '1'},
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=20, check=False)
+
     def workflows(self):
         return [yaml.safe_load((ROOT / '.github/workflows' / f'labapp-lifecycle-{m}.yml').read_text())
                 for m in ('inspect', 'cleanup')]
@@ -655,8 +712,30 @@ class WorkflowTests(unittest.TestCase):
                         patch('urllib.request.urlopen', side_effect=urlopen):
                     exec(compile(script, '<trusted-loader>', 'exec'), {})
                 files = list((Path(tmp) / 'labapp-trusted-lifecycle/lifecycle').iterdir())
-                self.assertEqual(len(files), 9)
+                self.assertEqual({p.name for p in files}, {
+                    '__init__.py', 'auth_http.py', 'cloud.py', 'compute.py',
+                    'controller.py', 'gcs.py', 'spec.py', 'store.py', 'cli.py',
+                    'access_records.py', 'oslogin.py'})
                 self.assertTrue(all(url.endswith('?ref=' + 'a' * 40) for url in requested))
                 self.assertEqual(credentials.read_text(), 'unchanged')
                 self.assertEqual((Path(tmp) / 'labapp-trusted-lifecycle/lifecycle/cli.py').read_bytes(),
                                  (ROOT / 'build/gcp/lifecycle/cli.py').read_bytes())
+                fetched = Path(tmp) / 'labapp-trusted-lifecycle'
+                result = self.import_fetched_cli(fetched)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(),
+                                 'isolated fetched CLI import and trust validation passed')
+                # Demonstrate this check detects the original omission rather
+                # than importing already-loaded modules from this test process.
+                for missing in ('access_records.py', 'oslogin.py'):
+                    path = fetched / 'lifecycle' / missing
+                    content = path.read_bytes()
+                    path.unlink()
+                    try:
+                        result = self.import_fetched_cli(fetched)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('ModuleNotFoundError', result.stderr)
+                        self.assertIn('lifecycle.' + path.stem, result.stderr)
+                    finally:
+                        path.write_bytes(content)
+                self.assertEqual(credentials.read_text(), 'unchanged')
