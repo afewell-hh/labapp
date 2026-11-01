@@ -1050,6 +1050,26 @@ def first_failure_bundle(raw):
     return value
 
 
+def terminal_export_mode(detail):
+    """'resume' only for a validated failed worker/resume/core-start-resume diagnostic, else 'fresh'."""
+    return 'resume' if (type(detail) is dict and detail.get('category') != 'none'
+                        and (detail.get('origin'), detail.get('phase'), detail.get('operation'))
+                        == ('worker', 'resume', 'core-start-resume')) else 'fresh'
+
+
+def terminal_mode(nonce):
+    """Expected export mode from the fixed nonce-bound terminal result; fresh-only fallback.
+
+    Never derived from the bundle, the live core mode or manager output. A missing, unsafe,
+    oversize or invalid record yields 'fresh', so no resume export is authorized from it.
+    """
+    try:
+        record = result_record(data(regular(ROOT / 'result.json', MAX_RESULT, 0)), nonce)
+    except Exception:
+        return 'fresh'
+    return terminal_export_mode(record['diagnostic'])
+
+
 def export_failure(nonce):
     """Fixed one-shot read for the owner: no path argument, ``absent`` or exact bytes.
 
@@ -1074,8 +1094,9 @@ def export_failure(nonce):
     except FileNotFoundError:
         return b'absent'
     bundle = first_failure_bundle(raw)
+    mode = terminal_mode(nonce)
     current = core.state()
-    require(current['nonce'] == nonce == bundle['nonce'] and bundle['mode'] == 'fresh'
+    require(current['nonce'] == nonce == bundle['nonce'] and bundle['mode'] == mode
             and bundle['boot'] == boot)
     operation, invocation = current.get('operation'), current.get('invocation')
     for item in (operation, invocation):
@@ -1085,8 +1106,8 @@ def export_failure(nonce):
         require(current.get('phase') == 'prepared'
                 and all(key not in current for key in ('mode', 'operation', 'invocation')))
     else:
-        require(current.get('mode') == 'fresh')
-    envelope = {'schema': 1, 'source_sha': value['source_sha'], 'nonce': nonce, 'mode': 'fresh',
+        require(current.get('mode') == mode)
+    envelope = {'schema': 1, 'source_sha': value['source_sha'], 'nonce': nonce, 'mode': mode,
                 'operation': operation, 'invocation': invocation, 'boot': boot}
     return encoded(envelope) + b'\n' + raw
 
