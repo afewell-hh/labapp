@@ -1717,13 +1717,23 @@ class BridgePrerequisiteMixin(GuestEnvironment):
             return output
         with patch.object(core, 'service_identity', side_effect=identity), \
              patch.object(core, 'boot', side_effect=lambda: self.boot_id[0]):
-            self.prepared() if mode == 'fresh' else self.resumable()
+            # Fault injection belongs to unit_ready under test, after preparation.
+            operation_failure = self.failure
+            self.failure = None
+            prepared = self.prepared() if mode == 'fresh' else self.resumable()
+            self.assertEqual(prepared['phase'], 'prepared' if mode == 'fresh' else 'resumable')
             core.reserve(mode)
             self.phase[mode] = 'activating'
             self.invocation[mode] = os.environ['INVOCATION_ID']
             core.unit_gate(mode)
             if mode == 'fresh':
                 self.runtime_files()
+            # Preserve setup evidence while excluding it from operation assertions.
+            self.preparation_calls = tuple(self.calls)
+            self.operation_start = len(self.calls)
+            self.assertEqual(sum(c[0][:2] == [core.PYTHON, str(core.BRIDGE)]
+                                 for c in self.preparation_calls), 0 if mode == 'fresh' else 2)
+            self.failure = operation_failure
             core.retain_failure_output(OLD_DIAGNOSTIC)
             deadline = core.state()['deadline']
             # Full original budget unless the case selects a shorter remaining time.
@@ -1762,8 +1772,11 @@ class BridgePrerequisiteMixin(GuestEnvironment):
                     return exc
         self.fail('unit_ready returned without stopping at the API boundary')
 
+    def operation_calls(self):
+        return self.calls[self.operation_start:]
+
     def helper_calls(self):
-        return [c for c in self.calls if c[0][:2] == [core.PYTHON, str(core.BRIDGE)]]
+        return [c for c in self.operation_calls() if c[0][:2] == [core.PYTHON, str(core.BRIDGE)]]
 
     def diagnostic_bytes(self):
         return (core.ROOT / 'last-command-output').read_bytes()
@@ -1808,7 +1821,7 @@ class BridgePrerequisiteMixin(GuestEnvironment):
         self.assertEqual(value['operation'], self.initial['operation'])
         for action in ('wait-switches', 'inspect-switches'):
             self.assertTrue(any(c[0][:3] == [core.HHFAB, 'vlab', action]
-                                and c[1] == self.deadline for c in self.calls))
+                                and c[1] == self.deadline for c in self.operation_calls()))
         self.assertEqual(self.diagnostic_bytes(), OLD_DIAGNOSTIC)
 
     def test_final_recheck_is_hard_failure_without_prerequisite_wait(self):
