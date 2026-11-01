@@ -1848,6 +1848,124 @@ class GuestDiagnostics(unittest.TestCase):
         private, (code, receipt, _, _) = self.private_drive(b'absent')
         self.assertEqual((receipt['private_diagnostic'], list(private.iterdir())), ('absent', []))
 
+    # -- #412 terminal-result-bound resume export (host side) ---------------------
+    RESUME = {'phase': 'resume', 'operation': 'core-start-resume'}
+
+    def resume_drive(self, export, detail=None, **kwargs):
+        """Like private_drive but the primary validated guest result is a chosen worker diagnostic."""
+        self.exports = []
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        detail = worker_detail(**(detail or self.RESUME))
+        return private, self.drive([self.encoded(result_value(self.nonce, 17, True, detail))],
+                                   private=private, export=export, **kwargs)
+
+    def test_accept_failure_expected_mode_is_host_held_and_never_taken_from_guest_bytes(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
+        fresh = self.export_bytes()
+        args = ('a' * 40, self.nonce, self.boot_uuid)
+        self.assertEqual(host.accept_failure(resume, *args, 'resume'), ('captured', resume))
+        self.assertEqual(host.accept_failure(fresh, *args), ('captured', fresh))
+        self.assertEqual(host.accept_failure(fresh, *args, 'fresh'), ('captured', fresh))
+        self.assertEqual(host.accept_failure(resume, *args), ('invalid', None))  # default stays fresh-only
+        for name, raw, mode in (('resume bytes, fresh expected', resume, 'fresh'),
+                                ('fresh bytes, resume expected', fresh, 'resume'),
+                                ('resume envelope, fresh bundle',
+                                 self.export_bytes(self.failure_bundle(), mode='resume'), 'resume'),
+                                ('fresh envelope, resume bundle',
+                                 self.export_bytes(self.failure_bundle(mode='resume')), 'resume'),
+                                ('unknown mode', resume, 'other')):
+            with self.subTest(name):
+                self.assertEqual(host.accept_failure(raw, *args, mode), ('invalid', None))
+
+    def test_validated_resume_terminal_result_retains_resume_export(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
+        private, (code, receipt, trace, text) = self.resume_drive(resume)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'captured', True))
+        self.assertEqual(next(private.iterdir()).read_bytes(), resume)
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
+        self.assertEqual(len(self.exports), 1)
+        self.assertEqual(self.exports[0]['args'][-3:-1], ['export-failure', '--nonce'])  # remote command fixed
+        self.assertNotIn(SENTINEL, text)
+
+    def test_resume_export_is_refused_unless_primary_terminal_result_is_resume_core_start(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
+        fresh = self.export_bytes()
+        for name, detail, raw, expected in (
+                ('fresh stage failure, resume bytes', None, resume, 'invalid'),
+                ('other resume operation, resume bytes', {'phase': 'resume', 'operation': 'core-stop'}, resume, 'invalid'),
+                ('fresh phase operation name, resume bytes',
+                 {'phase': 'fresh', 'operation': 'core-start-fresh'}, resume, 'invalid'),
+                ('resume terminal, fresh bytes', self.RESUME, fresh, 'invalid'),
+                ('resume terminal, mixed envelope', self.RESUME,
+                 self.export_bytes(self.failure_bundle(), mode='resume'), 'invalid'),
+                ('fresh terminal, fresh bytes', {'phase': 'stage', 'operation': 'install-docker'}, fresh, 'captured')):
+            with self.subTest(name):
+                self.setUp()
+                private, (code, receipt, _, _) = self.resume_drive(raw, detail or {'phase': 'stage', 'operation': 'install-docker'})
+                self.assertEqual((code, receipt['private_diagnostic']), (17, expected))
+                self.assertEqual(len(list(private.iterdir())), 1 if expected == 'captured' else 0)
+
+    def test_resume_mode_is_frozen_before_supplemental_observation_and_never_from_unvalidated_result(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
+        supplemental = self.encoded(result_value(self.nonce, 17, True, worker_detail(**self.RESUME)))
+        private = self.private_dir()
+        # Bootstrap fails before any primary result is consumed. The real observer
+        # then obtains a VALID resume result, which must remain diagnostic only.
+        code, receipt, trace, _ = self.drive([supplemental], fail_bootstrap=True,
+                                            private=private, export=resume)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']),
+                         (17, 'invalid', False))
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
+        self.assertEqual(receipt['guest_diagnostic_status'], 'valid')
+        self.assertLess(trace.index('read-result'), trace.index('stop'))
+        self.assertEqual(list(private.iterdir()), [])
+        for primary in (b'absent', b'invalid'):
+            with self.subTest(primary=primary):
+                self.setUp()
+                private = self.private_dir()
+                # An invalid primary record is consumed before failure; observe_guest does
+                # not replace invalid status, and it cannot authorize resume either.
+                code, receipt, _, _ = self.drive([primary], fail_bootstrap=(primary == b'absent'),
+                                                private=private, export=resume)
+                self.assertEqual(receipt['private_diagnostic'], 'invalid')
+                self.assertEqual(list(private.iterdir()), [])
+
+    def test_resume_query_cleanup_uncertainty_retains_bytes_and_primary_result(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume', query_cleanup='uncertain'), mode='resume')
+        private, (code, receipt, trace, _) = self.resume_drive(resume)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'invalid', True))
+        self.assertEqual(next(private.iterdir()).read_bytes(), resume)
+        self.assertTrue(all(receipt[k] for k in ('process_absent', 'local_files_absent', 'own_key_absent')))
+        self.assertIn('master-close', trace)
+        self.assertIn('dispatch-cleanup', trace)
+
+    def test_resume_export_interruption_preserves_primary_and_cleanup(self):
+        class ExportAbort(BaseException):
+            cleanup_uncertain = True
+        for error in (KeyboardInterrupt(SENTINEL), SystemExit(143), ExportAbort(SENTINEL)):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.resume_drive(error)
+                self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
+                                 (17, 17, 'unavailable', True))
+                self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
+                self.assertIn('master-close', trace)
+                self.assertIn('dispatch-cleanup', trace)
+                uncertain = getattr(error, 'cleanup_uncertain', False)
+                self.assertEqual(receipt['process_absent'], not uncertain)
+                self.assertEqual(receipt['local_files_absent'], not uncertain)
+                self.assertEqual(receipt['own_key_absent'], not uncertain)
+                self.assertEqual('remove-key' in trace, not uncertain)
+                self.assertEqual(list(private.iterdir()), [])
+                self.assertNotIn(SENTINEL, text)
+
+    def private_dir(self):
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        self.exports = []
+        return private
+
     def test_capture_acceptance_requires_host_initial_boot(self):
         for boot in (None, '', host.ZERO_BOOT):
             with self.subTest(boot=boot):

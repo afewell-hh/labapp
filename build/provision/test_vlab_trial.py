@@ -2474,3 +2474,260 @@ class FirstFailureExport(unittest.TestCase):
         out.write.assert_called_once_with(b'invalid')
         with patch.object(trial.os, 'geteuid', return_value=0), self.assertRaises(trial.Failure):
             trial.main(['export-failure', '--nonce', NONCE, '--sequence', '1'])
+
+
+class ResumeFailureLifecycleExport(unittest.TestCase):
+    """#412: genuine fresh success -> owned stop -> activation -> committed resume failure.
+
+    Uses the existing offline core fixture (fake systemctl/kubectl/hhfab only); the REAL core
+    state machine, first-failure writer, guest exporter and host accepter run. Offline fakes do
+    not show native systemd, journald or VLAB behaviour, and the native refusal stays unknown.
+    """
+    RESUME = {'origin': 'worker', 'phase': 'resume', 'operation': 'core-start-resume',
+              'category': 'child-exit', 'child_status': 17}
+    FRESH = {'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker',
+             'category': 'child-exit', 'child_status': 17}
+    RESUME_INVOCATION = 'd' * 32
+
+    def setUp(self):
+        import vlab_core
+        from test_vlab_core import GuestEnvironment
+        self.core = vlab_core
+        self.env = type('Env', (GuestEnvironment, unittest.TestCase), {'runTest': lambda s: None})()
+        self.env.setUp()
+        self.addCleanup(self.env.doCleanups)
+        self.env.contract['nonce'] = NONCE
+        self.env.write_contract()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        # GuestEnvironment fakes privileged core entrypoints on the shared os module.
+        # Export is read-only: retain its real filesystem ownership checks against
+        # this unprivileged fixture user without changing the core's privilege stub.
+        class ExportOS:
+            def geteuid(self):
+                return os.getuid()
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+        self.stack.enter_context(patch.object(trial, 'os', ExportOS()))
+        self.v = value()
+        self.root = self.env.base / 'trial'
+        self.root.mkdir(mode=0o700)
+        (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
+        reader = trial.regular
+        self.stack.enter_context(patch.object(trial, 'regular', side_effect=(
+            lambda p, n, uid=None, mode=None: reader(p, n, os.getuid() if uid == 0 else uid, mode))))
+        for target, name, replacement in ((trial, 'ROOT', self.root),
+                                          (trial, 'kernel_boot', lambda: self.v['boot_uuid']),
+                                          (vlab_core, 'boot', lambda: self.v['boot_uuid']),
+                                          (trial, 'load_sibling', lambda *_: vlab_core)):
+            self.stack.enter_context(patch.object(target, name, replacement))
+
+    def ready_failure(self):
+        return patch.object(self.core, 'unit_ready', side_effect=self.core.Failure('synthetic ready failure', 17))
+
+    def terminal(self, detail, **record):
+        body = {'schema': 2, 'code': detail['child_status'], 'contained': True,
+                'nonce': NONCE, 'diagnostic': detail, **record}
+        path = self.root / 'result.json'
+        path.unlink(missing_ok=True)
+        path.write_bytes(trial.encoded(body))
+        path.chmod(0o600)
+
+    def committed_resume_failure(self):
+        """Real fresh success, real owned stop + activation, then a committed resume reservation that fails."""
+        core, env = self.core, self.env
+        fresh = env.resumable()
+        self.assertEqual((fresh['mode'], fresh['phase']), ('fresh', 'resumable'))
+        self.assertEqual(fresh['stop_verified'], {'operation': fresh['operation'], 'invocation': fresh['invocation']})
+        self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
+        with patch.dict(os.environ, {'INVOCATION_ID': self.RESUME_INVOCATION}), self.ready_failure():
+            self.assertEqual(env.call('start-resume'), 17)
+        failed = core.state()
+        self.assertEqual((failed['mode'], failed['phase'], failed['invocation']),
+                         ('resume', 'failed', self.RESUME_INVOCATION))
+        self.assertNotEqual(failed['operation'], fresh['operation'])  # a NEW operation, never borrowed
+        self.assertNotEqual(failed['invocation'], fresh['invocation'])
+        return fresh, failed
+
+    def host(self):
+        import importlib
+        with patch.object(sys, 'path', [str(Path(__file__).resolve().parents[2]), *sys.path]):
+            return importlib.import_module('build.gcp.vlab_trial')
+
+    def test_core_writer_guest_exporter_host_accepter_resume_roundtrip(self):
+        fresh, failed = self.committed_resume_failure()
+        written = (self.core.ROOT / self.core.FIRST_FAILURE).read_bytes()
+        bundle = trial.first_failure_bundle(written)
+        self.assertEqual((bundle['mode'], bundle['operation'], bundle['invocation']),
+                         ('resume', failed['operation'], self.RESUME_INVOCATION))
+        self.assertEqual(bundle['primary']['code'], 17)
+        self.terminal(self.RESUME)
+        raw = trial.export_failure(NONCE)
+        first, _, rest = raw.partition(b'\n')
+        self.assertEqual(json.loads(first), {'schema': 1, 'source_sha': 'c' * 40, 'nonce': NONCE, 'mode': 'resume',
+                                             'operation': failed['operation'], 'invocation': self.RESUME_INVOCATION,
+                                             'boot': self.v['boot_uuid']})
+        self.assertEqual(rest, written)
+        host = self.host()
+        args = ('c' * 40, NONCE, self.v['boot_uuid'])
+        self.assertEqual(host.accept_failure(raw, *args, 'resume'), ('captured', raw))
+        self.assertEqual(host.accept_failure(raw, *args), ('invalid', None))  # fresh-only default unchanged
+        self.assertEqual(host.accept_failure(raw, *args, 'fresh'), ('invalid', None))
+
+    def test_exporter_rejects_resume_state_without_validated_resume_terminal_result(self):
+        # Rejected at the REAL mode guard (bundle/live mode vs terminal-derived mode), not a missing API.
+        self.committed_resume_failure()
+        success = {'schema': 2, 'code': 0, 'contained': True, 'nonce': NONCE, 'diagnostic': dict(trial.SUCCESS)}
+        cases = {
+            'no terminal result': None,
+            'fresh worker failure': lambda: self.terminal(self.FRESH),
+            'resume phase, other operation': lambda: self.terminal(dict(self.RESUME, operation='core-stop')),
+            'guardian-origin diagnostic': lambda: self.terminal({
+                'origin': 'guardian', 'phase': 'resume', 'operation': 'worker-supervision',
+                'category': 'child-signal', 'child_status': -9}, code=137),
+            'foreign nonce': lambda: self.terminal(self.RESUME, nonce='9' * 32),
+            'success record': lambda: (self.root / 'result.json').write_bytes(trial.encoded(success)),
+            'malformed JSON': lambda: (self.root / 'result.json').write_bytes(b'{"schema":2'),
+            'extra field': lambda: self.terminal(self.RESUME, extra=1),
+            'oversize': lambda: (self.root / 'result.json').write_bytes(b' ' * (trial.MAX_RESULT + 1)),
+            'invalid mismatched code': lambda: self.terminal(self.RESUME, code=2),
+        }
+        for name, prepare in cases.items():
+            with self.subTest(name):
+                (self.root / 'result.json').unlink(missing_ok=True)
+                if prepare:
+                    prepare()
+                    (self.root / 'result.json').chmod(0o600)
+                if name == 'guardian-origin diagnostic':
+                    record = trial.result_record(trial.data((self.root / 'result.json').read_bytes()), NONCE)
+                    self.assertEqual((record['code'], record['diagnostic']['origin']), (137, 'guardian'))
+                self.assertEqual(trial.terminal_mode(NONCE), 'fresh')
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+
+    def test_resume_terminal_does_not_vouch_for_stale_foreign_or_mismatched_state(self):
+        _, failed = self.committed_resume_failure()
+        self.terminal(self.RESUME)
+        self.assertEqual(trial.export_failure(NONCE).partition(b'\n')[0].count(b'"mode":"resume"'), 1)
+        for name, change in (('operation', {'operation': '9' * 32}), ('invocation', {'invocation': '9' * 32}),
+                             ('nonce', {'nonce': '9' * 32}), ('fresh mode', {'mode': 'fresh'}),
+                             ('no invocation', {'invocation': None})):
+            with self.subTest(name):
+                current = {k: v for k, v in dict(failed, **change).items() if v is not None}
+                self.core.atomic(self.core.ROOT / 'state.json', current)
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+        self.core.atomic(self.core.ROOT / 'state.json', failed)
+        with patch.object(trial, 'kernel_boot', return_value='33333333-3333-4333-8333-333333333333'), \
+             self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+        with self.assertRaises(trial.Failure):
+            trial.export_failure('9' * 32)
+
+    def test_unsafe_terminal_file_cannot_authorize_resume(self):
+        self.committed_resume_failure()
+        path = self.root / 'result.json'
+        target = self.root / 'other-result'
+        for unsafe in ('wide mode', 'hard link', 'symlink', 'directory', 'wrong owner'):
+            with self.subTest(unsafe=unsafe), ExitStack() as local:
+                self.terminal(self.RESUME)
+                if unsafe == 'wide mode':
+                    path.chmod(0o640)
+                elif unsafe == 'hard link':
+                    os.link(path, target)
+                elif unsafe == 'symlink':
+                    path.rename(target)
+                    path.symlink_to(target)
+                elif unsafe == 'directory':
+                    path.unlink()
+                    path.mkdir(mode=0o700)
+                else:
+                    original = os.fstat
+                    inode = path.stat().st_ino
+                    def foreign_owner(fd):
+                        info = original(fd)
+                        if info.st_ino != inode:
+                            return info
+                        fields = {name: getattr(info, name) for name in
+                                  ('st_mode', 'st_nlink', 'st_uid', 'st_ino', 'st_size',
+                                   'st_mtime_ns', 'st_ctime_ns')}
+                        return SimpleNamespace(**dict(fields, st_uid=info.st_uid + 1))
+                    local.enter_context(patch.object(os, 'fstat', side_effect=foreign_owner))
+                self.assertEqual(trial.terminal_mode(NONCE), 'fresh')
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+                if unsafe == 'directory':
+                    path.rmdir()
+                else:
+                    path.unlink()
+                target.unlink(missing_ok=True)
+
+    def test_terminal_read_preserves_explicit_signal_failure_and_base_interruptions(self):
+        self.committed_resume_failure()
+        self.terminal(self.RESUME)
+        reader = trial.regular
+        for error in (trial.Failure('signal', 130, 'interrupted'),
+                      trial.Failure('signal', 143, 'interrupted'), KeyboardInterrupt(), SystemExit(143)):
+            def interrupted(path, *args, **kwargs):
+                if path == self.root / 'result.json':
+                    raise error
+                return reader(path, *args, **kwargs)
+            with self.subTest(error=type(error).__name__, code=getattr(error, 'code', None)), \
+                 patch.object(trial, 'regular', side_effect=interrupted):
+                for call in (trial.terminal_mode, trial.export_failure):
+                    with self.assertRaises(type(error)) as caught:
+                        call(NONCE)
+                    self.assertIs(caught.exception, error)
+
+    def test_stale_fresh_null_reservation_stays_first_writer_and_is_not_rebound_to_resume(self):
+        core, env = self.core, self.env
+        env.prepared()
+        core.capture_first_failure('fresh', None, core.Failure('startup phase refused'), time.monotonic() + 60)
+        stale = (core.ROOT / core.FIRST_FAILURE).read_bytes()
+        self.assertIsNone(trial.first_failure_bundle(stale)['operation'])
+        self.assertEqual(env.call('start-fresh'), 0, env.stderr.getvalue())
+        self.assertEqual(env.call('activate-resume'), 0, env.stderr.getvalue())
+        with patch.dict(os.environ, {'INVOCATION_ID': self.RESUME_INVOCATION}), self.ready_failure():
+            self.assertEqual(env.call('start-resume'), 17)
+        self.assertEqual((core.ROOT / core.FIRST_FAILURE).read_bytes(), stale)  # first writer unchanged
+        self.terminal(self.RESUME)
+        with self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+
+    def test_null_reservation_after_activation_writes_nothing_and_exports_absent(self):
+        core, env = self.core, self.env
+        env.resumable()
+        core.capture_first_failure('resume', None, core.Failure('startup phase refused'), time.monotonic() + 60)
+        self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
+        self.terminal(self.RESUME)
+        self.assertEqual(trial.export_failure(NONCE), b'absent')
+
+    def test_fresh_failure_export_is_unchanged_and_resume_terminal_cannot_retarget_it(self):
+        core, env = self.core, self.env
+        env.prepared()
+        with patch.dict(os.environ, {'INVOCATION_ID': 'a' * 32}), self.ready_failure():
+            self.assertEqual(env.call('start-fresh'), 17)
+        self.assertEqual(core.state()['mode'], 'fresh')
+        for name, prepare in (('no terminal', None), ('fresh worker terminal', lambda: self.terminal(self.FRESH))):
+            with self.subTest(name):
+                (self.root / 'result.json').unlink(missing_ok=True)
+                if prepare:
+                    prepare()
+                first, _, rest = trial.export_failure(NONCE).partition(b'\n')
+                self.assertEqual(json.loads(first)['mode'], 'fresh')
+                self.assertEqual(trial.first_failure_bundle(rest)['mode'], 'fresh')
+        self.terminal(self.RESUME)
+        with self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+
+    def test_expected_mode_derives_only_from_a_failed_worker_resume_core_start_diagnostic(self):
+        guardian = {'origin': 'guardian', 'phase': 'resume', 'operation': 'worker-supervision',
+                    'category': 'exception', 'child_status': None}
+        self.assertEqual(trial.diagnostic(guardian), guardian)
+        for detail, expected in ((self.RESUME, 'resume'), (self.FRESH, 'fresh'),
+                                 (dict(self.RESUME, operation='core-stop'), 'fresh'),
+                                 (dict(trial.SUCCESS), 'fresh'), (None, 'fresh'), (guardian, 'fresh')):
+            with self.subTest(detail=detail):
+                self.assertEqual(trial.terminal_export_mode(detail), expected)

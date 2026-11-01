@@ -589,11 +589,13 @@ def export_command(nonce):
             'export-failure', '--nonce', nonce]
 
 
-def accept_failure(raw, source_sha, nonce, boot):
+def accept_failure(raw, source_sha, nonce, boot, mode='fresh'):
     """-> ('absent'|'invalid'|'captured', bundle). Expected values are HOST-held.
 
     The envelope (live guest state + contract + live boot) and the bundle header are two
-    independent guest records; both must match the host's own source/nonce/fixed mode/boot.
+    independent guest records; both must match the host's own source/nonce/mode/boot.
+    ``mode`` is frozen by the host from its validated terminal result ('resume' only for
+    worker/resume/core-start-resume); the default and any other value stay fresh-only.
     A self-consistent but foreign, stale or replaced bundle fails here. Mandatory, never optional.
     """
     if raw == b'absent':
@@ -607,13 +609,14 @@ def accept_failure(raw, source_sha, nonce, boot):
         guest.require(type(envelope) is dict and set(envelope) == {'schema', 'source_sha', 'nonce', 'mode',
                       'operation', 'invocation', 'boot'} and envelope['schema'] == 1
                       and type(envelope['schema']) is int)
+        guest.require(mode in ('fresh', 'resume'))
         guest.require(envelope['source_sha'] == source_sha and envelope['nonce'] == nonce
-                      and envelope['mode'] == 'fresh' and envelope['boot'] == boot)
+                      and envelope['mode'] == mode and envelope['boot'] == boot)
         for key in ('operation', 'invocation'):
             guest.require(envelope[key] is None or type(envelope[key]) is str
                           and re.fullmatch(guest.HEX32, envelope[key]))
         bundle = guest.first_failure_bundle(rest)
-        guest.require(bundle['nonce'] == nonce and bundle['mode'] == 'fresh' and bundle['boot'] == boot)
+        guest.require(bundle['nonce'] == nonce and bundle['mode'] == mode and bundle['boot'] == boot)
         guest.require(bundle['operation'] == envelope['operation']
                       and bundle['invocation'] == envelope['invocation'])
         return 'captured', raw
@@ -627,7 +630,7 @@ def retain_private(directory, lease, raw):
     guest.exclusive(directory / ('first-failure-' + lease + '.bin'), raw)
 
 
-def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, process_uncertain):
+def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, process_uncertain, mode='fresh'):
     """Diagnostic-only; returns a closed status. Owner-local cleanup uncertainty is NEVER swallowed."""
     try:
         try:
@@ -639,7 +642,7 @@ def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, proc
         until = owned_process.monotonic() + min(EXPORT_CAP_SECONDS, left)
         raw = master.remote(export_command(nonce), 'persistence', cap=EXPORT_CAP_SECONDS, cleanup=True,
                             until=until, limit=EXPORT_READ_LIMIT)
-        state, kept = accept_failure(raw, snapshot['source_sha'], nonce, boot)
+        state, kept = accept_failure(raw, snapshot['source_sha'], nonce, boot, mode)
         if state != 'captured':
             return state
         retain_private(directory, lease, kept)
@@ -698,6 +701,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     # Public guest diagnostic: `unavailable` until a bounded read or observation says otherwise.
     guest_status, guest_detail, guest_service = 'unavailable', None, None
     private_diagnostic = 'skipped'
+    export_mode = 'fresh'  # frozen from the primary validated terminal result only
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -866,6 +870,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             guest.require(state == 'valid', 'guest result invalid')
             result, contained = record['code'], record['contained']
             guest_detail = record['diagnostic']
+            export_mode = guest.terminal_export_mode(guest_detail)
             phase = 'guest-result'
             failure_category = 'guest' if result else 'none'
             break
@@ -914,7 +919,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 # closes: no reconnect, reauthentication or retry. Diagnostic only; it
                 # cannot change `result`, `contained` or the stop above.
                 private_diagnostic = extract_failure(master, clock, nonce, snapshot, initial['boot_uuid'],
-                                                     private, rec['request_id'], process_uncertain)
+                                                     private, rec['request_id'], process_uncertain, export_mode)
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

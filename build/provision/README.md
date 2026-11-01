@@ -2045,6 +2045,19 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   from moved/deleted state. Dangling or live links, wrong type/owner/mode and
   malformed or foreign bindings remain refusals. A host-origin failure still
   permits the existing one-shot export because a guest failure may be concurrent.
+* **Mode binding (issue #412).** The remote command is unchanged and takes no mode.
+  The expected mode is `fresh` unless the nonce-bound terminal `result.json` (read once
+  through the existing `result_record` validator and 4096-byte bound) is a failed
+  `worker` diagnostic with phase `resume` and operation `core-start-resume`
+  (`terminal_export_mode`); then it is `resume`. A missing, unsafe, oversize, foreign or
+  invalid record, a success, or any other diagnostic keeps `fresh`. The expected mode
+  is never taken from the bundle, the live core mode or manager output. The bundle
+  mode, the live core mode (when an operation exists) and the envelope mode must all
+  equal it; source/nonce/boot/operation/invocation and null checks are unchanged.
+  Limits: a refusal inside the resume reservation (before a new operation commits)
+  intentionally captures nothing (`absent`), and a stale first-writer bundle from an
+  earlier refused attempt is neither cleared nor rebound, so its export stays refused.
+  Diagnostic export compatibility does not establish the cause of a resume failure.
 
 The diagnostic runner fixtures (`test_vlab_core.py`) mock Popen, waitid, killpg,
 selector/I/O and monotonic time while exercising the actual runner and unchanged

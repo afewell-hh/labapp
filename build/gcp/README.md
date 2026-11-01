@@ -1575,8 +1575,12 @@ BEFORE the original master closes, the owner runs the fixed remote command
 `sudo -n python3 /var/lib/labapp-vlab-trial/vlab_trial.py export-failure --nonce N`
 through that same master (`cleanup=True`, no new SSH, reauthentication, reconnect or
 retry). It takes no path or selector. The host mandatorily compares the returned
-envelope and bundle header with its OWN source SHA, nonce, fixed mode `fresh` and
-initial boot UUID, and the envelope with the bundle's operation/invocation
+envelope and bundle header with its OWN source SHA, nonce, expected mode and
+initial boot UUID. The expected mode is `fresh` unless the owner's already validated
+primary terminal guest result is a failed `worker` diagnostic with phase `resume`
+and operation `core-start-resume` (issue #412); it is frozen at that validation,
+before supplemental observation or cleanup, and never read from guest export bytes.
+It also compares the envelope with the bundle's operation/invocation
 (including null equality; a reservation export requires prepared guest state with
 no mode/operation/invocation)
 (see the [core bundle](../provision/README.md#root-private-first-failure-bundle-issue-368));
