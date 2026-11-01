@@ -12,6 +12,7 @@ not guest OS shutdown. Resume never initializes, repairs, resets or rebuilds.
 """
 import argparse
 import base64
+import copy
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -1491,6 +1492,190 @@ def object_value(doc):
             'annotations': meta.get('annotations', {}), 'spec': doc.get('spec', {})}
 
 
+# Expected-only projection of the pinned Fabric v0.96.2 typed Default() output for
+# Switch and Connection. Bound to the pinned Fabricator v0.43.1 hhfab binary
+# identity (size, SHA-256), verified by the existing prerequisite/contract path,
+# and the installer Fabricator's actual selected Fabric API/controller/agent
+# versions. This is not proof of the
+# deployed CRD/OCI identity. Observed objects are never projected or normalized.
+PROJECTION_HHFAB_PIN = (170709176, 'b5c7e0265339b9b95fa1073967bfb6c6fede6086755c85eca24cb80637b04e37')
+PROJECTION_FABRIC_VERSION = 'v0.96.2'
+# These value structs survive encoding/json omitempty and PrintFab unchanged.
+# This is one named typed-empty representation, not recursive empty pruning.
+PROJECTION_EMPTY_OVERRIDES = {'versions': {'platform': {}, 'fabricator': {}, 'fabric': {},
+                                          'gateway': {}, 'vlab': {}}}
+FABRIC_LABELS = 'fabric.githedgehog.com/'
+CONNECTION_TYPE_LABELS = {'unbundled': 'unbundled', 'bundled': 'bundled', 'mclag': 'mclag',
+                          'eslag': 'eslag', 'mclagDomain': 'mclag-domain', 'fabric': 'fabric'}
+LABEL_NAME = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?')
+
+
+def projection_refused():
+    return Failure('expected projection refused')
+
+
+def projection_binding(expected):
+    """Bind to the trusted hhfab pin and actual affected installer version fields."""
+    require(TOOL_PINS.get(HHFAB) == PROJECTION_HHFAB_PIN, 'expected projection version binding refused')
+    fabricators = [d for d in expected if d.get('kind') == 'Fabricator']
+    if len(fabricators) != 1:
+        raise projection_refused()
+    fab = fabricators[0]
+    spec = fab.get('spec')
+    if (fab.get('apiVersion') != 'fabricator.githedgehog.com/v1beta1' or type(spec) is not dict
+            or type(spec.get('config')) is not dict):
+        raise projection_refused()
+    overrides = spec.get('overrides', {})
+    if type(overrides) is not dict or overrides not in ({}, {'versions': {}}, PROJECTION_EMPTY_OVERRIDES):
+        raise projection_refused()
+    status = fab.get('status')
+    versions = status.get('versions') if type(status) is dict else None
+    fabric = versions.get('fabric') if type(versions) is dict else None
+    require(type(fabric) is dict and all(type(fabric.get(key)) is str
+            and fabric[key] == PROJECTION_FABRIC_VERSION for key in ('api', 'controller', 'agent')),
+            'expected projection version binding refused')
+    # Fabricator status strings are not binary identity. In particular the public
+    # upstream oracle honestly retains its ordinary Go '(devel)' status; no such
+    # string can substitute for the existing verified production binary pin.
+
+
+def label_name(value):
+    if type(value) is not str or not LABEL_NAME.fullmatch(value):
+        raise projection_refused()
+    return value
+
+
+def add_labels(doc, derived):
+    meta = doc['metadata']
+    labels = meta.get('labels')
+    if labels is None:
+        labels = meta['labels'] = {}
+    if type(labels) is not dict:
+        raise projection_refused()
+    for key, value in derived.items():
+        if key in labels and labels[key] != value:
+            raise projection_refused()
+        labels[key] = value
+
+
+def project_switch(doc):
+    spec = doc.get('spec')
+    if type(spec) is not dict:
+        raise projection_refused()
+    # The printer's SPEED_* rewrite is not modelled; no generic speed stripping.
+    for key in ('portSpeeds', 'portGroupSpeeds'):
+        speeds = spec.get(key) or {}
+        if type(speeds) is not dict or any(type(v) is not str or v.startswith('SPEED_')
+                                           for v in speeds.values()):
+            raise projection_refused()
+    profile = spec.get('profile')
+    groups = spec.get('groups', [])
+    if type(groups) is not list or groups != sorted(set(label_name(g) for g in groups)):
+        raise projection_refused()
+    redundancy = spec.get('redundancy') or {}
+    if type(redundancy) is not dict or ('group' in redundancy and redundancy['group'] not in groups):
+        raise projection_refused()
+    namespaces = spec.get('vlanNamespaces')
+    if namespaces is None or namespaces == []:
+        namespaces = ['default']
+        spec['vlanNamespaces'] = list(namespaces)
+    if type(namespaces) is not list or namespaces != sorted(set(label_name(n) for n in namespaces)):
+        raise projection_refused()
+    derived = {FABRIC_LABELS + 'profile': label_name(profile)}
+    derived.update({'switchgroup.' + FABRIC_LABELS + g: 'true' for g in groups})
+    derived.update({'vlanns.' + FABRIC_LABELS + n: 'true' for n in namespaces})
+    add_labels(doc, derived)
+
+
+def link_endpoint(link, roles, used_ports, *, fabric=False):
+    if type(link) is not dict or set(link) != set(roles):
+        raise projection_refused()
+    names = []
+    for role in roles:
+        port = link[role]
+        allowed = {'port', 'ip'} if fabric else {'port'}
+        if (type(port) is not dict or not set(port) <= allowed
+                or type(port.get('port')) is not str or '/' not in port['port']
+                or ('ip' in port and type(port['ip']) is not str)):
+            raise projection_refused()
+        name, local = port['port'].split('/', 1)
+        if not local or port['port'] in used_ports:
+            raise projection_refused()
+        used_ports.add(port['port'])
+        names.append(label_name(name))
+    return names
+
+
+def project_connection(doc):
+    spec = doc.get('spec')
+    variants = [k for k in CONNECTION_TYPE_LABELS if type(spec) is dict and k in spec]
+    if type(spec) is not dict or len(spec) != 1 or len(variants) != 1:
+        raise projection_refused()
+    variant = variants[0]
+    body = spec[variant]
+    if type(body) is not dict:
+        raise projection_refused()
+    switches, servers, used_ports = [], [], set()
+
+    def lists(key):
+        value = body.get(key)
+        if type(value) is not list or not value:
+            raise projection_refused()
+        return value
+
+    if variant == 'unbundled':
+        require(set(body) == {'link'}, 'expected projection refused')
+        server, switch = link_endpoint(body['link'], ('server', 'switch'), used_ports)
+        servers.append(server)
+        switches.append(switch)
+    elif variant in ('bundled', 'mclag', 'eslag'):
+        if not set(body) <= {'links', 'fallback'} or 'links' not in body or (
+                variant == 'bundled' and 'fallback' in body) or (
+                'fallback' in body and type(body['fallback']) is not bool):
+            raise projection_refused()
+        for link in lists('links'):
+            server, switch = link_endpoint(link, ('server', 'switch'), used_ports)
+            servers.append(server)
+            switches.append(switch)
+    elif variant == 'mclagDomain':
+        if set(body) != {'peerLinks', 'sessionLinks'}:
+            raise projection_refused()
+        for key in ('peerLinks', 'sessionLinks'):
+            for link in lists(key):
+                switches.extend(link_endpoint(link, ('switch1', 'switch2'), used_ports))
+    else:
+        if set(body) != {'links'}:
+            raise projection_refused()
+        for link in lists('links'):
+            switches.extend(link_endpoint(link, ('spine', 'leaf'), used_ports, fabric=True))
+    # ConnectionLabels returns only its type label when Endpoints refuses.
+    # Reject those unsupported inputs rather than inventing endpoint labels.
+    switch_count, server_count = len(set(switches)), len(set(servers))
+    if variant in ('unbundled', 'bundled', 'mclag', 'eslag'):
+        maximum = {'unbundled': 1, 'bundled': 1, 'mclag': 2, 'eslag': 4}[variant]
+        if server_count != 1 or not 1 <= switch_count <= maximum:
+            raise projection_refused()
+    elif switch_count != 2:
+        raise projection_refused()
+    derived = {FABRIC_LABELS + 'connection-type': CONNECTION_TYPE_LABELS[variant]}
+    derived.update({'switch.' + FABRIC_LABELS + n: 'true' for n in switches})
+    derived.update({'server.' + FABRIC_LABELS + n: 'true' for n in servers})
+    add_labels(doc, derived)
+
+
+def project_expected(expected):
+    """Return a deep copy with only the pinned Switch/Connection defaults added."""
+    projection_binding(expected)
+    projected = copy.deepcopy(expected)
+    for doc in projected:
+        if doc.get('kind') in ('Switch', 'Connection'):
+            object_identity(doc)
+            if type(doc.get('metadata')) is not dict:
+                raise projection_refused()
+            (project_switch if doc['kind'] == 'Switch' else project_connection)(doc)
+    return projected
+
+
 def api_objects(resource, namespace, deadline):
     args = ['get', resource, '-o', 'json']
     args += ['-A'] if namespace is None else ['-n', namespace]
@@ -1534,10 +1719,14 @@ def api_ready(deadline):
         require(len(items) == count and all(d.get('kind') == kind for d in items),
                 'canonical API counts differ')
         observed.extend(items)
-    expected_map = {object_identity(d): object_value(d) for d in expected}
+    # Original identities are validated before any expected-only projection.
+    original_map = {object_identity(d): None for d in expected}
     actual_map = {object_identity(d): object_value(d) for d in observed}
-    require(len(expected_map) == len(expected) and len(actual_map) == len(observed)
-            and actual_map == expected_map, 'canonical API objects differ')
+    projected = project_expected(expected)
+    expected_map = {object_identity(d): object_value(d) for d in projected}
+    require(len(original_map) == len(expected) and len(expected_map) == len(expected)
+            and len(actual_map) == len(observed) and actual_map == expected_map,
+            'canonical API objects differ')
     require({d['metadata']['name'] for d in observed if d['kind'] == 'Switch'} ==
             {name for name, kind in VMS.items() if kind == 'switch'}
             and {d['metadata']['name'] for d in observed if d['kind'] == 'Server'} ==

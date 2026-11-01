@@ -1205,7 +1205,7 @@ an owned empty mode-0700 directory, totaling at most 1 MiB. The producer prints
 each file's size and the total, so whether the full vectors fit is measured, not
 assumed; the 1 MiB aggregate and three-file interface are unchanged.
 
-`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual, unchanged
+`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual
 `api_ready` with the independently produced 45 public objects and actual per-kind
 query counts (Fabricator 1, ControlNode 1, FabNode 0, Switch 7, Server 10,
 Connection 21, SwitchGroup 3, VLANNamespace 1, IPv4Namespace 1); readiness, node,
@@ -1214,16 +1214,69 @@ metadata is asserted from hand-written endpoint/type tables (cross-checked again
 ports in the raw source): per-Connection type and switch/server endpoint labels,
 per-Switch profile, group and `default` VLAN-namespace labels and the
 `vlanNamespaces: [default]` delta, unchanged values and link order against the raw
-canonical YAML, namespaces, and exact ControlNode namespace/spec. The independently
-printed/defaulted pair must refuse at `canonical API objects differ`. A matched
-baseline passes before each isolated negative (missing/wrong/extra endpoint and
-generated labels, annotations, specs, link order, namespaces, identities,
-Fabricator/ControlNode drift, unknown spec fields injected after typed decoding).
-Duplicate tests keep equal collapsed maps to exercise both production uniqueness
-guards. No production readiness rule is duplicated or changed. Missing, extra,
-insecure or oversized fixture files, or zero discovered tests, fail rather than skip.
+canonical YAML, namespaces, and exact ControlNode namespace/spec. The raw
+`object_value` asymmetry between printed and defaulted Switch (7) and Connection
+(21) objects is still asserted. The independently printed expected set now
+passes actual `api_ready` against the independently produced 45 observed objects
+through the expected-only projection below (no monkeypatched projection or
+version guard), and projection negatives start from that passing pair (missing/wrong/
+extra endpoint and generated labels, unknown labels, annotations, specs, IP/ASN/
+profile/port drift, link order, identities, counts, version binding, unsupported
+and conflicting expected forms). Duplicate tests keep equal collapsed maps to
+exercise both production uniqueness guards. Missing, extra, insecure or
+oversized fixture files, or zero discovered tests, fail rather than skip.
+Separately named matched synthetic controls preserve the earlier printer branch
+and strict-comparison coverage; they are not independent production positives.
 
-Not implemented and still unknown: a full expected projection, Fabricator
+### Expected-only Switch/Connection projection (issue #406)
+
+`vlab_core.project_expected` deep-copies the installer expected objects and adds
+only what the pinned Fabric typed `Default()` generates; observed objects, labels,
+annotations and specs are compared exactly and never normalized. Original expected
+and observed identities are validated first and both collapsed-map length guards,
+per-kind counts, zero FabNode, VM names, queries, caps and deadlines are unchanged.
+Projection preserves identity, count and order.
+
+- Switch: absent or empty `spec.vlanNamespaces` becomes `['default']`; labels
+  `fabric.githedgehog.com/profile`, `switchgroup.fabric.githedgehog.com/<group>`
+  and `vlanns.fabric.githedgehog.com/<namespace>` are derived from the expected
+  spec and added when missing. A conflicting existing value is refused. Refused
+  as unsupported: unsorted or duplicate `groups`/`vlanNamespaces`, a
+  `redundancy.group` absent from `groups`, and `SPEED_*` port speed values (no
+  speed stripping, sorting, insertion or reserialization).
+- Connection: exactly one structurally valid variant among unbundled, bundled,
+  mclag, eslag, mclagDomain (peerLinks and sessionLinks) and fabric (spine/leaf).
+  Derives `fabric.githedgehog.com/connection-type` (`mclag-domain` for
+  mclagDomain) and `switch.`/`server.fabric.githedgehog.com/<name>` endpoint labels
+  from link ports. Empty device/port components, repeated full ports and
+  unsupported device cardinalities refuse before label derivation, as required
+  by the upstream `Endpoints` path. Endpoint field shapes are checked; hydrated
+  fabric-link IP strings are preserved. No VPC label for these variants.
+- Fabricator, ControlNode, Server, SwitchGroup, VLANNamespace and IPv4Namespace
+  are unchanged.
+
+Version binding: projection is allowed only when `TOOL_PINS[HHFAB]` equals the
+pinned hhfab v0.43.1 size/SHA-256 (already verified by the prerequisite receipt
+and `verify_contract`), the single expected Fabricator is `v1beta1`, and each
+actual installer field `status.versions.fabric.api`, `.controller` and `.agent`
+is exactly the string `v0.96.2`. `GetFabAndNodes` calculates these fields and
+`PrintFab` retains Fabricator status in `fab.yaml`. Missing, malformed, stale or
+`(devel)` affected Fabric versions refuse. Overrides must be absent, `{}`,
+`{versions: {}}`, or the exact typed-empty shape `{versions: {platform: {},
+fabricator: {}, fabric: {}, gateway: {}, vlab: {}}}`. Value structs retain that
+last shape through Go serialization; no recursive empty pruning or nonempty
+override is allowed.
+
+The production Fabricator release identity comes from the already verified
+hhfab bytes, never from Fabricator status version strings. The public oracle's
+ordinary Go build honestly retains `(devel)` in its Fabricator status; that
+value is unchanged and supplies no binary provenance or production bypass.
+The selected affected Fabric versions plus trusted hhfab bytes bind these
+rules; they do not prove deployed CRD/OCI identity. Other mutable status remains
+outside the existing identity/labels/annotations/spec comparison.
+
+Not implemented and still unknown: other Fabric versions or general printer forms,
+Fabricator
 hydration (management/dummy IPs), full migration-branch coverage and `hhfab`
 build behavior; what live webhooks, deployed CRDs, OCI bytes or the controller
 do. The actual VLAN helper fills zero `to` from `from` and sorts ranges in place;

@@ -62,6 +62,55 @@ def public_fab():
                  'management': {'interface': 'enp2s1'}}}]
 
 
+def printer_defaults(doc):
+    """Independent model of the pinned typed Default() for the canonical wiring.
+
+    Written from the label tables (endpoint names found by scanning every 'port'
+    string), without reusing any production projection code.
+    """
+    pre = 'fabric.githedgehog.com/'
+    if doc['kind'] == 'Switch':
+        spec = doc['spec']
+        if not spec.get('vlanNamespaces'):
+            spec['vlanNamespaces'] = ['default']
+        labels = {pre + 'profile': spec['profile']}
+        for group in spec.get('groups', []):
+            labels['switchgroup.' + pre + group] = 'true'
+        for ns in spec['vlanNamespaces']:
+            labels['vlanns.' + pre + ns] = 'true'
+        doc['metadata'].setdefault('labels', {}).update(labels)
+    elif doc['kind'] == 'Connection':
+        found = []
+
+        def scan(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    found.append(item.split('/')[0]) if key == 'port' else scan(item)
+            elif isinstance(value, list):
+                for item in value:
+                    scan(item)
+        scan(doc['spec'])
+        labels = {pre + 'connection-type': {'mclagDomain': 'mclag-domain'}.get(
+            next(iter(doc['spec'])), next(iter(doc['spec'])))}
+        for name in found:
+            labels[('server.' if name.startswith('server-') else 'switch.') + pre + name] = 'true'
+        doc['metadata'].setdefault('labels', {}).update(labels)
+
+
+def installer_versions(docs):
+    """Independent public model of the affected pkg/fab/versions.go fields.
+
+    The candidate input has no status. GetFabAndNodes calculates these selected
+    versions and PrintFab retains status in the installer output. This is a
+    synthetic command fake, not evidence of an executed hhfab build.
+    """
+    for doc in docs:
+        if doc['kind'] == 'Fabricator':
+            doc['status'] = {'versions': {'fabric': {'api': 'v0.96.2',
+                'controller': 'v0.96.2', 'agent': 'v0.96.2'}}}
+    return docs
+
+
 class GuestEnvironment:
     """All fixed production paths are patched to one owned ephemeral fixture."""
     def setUp(self):
@@ -182,7 +231,8 @@ class GuestEnvironment:
         target = installer / 'hhfab-recipe'
         target.write_bytes(b'PUBLIC_NOT_EXECUTABLE')
         target.chmod(0o600)
-        (installer / 'fab.yaml').write_bytes(self.fab_path.read_bytes())
+        installed_fab = installer_versions(copy.deepcopy(self.fab))
+        (installer / 'fab.yaml').write_bytes(yaml.safe_dump_all(installed_fab, sort_keys=False).encode())
         (installer / 'fab.yaml').chmod(0o600)
         (installer / 'include.yaml').write_bytes(self.wiring.read_bytes())
         (installer / 'include.yaml').chmod(0o600)
@@ -293,6 +343,10 @@ class GuestEnvironment:
                          'ipv4namespaces': 'IPv4Namespace'}
                 all_docs = self.fab + core.yaml_documents(self.wiring.read_bytes())
                 items = copy.deepcopy([d for d in all_docs if d['kind'] == kinds[resource.split('.')[0]]])
+                # Observed side is written by an independent printer-default model,
+                # not by the production projection.
+                for item in items:
+                    printer_defaults(item)
                 if self.api_mutation:
                     self.api_mutation(items)
             return json.dumps({'items': items}).encode()
@@ -308,6 +362,29 @@ class GuestEnvironment:
 
 
 class GuestFixture(GuestEnvironment, unittest.TestCase):
+    def test_installer_selected_fabric_versions_are_required_by_actual_api_ready(self):
+        self.prepared()
+        self.runtime_files()
+        path = core.WORK / 'result' / core.RESULT / 'fab.yaml'
+        original = path.read_bytes()
+        self.assertEqual(core.api_ready(time.monotonic() + 10)['cluster_uid'], self.cluster_uid)
+        for field in ('api', 'controller', 'agent'):
+            for label, value in (('missing', None), ('stale', 'v0.96.1'),
+                                 ('devel', '(devel)'), ('malformed', ['v0.96.2'])):
+                with self.subTest(field=field, label=label):
+                    docs = core.yaml_documents(original)
+                    selected = docs[0]['status']['versions']['fabric']
+                    if value is None:
+                        del selected[field]
+                    else:
+                        selected[field] = value
+                    path.write_bytes(yaml.safe_dump_all(docs, sort_keys=False).encode())
+                    with self.assertRaises(core.Failure) as caught:
+                        core.api_ready(time.monotonic() + 10)
+                    self.assertEqual(str(caught.exception), 'expected projection version binding refused')
+        path.write_bytes(original)
+        self.assertEqual(core.api_ready(time.monotonic() + 10)['cluster_uid'], self.cluster_uid)
+
     def test_actual_entrypoint_full_fresh_stop_activate_resume_twice(self):
         initial = self.resumable()
         self.assertEqual(initial['phase'], 'resumable')
