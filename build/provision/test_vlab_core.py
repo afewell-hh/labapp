@@ -966,17 +966,18 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         # Offline fixtures: representative text only. Not native systemd output, scheduling or
         # ordering proof. Dates are never parsed; every case must round-trip byte for byte.
         def post(start, stop, code, status):
-            return ('ExecStartPost={ path=/usr/local/bin/labapp-ready ; argv[]=/usr/local/bin/labapp-ready ;'
+            return ('ExecStartPost={ path=/usr/bin/python3 ;'
+                    ' argv[]=/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-ready --mode fresh ;'
                     ' ignore_errors=no ; start_time=[%s] ; stop_time=[%s] ; pid=4321 ; code=%s ;'
                     ' status=%s }\n' % (start, stop, code, status))
         early, late = 'Sun 2026-11-01 17:00:01.000001 UTC', 'Sun 2026-11-01 17:00:02.000002 UTC'
         cases = {
-            'ordinary-exit-main-first': ('exited', '1', early, post(early, late, 'exited', '1')),
-            'timeout-like-124-post-first': ('exited', '124', late, post(early, early, 'exited', '124')),
-            'signal-143-equal': ('exited', '143', early, post(early, early, 'exited', '143')),
-            'signal-130-reversed': ('exited', '130', early, post(late, early, 'exited', '130')),
-            'signaled-child': ('killed', '9', late, post(early, late, 'killed', 'KILL')),
-            'zero-unset-observations': ('exited', '0', 'n/a', post('n/a', 'n/a', 'exited', '0')),
+            'ordinary-exit-main-first': ('1', '1', early, post(early, late, 'exited', '1')),
+            'timeout-like-124-post-first': ('1', '124', late, post(early, early, 'exited', '124')),
+            'signal-143-equal': ('1', '143', early, post(early, early, 'exited', '143')),
+            'signal-130-reversed': ('1', '130', early, post(late, early, 'exited', '130')),
+            'signaled-child': ('2', '9', late, post(early, late, 'killed', '9/KILL')),
+            'zero-unset-observations': ('1', '0', 'n/a', post('n/a', 'n/a', 'exited', '0')),
             'missing-new-properties': ('', '', None, ''),
         }
         for name, (code, status, exit_ts, start_post) in cases.items():
