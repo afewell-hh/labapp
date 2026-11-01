@@ -18,11 +18,17 @@ mkdir -m 700 /work/upstream/cmd/labapp-pinned-api
 cp /fixture/main.go /work/upstream/cmd/labapp-pinned-api/main.go
 cd /work/upstream
 echo 'Offline compiler: Go1.25.9, immutable upstream vendor, network disabled'
-# Compiler logs are public-only and bounded; a cap/timeout failure fails the job.
+# Compiler files retain the broad file bound; check the log before publishing.
 status=0
-(ulimit -f 1024; timeout --kill-after=5s 600s /opt/go/bin/go build \
+timeout --kill-after=5s 600s /opt/go/bin/go build \
   -p 2 -mod=vendor -trimpath -buildvcs=false -o /work/producer ./cmd/labapp-pinned-api \
-  > /work/build.log 2>&1) || status=$?
+  > /work/build.log 2>&1 || status=$?
+log_size=$(stat -c %s /work/build.log)
+if ((log_size > 1048576)); then
+  echo 'Compiler log exceeds publication bound' >&2
+  if ((status)); then exit "$status"; fi
+  exit 1
+fi
 cat /work/build.log
 if ((status)); then exit "$status"; fi
 timeout --kill-after=5s 30s /work/producer -out /work/output
