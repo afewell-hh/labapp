@@ -1442,6 +1442,45 @@ fields; core.prepare retains semantic authority and exact byte preservation.
 No original secret is reconstructed and no development credential is selected.
 Private keys/password/FAB/diagnostics stay out of stdout and public artifacts.
 
+### Transient GHCR registry authentication (issue #378)
+
+The required VLAB build pulls `ghcr.io/githedgehog/...` packages that need the
+[documented `docker login ghcr.io` prerequisite](https://docs.hedgehog.cloud/latest/getting-started/download/).
+The canonical build provisions that login for the **actual `ubuntu` hhfab user**
+with a narrowly authorized, transient GHCR record. This is the only credential
+exception to "no credential files leave the host": cloud/SDK/OS Login/private-key
+captures and any broader dotenv or credential store remain prohibited. Nothing in
+repository code sources `local.env`, reads environment variables or discovers a
+credential store.
+
+* **Lead preflight BEFORE VM dispatch.** The lead (never a worker or CI) already
+  proves with an actual `docker login ghcr.io` and exact required-package token and
+  manifest checks that the credential works, then writes ONE owner-private
+  (`0600`, owner-owned, non-group/world-writable parent, outside `--output`) JSON
+  record containing only the required values:
+  `{"schema":1,"registry":"ghcr.io","username":"...","token":"..."}`, and passes it
+  as `--ghcr-credentials PATH`. Missing, malformed, extra-field, oversized, other
+  registry, helper/identitytoken/URL, link, foreign-owner or loose-mode input is
+  refused before any cloud action with fixed text. Without the option the trial is
+  unchanged and sends nothing (a build needing GHCR will then fail at acquisition).
+* **Delivery.** The canonical record (<=1 KiB, validated again in the guest) is
+  sent only as stdin of the ONE existing one-shot bootstrap command over the pinned
+  original SSH master (bootstrap gets the extra argument `ghcr-auth`). It is never
+  in argv, SFTP, the manifest, hashes, the public receipt, diagnostics, output
+  files, persistent work/FAB/result/ISO, or the image. `import-host-upstream` is
+  not used (it would embed registry auth into the FAB).
+* **Guest order** (see the [guest contract](../provision/README.md#transient-ghcr-registry-authentication-issue-378)):
+  validated source/manifest/contract/lease/nonce/boot/deadline -> root-private
+  intent -> guardian started and bound -> stdin read -> volatile config created ->
+  readiness published -> guardian releases the worker -> removal and verified
+  absence right after fresh acquisition, before strict checks, stop, resume or success.
+* **Receipt/limits.** The receipt format is unchanged: cleanup uncertainty surfaces as
+  the guardian's `contained: false` (withholding clean success) and never skips VM
+  disposal or the independent cleanup dispatch. Removal does not prove the registry
+  could not see the credential, and tmpfs removal is not secure erasure.
+* Real credentials, activation and executable verification are lead-only. The
+  offline tests use synthetic canaries only.
+
 The guest result is read by a fixed stdlib-only reader (`READ_RESULT`) that does
 not import the guest module and has no path/command selector. It checks the
 root-owned private directory chain without links, one single-link root-owned

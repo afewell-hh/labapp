@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -82,7 +83,7 @@ def require(condition, message='fixed trial refused', category='policy'):
 PHASE_NAMES = ('startup', 'stage', 'fresh', 'strict', 'resume', 'persistence')
 OPERATIONS = {
     'startup': ('worker-binding',),
-    'stage': ('account-policy', 'daemon-absent-check', 'aux-inventory', 'aux-audit', 'aux-holds',
+    'stage': ('auth-check', 'account-policy', 'daemon-absent-check', 'aux-inventory', 'aux-audit', 'aux-holds',
               'aux-setup', 'aux-update', 'aux-check', 'aux-simulate', 'aux-simulate-exact',
               'aux-download', 'aux-files', 'aux-install', 'aux-postcheck', 'aux-cleanup',
               'install-qemu', 'install-docker', 'install-hhfab', 'install-kubectl', 'sudo-check',
@@ -90,7 +91,7 @@ OPERATIONS = {
               'docker-daemons', 'docker-access', 'kvm-device', 'tun-device', 'parser-check',
               'core-load', 'fab-validate', 'package-receipt', 'core-contract', 'resource-check',
               'core-prepare', 'prestart-audit'),
-    'fresh': ('core-start-fresh',),
+    'fresh': ('core-start-fresh', 'auth-remove'),
     'strict': ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-create'),
     'resume': ('core-stop', 'offline-audit', 'core-activate-resume', 'core-start-resume'),
     'persistence': ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-verify', 'nonce-remove',
@@ -440,7 +441,276 @@ def run(argv, clock, phase, cap=30, user=False):
     return out
 
 
-def bootstrap(incoming, expected_manifest):
+# ---- Transient GHCR registry authentication (#378) -------------------------------
+# One narrowly authorized secret path: the owner sends ONE registry-only JSON record
+# over the original bootstrap stdin; bootstrap builds the minimal Docker config in
+# a fixed volatile directory readable only by the actual ``ubuntu`` hhfab user and
+# the worker removes it right after fresh acquisition. Nothing derived from the
+# secret (value, hash, length, config bytes) enters argv, manifest, receipts, the
+# root tree, diagnostics or any image. Root-private records below hold identities
+# and sizes only.
+AUTH_REGISTRY = 'ghcr.io'
+AUTH_MOUNT = Path('/run')
+AUTH_DIR = AUTH_MOUNT / 'labapp-vlab-docker'
+AUTH_NAME = 'config.json'
+AUTH_HOME = Path('/home/ubuntu')
+AUTH_INPUT_LIMIT = 1024
+AUTH_GATE_SECONDS = 10
+AUTH_INTENT, AUTH_BOUND, AUTH_READY, AUTH_REMOVED = (
+    'auth-intent.json', 'auth-bound.json', 'auth-ready.json', 'auth-removed.json')
+AUTH_USER = r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}'
+AUTH_TOKEN = r'[A-Za-z0-9_.-]{20,255}'
+MOUNTINFO = Path('/proc/self/mountinfo')
+SWAPS = Path('/proc/swaps')
+AUTH_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def auth_credentials(raw):
+    """Closed registry-only record. No registry choice, helper, URL, token type or extra field.
+
+    Refusal text is fixed; neither input bytes nor parser messages are propagated.
+    """
+    try:
+        require(type(raw) is bytes and 0 < len(raw) <= AUTH_INPUT_LIMIT)
+        value = data(raw)
+        require(type(value) is dict and set(value) == {'schema', 'registry', 'username', 'token'}
+                and type(value['schema']) is int and value['schema'] == 1
+                and type(value['registry']) is str and value['registry'] == AUTH_REGISTRY
+                and type(value['username']) is str and re.fullmatch(AUTH_USER, value['username'])
+                and type(value['token']) is str and re.fullmatch(AUTH_TOKEN, value['token']))
+    except Exception:
+        raise Failure('GHCR credential input refused') from None
+    return {key: value[key] for key in ('schema', 'registry', 'username', 'token')}
+
+
+def auth_read_input(fd=0, seconds=10.0):
+    """Bounded read of the one stdin record; EOF is required (no unbounded wait)."""
+    end = time.monotonic() + seconds
+    raw = b''
+    try:
+        while len(raw) <= AUTH_INPUT_LIMIT:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                raise Failure('GHCR credential input refused')
+            chunk = os.read(fd, AUTH_INPUT_LIMIT + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except Failure:
+        raise
+    except Exception:
+        raise Failure('GHCR credential input refused') from None
+    return auth_credentials(raw)
+
+
+def auth_config(credentials):
+    """Equivalent minimal Docker config: one ghcr.io basic-auth entry, nothing else."""
+    pair = (credentials['username'] + ':' + credentials['token']).encode()
+    return encoded({'auths': {AUTH_REGISTRY: {'auth': base64.b64encode(pair).decode()}}})
+
+
+def harden_secret_process():
+    """No core dump and not dumpable for the root process that briefly holds the record."""
+    import ctypes
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+            and ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0,  # PR_SET_DUMPABLE
+            'secret process hardening refused')
+
+
+def auth_account():
+    user = pwd.getpwnam('ubuntu')
+    require(user.pw_uid >= 1000 and user.pw_gid != 0 and user.pw_dir == '/home/ubuntu'
+            and user.pw_shell == '/bin/bash', 'unexpected account policy')
+    return user
+
+
+def auth_volatile():
+    """Directory's mount is the standard /run tmpfs and no swap can hold its pages.
+
+    tmpfs is memory that CAN be swapped: require no active swap area, or an explicit
+    ``noswap`` tmpfs mount option. A path under /run alone is never trusted.
+    """
+    require(AUTH_DIR.parent == AUTH_MOUNT, 'credential location refused')
+    with MOUNTINFO.open('rb') as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    require(len(raw) <= 1024 * 1024, 'mount table refused')
+    best, target = None, str(AUTH_DIR)
+    for line in raw.decode().splitlines():
+        left, separator, right = line.partition(' - ')
+        a, b = left.split(), right.split()
+        require(separator and len(a) >= 6 and len(b) >= 3, 'mount table refused')
+        point = a[4]
+        if target == point or target.startswith(point.rstrip('/') + '/'):
+            if best is None or len(point) >= len(best[0]):  # a later entry at the same point overmounts
+                best = (point, a[5].split(','), b[0], b[2].split(','))
+    require(best is not None and best[0] == str(AUTH_MOUNT) and best[2] == 'tmpfs',
+            'credential volume is not the standard tmpfs')
+    rows = SWAPS.read_text().splitlines()[1:]
+    require(not any(row.strip() for row in rows) or 'noswap' in best[1] + best[3], 'swap may hold credentials')
+
+
+def auth_fallbacks_absent(uid):
+    """Refuse (never adopt or delete) other stores Docker/ORAS/containers-image would consult."""
+    for path in (AUTH_HOME / '.docker' / AUTH_NAME, AUTH_HOME / '.dockercfg',
+                 AUTH_HOME / '.config' / 'containers' / 'auth.json',
+                 AUTH_MOUNT / 'containers' / str(uid) / 'auth.json',
+                 AUTH_MOUNT / 'user' / str(uid) / 'containers' / 'auth.json'):
+        require(not os.path.lexists(path), 'fallback registry credential store refused')
+
+
+def auth_armed():
+    return os.path.lexists(ROOT / AUTH_INTENT)
+
+
+def auth_intent():
+    item = data(regular(ROOT / AUTH_INTENT, 4096, 0))
+    require(type(item) is dict and set(item) == {'schema', 'nonce', 'uid', 'gid'} and item['schema'] == 1
+            and type(item['nonce']) is str and re.fullmatch('[a-f0-9]{32}', item['nonce'])
+            and all(type(item[k]) is int and item[k] > 0 for k in ('uid', 'gid')), 'credential intent refused')
+    return item
+
+
+def auth_bound(intent, info):
+    """The directory is the exact one this run created: recorded identity, owner, mode, volume."""
+    bound = data(regular(ROOT / AUTH_BOUND, 4096, 0))
+    require(type(bound) is dict and set(bound) == {'schema', 'dev', 'ino', 'uid', 'gid'}
+            and (info.st_dev, info.st_ino, info.st_uid, info.st_gid) ==
+            (bound['dev'], bound['ino'], bound['uid'], bound['gid'])
+            and (info.st_uid, info.st_gid) == (intent['uid'], intent['gid'])
+            and stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+            and info.st_dev == os.stat(AUTH_MOUNT).st_dev, 'credential directory identity refused')
+
+
+def auth_config_ok(info, intent):
+    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600
+            and (info.st_uid, info.st_gid) == (intent['uid'], intent['gid']))
+
+
+def auth_install(value, credentials):
+    """Create the exact volatile config. Only reachable after the guardian is armed."""
+    intent = auth_intent()
+    user = auth_account()
+    require(intent['nonce'] == value['nonce'] and (user.pw_uid, user.pw_gid) == (intent['uid'], intent['gid']),
+            'credential binding refused')
+    auth_volatile()
+    auth_fallbacks_absent(user.pw_uid)
+    require(not os.path.lexists(AUTH_DIR) and not os.path.lexists(ROOT / AUTH_BOUND)
+            and not os.path.lexists(ROOT / AUTH_READY), 'preexisting credential path refused')
+    os.mkdir(AUTH_DIR, 0o700)
+    descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
+    try:
+        os.fchown(descriptor, user.pw_uid, user.pw_gid)
+        os.fchmod(descriptor, 0o700)
+        info = os.fstat(descriptor)
+        # Identity is recorded BEFORE any secret exists, so cleanup can prove ownership.
+        exclusive(ROOT / AUTH_BOUND, encoded({'schema': 1, 'dev': info.st_dev, 'ino': info.st_ino,
+                                              'uid': info.st_uid, 'gid': info.st_gid}))
+        auth_bound(intent, info)
+        fd = os.open(AUTH_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=descriptor)
+        try:
+            os.fchown(fd, user.pw_uid, user.pw_gid)  # ownership/mode fixed while still empty
+            os.fchmod(fd, 0o600)
+            raw = auth_config(credentials)
+            view = memoryview(raw)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+            file_info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        exclusive(ROOT / AUTH_READY, encoded({'schema': 1, 'nonce': value['nonce'],
+                                              'file_ino': file_info.st_ino, 'size': len(raw)}))
+    finally:
+        os.close(descriptor)
+    auth_verify(value)
+
+
+def auth_verify(value):
+    """Present, minimal, exactly owned and still volatile. Never reads the secret bytes."""
+    intent = auth_intent()
+    user = auth_account()
+    require(intent['nonce'] == value['nonce'] and (user.pw_uid, user.pw_gid) == (intent['uid'], intent['gid'])
+            and not os.path.lexists(ROOT / AUTH_REMOVED), 'credential binding refused')
+    ready = data(regular(ROOT / AUTH_READY, 4096, 0))
+    require(type(ready) is dict and set(ready) == {'schema', 'nonce', 'file_ino', 'size'}
+            and ready['schema'] == 1 and ready['nonce'] == value['nonce']
+            and type(ready['file_ino']) is int and type(ready['size']) is int, 'credential readiness refused')
+    auth_volatile()
+    auth_fallbacks_absent(user.pw_uid)
+    descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
+    try:
+        auth_bound(intent, os.fstat(descriptor))
+        require(os.listdir(descriptor) == [AUTH_NAME], 'credential directory contents refused')
+        info = os.stat(AUTH_NAME, dir_fd=descriptor, follow_symlinks=False)
+        require(auth_config_ok(info, intent) and info.st_ino == ready['file_ino']
+                and info.st_size == ready['size'], 'credential file identity refused')
+    finally:
+        os.close(descriptor)
+
+
+def auth_gate(value, clock):
+    """Guardian-side: nothing is provisioned until the armed credential is ready (bounded)."""
+    if not auth_armed():
+        return
+    require(auth_intent()['nonce'] == value['nonce'], 'credential binding refused')
+    until = time.monotonic() + min(AUTH_GATE_SECONDS, clock.remaining('stage'))
+    while not os.path.lexists(ROOT / AUTH_READY):
+        if time.monotonic() >= until:
+            raise Failure('credential ready gate expired', 124, 'phase-cutoff')
+        time.sleep(.05)
+    auth_verify(value)
+
+
+def auth_remove():
+    """Idempotent removal of exactly the owned directory and config file.
+
+    Absent is success. Anything not provably ours (no binding, replaced directory,
+    link, extra entry, other owner/mode/link count) is NOT deleted and raises a fixed
+    uncertainty failure. Never follows links; deletes only through the bound descriptor.
+    """
+    if not auth_armed():
+        return
+    try:
+        intent = auth_intent()
+        try:
+            descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
+        except FileNotFoundError:
+            require(not os.path.lexists(AUTH_DIR))
+            return
+        try:
+            info = os.fstat(descriptor)
+            auth_bound(intent, info)
+            foreign = False
+            for name in os.listdir(descriptor):
+                entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False) if name == AUTH_NAME else None
+                if entry is not None and auth_config_ok(entry, intent):
+                    os.unlink(name, dir_fd=descriptor)
+                else:
+                    foreign = True
+            require(not foreign and not os.listdir(descriptor))
+            current = os.stat(AUTH_DIR, follow_symlinks=False)
+            require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino))
+            os.rmdir(AUTH_DIR)
+        finally:
+            os.close(descriptor)
+        require(not os.path.lexists(AUTH_DIR))
+    except Exception:
+        failure = Failure('credential cleanup uncertain')
+        failure.cleanup_uncertain = True
+        raise failure from None
+
+
+def auth_absent():
+    require(not os.path.lexists(AUTH_DIR), 'credential still present')
+
+
+def bootstrap(incoming, expected_manifest, options=()):
+    options = tuple(options)
+    require(options in ((), ('ghcr-auth',)), 'unsupported bootstrap option')
+    authenticated = bool(options)
     require(os.geteuid() == 0 and re.fullmatch('[a-f0-9]{64}', expected_manifest))
     incoming = no_links(incoming)
     require(re.fullmatch('/tmp/labapp-vlab-[a-f0-9]{32}', str(incoming)))
@@ -470,6 +740,16 @@ def bootstrap(incoming, expected_manifest):
     require(all(not (base / name).exists() and not (base / name).is_symlink()
                 for base in UNIT_BASES for name in (UNIT, UNIT + '.d')), 'guardian unit override refused')
     no_links(ROOT.parent)
+    account = None
+    if authenticated:
+        # Refuse before ANY state exists: wrong volume/swap, preexisting target or fallback
+        # store. The secret has not been read yet; stdin is accepted only after the
+        # guardian below is armed.
+        harden_secret_process()
+        account = auth_account()
+        auth_volatile()
+        auth_fallbacks_absent(account.pw_uid)
+        require(not os.path.lexists(AUTH_DIR), 'preexisting credential path refused')
     ROOT.mkdir(mode=0o700)
     for name, item in table['files'].items():
         raw = regular(incoming / name, item['bytes'], uid)
@@ -477,6 +757,10 @@ def bootstrap(incoming, expected_manifest):
         exclusive(ROOT / name, raw)
     exclusive(ROOT / 'manifest.json', encoded(table))
     exclusive(ROOT / 'phase.json', encoded({'phase': 'stage'}))
+    if authenticated:
+        # Arms guardian gate and every cleanup path BEFORE a credential can exist.
+        exclusive(ROOT / AUTH_INTENT, encoded({'schema': 1, 'nonce': value['nonce'],
+                                               'uid': account.pw_uid, 'gid': account.pw_gid}))
     exclusive(UNIT_PATH, regular(ROOT / UNIT, MAX_SOURCE, 0), 0o644)
     no_links(RUNTIME_DROPIN.parent)
     RUNTIME_DROPIN.mkdir(mode=0o755)
@@ -504,6 +788,10 @@ def bootstrap(incoming, expected_manifest):
         fields = dict(line.split('=', 1) for line in observed.decode().splitlines())
         require(fields == {'MainPID': str(started['guardian_pid']), 'ActiveState': 'active'},
                 'original guardian process not active')
+        if authenticated:
+            # The guardian is running, bound and blocked at its ready gate, and its
+            # ExecStopPost cleanup is armed: only now is the secret accepted/usable.
+            auth_install(value, auth_read_input())
     except BaseException:
         # The fixed unit's ExecStopPost owns containment even if startup reply
         # was lost. Do not delete the reservation or retry a bootstrap.
@@ -511,6 +799,11 @@ def bootstrap(incoming, expected_manifest):
             run([SYSTEMCTL, 'stop', UNIT], clock, 'stage', 30)
         except BaseException:
             pass
+        if authenticated:
+            try:
+                auth_remove()  # idempotent; the primary failure below stays primary
+            except BaseException:
+                pass
         raise
 
 
@@ -662,6 +955,12 @@ def containment():
                 ok = ok and code == 0 and b'ActiveState=inactive\n' in out and b'SubState=dead\n' in out
         except BaseException:
             ok = False
+    # Readers (core/Docker) were stopped above. Always attempted, even after a stop
+    # failure: removal is protective. Uncertainty withholds containment, never VM disposal.
+    try:
+        auth_remove()
+    except BaseException:
+        ok = False
     require(ok, 'exact service containment uncertain')
 
 
@@ -737,6 +1036,9 @@ def guardian():
         # window; no provisioning starts before the guardian checks it.
         beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
         require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
+        # Armed credential gate: no worker/provisioning until bootstrap published the
+        # verified credential, within a bounded wait. Expiry fails closed into cleanup.
+        auth_gate(value, clock)
         operation = 'worker-spawn'
         child = subprocess.Popen([PYTHON, str(ROOT / 'vlab_trial.py'), 'worker'],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1129,6 +1431,10 @@ INSTALL_OPERATIONS = {'install-qemu.py': 'install-qemu', 'install-docker.py': 'i
 def provision(value):
     clock = Clock(value)
     require(own_cgroup() == '0::/system.slice/' + UNIT, 'worker requires original active guardian cgroup')
+    if auth_armed():
+        # Defense in depth behind the guardian gate: provisioning needs the verified credential.
+        mark('stage', 'auth-check')
+        auth_verify(value)
     mark('stage', 'account-policy')
     set_phase(clock, 'stage')
     user = pwd.getpwnam('ubuntu')
@@ -1194,10 +1500,19 @@ def provision(value):
     core_call('prepare', clock, 'stage', ['--input', str(ROOT / 'core-contract.json')], 120)
     mark('stage', 'prestart-audit')
     offline_observations(core, clock)
+    if auth_armed():
+        auth_verify(value)  # config and absence of fallback stores re-proved immediately before acquisition
     # A phase transition is labelled with the first operation of the new phase.
     mark('fresh', 'core-start-fresh')
     set_phase(clock, 'fresh')
     core_call('start-fresh', clock, 'fresh')
+    if auth_armed():
+        # Acquisition is complete: remove and positively verify absence BEFORE strict checks,
+        # stop, resume or success. A failure here is the primary failure; guardian retries.
+        mark('fresh', 'auth-remove')
+        auth_remove()
+        auth_absent()
+        exclusive(ROOT / AUTH_REMOVED, encoded({'schema': 1, 'nonce': value['nonce']}))
     mark('strict', 'strict-inspect')
     set_phase(clock, 'strict')
     before = strict_checks(core, clock, 'strict')
@@ -1211,6 +1526,8 @@ def provision(value):
     mark('resume', 'core-activate-resume')
     core_call('activate-resume', clock, 'resume', cap=120)
     mark('resume', 'core-start-resume')
+    if auth_armed():
+        auth_absent()  # resume must never see recreated credentials
     core_call('start-resume', clock, 'resume', cap=900)
     mark('persistence', 'strict-inspect')
     set_phase(clock, 'persistence')

@@ -9,6 +9,8 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/hhfab
 UMask=0077
+# hhfab reads the transient GHCR registry credential (#378): no core file may capture it.
+LimitCORE=0
 StandardInput=null
 LogNamespace=labapp-vlab
 StandardOutput=journal
