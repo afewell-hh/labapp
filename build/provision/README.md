@@ -650,14 +650,19 @@ over 4096 bytes. No child text, snippet, argument, environment, path, hash or
 dynamic key is emitted, and a missing or invalid observation prints
 `observation=unavailable`. Parsing keeps at most 24 prefix bytes and does linear
 work per read block, so CR-heavy, binary or very long records stay bounded. A
-failing observer is dropped without changing the refusal or the child cleanup.
+failing observer (including ordinary construction failures) is dropped without
+changing the refusal or the child cleanup. Observer interruption still propagates
+after cleanup attempts.
 
 On any primary failure the supervisor still attempts group `SIGKILL`, leader wait
 and pipe close, and the primary failure is preserved if one of those steps also
-fails; cleanup failure after an apparent success still fails. Leader reap does
-not prove that the whole session or every descendant is gone, and a child that
+fails, including interruption during a cleanup step; subsequent steps are still
+attempted. Cleanup failure or interruption after an apparent success still fails.
+Leader reap does not prove that the whole session or every descendant is gone, and a child that
 leaves its process group or sits in uninterruptible sleep is not preempted.
 Tests: `python3 -m unittest discover -s build/provision -p test_qemu.py -v`.
+CI requires this file and the nonempty `OverflowObservationTests` class to be
+discovered and rejects skipped tests.
 
 ### Explicit historical QEMU selection
 

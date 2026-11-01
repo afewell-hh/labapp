@@ -103,16 +103,18 @@ def _reap(proc):
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    except Exception as exc:
+    except BaseException as exc:
         failure = exc
     try:
         proc.wait(timeout=2)
-    except Exception as exc:
-        failure = failure or exc
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
     try:
         proc.stdout.close()
-    except Exception as exc:
-        failure = failure or exc
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
     return failure
 
 
@@ -123,14 +125,20 @@ def bounded(args, seconds, limit=1024 * 1024, env=None, on_start=None, observe=F
     overflow Refusal. They cover only output read through the cutoff."""
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=env, start_new_session=True)
-    output = bytearray()
-    started = time.monotonic()
-    deadline = started + seconds
-    observer = _Observer() if observe else None
     failed = False
     try:
-        # Keep observation inside the cleanup boundary: a failing observer must
-        # never strand the child just launched above. Existing callers unchanged.
+        # Every post-spawn initialization is inside the cleanup boundary.
+        output = bytearray()
+        started = time.monotonic()
+        deadline = started + seconds
+        observer = None
+        if observe:
+            try:
+                observer = _Observer()
+            except Exception:
+                # Ordinary diagnostic failures only drop optional observations.
+                # Interruptions still propagate through child cleanup below.
+                pass
         if on_start is not None:
             on_start(proc.pid)
         with selectors.DefaultSelector() as select:

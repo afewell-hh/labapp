@@ -388,13 +388,35 @@ class OverflowObservationTests(unittest.TestCase):
         self.assertEqual(data['outcome'], 'overflow')
 
     def test_crossing_block_is_observed_but_never_retained(self):
-        # One 1000-byte write is below PIPE_BUF, so it arrives as one read block.
+        # Pipe writes need not arrive as one read; assert only cutoff invariants.
         data = self.overflow('import os; os.write(1, b"x" * 1000)', 100)
-        self.assertEqual((data['retained_bytes'], data['observed_bytes'], data['blocks']), (0, 1000, 1))
+        self.assertLessEqual(data['retained_bytes'], 100)
+        self.assertGreater(data['observed_bytes'], 100)
+        self.assertLessEqual(data['observed_bytes'], 1000)
+        self.assertGreaterEqual(data['blocks'], 1)
+        self.assertLessEqual(data['observed_bytes'] - data['retained_bytes'], hhfab_release.READ_BLOCK)
         data = self.overflow('import os,time\nfor _ in range(30):\n os.write(1, b"y" * 500); time.sleep(.01)', 1200)
         self.assertLessEqual(data['retained_bytes'], 1200)
         self.assertGreater(data['observed_bytes'], 1200)
         self.assertLessEqual(data['observed_bytes'] - data['retained_bytes'], hhfab_release.READ_BLOCK)
+
+    def test_controlled_crossing_read_counts_the_whole_rejected_block(self):
+        # Exact read blocks are controlled here, independently of pipe scheduling.
+        proc = Mock(pid=42)
+        selector = Mock()
+        selector.__enter__ = Mock(return_value=selector)
+        selector.__exit__ = Mock(return_value=False)
+        selector.get_map.return_value = {3: object()}
+        selector.select.return_value = [(Mock(fileobj=proc.stdout), 1)]
+        with patch.object(hhfab_release.subprocess, 'Popen', return_value=proc), \
+             patch.object(hhfab_release.selectors, 'DefaultSelector', return_value=selector), \
+             patch.object(hhfab_release.os, 'read', side_effect=[b'a' * 60, b'b' * 30, b'c' * 20]) as read, \
+             patch.object(hhfab_release.os, 'killpg'):
+            data = self.overflow('unused controlled child', 100)
+        self.assertEqual((data['retained_bytes'], data['observed_bytes'], data['blocks']), (90, 110, 3))
+        self.assertEqual(read.call_count, 3)
+        proc.wait.assert_called_once_with(timeout=2)
+        proc.stdout.close.assert_called_once_with()
 
     def test_fragmented_combined_stdout_stderr_counts_records_not_fragments(self):
         program = ('import os\nfor _ in range(40):\n os.write(1, b"Ge"); os.write(2, b"t:1 par"); '
@@ -475,6 +497,62 @@ class OverflowObservationTests(unittest.TestCase):
         kill.assert_called_once_with(42, signal.SIGKILL)
         proc.wait.assert_called_once_with(timeout=2)
         proc.stdout.close.assert_called_once_with()
+
+    def test_observer_constructor_failure_or_interrupt_cannot_strand_spawned_child(self):
+        original_spawn = subprocess.Popen
+        for failure in (RuntimeError('observer constructor secret'), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                owned = []
+                def spawn(*args, **kwargs):
+                    proc = original_spawn(*args, **kwargs)
+                    owned.append(proc)
+                    return proc
+                with patch.object(hhfab_release.subprocess, 'Popen', side_effect=spawn), \
+                     patch.object(hhfab_release, '_Observer', side_effect=failure):
+                    if isinstance(failure, KeyboardInterrupt):
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            self.child('import time; time.sleep(10)')
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        with self.assertRaises(Refusal) as caught:
+                            self.child('import os; os.write(1, b"x" * 2000)', limit=100)
+                        self.assertEqual((str(caught.exception), caught.exception.observation),
+                                         ('command output overflow', None))
+                        self.assertEqual(self.module['_overflow_observation'](caught.exception.observation), UNAVAILABLE)
+                self.assertEqual(len(owned), 1)
+                self.assertIsNotNone(owned[0].returncode)
+                self.assertTrue(owned[0].stdout.closed)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(owned[0].pid, 0)
+
+    def test_cleanup_interrupt_at_each_step_preserves_primary_and_attempts_all_steps(self):
+        for step in ('kill', 'wait', 'close'):
+            for primary in (None, Refusal('primary')):
+                with self.subTest(step=step, primary=primary is not None):
+                    interrupted = KeyboardInterrupt()
+                    proc = Mock(pid=42)
+                    # The first wait is the successful command result when there
+                    # is no primary; cleanup gets its own subsequent wait.
+                    proc.wait.return_value = 0
+                    if step == 'wait':
+                        proc.wait.side_effect = [interrupted] if primary is not None else [0, interrupted]
+                    proc.stdout.close.side_effect = interrupted if step == 'close' else None
+                    selector = Mock()
+                    selector.__enter__ = Mock(return_value=selector)
+                    selector.__exit__ = Mock(return_value=False)
+                    selector.get_map.return_value = {}
+                    start = Mock(side_effect=primary) if primary is not None else None
+                    with patch.object(hhfab_release.subprocess, 'Popen', return_value=proc), \
+                         patch.object(hhfab_release.selectors, 'DefaultSelector', return_value=selector), \
+                         patch.object(hhfab_release.os, 'killpg',
+                                      side_effect=interrupted if step == 'kill' else None) as kill:
+                        with self.assertRaises(type(primary) if primary is not None else KeyboardInterrupt) as caught:
+                            bounded(['/controlled'], 3, on_start=start, observe=True)
+                    self.assertIs(caught.exception, primary if primary is not None else interrupted)
+                    kill.assert_called_once_with(42, signal.SIGKILL)
+                    self.assertEqual(proc.wait.call_count, 1 if primary is not None else 2)
+                    proc.wait.assert_called_with(timeout=2)
+                    proc.stdout.close.assert_called_once_with()
 
     def test_cleanup_failure_after_apparent_success_still_fails(self):
         with patch('hhfab_release.os.killpg', side_effect=PermissionError('uncertain')):
