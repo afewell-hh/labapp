@@ -1738,6 +1738,59 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   dashes> _SYSTEMD_INVOCATION_ID=<frozen> _SYSTEMD_UNIT=<fixed unit>` (at most 8 KiB,
   8 s). It remains allowed when the manager forgot the unit, and there is no unit-only
   fallback or history search. Success is never assumed from missing `ExecMain*`.
+* **Bundle schema 2 and `unit_ready` (issue #390).** The bundle schema is now `2` (state,
+  host envelope and public result schemas are unchanged). The shared guest/host validator
+  accepts only schema 2; there is no legacy schema-1 fallback because host and source are
+  pinned together. A new exactly typed private section `unit_ready` is
+  `{status, message, code}`: only `status=ok` carries a validated message (printable ASCII,
+  1..128) and strict integer code (0..255); `unavailable` and `invalid` require null
+  message and null code. It is a diagnostic observation inside the existing 32 KiB serialized
+  cap, with unchanged primary/command-context/manager/journal bounds, one manager and one
+  journal query, the shared 10 s capture/reap budget and the 35 s cleanup.
+  * **Record.** `unit-ready` writes one fixed root-private
+    `/var/lib/labapp-vlab-core/unit-ready-failure.json` (at most 1024 bytes, root 0600, single
+    link, root 0700 directory) using the same exclusive temp + `link()` first-writer pattern:
+    it never overwrites, adopts, retries or deletes a stale record or stale temp file. Exactly 12 keys:
+    `schema` (1, this record's own), `source` (`vlab_core`), `action` (`unit-ready`), `nonce`,
+    `mode`, `operation`, `invocation`, `boot`, `started`, `deadline`, `message`, `code`. There is
+    no argv, command output, raw exception or `repr`, credential, step/kind, wall-clock timestamp
+    or public notice. A `Failure` originating in this source keeps its text only if it is
+    printable ASCII 1..128 with a strict integer code 0..255 (the outer status is unchanged);
+    any other exception, or an unsafe text/code, records only the fixed `operational failure`
+    with code `1`.
+  * **When.** Only at the actual `unit_ready` failure boundary, after the ORIGINAL
+    `startup_snapshot` succeeded and after the readiness locks unwound. Before publishing it
+    revalidates the original nonce, mode, operation, invocation, boot, started and deadline
+    against the current state, the unit's `INVOCATION_ID`, the absence of any owned-stop
+    intent, the original boot and the original absolute operation clock; a failure before the
+    snapshot, an expired clock, a stop intent or any mismatch writes nothing, and authority
+    is never rebuilt from later state. `KeyboardInterrupt`, `SystemExit` and the exact handled
+    `Failure('terminated', 130|143)` are excluded; a genuine child command exiting 130 or 143 is
+    recorded (it has other text) and is not judged by its code alone. No new process, systemd,
+    journal or network query, wait, retry or renewal is made. Any secondary diagnostic error or
+    signal is swallowed, so the same exception and exit status propagate and cleanup is
+    untouched.
+  * **Outer read.** The first-failure capture reads the record ONCE (no wait, no reread) with
+    descriptor and path identity, no-follow/non-blocking open, regular file, root 0600, single
+    link, size, duplicate-key and strict-schema checks, and compares every binding including
+    the clocks to the ORIGINAL reserved operation and the frozen invocation and boot
+    independently (adopting the current invocation alone is not enough). Without all of the
+    original operation, invocation and boot there is no authoritative read. Missing (or late)
+    is `unavailable`; unsafe, changed, malformed or foreign is `invalid`. A reader error
+    never discards the other sections or prevents cleanup.
+  * **Lifetime.** Same as the core `prepared` state and the first-failure bundle: `prepare`
+    refuses an existing root, a failed fresh start cannot be resumed, a successful fresh start
+    writes no failure record, and a later normal resume may record its own. A stale or
+    unsupported-recovery record stays `invalid`/unknown. There is no cleanup, rotation or
+    adoption machinery.
+  * **Meaning and limits.** Missing is unknown. The record is the refusal this process
+    observed, never the initiating cause: the canonical-10 manager evidence showed the post
+    process exiting about 1.013 s before the main process, and the truncated journal kept the
+    hhfab cancellation but not the readiness refusal. Nothing here supports a 20-minute
+    inference or a kubeconfig-race assumption, and no readiness, timeout or retry changed.
+    Offline fixtures use fake commands, clock and files for the real `unit_ready`/`start`/
+    `main`/export/host-accept paths; they are not native systemd scheduling, and filesystem
+    non-preemptibility between the revalidation and the link remains a documented limit.
 * **Budget.** Both queries share one absolute deadline
   `min(start end, now + 10 s)` that includes spawn, I/O, kill/reap and pipe close
   (the last second of each query is held back for containment). If the original

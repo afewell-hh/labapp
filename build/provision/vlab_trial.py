@@ -986,6 +986,7 @@ FAILURE_LIMIT = 32 * 1024
 FAILURE_SECTIONS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
 FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
 FAILURE_STATUS = ('ok', 'truncated', 'unavailable', 'invalid')
+FAILURE_SCHEMA = 2  # first-failure BUNDLE schema only (#390); no legacy schema-1 fallback
 FAILURE_STAGES = ('reserve', 'manager', 'unit', 'final')
 HEX32 = '[0-9a-f]{32}'
 UUID = '[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}'
@@ -999,8 +1000,8 @@ def first_failure_bundle(raw):
     except (ValueError, RecursionError):
         raise Failure('failure bundle JSON refused') from None
     fields = {'schema', 'source', 'nonce', 'mode', 'operation', 'invocation', 'boot', 'stage',
-              'query_cleanup', 'state', 'primary', 'command_context', 'manager', 'journal'}
-    require(type(value) is dict and set(value) == fields and value['schema'] == 1
+              'query_cleanup', 'state', 'primary', 'unit_ready', 'command_context', 'manager', 'journal'}
+    require(type(value) is dict and set(value) == fields and value['schema'] == FAILURE_SCHEMA
             and type(value['schema']) is int and value['source'] == 'vlab_core'
             and value['mode'] in ('fresh', 'resume') and value['stage'] in FAILURE_STAGES
             and value['query_cleanup'] in ('confirmed', 'uncertain'))
@@ -1032,6 +1033,16 @@ def first_failure_bundle(raw):
             require(section['code'] is None or type(section['code']) is int and 0 <= section['code'] < 256)
         if name == 'command_context':
             require(section['label'] == FAILURE_CONTEXT)
+    # #390 observed unit-ready refusal: diagnostic observation, never an initiating cause.
+    ready = value['unit_ready']
+    require(type(ready) is dict and set(ready) == {'status', 'message', 'code'}
+            and ready['status'] in ('ok', 'unavailable', 'invalid'))
+    if ready['status'] == 'ok':
+        require(type(ready['message']) is str and re.fullmatch('[ -~]{1,128}', ready['message'])
+                and type(ready['code']) is int and 0 <= ready['code'] < 256
+                and value['invocation'] is not None and value['stage'] != 'reserve')
+    else:
+        require(ready['message'] is None and ready['code'] is None)
     # Output can exist only for an exact bound identity.
     require(value['manager']['status'] == 'unavailable' or value['invocation'] is not None)
     require(value['command_context']['status'] == 'unavailable' or value['operation'] is not None)

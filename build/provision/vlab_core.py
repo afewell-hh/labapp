@@ -86,6 +86,13 @@ AUX = {'/usr/bin/sudo': 'sudo', '/usr/bin/qemu-img': 'qemu-utils',
 # #368 first-failure bundle: fixed root-private diagnostic, never readiness authority.
 FIRST_FAILURE = 'first-failure.json'
 FIRST_FAILURE_LIMIT = 32 * 1024  # SERIALIZED bytes, enforced after JSON/base64 encoding
+FIRST_FAILURE_SCHEMA = 2         # bundle schema only; state/envelope/public schemas are unchanged
+# #390 observed unit-ready refusal: its own fixed root-private record, never an initiating cause.
+UNIT_READY_FAILURE = 'unit-ready-failure.json'
+UNIT_READY_LIMIT = 1024
+UNIT_READY_KEYS = frozenset(('schema', 'source', 'action', 'nonce', 'mode', 'operation', 'invocation',
+                             'boot', 'started', 'deadline', 'message', 'code'))
+UNIT_READY_FALLBACK = ('operational failure', 1)
 FAILURE_CAPS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
 FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
 SNAPSHOT_SECONDS = 10      # one shared absolute budget for BOTH queries incl. their reaping
@@ -484,12 +491,107 @@ def last_failure_context():
             os.close(fd)
 
 
-def write_first_failure(raw):
-    """First failure wins: link() fails if a bundle already exists, so nothing is overwritten."""
+def valid_unit_ready(record, mode, expected, invocation, boot_id):
+    """Strict closed 12-key record check against ORIGINAL frozen bindings; raises Failure."""
+    require(type(record) is dict and set(record) == UNIT_READY_KEYS
+            and type(record['schema']) is int and record['schema'] == 1
+            and record['source'] == 'vlab_core' and record['action'] == 'unit-ready'
+            and record['mode'] == mode and mode in START_SECONDS, 'unit-ready record refused')
+    for key, wanted in (('nonce', expected.get('nonce')), ('operation', expected.get('operation')),
+                        ('invocation', invocation), ('boot', boot_id)):
+        text = record[key]
+        require(type(text) is str and type(wanted) is str and text == wanted
+                and re.fullmatch(r'[0-9a-f]{32}' if key != 'boot' else r'[0-9a-f-]{36}', text),
+                'unit-ready binding refused')
+    require(boot_id == expected.get('boot'), 'unit-ready boot refused')
+    for key in ('started', 'deadline'):
+        require(type(record[key]) in (int, float) and type(expected.get(key)) in (int, float)
+                and record[key] == expected[key], 'unit-ready clock refused')
+    require(record['deadline'] - record['started'] == START_SECONDS[mode], 'unit-ready clock refused')
+    require(type(record['message']) is str and re.fullmatch(r'[ -~]{1,128}', record['message'])
+            and type(record['code']) is int and 0 <= record['code'] < 256, 'unit-ready text refused')
+
+
+def read_unit_ready(mode, value, invocation, boot_id):
+    """-> (status, message, code). ONE read of the fixed record, never a wait or reread.
+
+    Authority comes only from the ORIGINAL reserved operation (``value``) plus the frozen
+    invocation and boot; without all of them nothing is read. Missing is ``unavailable``;
+    unsafe, changed, malformed or foreign is ``invalid`` (message/code are then null).
+    """
+    unavailable, invalid = ('unavailable', None, None), ('invalid', None, None)
+    if value is None or invocation is None or boot_id is None:
+        return unavailable
+    fd = None
+    try:
+        no_links(ROOT)
+        root = ROOT.lstat()
+        require(stat.S_ISDIR(root.st_mode) and root.st_uid == ROOT_UID
+                and stat.S_IMODE(root.st_mode) == 0o700)
+        path = ROOT / UNIT_READY_FAILURE
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return unavailable
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == ROOT_UID
+                and stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+                and 0 < before.st_size <= UNIT_READY_LIMIT)
+        raw = os.read(fd, UNIT_READY_LIMIT + 1)
+        require(len(raw) == before.st_size and stable_stat(os.fstat(fd)) == stable_stat(before)
+                and stable_stat(path.lstat()) == stable_stat(before))
+        record = json_data(raw)
+        valid_unit_ready(record, mode, value, invocation, boot_id)
+        return 'ok', record['message'], record['code']
+    except BaseException:
+        return invalid
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def record_unit_ready_failure(mode, original, error):
+    """Publish the observed unit-ready refusal once; diagnostic only, caller swallows errors.
+
+    Runs after the readiness locks unwound and only for a failure after the ORIGINAL
+    startup snapshot. Authority is the snapshot, revalidated against current state, the unit
+    environment, the original boot and the original absolute clock; later state is never
+    used to reconstruct a missing snapshot. Handled termination is not a readiness refusal.
+    """
+    if not isinstance(error, Exception):
+        return  # KeyboardInterrupt, SystemExit and other non-Exception interruptions
+    if isinstance(error, Failure) and str(error) == 'terminated' \
+            and type(error.code) is int and error.code in (130, 143):
+        return  # exact handled SIGTERM/SIGINT; a genuine child code 130/143 has other text
+    message, code = UNIT_READY_FALLBACK
+    if isinstance(error, Failure):
+        text = str(error)
+        if re.fullmatch(r'[ -~]{1,128}', text) and type(error.code) is int and 0 <= error.code < 256:
+            message, code = text, error.code
+    current = state()
+    for key in ('schema', 'nonce', 'mode', 'operation', 'invocation', 'boot', 'started', 'deadline'):
+        require(key in current and key in original and type(current[key]) is type(original[key])
+                and current[key] == original[key], 'unit-ready authority changed')
+    require('stopping' not in current, 'owned stop intent present')
+    require(invocation_env() == original['invocation'], 'unit invocation changed')
+    require(original['mode'] == mode and operation_deadline(current) == original['deadline'],
+            'operation clock refused')  # same boot, same duration, not yet expired
+    record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': original['nonce'],
+              'mode': mode, 'operation': original['operation'], 'invocation': original['invocation'],
+              'boot': original['boot'], 'started': original['started'], 'deadline': original['deadline'],
+              'message': message, 'code': code}
+    valid_unit_ready(record, mode, original, original['invocation'], original['boot'])
+    raw = json.dumps(record, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    require(len(raw) <= UNIT_READY_LIMIT, 'unit-ready record overflow')
+    write_first_failure(raw, UNIT_READY_FAILURE)
+
+
+def write_first_failure(raw, name=FIRST_FAILURE):
+    """First failure wins: link() fails if a record already exists, so nothing is overwritten."""
     no_links(ROOT)
     require(ROOT.is_dir() and ROOT.stat().st_uid == ROOT_UID
             and stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'diagnostic root refused')
-    temp, target = ROOT / (FIRST_FAILURE + '.new'), ROOT / FIRST_FAILURE
+    temp, target = ROOT / (name + '.new'), ROOT / name
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, 'wb') as stream:
@@ -570,6 +672,8 @@ def capture_first_failure(mode, value, primary, deadline):
     parts = {'primary': (primary_status, out[-FAILURE_CAPS['primary']:]),
              'command_context': last_failure_context() if operation is not None else ('unavailable', b''),
              'manager': ('unavailable', b''), 'journal': ('unavailable', b'')}
+    # One non-waiting read, bound to the ORIGINAL reservation (not to later state).
+    ready_status, ready_message, ready_code = read_unit_ready(mode, value, invocation, boot_id)
     cleanup = 'confirmed'
     unit = UNIT[mode]
     if invocation is not None:
@@ -598,11 +702,13 @@ def capture_first_failure(mode, value, primary, deadline):
             min(end, time.monotonic() + JOURNAL_SECONDS), FAILURE_CAPS['journal'])
         cleanup = 'uncertain' if result == 'uncertain' else cleanup
         parts['journal'] = (status, raw)
-    header = {'schema': 1, 'source': 'vlab_core', 'nonce': nonce, 'mode': mode, 'operation': operation,
+    header = {'schema': FIRST_FAILURE_SCHEMA, 'source': 'vlab_core', 'nonce': nonce, 'mode': mode,
+              'operation': operation,
               'invocation': invocation, 'boot': boot_id, 'stage': stage, 'query_cleanup': cleanup,
               'state': {'status': state_status, 'phase': token('phase'),
                         'containment': token('containment'), 'service_result': token('service_result')},
               'primary': {'message': message, 'code': code},
+              'unit_ready': {'status': ready_status, 'message': ready_message, 'code': ready_code},
               'command_context': {'label': FAILURE_CONTEXT}, 'manager': {}, 'journal': {}}
     rendered = render_failure(header, parts)
     for name in ('journal', 'primary', 'command_context', 'manager'):
@@ -1495,6 +1601,20 @@ def bridge_ready(deadline, expected=None):
 
 def unit_ready(mode):
     original, deadline = startup_snapshot(mode)
+    try:
+        ready_body(mode, original, deadline)
+    except BaseException as error:
+        # Locks have unwound. Only a failure AFTER the original snapshot reaches here.
+        # Any secondary diagnostic error or signal is swallowed: the same exception
+        # (hence the same status) always propagates, and no cleanup is touched.
+        try:
+            record_unit_ready_failure(mode, original, error)
+        except BaseException:
+            pass
+        raise
+
+
+def ready_body(mode, original, deadline):
     with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         value = state()
         pin = check_live(original, deadline)
