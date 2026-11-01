@@ -32,7 +32,7 @@ Codex does not document an import mechanism, so this file uses plain links;
 ## Read before editing
 
 1. Your task issue and cited sources, using the shared workflow’s scoped parent-reading rules; newer lead comments supersede.
-2. [docs/contributing/agent-workflow.md](docs/contributing/agent-workflow.md): roles, testing, evidence, handoff.
+2. [docs/contributing/agent-workflow.md](docs/contributing/agent-workflow.md): roles, testing, evidence, handoff and [raw GitHub reading recipes](docs/contributing/agent-workflow.md#raw-github-reading-recipes).
 3. `README.md`, `STUDENT_QUICK_START.md`, and the code/docs you will change.
 
 ## Where things are

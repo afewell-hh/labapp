@@ -54,7 +54,7 @@ is never rerun in disguise or answered by widening permissions. Placeholders
 below are `<N>`, `<PR>` and `<comment-id>`:
 
 ```bash
-# Current checkpoint = the BODY up to the first "## " heading (not comments)
+# First current checkpoint section in BODY, ending before the next level-2 heading
 gh issue view <N> --repo afewell-hh/labapp --json body --jq '.body | split("\n## ")[0]'
 # One exact comment, selected by its full URL
 gh issue view <N> --repo afewell-hh/labapp --json comments \
@@ -63,16 +63,16 @@ gh issue view <N> --repo afewell-hh/labapp --json comments \
 gh pr view <PR> --repo afewell-hh/labapp --json headRefOid
 ```
 
-- Read the actual output. Record any denial, truncation, pagination or
-  summarization; an empty filtered result (for example a mistyped URL) is not
-  successful reading.
+- Read the actual output; verify its heading and record are intended/current.
+  Record any denial, truncation, pagination or summarization; an empty filtered
+  result (for example a mistyped URL) is not successful reading.
 - The current checkpoint is the body. Partial or stale comment pagination cannot
   establish latest status.
 - A PR head check does not show its source was read, and WebFetch summaries are
   not raw source. Omissions by an earlier worker remain omissions.
 - These recipes add no approval flow or enforcement and do not make reading
   optional. Exact non-main source and upstream raw-source fetches are not shown
-  by them to work (#290 stays limited); verify each route and report the result.
+  by them to work; verify each route and report the actual result.
 
 ## Research and sources
 
