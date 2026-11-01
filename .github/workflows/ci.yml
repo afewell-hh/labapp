@@ -594,7 +594,35 @@ jobs:
           raise SystemExit(0 if result.wasSuccessful() else 1)
           PYTEST
       - name: Required failure and bounded execution regressions
-        run: python3 -m unittest discover -s build/provision -p test_qemu.py -v
+        run: |
+          test -f build/provision/test_qemu.py
+          python3 -I -B - <<'PYTEST'
+          import os
+          import sys
+          import unittest
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          import test_qemu
+          required_class = getattr(test_qemu, 'OverflowObservationTests', None)
+          if not isinstance(required_class, type) or not issubclass(required_class, unittest.TestCase):
+              raise SystemExit('Required QEMU overflow observation class is absent')
+          loader = unittest.TestLoader()
+          required = loader.loadTestsFromTestCase(required_class)
+          if required.countTestCases() == 0:
+              raise SystemExit('Required QEMU overflow observation class discovered no tests')
+          suite = loader.discover(root, pattern='test_qemu.py')
+          def test_ids(tests):
+              for test in tests:
+                  if isinstance(test, unittest.TestSuite):
+                      yield from test_ids(test)
+                  else:
+                      yield test.id()
+          if suite.countTestCases() == 0 or not set(test_ids(required)).issubset(set(test_ids(suite))):
+              raise SystemExit('Required QEMU tests missing from discovery')
+          print(f'Required QEMU tests: {suite.countTestCases()}; overflow: {required.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PYTEST
       - name: Two fresh unchanged installations and nonroot offline fixture
         run: timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
       - name: Offline data, target drift and downloader ownership regressions

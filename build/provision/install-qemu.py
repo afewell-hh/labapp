@@ -28,6 +28,33 @@ ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
        "DEBIAN_FRONTEND": "noninteractive", "HOME": "/root"}
 
 
+_OBSERVED_LINES = ('get', 'hit', 'ign', 'err', 'w', 'e', 'dpkg', 'other')
+_OBSERVED_NUMBERS = ('cap', 'block', 'deadline_seconds', 'elapsed_ms', 'blocks',
+                     'observed_bytes', 'retained_bytes', 'long_records')
+
+
+def _overflow_observation(data):
+    """Fixed-format counters through the cutoff; never child text, or total output.
+
+    Rebuilt key by key from validated integers/booleans so no other value passes."""
+    def number(value):
+        return type(value) is int and 0 <= value <= 10 ** 12
+    try:
+        if (not isinstance(data, dict) or data.get('outcome') != 'overflow'
+                or not all(number(data.get(key)) for key in _OBSERVED_NUMBERS)
+                or not isinstance(data.get('lines'), dict)
+                or not all(number(data['lines'].get(key)) for key in _OBSERVED_LINES)
+                or type(data.get('unterminated_tail')) is not bool
+                or type(data.get('non_ascii')) is not bool):
+            return ' observation=unavailable'
+        numbers = ' '.join(f'{key}={data[key]}' for key in _OBSERVED_NUMBERS)
+        lines = ' '.join(f'{key}={data["lines"][key]}' for key in _OBSERVED_LINES)
+        return (f' observation=through-cutoff-not-total {numbers} lines[{lines}] '
+                f'unterminated_tail={int(data["unterminated_tail"])} non_ascii={int(data["non_ascii"])}')
+    except Exception:
+        return ' observation=unavailable'
+
+
 def call(args, seconds=10):
     # Labels are public constants, never command arguments, paths or child output.
     command = {
@@ -36,11 +63,13 @@ def call(args, seconds=10):
         '/usr/bin/apt-config': 'apt-config', '/usr/bin/gpgv': 'gpgv',
     }.get(args[0], 'other')
     try:
-        code, out = bounded(args, seconds, env=ENV)
+        code, out = bounded(args, seconds, env=ENV, observe=True)
     except Refusal as exc:
         reason = str(exc)
         if reason not in ('command timeout', 'command output overflow', 'overall deadline exceeded'):
             reason = 'command refused'
+        if reason == 'command output overflow':
+            reason += _overflow_observation(getattr(exc, 'observation', None))
         raise Refusal(f"command={command}: {reason}") from None
     if code:
         raise Refusal(f"command failed: {Path(args[0]).name} code={code!r} output_tail={out[-4096:]!r}")
