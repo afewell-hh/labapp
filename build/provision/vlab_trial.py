@@ -461,6 +461,10 @@ AUTH_GATE_SECONDS = 10
 AUTH_LOCK = 'auth.lock'
 AUTH_CLOSED = 'auth-closed.json'
 AUTH_FILE = 'auth-file.json'
+AUTH_UNLINKED = 'auth-unlinked.json'
+AUTH_DIR_REMOVED = 'auth-directory-removed.json'
+AUTH_OWNER = 0  # root throughout construction and the credential lifetime
+AUTH_ROOT_GID = 0
 AUTH_GUARDIAN = 'auth-guardian.json'
 AUTH_INTENT, AUTH_BOUND, AUTH_READY, AUTH_REMOVED = (
     'auth-intent.json', 'auth-bound.json', 'auth-ready.json', 'auth-removed.json')
@@ -529,8 +533,12 @@ def harden_secret_process():
 
 def auth_account():
     user = pwd.getpwnam('ubuntu')
+    group = grp.getgrgid(user.pw_gid)
     require(user.pw_uid >= 1000 and user.pw_gid != 0 and user.pw_dir == '/home/ubuntu'
-            and user.pw_shell == '/bin/bash', 'unexpected account policy')
+            and user.pw_shell == '/bin/bash' and group.gr_name == 'ubuntu'
+            and set(group.gr_mem) <= {'ubuntu'}
+            and all(other.pw_uid == user.pw_uid or other.pw_gid != user.pw_gid
+                    for other in pwd.getpwall()), 'unexpected account policy')
     return user
 
 
@@ -639,21 +647,37 @@ def auth_publish_check(value, intent):
     auth_open(intent)
 
 
-def auth_bound(intent, info, cleaning=False):
+def auth_bound(intent, info, private=False):
     """The directory is the exact one this run created: recorded identity, owner, mode, volume."""
     bound = data(regular(ROOT / AUTH_BOUND, 4096, 0))
     require(type(bound) is dict and set(bound) == {'schema', 'dev', 'ino', 'uid', 'gid'}
             and (info.st_dev, info.st_ino) == (bound['dev'], bound['ino'])
             and (bound['uid'], bound['gid']) == (intent['uid'], intent['gid'])
-            and ((info.st_uid, info.st_gid) == (intent['uid'], intent['gid'])
-                 or cleaning and (info.st_uid, info.st_gid) == (0, 0))
-            and stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+            and info.st_uid == AUTH_OWNER and stat.S_ISDIR(info.st_mode)
+            and ((info.st_gid == intent['gid'] and stat.S_IMODE(info.st_mode) == 0o750)
+                 or private and info.st_gid in (AUTH_ROOT_GID, intent['gid']) and stat.S_IMODE(info.st_mode) == 0o700)
             and info.st_dev == os.stat(AUTH_MOUNT).st_dev, 'credential directory identity refused')
 
 
-def auth_config_ok(info, intent):
-    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600
-            and (info.st_uid, info.st_gid) == (intent['uid'], intent['gid']))
+def auth_config_ok(info, intent, private=False):
+    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == AUTH_OWNER
+            and ((info.st_gid == intent['gid'] and stat.S_IMODE(info.st_mode) == 0o640)
+                 or private and info.st_gid in (AUTH_ROOT_GID, intent['gid']) and stat.S_IMODE(info.st_mode) == 0o600))
+
+
+def auth_file_binding(descriptor, fd, intent, private=False):
+    """Pin both names to the open descriptors, including metadata, before secret IO."""
+    directory, file_info = os.fstat(descriptor), os.fstat(fd)
+    auth_bound(intent, directory, private=private)
+    current = os.stat(AUTH_DIR, follow_symlinks=False)
+    named = os.stat(AUTH_NAME, dir_fd=descriptor, follow_symlinks=False)
+    receipt = data(regular(ROOT / AUTH_FILE, 4096, 0))
+    require((current.st_dev, current.st_ino) == (directory.st_dev, directory.st_ino)
+            and (named.st_dev, named.st_ino) == (file_info.st_dev, file_info.st_ino)
+            == (receipt['dev'], receipt['ino'])
+            and auth_config_ok(file_info, intent, private=private)
+            and auth_config_ok(named, intent, private=private), 'credential file identity refused')
+    return file_info
 
 
 def auth_install(value, credentials):
@@ -680,33 +704,36 @@ def auth_install_locked(value, credentials, intent):
         # Identity is recorded BEFORE any secret exists, so cleanup can prove ownership.
         exclusive(ROOT / AUTH_BOUND, encoded({'schema': 1, 'dev': info.st_dev, 'ino': info.st_ino,
                                               'uid': user.pw_uid, 'gid': user.pw_gid}))
-        os.fchown(descriptor, user.pw_uid, user.pw_gid)
-        os.fchmod(descriptor, 0o700)
         info = os.fstat(descriptor)
-        auth_bound(intent, info)
+        auth_bound(intent, info, private=True)
         fd = os.open(AUTH_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=descriptor)
         try:
             file_info = os.fstat(fd)
             exclusive(ROOT / AUTH_FILE, encoded({'schema': 1, 'dev': file_info.st_dev,
                                                  'ino': file_info.st_ino}))
-            os.fchown(fd, user.pw_uid, user.pw_gid)  # ownership/mode fixed while still empty
-            os.fchmod(fd, 0o600)
             auth_publish_check(value, intent)
             raw = auth_config(credentials)
             view = memoryview(raw)
             while view:
                 auth_open(intent)
+                auth_file_binding(descriptor, fd, intent, private=True)
                 written = os.write(fd, view)
                 require(written > 0, 'credential write refused')
                 view = view[written:]
             os.fsync(fd)
-            file_info = os.fstat(fd)
+            auth_publish_check(value, intent)
+            auth_file_binding(descriptor, fd, intent, private=True)
+            os.fchown(fd, AUTH_OWNER, user.pw_gid)
+            os.fchmod(fd, 0o640)
+            os.fchown(descriptor, AUTH_OWNER, user.pw_gid)
+            os.fchmod(descriptor, 0o750)
+            auth_publish_check(value, intent)
+            file_info = auth_file_binding(descriptor, fd, intent)
+            exclusive(ROOT / AUTH_READY, encoded({'schema': 1, 'nonce': value['nonce'],
+                                                  'file_ino': file_info.st_ino, 'size': len(raw)}))
         finally:
             os.close(fd)
-        auth_publish_check(value, intent)
-        exclusive(ROOT / AUTH_READY, encoded({'schema': 1, 'nonce': value['nonce'],
-                                              'file_ino': file_info.st_ino, 'size': len(raw)}))
     finally:
         os.close(descriptor)
     auth_verify(value)
@@ -756,7 +783,7 @@ def auth_gate(value, clock):
 def auth_remove():
     """Idempotent removal of exactly the owned directory and config file.
 
-    Absent is success. Anything not provably ours (no binding, replaced directory,
+    Absence of known objects needs positive exact removal receipts. Anything not provably ours (no binding, replaced directory,
     link, extra entry, other owner/mode/link count) is NOT deleted and raises a fixed
     uncertainty failure. Never follows links; deletes only through the bound descriptor.
     """
@@ -784,14 +811,16 @@ def auth_remove_locked(intent):
         descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
     except FileNotFoundError:
         require(not os.path.lexists(AUTH_DIR))
+        if os.path.lexists(ROOT / AUTH_FILE):
+            auth_removal_receipt(AUTH_UNLINKED, AUTH_FILE, intent)
+        if os.path.lexists(ROOT / AUTH_BOUND):
+            auth_removal_receipt(AUTH_DIR_REMOVED, AUTH_BOUND, intent)
         return
     try:
         info = os.fstat(descriptor)
-        auth_bound(intent, info, cleaning=True)
-        # Revoke the reader's directory write permission before examining names.
-        # Retain the bound inode even across a crash during this cleanup.
-        os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, 0o700)
+        auth_bound(intent, info, private=True)
+        if AUTH_NAME not in os.listdir(descriptor) and os.path.lexists(ROOT / AUTH_FILE):
+            auth_removal_receipt(AUTH_UNLINKED, AUTH_FILE, intent)
         foreign = False
         for name in os.listdir(descriptor):
             if name != AUTH_NAME:
@@ -801,9 +830,7 @@ def auth_remove_locked(intent):
             require(type(receipt) is dict and set(receipt) == {'schema', 'dev', 'ino'}
                     and receipt['schema'] == 1)
             entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            owned = auth_config_ok(entry, intent) or (
-                stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
-                and stat.S_IMODE(entry.st_mode) == 0o600 and entry.st_uid == 0 and entry.st_size == 0)
+            owned = auth_config_ok(entry, intent, private=True)
             if owned and (entry.st_dev, entry.st_ino) == (receipt['dev'], receipt['ino']):
                 current = os.stat(AUTH_DIR, follow_symlinks=False)
                 fresh = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
@@ -811,20 +838,38 @@ def auth_remove_locked(intent):
                         and (fresh.st_dev, fresh.st_ino, fresh.st_ctime_ns) ==
                         (entry.st_dev, entry.st_ino, entry.st_ctime_ns))
                 os.unlink(name, dir_fd=descriptor)
+                exclusive(ROOT / AUTH_UNLINKED, encoded({'schema': 1, 'nonce': intent['nonce'],
+                                                        'dev': entry.st_dev, 'ino': entry.st_ino}))
             else:
                 foreign = True
         require(not foreign and not os.listdir(descriptor))
         current = os.stat(AUTH_DIR, follow_symlinks=False)
         require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino))
         os.rmdir(AUTH_DIR)
+        exclusive(ROOT / AUTH_DIR_REMOVED, encoded({'schema': 1, 'nonce': intent['nonce'],
+                                                   'dev': info.st_dev, 'ino': info.st_ino}))
     finally:
         os.close(descriptor)
     require(not os.path.lexists(AUTH_DIR))
 
 
+def auth_removal_receipt(name, binding, intent):
+    """Missing known objects are uncertain without our positive exact removal."""
+    known = data(regular(ROOT / binding, 4096, 0))
+    removed = data(regular(ROOT / name, 4096, 0))
+    require(removed == {'schema': 1, 'nonce': intent['nonce'], 'dev': known['dev'], 'ino': known['ino']},
+            'credential removal unconfirmed')
+
+
 def auth_absent():
     require(not os.path.lexists(AUTH_DIR), 'credential still present')
     if auth_armed():
+        intent = auth_intent()
+        require(os.path.lexists(ROOT / AUTH_CLOSED), 'credential publication still open')
+        if os.path.lexists(ROOT / AUTH_FILE):
+            auth_removal_receipt(AUTH_UNLINKED, AUTH_FILE, intent)
+        if os.path.lexists(ROOT / AUTH_BOUND):
+            auth_removal_receipt(AUTH_DIR_REMOVED, AUTH_BOUND, intent)
         auth_fallbacks_absent(auth_account().pw_uid)
 
 

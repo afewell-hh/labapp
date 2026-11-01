@@ -1564,12 +1564,22 @@ Source contract (new synthetic tests are written but unrun; no guest proof):
   The worker re-verifies before any package action and again immediately before
   `start-fresh`.
 * **Location and identity.** Fixed `/run/labapp-vlab-docker` (`DOCKER_CONFIG`),
-  directory `0700` and `config.json` `0600`, owned by actual `ubuntu` uid/gid, created
-  without following links, `mkdir` refusing preexisting paths. The directory identity
-  (device, inode, owner) is recorded in root-private `auth-bound.json` BEFORE the
+  constructed root-private (`0700` directory, `0600` file) and kept root-owned for
+  its entire lifetime. After writing, root grants only read/search to the actual
+  `ubuntu` primary group: root:ubuntu directory `0750`, config `0640`. The primary
+  group must be named `ubuntu`, have no other named members and be no other
+  account's primary group. The reader receives no directory or file write access,
+  so it cannot rename, replace or chmod the original objects. No ACL dependency or
+  writable Docker login store is needed: this is a read-only client config.
+  Paths are created without following links, `mkdir` refusing preexisting paths. The directory identity
+  (device, inode, intended reader identity) is recorded in root-private `auth-bound.json` BEFORE the
   secret exists; `auth-file.json` binds the exact file device/inode before the first
   secret write, including partial writes. File inode and config size are recorded
-  in `auth-ready.json`; no secret value or digest enters root records. `vlab_core.SAFE_ENV`
+  in `auth-ready.json`; no secret value or digest enters root records.
+  Open descriptors are checked against current pathnames, exact device/inode,
+  owner, mode and single link before every secret write, before the read grant and
+  before readiness. Protection covers unprivileged reader mutation, not root or
+  an authorized reader copying credentials elsewhere. `vlab_core.SAFE_ENV`
   (which replaces the environment) exports only `DOCKER_CONFIG`; the fresh unit sets
   `LimitCORE=0` for the hhfab readers. These are conventional process limits, not
   a no-disk guarantee: ordinary exec resets dumpability and piped system core
@@ -1587,10 +1597,14 @@ Source contract (new synthetic tests are written but unrun; no guest proof):
   cleanup must acquire that lock and remove its output before proving absence.
   Lock timeout reports uncertainty; cleanup never waits indefinitely. `auth_remove`
   is idempotent and identity checked: it deletes only the bound
-  directory's single regular, single-link, `0600`, exact-owner `config.json` through the
+  directory's single regular, single-link, root-owned `config.json` through the
   open directory descriptor, after matching the file's exact device/inode receipt
-  and freshly validating current names, then the bound directory. Cleanup revokes
-  the reader's directory write access while removing entries. Any link, extra entry, replacement,
+  and freshly validating current names, then the bound directory. Cleanup accepts
+  the exact private construction modes or final read-only modes. It writes exact
+  nonce/device/inode unlink and directory-removal receipts only after those actions.
+  A known file or directory disappearing without its matching positive receipt is
+  uncertain, including an unexpectedly empty directory; absence alone never proves
+  removal of a published object. Any link, extra entry, replacement,
   wrong owner/mode/link count or missing binding is NOT deleted; it raises a fixed
   `credential cleanup uncertain` failure (`cleanup_uncertain`). An interruption
   before an identity receipt becomes durable leaves an unbound object untouched

@@ -1377,6 +1377,7 @@ CANARY_TOKEN = 'ghp_SYNTHETIC_CANARY_0123456789'
 CREDS = {'schema': 1, 'registry': 'ghcr.io', 'username': CANARY_USER, 'token': CANARY_TOKEN}
 REAL_AUTH_READ = trial.auth_read_input
 REAL_AUTH_DIR = trial.AUTH_DIR
+REAL_AUTH_ACCOUNT = trial.auth_account
 
 
 class TransientRegistryAuth(unittest.TestCase):
@@ -1405,6 +1406,10 @@ class TransientRegistryAuth(unittest.TestCase):
                                   ('AUTH_HOME', self.home), ('MOUNTINFO', self.mountinfo), ('SWAPS', self.swaps)):
             self.stack.enter_context(patch.object(trial, name, replacement))
         self.stack.enter_context(patch.object(trial, 'auth_account', return_value=self.user))
+        # Native fixtures run unprivileged: only root identity constants are mapped
+        # to the fixture owner; all modes, names, link counts and inode checks run.
+        self.stack.enter_context(patch.object(trial, 'AUTH_OWNER', os.getuid()))
+        self.stack.enter_context(patch.object(trial, 'AUTH_ROOT_GID', os.getgid()))
         self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']))
         self.stack.enter_context(patch.object(trial, 'guardian_processes', return_value={b'999999'}))
         self.stack.enter_context(patch.object(trial, 'auth_lock_ok', side_effect=lambda info:
@@ -1579,12 +1584,15 @@ class TransientRegistryAuth(unittest.TestCase):
                 else: self.dir.unlink()
 
     # -- install / verify / remove ------------------------------------------------
-    def test_install_creates_exact_ubuntu_owned_minimal_config_and_no_root_secret(self):
+    def test_install_creates_root_controlled_ubuntu_readonly_minimal_config(self):
         self.install()
         info, config = self.dir.stat(), self.dir / 'config.json'
-        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid), (0o700, os.getuid(), os.getgid()))
+        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid), (0o750, trial.AUTH_OWNER, self.user.pw_gid))
         file_info = config.stat()
-        self.assertEqual((stat.S_IMODE(file_info.st_mode), file_info.st_nlink, file_info.st_uid), (0o600, 1, os.getuid()))
+        self.assertEqual((stat.S_IMODE(file_info.st_mode), file_info.st_nlink, file_info.st_uid), (0o640, 1, trial.AUTH_OWNER))
+        self.assertEqual(file_info.st_gid, self.user.pw_gid)
+        self.assertEqual(stat.S_IMODE(info.st_mode) & 0o027, 0)
+        self.assertEqual(stat.S_IMODE(file_info.st_mode) & 0o137, 0)
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ['config.json'])
         self.assertEqual(json.loads(config.read_bytes()), self.expected_config())
         for name in (trial.AUTH_INTENT, trial.AUTH_BOUND, trial.AUTH_READY):
@@ -1592,13 +1600,77 @@ class TransientRegistryAuth(unittest.TestCase):
         self.assert_secret_only_in_config()
         trial.auth_verify(self.v)
 
+    def test_account_requires_an_exclusive_ubuntu_primary_group(self):
+        user = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_dir='/home/ubuntu', pw_shell='/bin/bash')
+        group = SimpleNamespace(gr_name='ubuntu', gr_mem=[])
+        with patch.object(trial.pwd, 'getpwnam', return_value=user), \
+             patch.object(trial.grp, 'getgrgid', return_value=group), \
+             patch.object(trial.pwd, 'getpwall', return_value=[user]) as accounts:
+            self.assertIs(REAL_AUTH_ACCOUNT(), user)
+            group.gr_mem = ['other']
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+            group.gr_mem = []
+            accounts.return_value = [user, SimpleNamespace(pw_uid=1002, pw_gid=1001)]
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+            accounts.return_value = [user]
+            group.gr_name = 'shared'
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+
+    def test_prewrite_name_or_mode_mutation_is_detected_before_any_secret_write(self):
+        real_config = trial.auth_config
+        for mutation in ('file-rename', 'directory-rename', 'chmod'):
+            with self.subTest(mutation):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                moved = self.base / ('moved-' + mutation)
+                self.arm()
+                def mutate(credentials):
+                    self.assertEqual(stat.S_IMODE(self.dir.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE((self.dir / trial.AUTH_NAME).stat().st_mode), 0o600)
+                    if mutation == 'file-rename':
+                        (self.dir / trial.AUTH_NAME).rename(moved)
+                    elif mutation == 'directory-rename':
+                        self.dir.rename(moved)
+                    else:
+                        (self.dir / trial.AUTH_NAME).chmod(0o666)
+                    return real_config(credentials)
+                with patch.object(trial, 'auth_config', side_effect=mutate), \
+                     patch.object(trial, 'manifest', side_effect=lambda value: value), \
+                     patch.object(trial.os, 'write') as write:
+                    with self.assertRaises((trial.Failure, OSError)):
+                        trial.auth_install(self.v, CREDS)
+                write.assert_not_called()
+                self.assertFalse((self.root / trial.AUTH_READY).exists())
+                with self.assertRaises(trial.Failure) as raised:
+                    trial.auth_remove()
+                self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assert_secret_only_in_config()  # even the moved object has no canary
+
+    def test_known_file_or_directory_disappearance_is_uncertain_without_unlink_receipts(self):
+        for missing in ('file', 'directory'):
+            with self.subTest(missing):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.install()
+                moved = self.base / ('lost-' + missing)
+                source = self.dir / trial.AUTH_NAME if missing == 'file' else self.dir
+                source.rename(moved)
+                for _ in range(2):
+                    with self.assertRaises(trial.Failure) as raised:
+                        trial.auth_remove()
+                    self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assertFalse((self.root / trial.AUTH_UNLINKED).exists())
+                survivor = moved if missing == 'file' else moved / trial.AUTH_NAME
+                self.assertEqual(json.loads(survivor.read_bytes()), self.expected_config())
+                self.assertFalse((self.root / trial.AUTH_DIR_REMOVED).exists())
+
     def test_verify_fails_closed_on_every_mutable_identity_or_content_change(self):
         def extra(config): (self.dir / 'extra').write_text('x')
         def link(config): config.unlink(); config.symlink_to(self.base / 'elsewhere')
         def replace(config): config.unlink(); config.write_text('{}')  # new identity, plausible owner/mode
         def hardlink(config): os.link(config, self.base / 'second-name')
-        def mode(config): config.chmod(0o640)
-        def dirmode(config): self.dir.chmod(0o750)
+        def mode(config): config.chmod(0o660)
+        def dirmode(config): self.dir.chmod(0o770)
         def swap(config): self.swap(True)
         def fallback(config): (self.home / '.dockercfg').write_text('x')
         def other_nonce(config): self.v['nonce'] = 'f' * 32
@@ -1626,6 +1698,8 @@ class TransientRegistryAuth(unittest.TestCase):
         self.install()
         trial.auth_remove()
         trial.auth_absent()
+        for name in (trial.AUTH_UNLINKED, trial.AUTH_DIR_REMOVED):
+            self.assertTrue((self.root / name).exists())
         trial.auth_remove()  # repeated cleanup is safe
         trial.auth_absent()
         self.assert_secret_only_in_config()
@@ -1650,8 +1724,8 @@ class TransientRegistryAuth(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.dir))
 
     def test_interruption_after_create_file_write_or_ready_is_exactly_cleanable(self):
-        real_exclusive, real_write = trial.exclusive, os.write
-        for point in ('directory', 'file', 'write', 'ready'):
+        real_exclusive, real_write, real_chmod = trial.exclusive, os.write, os.fchmod
+        for point in ('directory', 'file', 'write', 'file-grant', 'directory-grant', 'ready'):
             with self.subTest(point):
                 shutil.rmtree(self.root, ignore_errors=True)
                 shutil.rmtree(self.dir, ignore_errors=True)
@@ -1666,8 +1740,14 @@ class TransientRegistryAuth(unittest.TestCase):
                     if point == 'write':
                         raise KeyboardInterrupt()
                     return result
+                def chmod(fd, mode):
+                    real_chmod(fd, mode)
+                    if (point == 'file-grant' and mode == 0o640
+                            or point == 'directory-grant' and mode == 0o750):
+                        raise KeyboardInterrupt()
                 with patch.object(trial, 'exclusive', side_effect=receipt), \
                      patch.object(trial.os, 'write', side_effect=write), \
+                     patch.object(trial.os, 'fchmod', side_effect=chmod), \
                      patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(KeyboardInterrupt):
                     trial.auth_install(self.v, CREDS)
                 trial.auth_remove()
@@ -1766,7 +1846,7 @@ class TransientRegistryAuth(unittest.TestCase):
                 elif name == 'regular-replacement':
                     config.rename(self.base / 'old-config')  # keep old inode allocated
                     config.write_text('PUBLIC-FOREIGN-CONFIG')
-                    config.chmod(0o600)
+                    config.chmod(0o640)
                     survivors.append(config)
                 elif name == 'replaced-dir':
                     os.rename(self.dir, self.base / 'old-dir')

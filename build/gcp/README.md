@@ -1481,6 +1481,13 @@ credential store.
   Stdin and the gate share one original cutoff. Cleanup permanently closes
   publication before bounded lock acquisition; a late bootstrap cannot recreate
   auth after clean absence. Exact file device/inode receipts precede secret writes.
+  Construction stays root-private. The finished config remains root-owned,
+  with directory `0750` and file `0640` granting the validated exclusive `ubuntu`
+  primary group only search/read access. The reader cannot rename or chmod the
+  original objects. Descriptor/name/metadata checks precede writes and readiness;
+  missing known objects require positive exact unlink/removal receipts before
+  cleanup can claim success. This does not prevent root mutation or an authorized
+  reader copying a token.
 * **Receipt/limits.** The receipt format is unchanged: cleanup uncertainty surfaces as
   the guardian's `contained: false` (withholding clean success) and never skips VM
   disposal or the independent cleanup dispatch. Removal does not prove the registry
