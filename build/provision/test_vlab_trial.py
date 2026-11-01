@@ -2484,9 +2484,9 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
     not show native systemd, journald or VLAB behaviour, and the native refusal stays unknown.
     """
     RESUME = {'origin': 'worker', 'phase': 'resume', 'operation': 'core-start-resume',
-              'category': 'child-exit', 'child_status': 1}
+              'category': 'child-exit', 'child_status': 17}
     FRESH = {'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker',
-             'category': 'child-exit', 'child_status': 1}
+             'category': 'child-exit', 'child_status': 17}
     RESUME_INVOCATION = 'd' * 32
 
     def setUp(self):
@@ -2506,7 +2506,7 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
         (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
         reader = trial.regular
         self.stack.enter_context(patch.object(trial, 'regular', side_effect=(
-            lambda p, n, uid=None, mode=None: reader(p, n, None if uid == 0 else uid, mode))))
+            lambda p, n, uid=None, mode=None: reader(p, n, os.getuid() if uid == 0 else uid, mode))))
         for target, name, replacement in ((trial, 'ROOT', self.root),
                                           (trial, 'kernel_boot', lambda: self.v['boot_uuid']),
                                           (vlab_core, 'boot', lambda: self.v['boot_uuid']),
@@ -2517,7 +2517,8 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
         return patch.object(self.core, 'unit_ready', side_effect=self.core.Failure('synthetic ready failure', 17))
 
     def terminal(self, detail, **record):
-        body = {'schema': 2, 'code': 1, 'contained': True, 'nonce': NONCE, 'diagnostic': detail, **record}
+        body = {'schema': 2, 'code': detail['child_status'], 'contained': True,
+                'nonce': NONCE, 'diagnostic': detail, **record}
         path = self.root / 'result.json'
         path.unlink(missing_ok=True)
         path.write_bytes(trial.encoded(body))
@@ -2550,6 +2551,7 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
         bundle = trial.first_failure_bundle(written)
         self.assertEqual((bundle['mode'], bundle['operation'], bundle['invocation']),
                          ('resume', failed['operation'], self.RESUME_INVOCATION))
+        self.assertEqual(bundle['primary']['code'], 17)
         self.terminal(self.RESUME)
         raw = trial.export_failure(NONCE)
         first, _, rest = raw.partition(b'\n')
@@ -2573,7 +2575,7 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
             'resume phase, other operation': lambda: self.terminal(dict(self.RESUME, operation='core-stop')),
             'guardian-origin diagnostic': lambda: self.terminal({
                 'origin': 'guardian', 'phase': 'resume', 'operation': 'worker-supervision',
-                'category': 'child-signal', 'child_status': 9}, code=119),
+                'category': 'child-signal', 'child_status': -9}, code=137),
             'foreign nonce': lambda: self.terminal(self.RESUME, nonce='9' * 32),
             'success record': lambda: (self.root / 'result.json').write_bytes(trial.encoded(success)),
             'malformed JSON': lambda: (self.root / 'result.json').write_bytes(b'{"schema":2'),
@@ -2587,6 +2589,9 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
                 if prepare:
                     prepare()
                     (self.root / 'result.json').chmod(0o600)
+                if name == 'guardian-origin diagnostic':
+                    record = trial.result_record(trial.data((self.root / 'result.json').read_bytes()), NONCE)
+                    self.assertEqual((record['code'], record['diagnostic']['origin']), (137, 'guardian'))
                 self.assertEqual(trial.terminal_mode(NONCE), 'fresh')
                 with self.assertRaises(trial.Failure):
                     trial.export_failure(NONCE)
@@ -2609,6 +2614,61 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
             trial.export_failure(NONCE)
         with self.assertRaises(trial.Failure):
             trial.export_failure('9' * 32)
+
+    def test_unsafe_terminal_file_cannot_authorize_resume(self):
+        self.committed_resume_failure()
+        path = self.root / 'result.json'
+        target = self.root / 'other-result'
+        for unsafe in ('wide mode', 'hard link', 'symlink', 'directory', 'wrong owner'):
+            with self.subTest(unsafe=unsafe), ExitStack() as local:
+                self.terminal(self.RESUME)
+                if unsafe == 'wide mode':
+                    path.chmod(0o640)
+                elif unsafe == 'hard link':
+                    os.link(path, target)
+                elif unsafe == 'symlink':
+                    path.rename(target)
+                    path.symlink_to(target)
+                elif unsafe == 'directory':
+                    path.unlink()
+                    path.mkdir(mode=0o700)
+                else:
+                    original = os.fstat
+                    inode = path.stat().st_ino
+                    def foreign_owner(fd):
+                        info = original(fd)
+                        if info.st_ino != inode:
+                            return info
+                        fields = {name: getattr(info, name) for name in
+                                  ('st_mode', 'st_nlink', 'st_uid', 'st_ino', 'st_size',
+                                   'st_mtime_ns', 'st_ctime_ns')}
+                        return SimpleNamespace(**dict(fields, st_uid=info.st_uid + 1))
+                    local.enter_context(patch.object(os, 'fstat', side_effect=foreign_owner))
+                self.assertEqual(trial.terminal_mode(NONCE), 'fresh')
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+                if unsafe == 'directory':
+                    path.rmdir()
+                else:
+                    path.unlink()
+                target.unlink(missing_ok=True)
+
+    def test_terminal_read_preserves_explicit_signal_failure_and_base_interruptions(self):
+        self.committed_resume_failure()
+        self.terminal(self.RESUME)
+        reader = trial.regular
+        for error in (trial.Failure('signal', 130, 'interrupted'),
+                      trial.Failure('signal', 143, 'interrupted'), KeyboardInterrupt(), SystemExit(143)):
+            def interrupted(path, *args, **kwargs):
+                if path == self.root / 'result.json':
+                    raise error
+                return reader(path, *args, **kwargs)
+            with self.subTest(error=type(error).__name__, code=getattr(error, 'code', None)), \
+                 patch.object(trial, 'regular', side_effect=interrupted):
+                for call in (trial.terminal_mode, trial.export_failure):
+                    with self.assertRaises(type(error)) as caught:
+                        call(NONCE)
+                    self.assertIs(caught.exception, error)
 
     def test_stale_fresh_null_reservation_stays_first_writer_and_is_not_rebound_to_resume(self):
         core, env = self.core, self.env
@@ -2652,8 +2712,9 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
             trial.export_failure(NONCE)
 
     def test_expected_mode_derives_only_from_a_failed_worker_resume_core_start_diagnostic(self):
-        guardian = {'origin': 'guardian', 'phase': 'resume', 'operation': 'core-start-resume',
+        guardian = {'origin': 'guardian', 'phase': 'resume', 'operation': 'worker-supervision',
                     'category': 'exception', 'child_status': None}
+        self.assertEqual(trial.diagnostic(guardian), guardian)
         for detail, expected in ((self.RESUME, 'resume'), (self.FRESH, 'fresh'),
                                  (dict(self.RESUME, operation='core-stop'), 'fresh'),
                                  (dict(trial.SUCCESS), 'fresh'), (None, 'fresh'), (guardian, 'fresh')):

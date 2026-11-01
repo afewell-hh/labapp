@@ -2057,7 +2057,7 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   Limits: a refusal inside the resume reservation (before a new operation commits)
   intentionally captures nothing (`absent`), and a stale first-writer bundle from an
   earlier refused attempt is neither cleared nor rebound, so its export stays refused.
-  The actual canonical12 resume refusal cause remains unknown.
+  Diagnostic export compatibility does not establish the cause of a resume failure.
 
 The diagnostic runner fixtures (`test_vlab_core.py`) mock Popen, waitid, killpg,
 selector/I/O and monotonic time while exercising the actual runner and unchanged

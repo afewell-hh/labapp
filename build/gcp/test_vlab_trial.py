@@ -1908,15 +1908,57 @@ class GuestDiagnostics(unittest.TestCase):
 
     def test_resume_mode_is_frozen_before_supplemental_observation_and_never_from_unvalidated_result(self):
         resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
-        # No valid terminal result at all (bootstrap failure, observation unavailable): fresh-only.
-        private, (code, receipt, _, _) = self.drive([b'absent'], fail_bootstrap=True, private=self.private_dir(), export=resume)
-        self.assertEqual(receipt['private_diagnostic'], 'invalid')
-        self.assertEqual(list(self.private_dir().iterdir()), [])
-        # Invalid (not merely absent) guest result bytes also give no resume authorization.
-        self.setUp()
-        private, (code, receipt, _, _) = self.drive([b'invalid'], fail_bootstrap=True, private=self.private_dir(), export=resume)
-        self.assertEqual(receipt['private_diagnostic'], 'invalid')
+        supplemental = self.encoded(result_value(self.nonce, 17, True, worker_detail(**self.RESUME)))
+        private = self.private_dir()
+        # Bootstrap fails before any primary result is consumed. The real observer
+        # then obtains a VALID resume result, which must remain diagnostic only.
+        code, receipt, trace, _ = self.drive([supplemental], fail_bootstrap=True,
+                                            private=private, export=resume)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']),
+                         (17, 'invalid', False))
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
+        self.assertEqual(receipt['guest_diagnostic_status'], 'valid')
+        self.assertLess(trace.index('read-result'), trace.index('stop'))
         self.assertEqual(list(private.iterdir()), [])
+        for primary in (b'absent', b'invalid'):
+            with self.subTest(primary=primary):
+                self.setUp()
+                private = self.private_dir()
+                # An invalid primary record is consumed before failure; observe_guest does
+                # not replace invalid status, and it cannot authorize resume either.
+                code, receipt, _, _ = self.drive([primary], fail_bootstrap=(primary == b'absent'),
+                                                private=private, export=resume)
+                self.assertEqual(receipt['private_diagnostic'], 'invalid')
+                self.assertEqual(list(private.iterdir()), [])
+
+    def test_resume_query_cleanup_uncertainty_retains_bytes_and_primary_result(self):
+        resume = self.export_bytes(self.failure_bundle(mode='resume', query_cleanup='uncertain'), mode='resume')
+        private, (code, receipt, trace, _) = self.resume_drive(resume)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'invalid', True))
+        self.assertEqual(next(private.iterdir()).read_bytes(), resume)
+        self.assertTrue(all(receipt[k] for k in ('process_absent', 'local_files_absent', 'own_key_absent')))
+        self.assertIn('master-close', trace)
+        self.assertIn('dispatch-cleanup', trace)
+
+    def test_resume_export_interruption_preserves_primary_and_cleanup(self):
+        class ExportAbort(BaseException):
+            cleanup_uncertain = True
+        for error in (KeyboardInterrupt(SENTINEL), SystemExit(143), ExportAbort(SENTINEL)):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.resume_drive(error)
+                self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
+                                 (17, 17, 'unavailable', True))
+                self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
+                self.assertIn('master-close', trace)
+                self.assertIn('dispatch-cleanup', trace)
+                uncertain = getattr(error, 'cleanup_uncertain', False)
+                self.assertEqual(receipt['process_absent'], not uncertain)
+                self.assertEqual(receipt['local_files_absent'], not uncertain)
+                self.assertEqual(receipt['own_key_absent'], not uncertain)
+                self.assertEqual('remove-key' in trace, not uncertain)
+                self.assertEqual(list(private.iterdir()), [])
+                self.assertNotIn(SENTINEL, text)
 
     def private_dir(self):
         private = self.directory / 'private'

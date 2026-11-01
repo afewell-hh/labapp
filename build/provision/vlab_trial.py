@@ -1064,7 +1064,11 @@ def terminal_mode(nonce):
     oversize or invalid record yields 'fresh', so no resume export is authorized from it.
     """
     try:
-        record = result_record(data(regular(ROOT / 'result.json', MAX_RESULT, 0)), nonce)
+        record = result_record(data(regular(ROOT / 'result.json', MAX_RESULT, 0, mode=0o600)), nonce)
+    except Failure as error:
+        if error.category == 'interrupted' and error.code in (130, 143):
+            raise
+        return 'fresh'
     except Exception:
         return 'fresh'
     return terminal_export_mode(record['diagnostic'])
