@@ -29,6 +29,9 @@ separately.
 
 ## Evidence to check
 <!-- Claimed commands/results, cited sources, and whether denied/unrun checks were reported honestly. -->
+<!-- Provenance/coverage: exact head reviewed, whether the handoff lists read
+files/sections/comment IDs and skipped, partial, summarized or truncated
+sources, and whether conclusions that depend on gaps are marked provisional. -->
 
 - (fill in)
 
