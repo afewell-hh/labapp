@@ -1167,6 +1167,50 @@ refusal can leave readiness waiting for the bridge; a later bridge timeout
 does not establish the original cause. Earlier trial causes require their own
 evidence. Neither wrapper exec nor service activation establishes readiness.
 
+Cold-start bridge ordering (#372, researched 2026-10-31). In fabricator
+[v0.43.1](https://github.com/githedgehog/fabricator/tree/v0.43.1) (`pkg/hhfab/`
+`cmdvlab.go`, `cmdbuild.go`, `vlabrunner.go`, `cmdhelpers.go`, `vlabconfig.go`),
+`vlab up` synchronously builds the control installer (installer payload and
+ISO-root downloads) before `VLABRun`; `VLABRun` then prepares taps, where `hhbr` is
+created, and only afterwards prepares the ONIE/Flatcar VM images. So `hhbr`
+legitimately appears only after the cold installer build, which can exceed 60
+seconds; not every download precedes the bridge. `unit-ready` is an `ExecStartPost` of
+a `Type=exec` unit (see
+[systemd.service(5) v255 source](https://github.com/systemd/systemd/blob/v255/man/systemd.service.xml)),
+so it runs while that build is still in progress. In systemd v255
+[`service.c`](https://github.com/systemd/systemd/blob/v255/src/core/service.c) a
+failed start-post action enters the stop path with SIGTERM to the main process,
+as documented for failed `ExecStartPost` commands. The ordering explains why a
+fixed bridge timeout can terminate a legitimate cold build; this is source
+inference, not a native causal proof. The Ubuntu 24.04 systemd patch set was
+not reviewed. Trial findings and execution evidence belong in
+[#372](https://github.com/afewell-hh/labapp/issues/372).
+
+Before the unchanged helper call, `unit-ready` runs a core-only prerequisite poll
+(`bridge_prerequisite`): one bounded read-only `ip -j -d link show dev hhbr`
+per iteration (`BRIDGE_POLL_SECONDS` apart). Only the exact ordinary child
+failure (code 1, `child command failed`, bytes `Device "hhbr" does not exist.`
+plus newline), without executor cleanup uncertainty, is pending; every other result, exit code, timeout, overflow,
+malformed or duplicate JSON, foreign name/kind or non-positive index fails
+closed without retry. Before each probe and again right after a positive
+observation the published state must equal the snapshot exactly, the original
+boot and deadline must validate, and `check_live` must pin the original main
+process. Probes and sleeps are capped at the ORIGINAL operation deadline (no
+renewal, restart or longer allowance). The existing executor retains its separate
+two-second cleanup wait; clipping query work does not bound total cleanup by
+the operation deadline. Final readiness still refuses an expired deadline.
+Pending probes run with `retain=False`
+so they never overwrite `last-command-output`; a genuine probe failure retains
+its own non-empty private bytes, including returned malformed/foreign JSON,
+without replacing the original failure or code. Timeout and
+output-limit failures carry no partial bytes, so the previous diagnostic remains.
+The observed ifindex must equal the one the unchanged helper (wait 60, cap 60)
+then verifies. This comparison detects observed replacement; it is not an atomic
+identity transaction between processes. The unchanged helper contract still
+requires the caller to exclude concurrent link recreation. The final
+post-inspection `bridge_ready` adds no prerequisite poll and
+keeps the helper's existing hard failure; it is not a single-probe claim.
+
 The preliminary startup snapshot binds the original boot and operation deadline
 before any sibling lock wait. The locked reread preserves every field except
 an absent `service` becoming exactly the live invocation/cgroup/PID/start pin;
@@ -1198,7 +1242,12 @@ scheduling and descriptor contract, not a native appliance proof.
 
 The mocked fixtures in `test_vlab_core.py` call actual `unit-ready` through its
 publication and pause at the bridge boundary before/between run snapshots,
-for fresh and resume. Separate cases specify immutable/service/live PID/start
+for fresh and resume. Separate cold-start cases keep the bridge absent beyond
+61 virtual seconds, then complete actual API/inspection/final-bridge checks and
+the locked ready commit under the unchanged original deadline. Final helper
+absence remains a hard failure with no new prerequisite wait. Mocked executor
+cases exercise cleanup uncertainty while preserving the original error and
+private bytes. Separate cases specify immutable/service/live PID/start
 substitutions, full readiness commit consistency, bounded flock contention and
 late acquisition/privilege-drop expiry. These fixtures model source sequencing;
 execution evidence is recorded in CI and issue handoffs. Native systemd scheduling,

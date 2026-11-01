@@ -19,7 +19,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import yaml
 import vlab_core as core
@@ -62,7 +62,7 @@ def public_fab():
                  'management': {'interface': 'enp2s1'}}}]
 
 
-class GuestFixture(unittest.TestCase):
+class GuestEnvironment:
     """All fixed production paths are patched to one owned ephemeral fixture."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='labapp-vlab-core-')
@@ -306,6 +306,8 @@ class GuestFixture(unittest.TestCase):
             return b''
         raise AssertionError('UNINSPECTED CHILD PATH ' + repr(argv))
 
+
+class GuestFixture(GuestEnvironment, unittest.TestCase):
     def test_actual_entrypoint_full_fresh_stop_activate_resume_twice(self):
         initial = self.resumable()
         self.assertEqual(initial['phase'], 'resumable')
@@ -400,6 +402,8 @@ class GuestFixture(unittest.TestCase):
                 with self.assertRaises(ReadyPaused):
                     core.unit_ready(mode)
             self.assertIn('service', core.state())
+            self.assertTrue(any(c[0] == ['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr']
+                                for c in self.calls))
         def change():
             if mutate:
                 current = core.state()
@@ -1644,6 +1648,329 @@ class GuestFixture(unittest.TestCase):
             self.assertEqual(core.state(), value)
 
 
+ABSENT = b'Device "hhbr" does not exist.\n'
+OLD_DIAGNOSTIC = b'OLD-DIAGNOSTIC-' + SENTINEL.encode()
+
+
+def bridge_json(index=42, **link):
+    value = {'ifname': 'hhbr', 'ifindex': index, 'linkinfo': {'info_kind': 'bridge'}}
+    value.update(link)
+    return json.dumps([value]).encode()
+
+
+def absent():
+    return core.Failure('child command failed', 1, ABSENT)
+
+
+class BridgePrerequisiteMixin(GuestEnvironment):
+    """Actual unit_ready and bridge poll; only external commands, identity, clock and sleep are fake.
+
+    The pending probe is distinguished by retain=False. No real child, native command or sleep.
+    """
+    mode = None
+
+    class Stop(BaseException):
+        pass
+
+    def bridge_run(self, answers, changes=(), start_offset=None, *, complete=False,
+                   final_failure=None, final_link=None):
+        """answers: per-probe bytes (stdout) or Failure; the last answer repeats.
+        changes: (probe number, callable) applied while that probe is answered."""
+        self.live = {}
+        self.show_edit = {}
+        self.boot_id = ['12345678-1234-1234-1234-123456789abc']
+        self.probes = 0
+        self.sleeps = []
+        self.helper_count = 0
+        mode = self.mode
+        def identity(fields):
+            core.require(fields['MainPID'] != '0', 'main process absent')
+            return {'invocation': fields['InvocationID'], 'group': fields['ControlGroup'],
+                    'pid': int(fields['MainPID']), 'start': '12345', **self.live}
+        def wrapper(argv, deadline, cap=30, user=False, *, retain=True):
+            if argv[:5] == ['/usr/sbin/ip', '-j', '-d', 'link', 'show'] and retain is False:
+                self.probes += 1
+                for number, change in changes:
+                    if number == self.probes:
+                        change()
+                answer = answers[min(self.probes, len(answers)) - 1]
+                self.calls.append((list(argv), deadline, cap, user))
+                core.remaining(deadline)
+                self.assertEqual(cap, 3)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            if argv[:2] == [core.PYTHON, str(core.BRIDGE)]:
+                self.helper_count += 1
+                if self.helper_count == 2 and final_failure is not None:
+                    self.calls.append((list(argv), deadline, cap, user))
+                    raise final_failure
+            if (final_link is not None and self.helper_count == 2
+                    and argv[:5] == ['/usr/sbin/ip', '-j', '-d', 'link', 'show']):
+                self.calls.append((list(argv), deadline, cap, user))
+                return final_link
+            output = self.command(argv, deadline, cap, user, retain=retain)
+            if argv[0] == core.SYSTEMCTL and argv[1] == 'show' and self.show_edit:
+                fields = dict(line.split('=', 1) for line in output.decode().splitlines())
+                fields.update(self.show_edit)
+                output = '\n'.join(k + '=' + v for k, v in fields.items()).encode()
+            return output
+        with patch.object(core, 'service_identity', side_effect=identity), \
+             patch.object(core, 'boot', side_effect=lambda: self.boot_id[0]):
+            # Fault injection belongs to unit_ready under test, after preparation.
+            operation_failure = self.failure
+            self.failure = None
+            prepared = self.prepared() if mode == 'fresh' else self.resumable()
+            self.assertEqual(prepared['phase'], 'prepared' if mode == 'fresh' else 'resumable')
+            core.reserve(mode)
+            self.phase[mode] = 'activating'
+            self.invocation[mode] = os.environ['INVOCATION_ID']
+            core.unit_gate(mode)
+            if mode == 'fresh':
+                self.runtime_files()
+            # Preserve setup evidence while excluding it from operation assertions.
+            self.preparation_calls = tuple(self.calls)
+            self.operation_start = len(self.calls)
+            self.assertEqual(sum(c[0][:2] == [core.PYTHON, str(core.BRIDGE)]
+                                 for c in self.preparation_calls), 0 if mode == 'fresh' else 2)
+            self.failure = operation_failure
+            core.retain_failure_output(OLD_DIAGNOSTIC)
+            deadline = core.state()['deadline']
+            # Full original budget unless the case selects a shorter remaining time.
+            now = [deadline - (core.START_SECONDS[mode] if start_offset is None else start_offset)]
+            def sleep(seconds):
+                self.sleeps.append(seconds)
+                now[0] += seconds
+            self.now = now
+            self.deadline = deadline
+            self.initial = core.state()
+            actual_save = core.save
+            self.commits = []
+            def save(value):
+                if value['phase'] == 'ready':
+                    # Prove the actual final save retains the operation lock.
+                    with self.assertRaisesRegex(core.Failure, 'another operation owns the lock'):
+                        with core.locked():
+                            self.fail('ready commit released the state lock')
+                    self.commits.append(copy.deepcopy(value))
+                actual_save(value)
+            with patch.object(core.time, 'monotonic', side_effect=lambda: now[0]), \
+                 patch.object(core.time, 'sleep', side_effect=sleep), \
+                 patch.object(core, 'execute', side_effect=wrapper), \
+                 patch.object(core, 'api_ready', side_effect=core.api_ready if complete else self.Stop) as api, \
+                 patch.object(core, 'save', side_effect=save), \
+                 patch.object(core, 'bridge_ready', wraps=core.bridge_ready) as ready:
+                self.ready = ready
+                self.api = api
+                try:
+                    core.unit_ready(mode)
+                    self.assertTrue(complete)
+                    return None
+                except self.Stop:
+                    return None
+                except core.Failure as exc:
+                    return exc
+        self.fail('unit_ready returned without stopping at the API boundary')
+
+    def operation_calls(self):
+        return self.calls[self.operation_start:]
+
+    def helper_calls(self):
+        return [c for c in self.operation_calls() if c[0][:2] == [core.PYTHON, str(core.BRIDGE)]]
+
+    def diagnostic_bytes(self):
+        return (core.ROOT / 'last-command-output').read_bytes()
+
+    def assertFailedClosed(self, exc, probes, code=None):
+        self.assertIsInstance(exc, core.Failure)
+        if code is not None:
+            self.assertEqual(exc.code, code)
+        self.assertEqual(self.probes, probes)
+        self.assertFalse(self.helper_calls())
+        self.assertNotEqual(core.state()['phase'], 'ready')
+
+    def test_absent_beyond_61_seconds_then_valid_creation(self):
+        self.assertIsNone(self.bridge_run([absent()] * 40 + [bridge_json(42)]))
+        self.assertEqual(self.probes, 41)
+        self.assertGreater(sum(self.sleeps), 61)
+        self.assertLess(self.now[0], self.deadline)
+        self.assertEqual(len(self.helper_calls()), 1)
+        self.ready.assert_called_once_with(self.deadline, 42)
+        self.assertEqual(self.diagnostic_bytes(), OLD_DIAGNOSTIC)
+        self.assertNotEqual(core.state()['phase'], 'ready')
+
+    def test_immediately_present_needs_no_sleep(self):
+        self.assertIsNone(self.bridge_run([bridge_json(42)]))
+        self.assertEqual((self.probes, self.sleeps), (1, []))
+
+    def test_cold_absence_then_actual_locked_ready_commit(self):
+        self.assertIsNone(self.bridge_run([absent()] * 40 + [bridge_json()], complete=True))
+        self.assertGreater(sum(self.sleeps), 61)
+        self.assertLess(self.now[0], self.deadline)
+        self.assertEqual(self.probes, 41)
+        self.assertEqual(len(self.helper_calls()), 2)
+        self.assertEqual(self.api.call_count, 2)
+        self.assertEqual(self.ready.call_args_list[0].args, (self.deadline, 42))
+        self.assertEqual(self.ready.call_args_list[1].args, (self.deadline,))
+        value = core.state()
+        self.assertEqual(self.commits, [value])
+        self.assertEqual(value['phase'], 'ready')
+        self.assertEqual(value['deadline'], self.initial['deadline'])
+        self.assertEqual(value['started'], self.initial['started'])
+        self.assertEqual(value['deadline'] - value['started'], core.START_SECONDS[self.mode])
+        self.assertEqual(value['operation'], self.initial['operation'])
+        for action in ('wait-switches', 'inspect-switches'):
+            self.assertTrue(any(c[0][:3] == [core.HHFAB, 'vlab', action]
+                                and c[1] == self.deadline for c in self.operation_calls()))
+        self.assertEqual(self.diagnostic_bytes(), OLD_DIAGNOSTIC)
+
+    def test_final_recheck_is_hard_failure_without_prerequisite_wait(self):
+        failure = absent()
+        exc = self.bridge_run([bridge_json()], complete=True, final_failure=failure)
+        self.assertIs(exc, failure)
+        self.assertEqual((exc.code, exc.private_output), (1, ABSENT))
+        self.assertEqual((self.probes, self.sleeps, self.helper_count), (1, [], 2))
+        self.assertEqual(self.ready.call_args_list[-1].args, (self.deadline,))
+        self.assertEqual(self.commits, [])
+        self.assertNotEqual(core.state()['phase'], 'ready')
+
+    def test_final_recheck_rejects_nonmapping_bridge_data(self):
+        for field in ('linkinfo', 'info_data'):
+            for malformed in (None, [], 1, 'foreign'):
+                with self.subTest(field=field, malformed=malformed):
+                    self.setUp()
+                    info = malformed if field == 'linkinfo' else {'info_kind': 'bridge', 'info_data': malformed}
+                    exc = self.bridge_run([bridge_json()], complete=True,
+                                          final_link=bridge_json(linkinfo=info))
+                    self.assertIsInstance(exc, core.Failure)
+                    self.assertEqual((self.probes, self.sleeps, self.helper_count), (1, [], 2))
+                    self.assertEqual(self.commits, [])
+
+    def test_absence_through_original_deadline_fails_124_without_helper(self):
+        exc = self.bridge_run([absent()], start_offset=10)
+        self.assertFailedClosed(exc, self.probes, 124)
+        self.assertGreater(self.probes, 1)
+        self.assertLessEqual(self.now[0], self.deadline + 1e-6)
+        self.assertEqual(self.diagnostic_bytes(), OLD_DIAGNOSTIC)
+
+    def test_sleep_is_capped_at_original_deadline(self):
+        exc = self.bridge_run([absent()], start_offset=0.5)
+        self.assertFailedClosed(exc, 1, 124)
+        self.assertAlmostEqual(sum(self.sleeps), 0.5)
+        self.assertLessEqual(self.now[0], self.deadline + 1e-6)
+
+    def test_expired_clock_refuses_before_any_probe(self):
+        exc = self.bridge_run([bridge_json(42)], start_offset=-1)
+        self.assertFailedClosed(exc, 0, 124)
+
+    def live_changes(self):
+        def state_edit(edit):
+            def apply():
+                current = core.state()
+                edit(current)
+                core.save(current)
+            return apply
+        def show(**fields):
+            return lambda: self.show_edit.update(fields)
+        return {
+            'mainpid-zero-while-activating': show(MainPID='0'),
+            'inactive': show(ActiveState='inactive', MainPID='0'),
+            'failed': show(ActiveState='failed', MainPID='0'),
+            'replaced-pid': show(MainPID='999999'),
+            'replaced-start': lambda: self.live.update(start='999'),
+            'replaced-invocation': show(InvocationID='c' * 32),
+            'replaced-cgroup': show(ControlGroup='/system.slice/other.service'),
+            'replaced-unit': show(Id='other.service'),
+            'dropin': show(DropInPaths='/run/systemd/system/x.d/y.conf'),
+            'daemon-reload': show(NeedDaemonReload='yes'),
+            'state-phase': state_edit(lambda s: s.update(phase='failed')),
+            'state-extra-field': state_edit(lambda s: s.update(extra=1)),
+            'state-service-removed': state_edit(lambda s: s.pop('service')),
+            'state-boot': state_edit(lambda s: s.update(boot='f' * 8 + '-' + 'f' * 4 + '-' + 'f' * 4 + '-' + 'f' * 4 + '-' + 'f' * 12)),
+            'state-deadline': state_edit(lambda s: s.update(deadline=s['deadline'] + 1)),
+            'reboot': lambda: self.boot_id.__setitem__(0, 'abcdef12-1234-1234-1234-123456789abc'),
+        }
+
+    def test_live_changes_fail_closed_while_absent_and_right_after_presence(self):
+        for name, change in self.live_changes().items():
+            with self.subTest(name + ' while absent'):
+                self.setUp()  # fresh fixture; earlier cleanups unwind LIFO at test end
+                exc = self.bridge_run([absent(), absent(), bridge_json(42)],
+                                      [(1, self.live_changes()[name])])
+                self.assertFailedClosed(exc, 1)
+            with self.subTest(name + ' immediately after presence'):
+                self.setUp()
+                exc = self.bridge_run([absent(), bridge_json(42)], [(2, self.live_changes()[name])])
+                self.assertFailedClosed(exc, 2)
+
+    def genuine_failures(self):
+        return {
+            'extra-newline': (absent_with(b'Device "hhbr" does not exist.\n\n'), True),
+            'altered-name': (absent_with(b'Device "hhbx" does not exist.\n'), True),
+            'missing-newline': (absent_with(b'Device "hhbr" does not exist.'), True),
+            'exit-2': (core.Failure('child command failed', 2, ABSENT), True),
+            'permission': (absent_with(b'RTNETLINK answers: Operation not permitted\n'), True),
+            'timeout': (core.Failure('child deadline exceeded', 124), False),
+            'overflow': (core.Failure('private child output overflow'), False),
+            'empty-output': (b'', False),
+            'malformed-json': (b'{', False),
+            'empty-list': (b'[]', False),
+            'two-links': (json.dumps([json.loads(bridge_json())[0]] * 2).encode(), False),
+            'duplicate-key': (b'[{"ifname":"hhbr","ifname":"hhbr","ifindex":42,"linkinfo":{"info_kind":"bridge"}}]', False),
+            'non-list': (b'{"ifname":"hhbr"}', False),
+            'non-object': (b'[1]', False),
+            'foreign-name': (bridge_json(ifname='foreign0'), False),
+            'foreign-kind': (bridge_json(linkinfo={'info_kind': 'dummy'}), False),
+            'index-zero': (bridge_json(0), False),
+            'bool-index': (bridge_json(True), False),
+            **{'linkinfo-' + str(i): (bridge_json(linkinfo=value), False)
+               for i, value in enumerate((None, [], 1, 'foreign'))},
+            **{'info-data-' + str(i): (bridge_json(linkinfo={'info_kind': 'bridge', 'info_data': value}), False)
+               for i, value in enumerate((None, [], 1, 'foreign'))},
+        }
+
+    def test_genuine_probe_failures_fail_closed_without_retry_and_keep_evidence(self):
+        for name, (answer, has_bytes) in self.genuine_failures().items():
+            with self.subTest(name):
+                self.setUp()
+                exc = self.bridge_run([answer])
+                self.assertFailedClosed(exc, 1)
+                if isinstance(answer, core.Failure):
+                    self.assertIs(exc, answer)
+                    self.assertEqual((exc.code, str(exc)), (answer.code, str(answer)))
+                if isinstance(answer, core.Failure):
+                    expected = answer.private_output if has_bytes else OLD_DIAGNOSTIC
+                else:
+                    expected = answer or OLD_DIAGNOSTIC
+                self.assertEqual(self.diagnostic_bytes(), expected)
+
+    def test_ifindex_replacement_between_probe_and_helper_fails(self):
+        exc = self.bridge_run([bridge_json(41)])
+        self.assertIsInstance(exc, core.Failure)
+        self.assertEqual(str(exc), 'bridge identity changed')
+        self.assertEqual(len(self.helper_calls()), 1)
+        self.assertNotEqual(core.state()['phase'], 'ready')
+
+    def test_helper_hard_failure_is_not_retried_and_keeps_code(self):
+        self.failure = lambda argv: argv[0] == core.PYTHON
+        exc = self.bridge_run([bridge_json(42)])
+        self.assertIsInstance(exc, core.Failure)
+        self.assertEqual(exc.code, 17)
+        self.assertEqual((self.probes, len(self.helper_calls())), (1, 1))
+
+
+def absent_with(raw):
+    return core.Failure('child command failed', 1, raw)
+
+
+class BridgePrerequisiteFresh(BridgePrerequisiteMixin, unittest.TestCase):
+    mode = 'fresh'
+
+
+class BridgePrerequisiteResume(BridgePrerequisiteMixin, unittest.TestCase):
+    mode = 'resume'
+
+
 class FormatAndSourceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='labapp-vlab-executor-')
@@ -1651,6 +1978,68 @@ class FormatAndSourceTests(unittest.TestCase):
         self.root_patch = patch.object(core, 'ROOT', Path(self.temp.name) / 'state')
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+
+    def test_probe_parser_failure_preserves_object_code_and_returned_bytes(self):
+        raw = b'{"public":"malformed bridge observation"}'
+        failure = core.Failure('bridge query refused', 37)
+        with patch.object(core, 'execute', return_value=raw), \
+             patch.object(core, 'bridge_link', side_effect=failure), \
+             patch.object(core, 'retain_failure_output') as retain:
+            with self.assertRaises(core.Failure) as raised:
+                core.bridge_probe(101.0)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(raised.exception.code, 37)
+        retain.assert_called_once_with(raw)
+
+    def test_actual_executor_absence_cannot_hide_uncertain_cleanup(self):
+        # Actual execute control flow, with every child/selector/OS observation mocked.
+        # No children, signals, reads or real sleeps are performed by this fixture.
+        for cleanup in ('confirmed', 'kill-unverified', 'reap-unverified'):
+            with self.subTest(cleanup=cleanup):
+                child = MagicMock()
+                child.pid = 123456
+                child.stdout.fileno.return_value = 123
+                child.wait.side_effect = [1, subprocess.TimeoutExpired('public-query', 2)
+                                          if cleanup == 'reap-unverified' else 1]
+                selector = MagicMock()
+                selector.__enter__.return_value = selector
+                selector.select.return_value = [object()]
+                failures = []
+                def query(*args, **kwargs):
+                    try:
+                        return EXECUTE(*args, **kwargs)
+                    except core.Failure as exc:
+                        failures.append(exc)
+                        raise
+                with patch.object(core, 'execute', side_effect=query), \
+                     patch.object(core.subprocess, 'Popen', return_value=child), \
+                     patch.object(core.selectors, 'DefaultSelector', return_value=selector), \
+                     patch.object(core.os, 'read', side_effect=[ABSENT, b'']), \
+                     patch.object(core.os, 'killpg', side_effect=OSError('public uncertainty')
+                                  if cleanup == 'kill-unverified' else None) as kill, \
+                     patch.object(core.time, 'monotonic', return_value=100.0), \
+                     patch.object(core, 'retain_failure_output') as retain, \
+                     patch('sys.stderr', new_callable=io.StringIO) as errors:
+                    if cleanup == 'confirmed':
+                        self.assertIsNone(core.bridge_probe(101.0))
+                        retain.assert_not_called()
+                        self.assertEqual(errors.getvalue(), '')
+                    else:
+                        with self.assertRaises(core.Failure) as raised:
+                            core.bridge_probe(101.0)
+                        self.assertIs(raised.exception, failures[0])
+                        self.assertTrue(raised.exception.cleanup_uncertain)
+                        retain.assert_called_once_with(ABSENT)
+                        self.assertIn('child group containment unverified', errors.getvalue())
+                        self.assertNotIn(ABSENT.decode(), errors.getvalue())
+                self.assertEqual(len(failures), 1)
+                self.assertEqual((failures[0].code, str(failures[0]), failures[0].private_output),
+                                 (1, 'child command failed', ABSENT))
+                kill.assert_called_once_with(child.pid, signal.SIGKILL)
+                child.stdout.close.assert_called_once_with()
+                self.assertEqual(child.wait.call_args_list[0].kwargs, {'timeout': 1.0})
+                if cleanup != 'kill-unverified':
+                    self.assertEqual(child.wait.call_args_list[1].kwargs, {'timeout': 2})
 
     def test_executor_retains_one_bounded_private_failure_output(self):
         core.ROOT.mkdir(mode=0o700)
