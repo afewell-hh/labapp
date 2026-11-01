@@ -1582,7 +1582,9 @@ Source contract (new synthetic tests are written but unrun; no guest proof):
   `swapon` is only caught by the repeated pre-`start-fresh` verification.
 * **Cleanup.** Cleanup permanently closes publication before checking absence or
   waiting at most two seconds for the shared lock, clipped to the original cleanup
-  cutoff. A stopped publisher cannot resume publication after that closure.
+  cutoff. A stopped publisher cannot recreate credentials after verified clean
+  removal. A publisher already holding the lock can finish an in-flight write;
+  cleanup must acquire that lock and remove its output before proving absence.
   Lock timeout reports uncertainty; cleanup never waits indefinitely. `auth_remove`
   is idempotent and identity checked: it deletes only the bound
   directory's single regular, single-link, `0600`, exact-owner `config.json` through the
