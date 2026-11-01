@@ -62,6 +62,41 @@ def public_fab():
                  'management': {'interface': 'enp2s1'}}}]
 
 
+def printer_defaults(doc):
+    """Independent model of the pinned typed Default() for the canonical wiring.
+
+    Written from the label tables (endpoint names found by scanning every 'port'
+    string), without reusing any production projection code.
+    """
+    pre = 'fabric.githedgehog.com/'
+    if doc['kind'] == 'Switch':
+        spec = doc['spec']
+        if not spec.get('vlanNamespaces'):
+            spec['vlanNamespaces'] = ['default']
+        labels = {pre + 'profile': spec['profile']}
+        for group in spec.get('groups', []):
+            labels['switchgroup.' + pre + group] = 'true'
+        for ns in spec['vlanNamespaces']:
+            labels['vlanns.' + pre + ns] = 'true'
+        doc['metadata'].setdefault('labels', {}).update(labels)
+    elif doc['kind'] == 'Connection':
+        found = []
+
+        def scan(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    found.append(item.split('/')[0]) if key == 'port' else scan(item)
+            elif isinstance(value, list):
+                for item in value:
+                    scan(item)
+        scan(doc['spec'])
+        labels = {pre + 'connection-type': {'mclagDomain': 'mclag-domain'}.get(
+            next(iter(doc['spec'])), next(iter(doc['spec'])))}
+        for name in found:
+            labels[('server.' if name.startswith('server-') else 'switch.') + pre + name] = 'true'
+        doc['metadata'].setdefault('labels', {}).update(labels)
+
+
 class GuestEnvironment:
     """All fixed production paths are patched to one owned ephemeral fixture."""
     def setUp(self):
@@ -293,6 +328,10 @@ class GuestEnvironment:
                          'ipv4namespaces': 'IPv4Namespace'}
                 all_docs = self.fab + core.yaml_documents(self.wiring.read_bytes())
                 items = copy.deepcopy([d for d in all_docs if d['kind'] == kinds[resource.split('.')[0]]])
+                # Observed side is written by an independent printer-default model,
+                # not by the production projection.
+                for item in items:
+                    printer_defaults(item)
                 if self.api_mutation:
                     self.api_mutation(items)
             return json.dumps({'items': items}).encode()

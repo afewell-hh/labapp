@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import stat
 import unittest
+from unittest.mock import patch
 
 import yaml
 import vlab_core as core
@@ -240,13 +241,141 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
 
     # ---- independent serializer/default refusal -------------------------------
 
-    def test_real_api_ready_refuses_independent_upstream_difference(self):
-        self.full()
-        self.refused(copy.deepcopy(self.printed), copy.deepcopy(self.defaulted))
+    def independent(self):
+        """Printed expected -> production projection -> independent upstream full45 observed."""
+        expected, actual = copy.deepcopy(self.printed), copy.deepcopy(self.defaulted)
+        result = self.check_api(expected, actual)
+        self.assertEqual(result['cluster_uid'], self.cluster_uid)
+        return expected, actual
 
-    def test_synthetic_independent_upstream_difference_refused(self):
+    def expected_refused(self, kind, name, mutate, message='expected projection refused'):
+        expected, actual = self.independent()
+        mutate(named(expected, kind, name))
+        with self.assertRaises(core.Failure) as caught:
+            self.check_api(expected, actual)
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_raw_serializer_asymmetry_is_preserved(self):
+        # The unprojected comparison key still differs for exactly Switch/Connection.
+        printed = {core.object_identity(d): core.object_value(d) for d in self.printed}
+        defaulted = {core.object_identity(d): core.object_value(d) for d in self.defaulted}
+        self.assertEqual(set(printed), set(defaulted))
+        differing = Counter(i[1] for i in printed if printed[i] != defaulted[i])
+        self.assertEqual(differing, Counter({'Switch': 7, 'Connection': 21}))
+
+    def test_independent_printed_projects_to_upstream_observed(self):
+        before = copy.deepcopy(self.printed)
+        self.independent()
+        projected = core.project_expected(self.printed)
+        self.assertEqual(self.printed, before)
+        self.assertEqual([core.object_identity(d) for d in projected],
+                         [core.object_identity(d) for d in self.printed])
+        for kind in ('Fabricator', 'ControlNode', 'Server', 'SwitchGroup', 'VLANNamespace', 'IPv4Namespace'):
+            self.assertEqual([d for d in projected if d['kind'] == kind],
+                             [d for d in self.printed if d['kind'] == kind])
+
+    def test_synthetic_unsupported_forms_are_not_inferred(self):
+        # Group insertion/sorting and SPEED_* rewrites remain unsupported, not guessed.
         self.passing()
-        self.refused(self.assembled(self.syn_printed), self.assembled(self.syn_defaulted))
+        with self.assertRaises(core.Failure) as caught:
+            self.check_api(self.assembled(self.syn_printed), self.assembled(self.syn_defaulted))
+        self.assertEqual(str(caught.exception), 'expected projection refused')
+
+    def test_independent_observed_negatives(self):
+        cases = (
+            ('Switch', 'leaf-01', lambda d: d['metadata']['labels'].pop(PREFIX + 'profile')),
+            ('Switch', 'leaf-01', lambda d: d['metadata']['labels'].update({PREFIX + 'profile': 'other'})),
+            ('Switch', 'leaf-01', lambda d: d['metadata']['labels'].update({'vlanns.' + PREFIX + 'extra': 'true'})),
+            ('Switch', 'leaf-01', lambda d: d['metadata']['labels'].update({'example.com/extra': 'public'})),
+            ('Switch', 'leaf-01', lambda d: d['metadata'].update(annotations={'example.com/note': 'public'})),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(unknownField=True)),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(vlanNamespaces=[])),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(asn=65102)),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(ip='172.30.0.9/21')),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(profile='other')),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(role='spine')),
+            ('Connection', VARIANTS['mclag'], lambda d: d['spec']['mclag']['links'].reverse()),
+            ('Connection', VARIANTS['unbundled'], lambda d: d['spec']['unbundled']['link']['switch'].update(port='leaf-01/E1/99')),
+            ('Connection', VARIANTS['mclag-domain'], lambda d: d['spec']['mclagDomain']['sessionLinks'].reverse()),
+            ('Connection', VARIANTS['fabric'], lambda d: d['metadata']['labels'].pop('switch.' + PREFIX + 'spine-01')),
+            ('Connection', VARIANTS['fabric'], lambda d: d['metadata']['labels'].update({'server.' + PREFIX + 'server-99': 'true'})),
+            ('Connection', VARIANTS['eslag'], lambda d: d['metadata']['labels'].update({PREFIX + 'connection-type': 'mclag'})),
+            ('Connection', VARIANTS['bundled'], lambda d: d['metadata']['labels'].update({'vpc.' + PREFIX + 'x': 'true'})),
+            ('Connection', VARIANTS['mclag'], lambda d: d['metadata'].update(annotations={'example.com/note': 'public'})),
+            ('Connection', VARIANTS['mclag'], lambda d: d['spec']['mclag'].update(unknownField=True)),
+        )
+        for index, (kind, name, mutate) in enumerate(cases):
+            with self.subTest(index=index, kind=kind, name=name):
+                self.negative(kind, name, mutate, baseline=self.independent)
+
+    def test_independent_identity_count_and_duplicate_negatives(self):
+        expected, actual = self.independent()
+        actual.remove(named(actual, 'Server', 'server-10'))
+        with self.assertRaises(core.Failure):
+            self.check_api(expected, actual)
+        expected, actual = self.independent()
+        expected.append(copy.deepcopy(named(expected, 'Switch', 'leaf-01')))
+        self.refused(expected, actual)
+        expected, actual = self.independent()
+        expected.remove(named(expected, 'Switch', 'leaf-02'))
+        index = next(i for i, d in enumerate(actual) if d['kind'] == 'Switch' and d['metadata']['name'] == 'leaf-02')
+        actual[index] = copy.deepcopy(named(actual, 'Switch', 'leaf-01'))
+        self.refused(expected, actual)
+        expected, actual = self.independent()
+        named(actual, 'Server', 'server-01')['metadata']['name'] = 'server-99'
+        self.refused(expected, actual)
+
+    def test_version_binding_negatives(self):
+        for label, pin in (('stale', (170709176, '0' * 64)), ('malformed', 'v0.43.1'), ('missing', None)):
+            expected, actual = self.independent()
+            tools = dict(core.TOOL_PINS)
+            if pin is None:
+                del tools[core.HHFAB]
+            else:
+                tools[core.HHFAB] = pin
+            with self.subTest(label), patch.dict(core.TOOL_PINS, tools, clear=True):
+                with self.assertRaises(core.Failure) as caught:
+                    self.check_api(expected, actual)
+                self.assertEqual(str(caught.exception), 'expected projection version binding refused')
+        for label, value in (('fabric api override', {'versions': {'fabric': {'api': 'v0.96.3'}}}),
+                             ('controller override', {'versions': {'fabric': {'controller': 'v0.1.0'}}}),
+                             ('agent override', {'versions': {'fabric': {'agent': 'v0.1.0'}}}),
+                             ('malformed', 'v0.96.2'), ('list', [])):
+            with self.subTest(label):
+                self.expected_refused('Fabricator', 'default', lambda d, v=value: d['spec'].update(overrides=v))
+
+    def test_missing_fabricator_refuses_projection(self):
+        expected, actual = self.independent()
+        expected.remove(named(expected, 'Fabricator', 'default'))
+        with self.assertRaises(core.Failure) as caught:
+            self.check_api(expected, actual)
+        self.assertEqual(str(caught.exception), 'expected projection refused')
+
+    def test_unsupported_and_conflicting_expected_forms_refused(self):
+        def link_key(variant, key):
+            return lambda d: d['spec'][variant]['links'][0].update({key: {'port': 'x/E1/1'}})
+        cases = (
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(portSpeeds={'E1/2': 'SPEED_25G'})),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(portGroupSpeeds={'1': 'SPEED_10G'})),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(groups=['zeta', 'alpha'])),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(groups=['mclag-1', 'mclag-1'])),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(vlanNamespaces=['b', 'a'])),
+            ('Switch', 'leaf-01', lambda d: d['spec'].update(redundancy={'group': 'other', 'type': 'mclag'})),
+            ('Switch', 'leaf-01', lambda d: d['spec'].pop('profile')),
+            ('Switch', 'leaf-01', lambda d: d['metadata'].update(labels={PREFIX + 'profile': 'other'})),
+            ('Switch', 'leaf-01', lambda d: d['metadata'].update(labels={'switchgroup.' + PREFIX + 'mclag-1': 'false'})),
+            ('Connection', VARIANTS['mclag'], lambda d: d['metadata'].update(labels={PREFIX + 'connection-type': 'eslag'})),
+            ('Connection', VARIANTS['mclag'], lambda d: d['spec'].update(unbundled={})),
+            ('Connection', VARIANTS['mclag'], lambda d: d.update(spec={})),
+            ('Connection', VARIANTS['mclag'], lambda d: d['spec']['mclag'].update(links=[])),
+            ('Connection', VARIANTS['mclag'], link_key('mclag', 'extra')),
+            ('Connection', VARIANTS['bundled'], lambda d: d['spec']['bundled'].update(fallback=True)),
+            ('Connection', VARIANTS['mclag-domain'], lambda d: d['spec']['mclagDomain'].pop('peerLinks')),
+        )
+        for index, (kind, name, mutate) in enumerate(cases):
+            with self.subTest(index=index, kind=kind, name=name):
+                self.expected_refused(kind, name, mutate)
 
     # ---- complete canonical objects -------------------------------------------
 

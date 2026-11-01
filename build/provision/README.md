@@ -1214,16 +1214,53 @@ metadata is asserted from hand-written endpoint/type tables (cross-checked again
 ports in the raw source): per-Connection type and switch/server endpoint labels,
 per-Switch profile, group and `default` VLAN-namespace labels and the
 `vlanNamespaces: [default]` delta, unchanged values and link order against the raw
-canonical YAML, namespaces, and exact ControlNode namespace/spec. The independently
-printed/defaulted pair must refuse at `canonical API objects differ`. A matched
-baseline passes before each isolated negative (missing/wrong/extra endpoint and
-generated labels, annotations, specs, link order, namespaces, identities,
-Fabricator/ControlNode drift, unknown spec fields injected after typed decoding).
-Duplicate tests keep equal collapsed maps to exercise both production uniqueness
-guards. No production readiness rule is duplicated or changed. Missing, extra,
-insecure or oversized fixture files, or zero discovered tests, fail rather than skip.
+canonical YAML, namespaces, and exact ControlNode namespace/spec. The raw
+`object_value` asymmetry between printed and defaulted Switch (7) and Connection
+(21) objects is still asserted. The independently printed expected set now
+passes actual `api_ready` against the independently produced 45 observed objects
+through the expected-only projection below (no monkeypatched projection or
+version guard), and every negative starts from that passing pair (missing/wrong/
+extra endpoint and generated labels, unknown labels, annotations, specs, IP/ASN/
+profile/port drift, link order, identities, counts, version binding, unsupported
+and conflicting expected forms). Duplicate tests keep equal collapsed maps to
+exercise both production uniqueness guards. Missing, extra, insecure or
+oversized fixture files, or zero discovered tests, fail rather than skip.
 
-Not implemented and still unknown: a full expected projection, Fabricator
+### Expected-only Switch/Connection projection (issue #406)
+
+`vlab_core.project_expected` deep-copies the installer expected objects and adds
+only what the pinned Fabric typed `Default()` generates; observed objects, labels,
+annotations and specs are compared exactly and never normalized. Original expected
+and observed identities are validated first and both collapsed-map length guards,
+per-kind counts, zero FabNode, VM names, queries, caps and deadlines are unchanged.
+Projection preserves identity, count and order.
+
+- Switch: absent or empty `spec.vlanNamespaces` becomes `['default']`; labels
+  `fabric.githedgehog.com/profile`, `switchgroup.fabric.githedgehog.com/<group>`
+  and `vlanns.fabric.githedgehog.com/<namespace>` are derived from the expected
+  spec and added when missing. A conflicting existing value is refused. Refused
+  as unsupported: unsorted or duplicate `groups`/`vlanNamespaces`, a
+  `redundancy.group` absent from `groups`, and `SPEED_*` port speed values (no
+  speed stripping, sorting, insertion or reserialization).
+- Connection: exactly one structurally valid variant among unbundled, bundled,
+  mclag, eslag, mclagDomain (peerLinks and sessionLinks) and fabric (spine/leaf).
+  Derives `fabric.githedgehog.com/connection-type` (`mclag-domain` for
+  mclagDomain) and `switch.`/`server.fabric.githedgehog.com/<name>` endpoint labels
+  from link ports. No VPC label for these variants.
+- Fabricator, ControlNode, Server, SwitchGroup, VLANNamespace and IPv4Namespace
+  are unchanged.
+
+Version binding: projection is allowed only when `TOOL_PINS[HHFAB]` equals the
+pinned hhfab v0.43.1 size/SHA-256 (already verified by the prerequisite receipt
+and `verify_contract`) and the single expected Fabricator is `v1beta1` with no
+`spec.overrides` (or only empty `versions`). Per the cited source, that release
+selects Fabric v0.96.2 API/controller/agent without overrides. The installer
+`fab.yaml` carries no other version field. This is a binding to the trusted
+binary and absence of overrides, not proof of the deployed CRD/OCI identity.
+No `(devel)` build is accepted and no release provenance is invented in fixtures.
+
+Not implemented and still unknown: other Fabric versions or general printer forms,
+Fabricator
 hydration (management/dummy IPs), full migration-branch coverage and `hhfab`
 build behavior; what live webhooks, deployed CRDs, OCI bytes or the controller
 do. The actual VLAN helper fills zero `to` from `from` and sorts ranges in place;
