@@ -2301,6 +2301,41 @@ class FirstFailureExport(unittest.TestCase):
         with self.assertRaises(trial.Failure):
             trial.export_failure('9' * 32)
 
+    def test_missing_core_root_is_absent_only_after_contract_nonce_and_live_boot_checks(self):
+        (self.state_root / 'state.json').unlink()
+        self.state_root.rmdir()
+        self.assertEqual(self.export(), b'absent')
+        with self.assertRaises(trial.Failure):
+            trial.export_failure('9' * 32)
+        with patch.object(trial, 'kernel_boot', return_value='33333333-3333-4333-8333-333333333333'), \
+             self.assertRaises(trial.Failure):
+            self.export()
+        (self.root / 'contract.json').write_bytes(b'{}')
+        with self.assertRaises(trial.Failure):
+            self.export()
+
+    def test_unsafe_core_root_is_refused_even_when_bundle_is_absent(self):
+        (self.state_root / 'state.json').unlink()
+        self.state_root.rmdir()
+        for target in (self.base / 'missing-target', self.root):
+            with self.subTest(link=target.name):
+                self.state_root.symlink_to(target)
+                with self.assertRaises(trial.Failure):
+                    self.export()
+                self.state_root.unlink()
+        self.state_root.write_bytes(b'PUBLIC-FIXTURE')
+        with self.assertRaises(trial.Failure):
+            self.export()
+        self.state_root.unlink()
+        self.state_root.mkdir(mode=0o700)
+        for mode in (0o750, 0o777):
+            self.state_root.chmod(mode)
+            with self.subTest(mode=mode), self.assertRaises(trial.Failure):
+                self.export()
+        self.state_root.chmod(0o700)
+        with patch.object(trial.os, 'geteuid', return_value=os.getuid() + 1), self.assertRaises(trial.Failure):
+            self.export()
+
     def test_reservation_bundle_has_null_binding_and_runs_no_query(self):
         prepared = {'schema': 1, 'nonce': NONCE, 'phase': 'prepared'}
         self.core.atomic(self.state_root / 'state.json', prepared)

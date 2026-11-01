@@ -175,6 +175,8 @@ class OwnerTrial(unittest.TestCase):
         registration.current.assert_not_called()
         cleanup.assert_called_once_with(value)
         receipt = json.loads(output.call_args.args[0])
+        self.assertEqual((receipt['phase'], receipt['host_operation'], receipt['failure_category']),
+                         ('preflight', 'source-check', 'guest'))
         self.assertFalse(receipt['own_key_absent'])
         self.assertTrue(receipt['local_files_absent'])
 
@@ -290,6 +292,7 @@ class OwnerTrial(unittest.TestCase):
                 master.assert_not_called()
                 receipt = json.loads(printed.call_args.args[0])
                 self.assertEqual(receipt['phase'], 'access-prepare' if stage == 'prepare' else 'access-import')
+                self.assertEqual(receipt['host_operation'], receipt['phase'])
                 self.assertEqual(receipt['failure_category'], category)
                 self.assertNotIn('PRIVATE', printed.call_args.args[0])
                 self.assertFalse(receipt['own_key_absent'])
@@ -579,6 +582,7 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(trace[-3:], ['master-close','removed','captured-cancel'])
         self.assertTrue(all(receipt[k] for k in ('contained','process_absent','own_key_absent','local_files_absent','independent_cleanup_dispatched')))
         self.assertEqual((receipt['phase'], receipt['failure_category']), ('guest-result', 'none'))
+        self.assertEqual(receipt['host_operation'], 'result-validate')
         self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']),
                          ('valid', dict(guest.SUCCESS)))
         self.assertIsNone(receipt['guest_service'])
@@ -854,6 +858,44 @@ class OwnedProcessGroup(unittest.TestCase):
         self.assertTrue(stdin.closed)
         self.assertTrue(proc.stdout.closed)
         self.assertSignalsBeforeReapOnly(kernel)
+
+    def test_actual_input_write_errors_reach_closed_owner_receipt_and_keep_cleanup_uncertainty(self):
+        for error in (OSError(SENTINEL), BrokenPipeError(SENTINEL)):
+            with self.subTest(error=type(error).__name__):
+                diagnostic = GuestDiagnostics()
+                diagnostic.setUp()
+                try:
+                    clock = FakeClock()
+                    kernel = Kernel(clock, errors={9: PermissionError(SENTINEL)})
+                    read_fd, write_fd = os.pipe()
+                    stdin = os.fdopen(write_fd, 'wb', buffering=0)
+                    proc = FakeProc(kernel, stdin=stdin)
+                    actual_command = host.command
+                    try:
+                        with patch.object(host.subprocess, 'Popen', return_value=proc), \
+                             patch.object(owned.os, 'killpg', side_effect=kernel.killpg), \
+                             patch.object(owned.os, 'waitid', side_effect=kernel.waitid), \
+                             patch.object(owned, 'monotonic', side_effect=clock.monotonic), \
+                             patch.object(owned, 'sleep', side_effect=clock.sleep), \
+                             patch.object(host.os, 'write', side_effect=error) as write:
+                            code, receipt, trace, text = diagnostic.drive([b'absent'], candidate_command=actual_command)
+                        write.assert_called_once()
+                        self.assertIn(b'PUBLIC-NONDEPLOYABLE-PASSWORD', bytes(write.call_args.args[1]))
+                        self.assertEqual((code, receipt['code'], receipt['phase'], receipt['failure_category'],
+                                          receipt['host_operation']), (1, 1, 'guest-work', 'unknown', 'candidate-generation'))
+                        self.assertFalse(receipt['process_absent'] or receipt['local_files_absent'] or receipt['own_key_absent'])
+                        self.assertIn('dispatch-cleanup', trace)
+                        self.assertNotIn(SENTINEL, text)
+                        self.assertNotIn('PUBLIC-NONDEPLOYABLE-PASSWORD', text)
+                        self.assertTrue(stdin.closed and proc.stdout.closed)
+                        self.assertLessEqual(clock.now, 10)
+                        self.assertSignalsBeforeReapOnly(kernel, kill=False)
+                    finally:
+                        stdin.close()
+                        os.close(read_fd)
+                        proc.release()
+                finally:
+                    diagnostic.doCleanups()
 
     def test_nonblocking_partial_input_failure_and_wouldblock_preserve_cleanup(self):
         for fails in (False, True):
@@ -1473,7 +1515,8 @@ class GuestDiagnostics(unittest.TestCase):
 
     # -- actual trial orchestration: fake master/process only ---------------------
     def drive(self, replies, *, fail_bootstrap=False, service=b'', observation_down=False,
-              observation_error=None, stop_error=None, private=None, export=b'absent', close=True):
+              observation_error=None, stop_error=None, private=None, export=b'absent', close=True,
+              fault=None, primary_error=None, candidate_command=None, close_error=None, cleanup_error=None):
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
         registration, records = Mock(), Mock()
@@ -1483,6 +1526,23 @@ class GuestDiagnostics(unittest.TestCase):
         importer = Mock()
         importer.prepare.return_value = ({'posix': {'username': 'owner'}}, 1)
         trace, pulse, pending = [], threading.Event(), list(replies)
+        bootstrapped = threading.Event()
+        def inject(boundary):
+            if fault == boundary:
+                trace.append(('fault', boundary))
+                raise primary_error if primary_error is not None else RuntimeError(SENTINEL)
+        def current():
+            if bootstrapped.is_set():
+                self.assertIn('bootstrap-complete', trace)
+                inject('registration')
+            return rec
+        registration.current.side_effect = current
+        real_trust = host.trusted_source
+        def trust(snap, *, initial=False):
+            if bootstrapped.is_set() and fault == 'github':
+                self.assertIn('bootstrap-complete', trace)
+                # Exercise the real github() parser with a successful malformed response.
+                real_trust(snap, initial=initial)
         services = list(service) if isinstance(service, list) else [service]
         nonce, boot = self.nonce, '22222222-2222-4222-8222-222222222222'
         payload_dir, output = self.directory / 'inputs', self.directory / 'output'
@@ -1494,6 +1554,9 @@ class GuestDiagnostics(unittest.TestCase):
             (payload_dir / name).write_bytes(raw)
             pins[name] = (len(raw), guest.sha(raw))
         def command(args, *unused, **kwargs):
+            if args[:2] == ['gh', 'api']:
+                trace.append('github-success-malformed')
+                return ('{"unclosed":"' + SENTINEL).encode()
             if args[:3] == ['gcloud', 'auth', 'list']: return (host.OWNER + '\n').encode()
             if args[:3] == ['gcloud', 'config', 'get-value']: return b'(unset)\n'
             if args[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
@@ -1503,9 +1566,14 @@ class GuestDiagnostics(unittest.TestCase):
                 target = Path(args[-1])
                 target.write_text('PUBLIC_SYNTHETIC_KEY_PLACEHOLDER')
                 Path(str(target) + '.pub').write_text('ssh-ed25519 UEVCTElDX0ZJWFRVUkU=')
-            if args[0] == '/usr/bin/openssl': return ('$5$publicfixture$' + 'a' * 43 + '\n').encode()
+            if args[0] == '/usr/bin/openssl':
+                if candidate_command is not None:
+                    return candidate_command(args, *unused, **kwargs)
+                inject('candidate')
+                return ('$5$publicfixture$' + 'a' * 43 + '\n').encode()
             return b'[]'
         def sources(snap, directory):
+            inject('source-stage')
             table = {}
             for name in guest.SOURCES:
                 raw = ('PUBLIC-SOURCE-' + name).encode()
@@ -1515,19 +1583,24 @@ class GuestDiagnostics(unittest.TestCase):
         test = self
         class Session:
             def start(self): trace.append('master-start')
-            def transfer(self, incoming, names, phase='stage'): trace.append(('transfer', tuple(names)))
+            def transfer(self, incoming, names, phase='stage'):
+                trace.append(('transfer', tuple(names)))
+                if 'manifest.json' in names:
+                    inject('transfer')
             def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
                 if args == host.RESULT_COMMAND:
                     trace.append('read-result')
+                    inject('result')
                     if observation_error is not None and observation_error[0] == 'reader':
                         raise observation_error[1]
                     if observation_down: raise guest.Failure('original master lost', 124)
-                    if not fail_bootstrap: test.assertTrue(pulse.wait(2), 'heartbeat never started')
+                    if bootstrapped.is_set(): test.assertTrue(pulse.wait(2), 'heartbeat never started')
                     reply = pending.pop(0) if len(pending) > 1 else pending[0]
                     if isinstance(reply, BaseException): raise reply
                     return reply
                 if args == host.SERVICE_COMMAND:
                     trace.append('read-service')
+                    inject('service')
                     if observation_error is not None and observation_error[0] == 'manager':
                         raise observation_error[1]
                     if observation_down: raise guest.Failure('original master lost', 124)
@@ -1546,6 +1619,10 @@ class GuestDiagnostics(unittest.TestCase):
                     return b''
                 if host.BOOTSTRAP in args and fail_bootstrap:
                     raise guest.Failure('bootstrap refused', 17)
+                if host.BOOTSTRAP in args:
+                    inject('bootstrap')
+                    trace.append('bootstrap-complete')
+                    bootstrapped.set()
                 if args[:4] == ['/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'stop']:
                     trace.append('stop')
                     if stop_error is not None: raise stop_error
@@ -1553,19 +1630,84 @@ class GuestDiagnostics(unittest.TestCase):
                 return b''
             def close(self):
                 trace.append('master-close')
+                if close_error is not None: raise close_error
                 return close
-        with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'), \
+        def cleanup(name):
+            trace.append(name)
+            if cleanup_error is not None: raise cleanup_error
+        with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source', side_effect=trust), \
              patch.object(host, 'OwnKeyImport', return_value=importer), patch.object(host, 'Master', return_value=Session()), \
              patch.object(host, 'source_files', side_effect=sources), patch.object(guest, 'PAYLOADS', pins), \
              patch.object(host, 'extract_ed25519', return_value='ssh-ed25519 UEVCTElDX0ZJWFRVUkU=\n'), \
              patch.object(host.secrets, 'token_hex', side_effect=lambda n: 'd' * (n * 2)), \
              patch.object(host.secrets, 'token_urlsafe', return_value='PUBLIC-NONDEPLOYABLE-PASSWORD'), \
-             patch.object(host, 'cleanup_own_key', side_effect=lambda *a, **k: trace.append('remove-key')), \
-             patch.object(host, 'cleanup_dispatch', side_effect=lambda *a: trace.append('dispatch-cleanup')), \
+             patch.object(host, 'cleanup_own_key', side_effect=lambda *a, **k: cleanup('remove-key')), \
+             patch.object(host, 'cleanup_dispatch', side_effect=lambda *a: cleanup('dispatch-cleanup')), \
              patch('builtins.print') as printed:
             code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
                               private=private)
-        return code, json.loads(printed.call_args.args[0]), trace, printed.call_args.args[0]
+        text = '\n'.join(str(arg) for call in printed.call_args_list for arg in call.args)
+        return code, json.loads(printed.call_args.args[0]), trace, text
+
+    def test_host_operations_identify_existing_boundaries_without_exception_data(self):
+        cases = {'source-stage': 'source-stage', 'candidate': 'candidate-generation',
+                 'transfer': 'source-transfer', 'bootstrap': 'bootstrap',
+                 'registration': 'registration-check', 'github': 'source-check',
+                 'result': 'result-read', 'service': 'service-read'}
+        for fault, operation in cases.items():
+            with self.subTest(fault=fault):
+                code, receipt, trace, text = self.drive([b'absent'], fault=fault)
+                self.assertEqual((code, receipt['code'], receipt['phase'], receipt['failure_category'],
+                                  receipt['host_operation']), (1, 1, 'guest-work', 'unknown', operation))
+                self.assertIn(receipt['host_operation'], host.HOST_OPERATIONS)
+                if fault in ('registration', 'github', 'result', 'service'):
+                    self.assertIn('bootstrap-complete', trace)
+                if fault == 'github':
+                    self.assertLess(trace.index('bootstrap-complete'), trace.index('github-success-malformed'))
+                self.assertNotIn(SENTINEL, text)
+                self.assertNotIn('RuntimeError', text)
+                self.assertNotIn(str(self.directory), text)
+                self.assertLess(trace.index('stop'), trace.index('master-close'))
+                self.assertLess(trace.index('master-close'), trace.index('remove-key'))
+                self.assertLess(trace.index('remove-key'), trace.index('dispatch-cleanup'))
+                self.assertTrue(receipt['process_absent'] and receipt['local_files_absent'] and receipt['own_key_absent'])
+            self.setUp()
+
+    def test_primary_operation_category_and_code_survive_each_cleanup_failure(self):
+        for primary, code, category in ((RuntimeError(SENTINEL), 1, 'unknown'),
+                                         (guest.Failure(SENTINEL, 17), 17, 'guest'),
+                                         (KeyboardInterrupt(SENTINEL), 130, 'interrupted')):
+            for cleanup in ('stop', 'export', 'close', 'key-and-dispatch'):
+                with self.subTest(category=category, cleanup=cleanup):
+                    kwargs = {'stop': {'stop_error': OSError(SENTINEL)},
+                              'export': {'export': OSError(SENTINEL)},
+                              'close': {'close_error': OSError(SENTINEL)},
+                              'key-and-dispatch': {'cleanup_error': OSError(SENTINEL)}}[cleanup]
+                    private = self.directory / 'private'
+                    private.mkdir(mode=0o700)
+                    result, receipt, trace, text = self.drive(
+                        [b'absent'], fault='registration', primary_error=primary, private=private, **kwargs)
+                    self.assertEqual((result, receipt['code'], receipt['failure_category'], receipt['host_operation']),
+                                     (code, code, category, 'registration-check'))
+                    self.assertIn('bootstrap-complete', trace)
+                    self.assertIn('dispatch-cleanup', trace)
+                    self.assertFalse(receipt['contained'])
+                    self.assertNotIn(SENTINEL, text)
+                self.setUp()
+
+    def test_host_failure_still_captures_concurrent_guest_bundle_once_with_original_bounds(self):
+        private, (code, receipt, trace, text) = self.private_drive(self.export_bytes(), fault='registration')
+        self.assertEqual((code, receipt['failure_category'], receipt['host_operation'], receipt['private_diagnostic']),
+                         (1, 'unknown', 'registration-check', 'captured'))
+        self.assertIn('bootstrap-complete', trace)
+        self.assertEqual(len(self.exports), 1)
+        self.assertEqual(trace.count('master-start'), 1)
+        self.assertLess(trace.index('stop'), trace.index('export'))
+        self.assertLess(trace.index('export'), trace.index('master-close'))
+        self.assertEqual(self.exports[0]['cap'], host.EXPORT_CAP_SECONDS)
+        self.assertLessEqual(self.exports[0]['until'] - host.owned_process.monotonic(), host.EXPORT_CAP_SECONDS)
+        self.assertEqual(next(private.iterdir()).read_bytes(), self.export_bytes())
+        self.assertNotIn(SENTINEL, text)
 
     # -- #368 owner-private first-failure extraction (fake original master only) ------
     boot_uuid = '22222222-2222-4222-8222-222222222222'

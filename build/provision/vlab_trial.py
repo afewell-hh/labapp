@@ -1051,7 +1051,11 @@ def export_failure(nonce):
     boot = kernel_boot()
     require(boot == value['boot_uuid'])
     core = load_sibling('vlab_core')
-    root = core.ROOT.lstat()
+    try:
+        root = core.ROOT.lstat()
+    except FileNotFoundError:
+        # No available bundle; does not distinguish never-created from removed state.
+        return b'absent'
     require(stat.S_ISDIR(root.st_mode) and root.st_uid == os.geteuid()
             and stat.S_IMODE(root.st_mode) == 0o700)  # main() already requires euid 0
     try:

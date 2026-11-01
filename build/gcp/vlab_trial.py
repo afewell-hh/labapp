@@ -670,6 +670,16 @@ def cleanup_dispatch(snapshot):
     # 202 means accepted cancellation, never observed resource cleanup/FREE.
 
 
+# Callsite context only, never inferred from exception text/type or guest output.
+HOST_OPERATIONS = frozenset({
+    'preflight', 'source-check', 'registration-check', 'owner-check', 'key-generation',
+    'key-registration', 'access-prepare', 'access-import', 'host-key', 'master-start',
+    'guest-boot', 'guest-probe', 'source-stage', 'payload-stage', 'candidate-generation',
+    'manifest-generation', 'source-transfer', 'bootstrap', 'heartbeat-start', 'poll-check',
+    'result-read', 'service-read', 'result-validate',
+})
+
+
 def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None):
     expected_snapshot(snapshot)
     rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
@@ -684,15 +694,19 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     master = context = heartbeat_thread = None
     result, contained, process_absent, key_absent, dispatched = 1, False, False, False, False
     phase, failure_category = 'preflight', 'none'
+    host_operation = 'preflight'
     # Public guest diagnostic: `unavailable` until a bounded read or observation says otherwise.
     guest_status, guest_detail, guest_service = 'unavailable', None, None
     private_diagnostic = 'skipped'
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
+        host_operation = 'source-check'
         trusted_source(snapshot, initial=True)
+        host_operation = 'registration-check'
         rec = registration.current()
         # Confirm exact active owner, no account switch/impersonation/key agent.
+        host_operation = 'owner-check'
         account = command(['gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'], 15).decode().strip()
         guest.require(account == OWNER)
         impersonation = command(['gcloud', 'config', 'get-value', 'auth/impersonate_service_account', '--quiet'], 15).decode().strip()
@@ -703,32 +717,44 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                       'canonical SELF identity differs')
         version = guest.data(command(['gcloud', 'version', '--format=json'], 15))
         guest.require(version.get('Google Cloud SDK') == '575.0.0')
+        host_operation = 'key-generation'
         command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(output / 'oslogin')], 10)
         public_key = guest.regular(output / 'oslogin.pub', 4096, os.geteuid()).decode().strip()
+        host_operation = 'key-registration'
         context = registration.register(public_key)
         importer = OwnKeyImport(records, context, login, producer_run_id=rec['run_id'], producer_attempt=rec['attempt'],
                                 now=lambda: datetime.now(timezone.utc))
         phase = 'access-prepare'
+        host_operation = 'access-prepare'
         intent, _ = importer.prepare(public_key)
         phase = 'access-import'
+        host_operation = 'access-import'
         importer.import_once()
         phase = 'guest-access'
+        host_operation = 'registration-check'
         registration.current()
+        host_operation = 'host-key'
         hostkey = command(['gcloud', 'compute', 'instances', 'get-guest-attributes', rec['names']['instance'],
                            '--project=' + spec.PROJECT, '--zone=' + spec.ZONE,
                            '--query-path=hostkeys/ssh-ed25519', '--format=json'], min(20, clock.remaining('access')), limit=4096)
         key_line = extract_ed25519(hostkey)
+        host_operation = 'registration-check'
         registration.current()
+        host_operation = 'host-key'
         guest.exclusive(output / 'known_hosts', ('labapp-trial-' + rec['ids']['instance'] + ' ' + key_line).encode())
         command(['/usr/bin/ssh-keygen', '-l', '-f', str(output / 'known_hosts'), '-E', 'sha256'], 10)
+        host_operation = 'master-start'
         master = Master(output, snapshot, intent['posix']['username'], clock, failed)
         master.start()
         # Harmless marker transfer and sudo/boot proof before appliance bytes.
+        host_operation = 'guest-boot'
         boot = master.remote(['/usr/bin/cat', '/proc/sys/kernel/random/boot_id'], 'access').decode().strip()
         guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', boot))
         initial['boot_uuid'] = boot
         guest.contract(initial)
+        host_operation = 'registration-check'
         registration.current()
+        host_operation = 'guest-probe'
         master.remote(['/usr/bin/sudo', '-n', '/usr/bin/true'], 'access')
         incoming = '/tmp/labapp-vlab-' + nonce
         master.remote(['/usr/bin/mkdir', '-m', '0700', incoming], 'access')
@@ -737,11 +763,14 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         guest.require(master.remote(['/usr/bin/cat', incoming + '/marker'], 'access') == nonce.encode())
         master.remote(['/usr/bin/rm', '--', incoming + '/marker'], 'access')
         phase = 'guest-work'
+        host_operation = 'source-stage'
         source = source_files(snapshot, output)
+        host_operation = 'payload-stage'
         for name, pin in guest.PAYLOADS.items():
             raw = guest.regular(guest.no_links(payloads / name), pin[0], os.geteuid())
             guest.require((len(raw), guest.sha(raw)) == pin)
             guest.exclusive(output / name, raw)
+        host_operation = 'candidate-generation'
         command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(output / 'candidate')], 10)
         candidate_key = guest.regular(output / 'candidate.pub', 4096, os.geteuid()).decode().split()
         password = secrets.token_urlsafe(36)
@@ -749,16 +778,22 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         password_hash = command(['/usr/bin/openssl', 'passwd', '-5', '-stdin'], 10, input_bytes=(password + '\n').encode(),
                                 limit=4096, env=SAFE_ENV).decode().strip()
         guest.exclusive(output / 'fab.yaml', candidate_fab(' '.join(candidate_key[:2]), password_hash, secrets.token_hex(32)))
+        host_operation = 'manifest-generation'
         guest.exclusive(output / 'contract.json', canonical(initial))
         for name in guest.FILES - set(source):
             raw = guest.regular(output / name, guest.PAYLOADS[name][0] if name in guest.PAYLOADS else guest.MAX_SOURCE, os.geteuid())
             source[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
         table = guest.manifest({'schema': 1, 'source_sha': snapshot['source_sha'], 'files': source})
         guest.exclusive(output / 'manifest.json', canonical(table))
+        host_operation = 'registration-check'
         registration.current()
+        host_operation = 'source-check'
         trusted_source(snapshot)
+        host_operation = 'source-transfer'
         master.transfer(incoming, [*sorted(guest.FILES), 'manifest.json'])
+        host_operation = 'registration-check'
         registration.current()
+        host_operation = 'bootstrap'
         bootstrap = ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', BOOTSTRAP, incoming,
                      source['vlab_trial.py']['sha256'], guest.sha(canonical(table))]
         if ghcr is None:
@@ -782,17 +817,24 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 if getattr(error, 'cleanup_uncertain', False):
                     process_uncertain.set()
                 failed.set()
+        host_operation = 'heartbeat-start'
         heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
         heartbeat_thread.start()
         while True:
+            host_operation = 'poll-check'
             guest.require(not failed.is_set(), 'heartbeat failed')
+            host_operation = 'registration-check'
             registration.current()
+            host_operation = 'source-check'
             trusted_source(snapshot)
+            host_operation = 'poll-check'
             clock.remaining('persistence')
             # No FAB/kubeconfigs are pulled; the only private pull is the ONE fixed
             # first-failure export in `finally` (#368). One fixed sanitized result
             # is read after the guardian has contained services.
+            host_operation = 'result-read'
             raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
+            host_operation = 'result-validate'
             state, record = guest_result(raw, nonce)
             if state == 'absent':
                 guest_status = 'pending'
@@ -800,6 +842,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 # publish anything. Observe only the original channel, within the
                 # existing work clock; manager data never supplies a result.
                 try:
+                    host_operation = 'service-read'
                     guest_service = service_observation(master.remote(
                         SERVICE_COMMAND, 'persistence', cap=8, limit=1024))
                 except BaseException as error:
@@ -807,11 +850,14 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                         process_uncertain.set()
                     raise
                 if guest_service is None or guest_service['active_state'] not in ('failed', 'inactive'):
+                    host_operation = 'poll-check'
                     stop.wait(5)
                     continue
                 # Bounded recheck closes the normal result-publication race.
                 # A terminal service without a genuine record fails promptly.
+                host_operation = 'result-read'
                 raw = master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT)
+                host_operation = 'result-validate'
                 state, record = guest_result(raw, nonce)
                 if state == 'absent':
                     guest_status = 'missing'
@@ -839,6 +885,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     finally:
+        # Keep primary callsite context frozen throughout supplemental diagnostics/cleanup.
         stop.set()
         heartbeat_absent = True
         if heartbeat_thread:
@@ -906,7 +953,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         except BaseException:
             pass
         receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
-                   'phase': phase, 'failure_category': failure_category,
+                   'phase': phase, 'failure_category': failure_category, 'host_operation': host_operation,
                    'own_key_absent': key_absent, 'local_files_absent': local_absent,
                    'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id'],
                    # Closed values only; never text, argv, paths or raw manager output.
