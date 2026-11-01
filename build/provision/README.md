@@ -1122,6 +1122,41 @@ cleanup body, and an explicitly synthetic real-installer archive with recomputed
 pins. They never execute Helm or real curl. Checksum-only trust does not prove
 GPG/provenance, installed baseline metadata, runtime or full image/course equivalence.
 
+## Pinned public serializer/default asymmetry fixture (#394, source only)
+
+`fixtures/pinned-api/` (`go.mod`, `main.go`) loads fixed public Switch, Server and
+Connection YAML with the real `apiutil.NewLoader`/`LoadAdd`/`PrintInclude`, reloads
+the printed YAML, deep-copies the typed objects, calls their actual `Default()` and
+encodes with ordinary `encoding/json` (never `PrintKubeObject` again). It writes
+`expected.yaml`, `observed.json` and `meta.json`. `test_pinned_api_fixture.py`
+feeds those independently produced sides to the real `object_identity`/
+`object_value` and the same equality rule `api_ready` uses. Not part of the
+default `test_vlab_core.py` discovery; it fails (never skips) without the fixture.
+
+Provenance (read 2026-11-01, raw sources): `githedgehog/fabricator` tag `v0.43.1`
+(tag object `3fa6149cd18d5a64c9d3ca40edf35a91276f30b0`; peeled commit NOT yet
+resolved) `go.mod` requires `go.githedgehog.com/fabric v0.96.2`; printer
+`pkg/util/apiutil/printer.go`, loader `loader.go`, `scheme.go` (`FabricGatewayGVKs`),
+fabric `api/wiring/v1beta1/{meta,switch_types,connection_types}.go`. `go.sum` is
+not yet committed: it needs one lead-reviewed public-only module fetch (not offline
+evidence), then commit `go.sum` and run with `-mod=readonly`.
+
+```bash
+# Separately scoped hosted step only (public module fetch; no credentials, Docker
+# socket, registry, cloud or hhfab build); bounded, then the Python suite:
+out=$(mktemp -d); (cd build/provision/fixtures/pinned-api &&
+  GOTOOLCHAIN=local GOFLAGS=-mod=readonly timeout 300 go run . -out "$out")
+LABAPP_PINNED_API_FIXTURE_DIR="$out" python3 -I -B -m unittest discover -s build/provision \
+  -p test_pinned_api_fixture.py -v   # step must also refuse zero tests
+```
+
+Limits: proves the pinned source serializer/default asymmetry for these fixed
+objects, not live admission, OCI bytes, canonical11's actual diff, full readiness or
+VM function. Typed Go decoding drops unknown fields, so the unknown-spec-field case is
+injected into decoded JSON. Spec default/ordering assertions are predictions from the
+source reads and unexecuted; a failure means the prediction, not readiness, is wrong.
+It does not call `api_ready` (fixed counts, kubectl, kubeconfig). Status: UNRUN.
+
 ## Dedicated guest VLAB core assembly and preserved-state resume
 
 `vlab_core.py` is a fixed guest component, invoked with Ubuntu 24.04 Python 3.12
