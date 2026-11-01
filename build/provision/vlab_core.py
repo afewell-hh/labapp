@@ -93,7 +93,7 @@ SNAPSHOT_REAP = 1.0        # held back inside each query's end to kill/reap its 
 MANAGER_SECONDS, JOURNAL_SECONDS = 2, 8
 JOURNAL_NAMESPACE = 'labapp-vlab'
 JOURNAL_LINES = 64
-MANAGER_PROPERTIES = 'ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,ExecMainPID'
+MANAGER_PROPERTIES = 'ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,ExecMainPID,ExecMainExitTimestamp,ExecStartPost'
 NETFILTER = ('bridge-nf-call-iptables', 'bridge-nf-call-ip6tables', 'bridge-nf-call-arptables')
 RESULT = 'control--control-1--install'
 DEV_PASSWORD = '$5$8nAYPGcl4l6G7Av1$Qi4/gnM0yPtGv9kjpMh78NuNSfQWy7vR1rulHpurL36'
@@ -574,7 +574,8 @@ def capture_first_failure(mode, value, primary, deadline):
     unit = UNIT[mode]
     if invocation is not None:
         status, raw, _, result = diagnostic_run(
-            [SYSTEMCTL, 'show', unit, '--no-pager', '--property=' + MANAGER_PROPERTIES],
+            [SYSTEMCTL, 'show', unit, '--no-pager', '--timestamp=us+utc',
+             '--property=' + MANAGER_PROPERTIES],
             min(end, time.monotonic() + MANAGER_SECONDS), FAILURE_CAPS['manager'])
         cleanup = 'uncertain' if result == 'uncertain' else cleanup
         if status in ('ok', 'truncated'):
