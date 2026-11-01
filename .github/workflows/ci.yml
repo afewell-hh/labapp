@@ -12,6 +12,20 @@ permissions:
   contents: read
 
 jobs:
+  pinned-api-fixture:
+    name: Pinned public API serializer and typed-default comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Public preparation then isolated required offline fixture
+        # Outer bound dominates phase maxima; reserve 75s for exact cleanup.
+        run: timeout --kill-after=75s 23m bash build/provision/fixtures/pinned-api/run-hosted.sh
+
   inspection-offline:
     name: Private filesystem collector offline suite
     runs-on: ubuntu-24.04
