@@ -42,6 +42,8 @@ coverage even when the source is accessible to someone else. Continue sound
 independent work; conclusions that depend on the gap are provisional. Later
 lead or reviewer coverage does not retroactively complete worker onboarding.
 Do not guess why a source was skipped; record that it was.
+The lead records which criteria received complete independent coverage and which
+remain provisional.
 
 ## Research and sources
 
@@ -162,17 +164,16 @@ discover prerequisites. Checklist:
 - Identity, environment and working directory the contract expects.
 - Caller-created directories: existence, contents, ownership and modes.
 - Input provenance: where each input came from and that it is the reviewed one.
-- Output file mode and the caller's umask.
+- Output file ownership/mode and the caller's umask.
 - Original clocks and watchdog state (intent, deadlines, timers).
 
-**Refusal recovery.** Separate two cases. (1) The refusal is proven to happen
-before intent or any API mutation and was caused by a caller prerequisite: fix
-that prerequisite and rerun through the supported path. (2) Whether a mutation
-occurred is uncertain: do not replay it. Use supported recovery only, with
-bounded read-only observations to determine completion under the same intent
-and deadlines. Do not reset deadlines, disable a watchdog to pass a check,
-apply a blanket retry rule, expand permissions or seek new approvals; scheduled
-timers keep running. Escalate to the lead with the exact refusal.
+**Refusal recovery.** For a caller-prerequisite refusal proven to have created
+or changed no intent and sent no API mutation, correct the prerequisite and use
+the supported path. If mutation completion is uncertain, do not blindly replay
+it; use supported recovery. Read-only verification may overlap a scheduled timer
+activation: use bounded completion observations under the original intent and
+deadlines. Do not reset deadlines, disable a watchdog to pass a check, apply
+blanket retry rules, expand permissions or introduce additional approval steps.
 
 ## Bounded iterations and escalation
 

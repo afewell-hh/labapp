@@ -47,14 +47,10 @@ Out of scope (cloud/production access, other components, refactors):
 A failed, denied or unrun check is reported as such, not as passing.
 
 ## Sources and compatibility
-<!-- Official docs / issues / code to read first, with the version scope that applies. -->
-
-- (fill in)
-
-## Read first, with reasons
-<!-- Name consequential files/sections/comment IDs and why each matters. Product,
-safety and authorization context stays required; a checkpoint may replace long
-parent history but not a named dependency. -->
+<!-- Official docs / issues / code to read first, with the version scope that
+applies. Name consequential files/sections/comment IDs and why each matters.
+Product, safety and authorization context stays required; a checkpoint may
+replace long parent history but not a named dependency. -->
 
 - (fill in)
 
