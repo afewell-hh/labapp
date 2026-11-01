@@ -2500,6 +2500,17 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
         self.env.write_contract()
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        # GuestEnvironment fakes privileged core entrypoints on the shared os module.
+        # Export is read-only: retain its real filesystem ownership checks against
+        # this unprivileged fixture user without changing the core's privilege stub.
+        class ExportOS:
+            def geteuid(self):
+                return os.getuid()
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+        self.stack.enter_context(patch.object(trial, 'os', ExportOS()))
         self.v = value()
         self.root = self.env.base / 'trial'
         self.root.mkdir(mode=0o700)
