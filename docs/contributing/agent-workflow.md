@@ -195,6 +195,21 @@ discover prerequisites. Checklist:
 - Input provenance: where each input came from and that it is the reviewed one.
 - Output file ownership/mode and the caller's umask.
 - Original clocks and watchdog state (intent, deadlines, timers).
+- Operation principals and resource links: name the principal each intended
+  operation runs as (for example VM delete versus the caller) and check the
+  contract's documented resource-link forms (such as gcloud versus REST Compute
+  URL hosts) for that operation; do not adopt a blanket normalization policy.
+
+**Prepare before clocks start.** Before any time-limited evidence or deadline
+begins, prepare and review inert templates (admission, snapshot, owned-VM
+refresh, disposal) and have the owned-VM refresh path ready, with occupied
+quotas and protected baselines identified. ROOT verifies existing local
+bindings, paths, ownership, payloads and output readiness. Acquire
+time-limited actual cloud reads last, immediately before consumption. Fill
+remaining live bindings only from genuine responses, in minimal reviewed diffs.
+If evidence expires, refresh with new actual reads and exclusive output paths;
+never rewrite old timestamps or renew original deadlines. SOURCE review does
+not substitute for facts, and disposal checks are never weakened.
 
 **Refusal recovery.** For a caller-prerequisite refusal proven to have created
 or changed no intent and sent no API mutation, correct the prerequisite and use
