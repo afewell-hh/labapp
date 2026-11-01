@@ -2253,8 +2253,12 @@ class FirstFailureExport(unittest.TestCase):
         self.stack.enter_context(patch.object(core, 'diagnostic_run', side_effect=self.query))
         self.v = v
         self.operation, self.invocation = 'e' * 32, 'f' * 32
+        started = time.monotonic()
         self.value = {'schema': 1, 'nonce': NONCE, 'mode': 'fresh', 'operation': self.operation,
-                      'phase': 'starting', 'invocation': self.invocation}
+                      'phase': 'starting', 'invocation': self.invocation, 'boot': v['boot_uuid'],
+                      'started': started, 'deadline': started + core.START_SECONDS['fresh']}
+        # reserve() returns before unit_gate publishes the invocation in current state.
+        self.reserved = {key: item for key, item in self.value.items() if key != 'invocation'}
         core.atomic(self.state_root / 'state.json', self.value)
 
     def query(self, argv, end, keep):
@@ -2265,12 +2269,13 @@ class FirstFailureExport(unittest.TestCase):
 
     def capture(self, value=True, error=None):
         error = error or self.core.Failure('child command failed', 1, b'primary ' + SENTINEL.encode())
-        self.core.capture_first_failure('fresh', self.value if value else None, error, time.monotonic() + 60)
+        self.core.capture_first_failure('fresh', self.reserved if value else None, error, time.monotonic() + 60)
 
     def export(self):
         return trial.export_failure(NONCE)
 
     def test_real_writer_roundtrip_validates_and_binds_independent_envelope(self):
+        self.assertNotIn('invocation', self.reserved)
         self.capture()
         raw = self.export()
         first, _, rest = raw.partition(b'\n')
@@ -2288,24 +2293,31 @@ class FirstFailureExport(unittest.TestCase):
 
     def test_real_unit_ready_record_roundtrips_through_capture_export_and_validator(self):
         core = self.core
-        started = time.monotonic()
-        value = dict(self.value, boot=self.v['boot_uuid'], started=started,
-                     deadline=started + core.START_SECONDS['fresh'])
-        core.atomic(self.state_root / 'state.json', value)
+        value = self.value
 
         def publish(message, code):
             record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
                       'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
-                      'boot': value['boot'], 'started': started, 'deadline': value['deadline'],
+                      'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
                       'message': message, 'code': code}
             core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
 
         publish('synthetic readiness refusal', 17)
-        core.capture_first_failure('fresh', value, core.Failure('child command failed', 1, b'x'),
-                                   time.monotonic() + 60)
+        self.assertNotIn('invocation', self.reserved)
+        self.capture(error=core.Failure('child command failed', 1, b'x'))
         bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
         self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17})
         self.assertLessEqual(len((self.state_root / self.core.FIRST_FAILURE).read_bytes()), trial.FAILURE_LIMIT)
+
+    def test_missing_current_clock_authority_invalidates_only_readiness_section(self):
+        current = {key: item for key, item in self.value.items() if key != 'started'}
+        self.core.atomic(self.state_root / 'state.json', current)
+        self.capture()
+        bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertEqual(len(self.queries), 2)
 
     def test_absent_and_every_binding_mismatch_is_refused_not_trusted(self):
         self.assertEqual(self.export(), b'absent')
