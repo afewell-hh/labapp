@@ -71,6 +71,9 @@ PUBLIC_CONFIG = {
 }
 PUBLIC_CONTROL = {'bootstrap': {'disk': '/dev/sda'}, 'external': {'interface': 'enp2s0', 'ip': 'dhcp'},
                   'management': {'interface': 'enp2s1'}}
+# Pinned ControlNodeSpec.Dummy is a value struct: encoding/json's omitempty
+# retains it as {}, including through PrintFab. The raw renderer omits it.
+EXPECTED_TYPED_CONTROL = {**PUBLIC_CONTROL, 'dummy': {}}
 EMPTY = ('""', '0', 'false', 'null', '[]', '{}')
 
 
@@ -319,8 +322,9 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
 
     def test_vlan_helper_is_not_presumed_normalizing(self):
         # Source evidence: Default() assigns normalized VLAN ranges only on the
-        # helper's error path; success keeps the input list. No intended
-        # normalization is implemented or asserted beyond unchanged canonical data.
+        # helper's error path. The helper fills to=0 from from and sorts in place;
+        # its merged return is unused on success. Only this canonical singleton
+        # is asserted unchanged; no intended generic normalization is presumed.
         vlan = named(self.defaulted, 'VLANNamespace', 'default')
         self.assertEqual(vlan['spec'], {'ranges': [{'from': 1000, 'to': 2999}]})
         self.assertFalse(vlan['metadata'].get('labels'))
@@ -344,9 +348,15 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
             self.assertEqual(doc['metadata']['namespace'], 'fab')
             self.assertFalse(doc['metadata'].get('labels'))
             self.assertFalse(doc['metadata'].get('annotations'))
-        # ControlNode namespace/spec are exact in both printed and observed sides.
-        self.assertEqual(printed_control['spec'], PUBLIC_CONTROL)
-        self.assertEqual(named(self.defaulted, 'ControlNode', 'control-1')['spec'], PUBLIC_CONTROL)
+        # Assert the single named raw-input -> typed-serialization delta.
+        self.assertNotIn('dummy', PUBLIC_CONTROL)
+        self.assertEqual(set(EXPECTED_TYPED_CONTROL) - set(PUBLIC_CONTROL), {'dummy'})
+        self.assertEqual(EXPECTED_TYPED_CONTROL['dummy'], {})
+        for docs in (fab_meta['loadedBeforeMerge'], fab_meta['reloadLoadedBeforeMerge'],
+                     fab_meta['afterReloadMergeBeforeExplicitDefault'], self.printed, self.defaulted):
+            spec = named(docs, 'ControlNode', 'control-1')['spec']
+            self.assertEqual(spec, EXPECTED_TYPED_CONTROL)
+            self.assertEqual({k: v for k, v in spec.items() if k != 'dummy'}, PUBLIC_CONTROL)
         config = printed_fab['spec']['config']
         control = config['control']
         self.assertRegex(control['joinToken'], r'[a-f0-9]{64}')
@@ -381,7 +391,15 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
         for kind, name in (('Fabricator', 'default'), ('ControlNode', 'control-1')):
             self.assertEqual(core.object_value(named(self.printed, kind, name)),
                              core.object_value(named(self.defaulted, kind, name)))
-        for doc in fab_meta['originals'] + fab_meta['beforeDefault']:
+        self.assertEqual(fab_meta['loadedBeforeMerge'], fab_meta['originals'])
+        for doc in fab_meta['reloadLoadedBeforeMerge']:
+            self.assertEqual(core.object_value(doc), core.object_value(named(
+                self.printed, doc['kind'], doc['metadata']['name'])))
+        for doc in fab_meta['afterReloadMergeBeforeExplicitDefault']:
+            self.assertEqual(core.object_value(doc), core.object_value(named(
+                self.defaulted, doc['kind'], doc['metadata']['name'])))
+        for doc in (fab_meta['originals'] + fab_meta['loadedBeforeMerge']
+                    + fab_meta['reloadLoadedBeforeMerge'] + fab_meta['afterReloadMergeBeforeExplicitDefault']):
             self.assertEqual(doc['metadata']['namespace'], 'fab')
 
     def test_separate_public_fabricator_controls_execute_branches(self):

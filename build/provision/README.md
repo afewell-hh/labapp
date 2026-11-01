@@ -1150,7 +1150,15 @@ whether the printed Fabricator is a fixed point of reload+merge+print, and wheth
 a further typed `Default()` changes it; separate controls prove a set non-default
 value survives the merge and that `Fabricator.Default` resets
 `LoopbackWorkaroundDisable`. FabNode count is explicitly 0 and ControlNode 1.
-Originals and pre-default copies are checked unchanged. Output remains exactly
+`loadedBeforeMerge` and `reloadLoadedBeforeMerge` are independent strict-decoded
+typed snapshots captured before each `GetFabAndNodes` call. The
+`afterReloadMergeBeforeExplicitDefault` snapshot is already merged, defaulted
+by validation and versioned; it precedes only the extra explicit `Default()`.
+Originals and the sources of explicit-default copies are checked unchanged.
+The raw public ControlNode renderer input omits `dummy`; its pinned value-struct
+field survives `encoding/json`'s `omitempty` as `dummy: {}` in typed snapshots,
+printed YAML and observed JSON. Tests assert that exact named serialization
+delta while preserving every raw input field. Output remains exactly
 `expected.yaml` (printed Fabricator, ControlNode and 43 wiring objects),
 `observed.json` (`canonical` 45 defaulted objects and `synthetic` 4) and
 `meta.json`, created exclusively as owned regular single-link mode-0600 files in
@@ -1176,14 +1184,14 @@ Duplicate tests keep equal collapsed maps to exercise both production uniqueness
 guards. No production readiness rule is duplicated or changed. Missing, extra,
 insecure or oversized fixture files, or zero discovered tests, fail rather than skip.
 
-Not implemented and still unknown: a future expected-projection of generated
-labels; Fabricator hydration (management/dummy IPs), migrations and `hhfab` build
-behavior; what live webhooks, deployed CRDs, OCI bytes or the controller do. The
-actual VLAN helper only assigns normalized ranges on its error path and discards
-the merged return on success; no intended normalization is presumed. The pinned
-source files were read through summarizing fetches on 2026-11-01 (not byte-exact
-raw copies); SOURCE-only authoring means this change has not been compiled or run
-at the time of writing (see the PR for the executed evidence).
+Not implemented and still unknown: a full expected projection, Fabricator
+hydration (management/dummy IPs), full migration-branch coverage and `hhfab`
+build behavior; what live webhooks, deployed CRDs, OCI bytes or the controller
+do. The actual VLAN helper fills zero `to` from `from` and sorts ranges in place;
+`Default()` assigns the returned ranges only on error and discards the merged
+return on success. The canonical singleton stays unchanged; no generic merging
+is presumed. Execution evidence belongs in the associated PR and CI runs;
+these assertions do not establish effective deployed behavior.
 
 Source provenance, independently read as raw primary code on 2026-11-01:
 [Fabricator v0.43.1](https://github.com/githedgehog/fabricator/tree/65254ebab3cb7173598985dfb9f3f358e08769ca),
@@ -1199,6 +1207,9 @@ removes generated labels and last-applied annotations. Fabric's
 [Switch defaults](https://github.com/githedgehog/fabric/blob/8b0aefa0937a95e51cc04ec3ea33fadb06782a99/api/wiring/v1beta1/switch_types.go#L183)
 and Connection/Server defaults define the asserted transformations. Source webhook
 registration invokes those defaults; the fake client does not run admission.
+The pinned [ControlNode value struct](https://github.com/githedgehog/fabricator/blob/65254ebab3cb7173598985dfb9f3f358e08769ca/api/fabricator/v1beta1/controlnode_types.go#L18)
+and [Go 1.25.9 JSON omission rules](https://github.com/golang/go/blob/go1.25.9/src/encoding/json/encode.go#L113)
+explain the explicit empty `dummy` serialization expectation.
 
 The hosted wrapper compiles only this helper in a temporary command directory
 inside the immutable Fabricator checkout, using its unchanged module/vendor tree

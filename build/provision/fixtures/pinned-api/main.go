@@ -345,6 +345,7 @@ func configPaths(config any) map[string]string {
 
 type fabRun struct {
 	originals                []json.RawMessage
+	loadedBeforeMerge        []json.RawMessage
 	fabricator               fabapi.Fabricator
 	controls                 []fabapi.ControlNode
 	nodes                    []fabapi.FabNode
@@ -373,6 +374,9 @@ func loadFab(ctx context.Context, input []byte) fabRun {
 	if preConfig == nil {
 		fail("fabricator input has no Fabricator")
 	}
+	// Snapshot strict-decoded typed input before GetFabAndNodes merges defaults,
+	// validates (including Fabricator.Default), and calculates versions.
+	loadedBeforeMerge := encodeEach(originals)
 	f, controls, nodes, err := fab.GetFabAndNodes(ctx, loader.GetClient(), fab.GetFabAndNodesOpts{AllowNotHydrated: true})
 	if err != nil {
 		fail("get fabricator and nodes: %v", err)
@@ -380,7 +384,8 @@ func loadFab(ctx context.Context, input []byte) fabRun {
 	if !bytes.Equal(originalBytes, encode(originals)) {
 		fail("fabricator loading changed original controls")
 	}
-	run := fabRun{originals: encodeEach(originals), fabricator: f, controls: controls, nodes: nodes}
+	run := fabRun{originals: encodeEach(originals), loadedBeforeMerge: loadedBeforeMerge,
+		fabricator: f, controls: controls, nodes: nodes}
 	pre, post := configPaths(preConfig), configPaths(f.Spec.Config)
 	for path, value := range post {
 		if old, ok := pre[path]; !ok {
@@ -452,16 +457,18 @@ func main() {
 	fixedPoint := bytes.Equal(printedFab, reprinted)
 
 	invoked := map[string]int{}
-	fabBefore := []json.RawMessage{encode(&reloaded.fabricator)}
+	// Reload/GetFabAndNodes has already merged, defaulted and versioned these.
+	// This snapshot precedes only the extra explicit typed Default below.
+	fabAfterReloadMerge := []json.RawMessage{encode(&reloaded.fabricator)}
 	cp := reloaded.fabricator.DeepCopy()
 	fabObserved := []json.RawMessage{observe(cp, fabapi.GroupVersion.WithKind("Fabricator"), invoked)}
-	if !bytes.Equal(fabBefore[0], encode(&reloaded.fabricator)) {
+	if !bytes.Equal(fabAfterReloadMerge[0], encode(&reloaded.fabricator)) {
 		fail("typed Default changed its Fabricator source control")
 	}
 	defaultUnchanged := bytes.Equal(encode(&reloaded.fabricator), encode(cp))
 	for i := range reloaded.controls {
 		before := encode(&reloaded.controls[i])
-		fabBefore = append(fabBefore, before)
+		fabAfterReloadMerge = append(fabAfterReloadMerge, before)
 		cpc := reloaded.controls[i].DeepCopy()
 		fabObserved = append(fabObserved, observe(cpc, fabapi.GroupVersion.WithKind("ControlNode"), invoked))
 		if !bytes.Equal(before, encode(&reloaded.controls[i])) {
@@ -487,7 +494,9 @@ func main() {
 			"beforeDefault": synthetic.before, "defaulted": synthetic.defaulted,
 			"typedDefaultInvoked": synthetic.invoked, "originalsUnchanged": true},
 		"fabricator": map[string]any{
-			"originals": generated.originals, "beforeDefault": fabBefore,
+			"originals": generated.originals, "loadedBeforeMerge": generated.loadedBeforeMerge,
+			"reloadLoadedBeforeMerge": reloaded.loadedBeforeMerge,
+			"afterReloadMergeBeforeExplicitDefault": fabAfterReloadMerge,
 			"typedDefaultInvoked": invoked, "controlNodes": len(generated.controls), "fabNodes": len(generated.nodes),
 			"mergeAdded": nonNil(generated.added), "mergeChanged": nonNil(generated.changed),
 			"mergeRemoved": nonNil(generated.removed),
