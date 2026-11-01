@@ -1190,6 +1190,33 @@ PUBLIC/AUTO_ONLY/PREMIUM and cover only the subnet's primary range. NAT cannot
 select a single VM; approval for temporary subnet egress remains separate.
 The VM lease stays 120 minutes. Existing VM cleanup does not own this network.
 
+The closed policy requires the exact integer `minPortsPerVm: 1024` in every
+configured NAT read; omission or any other value refuses capture/cleanup.
+Allocation stays static: omitted `enableDynamicPortAllocation` or boolean
+`false` is accepted, while `true` and malformed values refuse. Optional server
+defaults remain closed; configured/effective TIME_WAIT stays 120, EIM/logging
+stay disabled, and extra NAT IPs, rules or tunable parameters are not introduced.
+The separately reviewed owner creation bridge must request 1024 and verify its
+returned capture before activation; this helper supplies no creation tool.
+Previously disposed 64-port trial states stay archived; this policy does not
+provide legacy-state recovery or name adoption.
+
+Current official [Public NAT setup](https://docs.cloud.google.com/nat/docs/set-up-manage-network-address-translation)
+documents the static minimum range 2–57344 (default 64), and the
+[Compute v1 router schema](https://docs.cloud.google.com/compute/docs/reference/rest/v1/routers)
+defines integer minimum ports rounded up to a power of two and omitted dynamic
+allocation as disabled. [Port allocation](https://docs.cloud.google.com/nat/docs/ports-and-addresses)
+documents 64,512 TCP and 64,512 UDP ports per NAT IP. For the approved primary-only
+VM profile, three VMs at 1024 reserve 3072 ports per protocol, within one IP's
+capacity. This arithmetic does not expand the existing maximum of three
+inclusive VM slots or prove actual allocation, convergence or workload success.
+These live documentation references were checked 2026-11-01; installed/API runtime
+behavior still needs separate verification. The fixed 1024 is deliberate 16x
+headroom over the historical 64-port allocation that reached saturation with
+resource drops; demand was censored by that cap, so 1024 is not a measured required
+peak. Native acceptance must measure applied ports, saturation and drops during
+a representative build, then positively verify every owned child's disposal.
+
 Use only from a frozen, accepted full source checkout installed at
 `/home/ubuntu/.local/share/labapp-trial-egress-349/source` with the existing
 trusted private Python3.12 runtime named in `labapp-trial-egress.service`.

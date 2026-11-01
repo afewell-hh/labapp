@@ -26,7 +26,7 @@ def router(nat=False):
              'description': e.DESCRIPTION + 'a' * 64, 'region': e.REGION,
              'network': e.ROOT + '/global/networks/default', 'selfLink': e.ROUTER}
     if nat:
-        value['nats'] = [{'name': e.NAT, 'type': 'PUBLIC', 'autoNetworkTier': 'PREMIUM',
+        value['nats'] = [{'name': e.NAT, 'type': 'PUBLIC', 'autoNetworkTier': 'PREMIUM', 'minPortsPerVm': 1024,
                          'natIpAllocateOption': 'AUTO_ONLY', 'sourceSubnetworkIpRangesToNat': 'LIST_OF_SUBNETWORKS',
                          'subnetworks': [{'name': e.SUBNET, 'sourceIpRangesToNat': ['PRIMARY_IP_RANGE']}]}]
     return value
@@ -214,6 +214,55 @@ class Egress(unittest.TestCase):
             config[0][key] = value
             with self.assertRaises(e.Failure): e.valid_nat(config)
 
+    def test_required_static_ports_with_optional_server_defaults_capture_and_cleanup(self):
+        self.owned()
+        api = FakeAPI()
+        api.value['nats'][0].update(
+            enableDynamicPortAllocation=False, enableEndpointIndependentMapping=False,
+            tcpTimeWaitTimeoutSec=120, effectiveTcpTimeWaitTimeoutSec=120,
+            logConfig={'enable': False, 'filter': 'ALL'}, natIps=[], drainNatIps=[], rules=[])
+        e.valid_nat(api.value['nats'])
+        e.capture_nat(self.state, api)
+        captured = self.state.read('nat.json')
+        self.assertEqual(captured, api.value['nats'])
+        self.assertEqual(captured[0]['minPortsPerVm'], 1024)
+        self.assertIs(type(captured[0]['minPortsPerVm']), int)
+        result = e.cleanup(self.state, api)
+        self.assertTrue(result['router_absent'] and result['allocations_absent'])
+        self.assertEqual([c for c in api.calls if c in ('PATCH', 'DELETE')], ['PATCH', 'DELETE'])
+
+    def test_missing_wrong_or_malformed_static_ports_refuse_capture_and_cleanup(self):
+        self.owned()
+        changes = [{}, *({'minPortsPerVm': value}
+                        for value in (64, 128, 512, 2048, True, '1024', None, 1024.0)),
+                   {'minPortsPerVm': 1024, 'enableDynamicPortAllocation': True},
+                   {'minPortsPerVm': 1024, 'enableDynamicPortAllocation': 0},
+                   {'minPortsPerVm': 1024, 'maxPortsPerVm': 2048}]
+        for change in changes:
+            for phase in (e.capture_nat, e.cleanup):
+                with self.subTest(change=change, phase=phase.__name__):
+                    api = FakeAPI()
+                    api.value['nats'][0].pop('minPortsPerVm')
+                    api.value['nats'][0].update(change)
+                    with self.assertRaises(e.Failure):
+                        phase(self.state, api)
+                    self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+                    for filename in ('nat.json', 'initial-allocations.json', 'allocations.json',
+                                     'nat-attempt.json', 'delete-attempt.json'):
+                        self.assertIsNone(self.state.read(filename, optional=True))
+
+    def test_nat_capture_reread_port_drift_refuses_without_persisting_capture(self):
+        self.owned()
+        api = FakeAPI()
+        first = api.router()
+        changed = deepcopy(first)
+        changed['nats'][0]['minPortsPerVm'] = 64
+        api.router = Mock(side_effect=[first, changed])
+        with self.assertRaises(e.Failure): e.capture_nat(self.state, api)
+        self.assertIsNone(self.state.read('nat.json', optional=True))
+        self.assertIsNone(self.state.read('initial-allocations.json', optional=True))
+        self.assertFalse(any(c in ('PATCH', 'DELETE') for c in api.calls))
+
     def test_capture_requires_own_terminal_insert_before_nat(self):
         self.state.write('intent.json', pending())
         self.state.write('create-operation.json', op())
@@ -330,7 +379,7 @@ class Egress(unittest.TestCase):
         self.owned()
         api = FakeAPI()
         e.capture_nat(self.state, api)
-        api.value['nats'][0]['minPortsPerVm'] = 64
+        api.value['nats'][0]['enableDynamicPortAllocation'] = False
         with self.assertRaises(e.Failure): e.cleanup(self.state, api)
         self.assertNotIn('PATCH', api.calls)
 

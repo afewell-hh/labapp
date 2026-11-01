@@ -213,11 +213,11 @@ def valid_nat(nats):
     require(type(nats) is list and len(nats) <= 1)
     if not nats:
         return
-    fixed = {'name': NAT, 'type': 'PUBLIC', 'autoNetworkTier': 'PREMIUM',
+    fixed = {'name': NAT, 'type': 'PUBLIC', 'autoNetworkTier': 'PREMIUM', 'minPortsPerVm': 1024,
              'natIpAllocateOption': 'AUTO_ONLY', 'sourceSubnetworkIpRangesToNat': 'LIST_OF_SUBNETWORKS',
              'subnetworks': [{'name': SUBNET, 'sourceIpRangesToNat': ['PRIMARY_IP_RANGE']}]}
     defaults = {'enableDynamicPortAllocation': False, 'enableEndpointIndependentMapping': False,
-                'minPortsPerVm': 64, 'udpIdleTimeoutSec': 30, 'icmpIdleTimeoutSec': 30,
+                'udpIdleTimeoutSec': 30, 'icmpIdleTimeoutSec': 30,
                 'tcpEstablishedIdleTimeoutSec': 1200, 'tcpTransitoryIdleTimeoutSec': 30,
                 'tcpTimeWaitTimeoutSec': 120, 'effectiveTcpTimeWaitTimeoutSec': 120,
                 'logConfig': {'enable': False, 'filter': 'ALL'}, 'endpointTypes': ['ENDPOINT_TYPE_VM'],
