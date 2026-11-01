@@ -625,6 +625,40 @@ unknown bounded-refusal text is withheld. The unchanged combined-output cap is
 These diagnostics locate a new observed failure; they cannot reconstruct the
 stage or cause of earlier failures or prove installation/runtime success.
 
+#### QEMU installation output-overflow observations
+
+Only `install-qemu.py` opts in (`bounded(..., observe=True)`); every other
+`bounded()` caller keeps its exact error string, behavior and no observation.
+The 1 MiB combined stdout/stderr cap stays a hard refusal: the overflowing block
+is never retained, and an overflowing command is never a success, even if it
+would later exit 0 or 100. An overflow refusal appends one fixed line to the
+existing `[stage=S: ]command=LABEL: command output overflow` text:
+
+```text
+observation=through-cutoff-not-total cap= block= deadline_seconds= elapsed_ms=
+blocks= observed_bytes= retained_bytes= long_records=
+lines[get= hit= ign= err= w= e= dpkg= other=] unterminated_tail=0|1 non_ascii=0|1
+```
+
+All values are bounded integers or 0/1 flags in that fixed order. Counters cover
+only output read up to the cutoff; they are not total child output, a native
+exit status or a cause. `observed_bytes` includes the crossing read block and so
+can exceed `cap`; `retained_bytes` never does. Records end at CR or LF and are
+classified by a fixed leading-byte prefix (`Get:`, `Hit:`, `Ign:`, `Err:`, `W:`,
+`E:`, common dpkg progress lines, else `other`); `long_records` counts records
+over 4096 bytes. No child text, snippet, argument, environment, path, hash or
+dynamic key is emitted, and a missing or invalid observation prints
+`observation=unavailable`. Parsing keeps at most 24 prefix bytes and does linear
+work per read block, so CR-heavy, binary or very long records stay bounded. A
+failing observer is dropped without changing the refusal or the child cleanup.
+
+On any primary failure the supervisor still attempts group `SIGKILL`, leader wait
+and pipe close, and the primary failure is preserved if one of those steps also
+fails; cleanup failure after an apparent success still fails. Leader reap does
+not prove that the whole session or every descendant is gone, and a child that
+leaves its process group or sits in uninterruptible sleep is not preempted.
+Tests: `python3 -m unittest discover -s build/provision -p test_qemu.py -v`.
+
 ### Explicit historical QEMU selection
 
 The no-option default and explicit `--selection test-20261024` retain the four

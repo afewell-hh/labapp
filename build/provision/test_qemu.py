@@ -2,6 +2,7 @@
 import contextlib
 import os
 from pathlib import Path
+import re
 import runpy
 import signal
 import sys
@@ -12,12 +13,19 @@ import test_bridge_ipv4_harness as ownership
 import unittest
 from unittest.mock import patch, Mock
 
+import hhfab_release
 from hhfab_release import Refusal, bounded
 import qemu_container as container
 import qemu_offline as offline_protocol
 import qemu_witness as witness
 
 INSTALL = Path(__file__).with_name('install-qemu.py')
+UNAVAILABLE = ' observation=unavailable'
+# The complete public diagnostic grammar: fixed keys, integers and 0/1 flags only.
+OBSERVED = (' observation=through-cutoff-not-total cap=\\d+ block=\\d+ deadline_seconds=\\d+ elapsed_ms=\\d+'
+            ' blocks=\\d+ observed_bytes=\\d+ retained_bytes=\\d+ long_records=\\d+'
+            ' lines\\[get=\\d+ hit=\\d+ ign=\\d+ err=\\d+ w=\\d+ e=\\d+ dpkg=\\d+ other=\\d+\\]'
+            ' unterminated_tail=[01] non_ascii=[01]')
 
 
 class InstallTests(unittest.TestCase):
@@ -140,8 +148,10 @@ class CommandDiagnosticTests(unittest.TestCase):
                      patch.dict(self.globals, {'bounded': Mock(side_effect=Refusal(reason))}):
                     with self.assertRaises(Refusal) as caught:
                         self.module['call'](args, 7)
-                    self.assertEqual(str(caught.exception), f'command={label}: {reason}')
-                    self.globals['bounded'].assert_called_once_with(args, 7, env=self.module['ENV'])
+                    # A refusal without a valid closed observation says so; no text is invented.
+                    self.assertEqual(str(caught.exception), f'command={label}: {reason}'
+                                     + (UNAVAILABLE if 'overflow' in reason else ''))
+                    self.globals['bounded'].assert_called_once_with(args, 7, env=self.module['ENV'], observe=True)
 
     def test_unknown_bounded_refusal_does_not_export_exception_text(self):
         with patch.dict(self.globals, {'bounded': Mock(side_effect=Refusal('secret-token sentinel\n/private/path'))}):
@@ -161,7 +171,8 @@ class CommandDiagnosticTests(unittest.TestCase):
         for failing, stage in enumerate(self.STAGES):
             for reason in ('command output overflow', 'command timeout'):
                 calls = []
-                def bounded_call(args, seconds, env=None):
+                def bounded_call(args, seconds, env=None, observe=False):
+                    self.assertIs(observe, True)
                     calls.append(args)
                     self.assertEqual(seconds, 180)
                     self.assertIs(env, self.module['ENV'])
@@ -177,7 +188,8 @@ class CommandDiagnosticTests(unittest.TestCase):
                     with self.assertRaises(Refusal) as caught:
                         self.module['_transaction'](Path(directory), ['/usr/bin/apt-get'], 10,
                                                     {}, None, None, None)
-                    self.assertEqual(str(caught.exception), f'stage={stage}: command=apt-get: {reason}')
+                    self.assertEqual(str(caught.exception), f'stage={stage}: command=apt-get: {reason}'
+                                     + (UNAVAILABLE if 'overflow' in reason else ''))
                     expected = [
                         ['/usr/bin/apt-get', '-o', 'APT::Update::Error-Mode=any', 'update'],
                         ['/usr/bin/apt-get', 'check'],
@@ -191,7 +203,7 @@ class CommandDiagnosticTests(unittest.TestCase):
 
     def test_transaction_nonzero_retains_stage_and_native_failure(self):
         calls = []
-        def native(args, seconds, env=None):
+        def native(args, seconds, env=None, observe=False):
             calls.append(args)
             return (100, b'fixed native failure') if args[-1] == 'check' else (0, b'')
         with tempfile.TemporaryDirectory() as directory, \
@@ -225,7 +237,7 @@ class CommandDiagnosticTests(unittest.TestCase):
         environment = dict(self.module['ENV'])
         with patch.dict(self.globals, {'preflight': lambda: {},
                                       'bounded': Mock(side_effect=Refusal('command output overflow'))}):
-            with self.assertRaisesRegex(Refusal, '^stage=update: command=apt-get: command output overflow$'):
+            with self.assertRaisesRegex(Refusal, '^stage=update: command=apt-get: command output overflow observation=unavailable$'):
                 self.module['install']()
         self.assertEqual(self.module['ENV'], environment)
         self.assertEqual(set(Path('/var/tmp').glob('labapp-qemu-*')), before)
@@ -240,7 +252,10 @@ class CommandDiagnosticTests(unittest.TestCase):
                            f'Path({str(pidfile)!r}).write_text(str(os.getpid())); {action}')
                 with self.assertRaises(Refusal) as caught:
                     self.module['call']([sys.executable, '-c', program], seconds)
-                self.assertEqual(str(caught.exception), f'command=other: {reason}')
+                if 'overflow' in reason:
+                    self.assertRegex(str(caught.exception), '^' + re.escape(f'command=other: {reason}') + OBSERVED + '$')
+                else:
+                    self.assertEqual(str(caught.exception), f'command=other: {reason}')
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pidfile.read_text()), 0)
 
@@ -341,6 +356,153 @@ class WitnessTests(unittest.TestCase):
         with patch('selectors.EpollSelector.select', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 bounded([sys.executable, '-c', 'import time; time.sleep(10)'], 2)
+
+
+class OverflowObservationTests(unittest.TestCase):
+    """Closed overflow observations from the shared supervisor and the QEMU caller.
+
+    Children are small safe Python programs run by the supervisor; assertions use
+    invariants that hold for any pipe read-block boundaries."""
+    SECRET = b'SECRET-TOKEN-7f3a /private/path'
+
+    def setUp(self):
+        self.module = runpy.run_path(str(INSTALL))
+
+    def child(self, program, seconds=5, limit=1024 * 1024, **kwargs):
+        return bounded([sys.executable, '-c', program], seconds, limit=limit, observe=True, **kwargs)
+
+    def overflow(self, program, limit, seconds=5):
+        with self.assertRaises(Refusal) as caught:
+            self.child(program, seconds, limit)
+        self.assertEqual(str(caught.exception), 'command output overflow')
+        self.assertIsNotNone(caught.exception.observation)
+        return caught.exception.observation
+
+    def test_exact_limit_succeeds_and_limit_plus_one_fails_with_hard_cap(self):
+        code, output = self.child('import os; os.write(1, b"x" * 1000)', limit=1000)
+        self.assertEqual((code, len(output)), (0, 1000))
+        data = self.overflow('import os; os.write(1, b"x" * 1001)', 1000)
+        self.assertEqual(data['cap'], 1000)
+        self.assertLessEqual(data['retained_bytes'], 1000)
+        self.assertGreaterEqual(data['observed_bytes'], 1001)
+        self.assertEqual(data['outcome'], 'overflow')
+
+    def test_crossing_block_is_observed_but_never_retained(self):
+        # One 1000-byte write is below PIPE_BUF, so it arrives as one read block.
+        data = self.overflow('import os; os.write(1, b"x" * 1000)', 100)
+        self.assertEqual((data['retained_bytes'], data['observed_bytes'], data['blocks']), (0, 1000, 1))
+        data = self.overflow('import os,time\nfor _ in range(30):\n os.write(1, b"y" * 500); time.sleep(.01)', 1200)
+        self.assertLessEqual(data['retained_bytes'], 1200)
+        self.assertGreater(data['observed_bytes'], 1200)
+        self.assertLessEqual(data['observed_bytes'] - data['retained_bytes'], hhfab_release.READ_BLOCK)
+
+    def test_fragmented_combined_stdout_stderr_counts_records_not_fragments(self):
+        program = ('import os\nfor _ in range(40):\n os.write(1, b"Ge"); os.write(2, b"t:1 par"); '
+                   'os.write(1, b"t\\n"); os.write(2, b"Hit:2 x\\nW: w\\r")')
+        data = self.overflow(program, 200)
+        lines = data['lines']
+        self.assertGreater(lines['get'], 0)
+        self.assertLessEqual(lines['get'], 40)
+        self.assertEqual(lines['other'], 0)
+        self.assertLessEqual(abs(lines['get'] - lines['hit']), 1)
+
+    def test_classification_is_independent_of_chunking_and_handles_cr_long_and_binary(self):
+        text = (b'Get:1 a\rHit:2 b\r\r\rIgn:3 c\nErr:4 d\nW: e\nE: f\nSetting up p (1) ...\n'
+                b'(Reading database ... 5%\r(Reading database ... 10%\r\xff\xfe\x00junk\n' + b'z' * 20000 + b'\ntail')
+        whole = hhfab_release._Observer()
+        whole.feed(text)
+        for size in (1, 3, 7, 4096):
+            part = hhfab_release._Observer()
+            for index in range(0, len(text), size):
+                part.feed(text[index:index + size])
+            with self.subTest(size=size):
+                self.assertEqual((part.lines, part.long_records, part.non_ascii, part._length),
+                                 (whole.lines, whole.long_records, whole.non_ascii, whole._length))
+                self.assertLessEqual(len(part._prefix), hhfab_release._PREFIX)
+        self.assertEqual(whole.lines, dict(get=1, hit=1, ign=1, err=1, w=1, e=1, dpkg=3, other=2))
+        self.assertEqual((whole.long_records, whole.non_ascii), (1, True))
+        self.assertEqual(whole.snapshot(10, 0, 5, 0)['unterminated_tail'], True)
+
+    def test_real_cr_heavy_binary_and_overlong_records_are_bounded(self):
+        program = ('import os\nfor _ in range(200):\n os.write(1, b"\\r" * 500 + b"Get:1 \\xff\\x00" + b"q" * 9000 + b"\\n")')
+        data = self.overflow(program, 50000)
+        self.assertTrue(data['non_ascii'])
+        self.assertGreater(data['long_records'], 0)
+        self.assertGreater(data['lines']['get'], 0)
+        self.assertEqual(data['lines']['other'], 0)
+
+    def test_native_nonzero_timeout_and_default_mode_carry_no_observation(self):
+        self.assertEqual(self.child('import sys; print("Err:1 x"); sys.exit(3)'), (3, b'Err:1 x\n'))
+        with self.assertRaises(Refusal) as caught:
+            self.child('import time; time.sleep(10)', .2)
+        self.assertEqual((str(caught.exception), caught.exception.observation), ('command timeout', None))
+        with self.assertRaises(Refusal) as caught:
+            bounded([sys.executable, '-c', 'import os; os.write(1, b"x" * 2000)'], 5, limit=100)
+        self.assertEqual((str(caught.exception), caught.exception.observation), ('command output overflow', None))
+
+    def test_retained_descendant_pipe_times_out_without_success(self):
+        program = ('import subprocess,sys; subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]); '
+                   'print("Get:1 leader exits")')
+        started = hhfab_release.time.monotonic()
+        with self.assertRaises(Refusal) as caught:
+            self.child(program, .5)
+        self.assertEqual(str(caught.exception), 'command timeout')
+        self.assertLess(hhfab_release.time.monotonic() - started, 5)
+
+    def test_interrupt_and_observer_failure_preserve_primary_behaviour(self):
+        with patch('selectors.EpollSelector.select', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.child('import time; time.sleep(10)', 2)
+        broken = RuntimeError('observer secret')
+        with patch.object(hhfab_release._Observer, 'feed', side_effect=broken):
+            with self.assertRaises(Refusal) as caught:
+                self.child('import os; os.write(1, b"x" * 2000)', limit=100)
+        self.assertEqual((str(caught.exception), caught.exception.observation), ('command output overflow', None))
+        with patch.object(hhfab_release._Observer, 'snapshot', side_effect=broken):
+            with self.assertRaises(Refusal) as caught:
+                self.child('import os; os.write(1, b"x" * 2000)', limit=100)
+        self.assertEqual((str(caught.exception), caught.exception.observation), ('command output overflow', None))
+        self.assertEqual(self.child('print("ok")'), (0, b'ok\n'))
+
+    def test_primary_survives_every_cleanup_failure_and_all_cleanup_still_runs(self):
+        proc = Mock(pid=42)
+        proc.wait.side_effect = subprocess.TimeoutExpired('x', 2)
+        proc.stdout.close.side_effect = OSError('close')
+        with patch('hhfab_release.subprocess.Popen', return_value=proc), \
+             patch('hhfab_release.os.killpg', side_effect=PermissionError('kill')) as kill:
+            with self.assertRaisesRegex(Refusal, '^primary$'):
+                bounded(['/native'], 3, on_start=Mock(side_effect=Refusal('primary')), observe=True)
+        kill.assert_called_once_with(42, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=2)
+        proc.stdout.close.assert_called_once_with()
+
+    def test_cleanup_failure_after_apparent_success_still_fails(self):
+        with patch('hhfab_release.os.killpg', side_effect=PermissionError('uncertain')):
+            with self.assertRaises(PermissionError):
+                self.child('print("done")')
+
+    def test_qemu_caller_exposes_only_fixed_numeric_format_without_child_text(self):
+        program = ('import os,sys; sys.stdout.flush()\nfor _ in range(30000):\n'
+                   f' os.write(1, b"Get:1 " + {self.SECRET!r} + b"\\n")')
+        with self.assertRaises(Refusal) as caught:
+            self.module['call']([sys.executable, '-c', program, 'token=SECRET-TOKEN-7f3a'], 5)
+        text = str(caught.exception)
+        self.assertRegex(text, '^' + re.escape('command=other: command output overflow') + OBSERVED + '$')
+        self.assertNotIn('SECRET', text)
+        self.assertNotIn('/private', text)
+        self.assertIn('cap=1048576 block=65536', text)
+
+    def test_formatter_drops_unknown_keys_and_rejects_invalid_data(self):
+        good = dict(cap=1, block=2, deadline_seconds=3, elapsed_ms=4, blocks=5, observed_bytes=6,
+                    retained_bytes=0, long_records=0, outcome='overflow', unterminated_tail=False,
+                    non_ascii=True, lines=dict.fromkeys(('get', 'hit', 'ign', 'err', 'w', 'e', 'dpkg', 'other'), 1))
+        fmt = self.module['_overflow_observation']
+        self.assertRegex(fmt(dict(good, secret='SECRET', dynamic_key='x')), '^' + OBSERVED + '$')
+        self.assertNotIn('SECRET', fmt(dict(good, secret='SECRET')))
+        for bad in (None, 'text', dict(good, cap='1'), dict(good, cap=True), dict(good, cap=-1),
+                    dict(good, non_ascii=1), dict(good, lines={'get': 1}), dict(good, outcome='timeout')):
+            with self.subTest(bad=bad):
+                self.assertEqual(fmt(bad), UNAVAILABLE)
 
 
 class OwnershipTests(ownership.CleanupTests):
