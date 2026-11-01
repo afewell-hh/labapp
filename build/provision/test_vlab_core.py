@@ -2415,5 +2415,28 @@ for _mode in ('fresh', 'resume'):
                     startup_race_case(_mode, _timing, live=_live))
 
 
+class RegistryCredentialEnvironment(unittest.TestCase):
+    """#378: the core only exports the fixed volatile Docker config location to ubuntu hhfab."""
+    def test_safe_env_exports_exactly_the_fixed_docker_config_and_nothing_ambient(self):
+        self.assertEqual(core.SAFE_ENV['DOCKER_CONFIG'], '/run/labapp-vlab-docker')
+        self.assertEqual(set(core.SAFE_ENV), {'PATH', 'HOME', 'LC_ALL', 'LANG', 'DOCKER_CONFIG'})
+        self.assertNotIn('REGISTRY_AUTH_FILE', core.SAFE_ENV)
+        self.assertNotIn('XDG_RUNTIME_DIR', core.SAFE_ENV)
+
+    def test_resume_run_refuses_a_recreated_credential_directory_before_any_resume_work(self):
+        real = os.path.lexists
+        with patch.object(core, 'startup_snapshot', return_value=({}, time.monotonic() + 30)), \
+             patch.object(core, 'locked', side_effect=lambda *a, **k: ExitStack()), \
+             patch.object(core, 'state', return_value={}), \
+             patch.object(core, 'check_live', return_value={'pid': os.getpid()}), \
+             patch.object(core, 'same_start'), patch.object(core, 'verify_contract'), \
+             patch.object(core.os.path, 'lexists', side_effect=lambda p: True if p == core.DOCKER_CONFIG else real(p)), \
+             patch.object(core, 'critical_snapshot') as critical, patch.object(core.os, 'execve') as replace:
+            with self.assertRaises(core.Failure):
+                core.unit_run('resume')
+        critical.assert_not_called()
+        replace.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

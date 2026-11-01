@@ -48,8 +48,13 @@ SYSTEMCTL = '/usr/bin/systemctl'
 JOURNALCTL = '/usr/bin/journalctl'
 DPKG = '/usr/bin/dpkg-query'
 BRIDGE = LIB / 'ensure-bridge-ipv4.py'
+# Fixed volatile Docker client config for the transient GHCR credential (#378). The
+# canonical trial (vlab_trial.AUTH_DIR) creates and removes it; the core only exports
+# the location to the actual ubuntu hhfab and never creates, reads or recreates it.
+DOCKER_CONFIG = '/run/labapp-vlab-docker'
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-            'HOME': '/home/ubuntu', 'LC_ALL': 'C.UTF-8', 'LANG': 'C.UTF-8'}
+            'HOME': '/home/ubuntu', 'LC_ALL': 'C.UTF-8', 'LANG': 'C.UTF-8',
+            'DOCKER_CONFIG': DOCKER_CONFIG}
 UNIT = {'fresh': 'labapp-vlab-fresh.service', 'resume': 'hhfab-vlab-resume.service'}
 LIMIT = 1024 * 1024
 STATIC_LIMIT = 4 * LIMIT
@@ -1281,6 +1286,7 @@ def unit_run(mode):
         value = current
     verify_contract(value, deadline)
     if mode == 'resume':
+        require(not os.path.lexists(DOCKER_CONFIG), 'registry credential directory present at resume')
         require(critical_snapshot(deadline) == value['critical'], 'resume critical state changed')
         verify_readonly_mounts()
     else:

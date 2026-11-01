@@ -678,7 +678,8 @@ credentials; retain it only for the owned transfer and remove it afterwards.
 The capture exclusively creates a0600 file. It binds actual status, architecture,
 foreign architectures, selections, holds/audit, archive keyring, OS identity,
 module files and hashes of supported `/etc/apt` policy files and effective APT
-configuration. Auth credential files are never read or transferred.
+configuration. APT auth credential files are never read or transferred (the separate,
+narrowly authorized GHCR record of the canonical trial is described under issue #378).
 It does not export source/config contents or auth/proxy credentials.
 
 Supported policy is deliberately narrow: amd64 only, no foreign architectures,
@@ -1524,6 +1525,107 @@ later create response fails ownership checks, the receipt retains only the
 earlier verified objects; it does not declare the two-object create complete.
 Mocked admission tests model the
 documented contract; they are not native validation of the live webhook.
+
+### Transient GHCR registry authentication (issue #378)
+
+Primary sources: [Hedgehog download prerequisite](https://docs.hedgehog.cloud/latest/getting-started/download/)
+(`docker login ghcr.io` with the provided username and token),
+[docker login](https://docs.docker.com/reference/cli/docker/login/) (config file;
+base64 `auth` storage when no credential store is used) and
+[tmpfs](https://docs.kernel.org/filesystems/tmpfs.html) (pages may be swapped; the
+`noswap` option disables it). Source access on 2026-11-01: the initial worker
+used summaries only; the revision worker read raw Docker CLI `login.md` and Linux
+`tmpfs.rst` from their maintainer repositories, and the raw Hedgehog download
+page's login section. These current documentation pages do not establish guest
+runtime behavior. Fabricator v0.43.1 Docker/ORAS/containers-image behavior relies
+on the lead's pinned raw review in #377.
+
+Source contract (new synthetic tests are written but unrun; no guest proof):
+
+* **Input.** `bootstrap` gains the single fixed option `ghcr-auth`. Only then it
+  applies `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`, refuses before creating any state unless
+  `/run` is the standard `tmpfs` with no active swap area (or an explicit `noswap`
+  mount), the target is absent and no fallback store exists, and later reads at most
+  1 KiB from stdin (EOF required). Read and guardian gate share one original cutoff,
+  fixed before guardian startup at at most 10 s and clipped to the original stage
+  clock and startup heartbeat grace. Neither read nor gate appends time. The record has exactly
+  `schema=1, registry=ghcr.io, username, token` (bounded character sets); no other
+  registry, helper, `identitytoken`/`registrytoken`, URL, command, path or field.
+  Refusals use fixed text and never echo input.
+* **Arming before secret.** Root-private `auth-intent.json` (nonce, ubuntu uid/gid; no
+  secret) is written before the guardian starts. The secret is read only after the
+  guardian is started, bound to the lease/nonce/boot and confirmed as the active main
+  process. Publication rechecks the original guardian receipt, cgroup liveness,
+  complete contract, source manifest/bytes, boot and original cutoff under a bounded
+  root-private lock. No lock is held across stdin. The guardian blocks at the shared ready gate: no worker or
+  provisioning can run until `auth-ready.json` exists and the config verifies; gate
+  expiry, lost bootstrap/channel or invalid input fail closed into containment.
+  Before spawning, the guardian rechecks boot, its original clock and heartbeat.
+  The worker re-verifies before any package action and again immediately before
+  `start-fresh`.
+* **Location and identity.** Fixed `/run/labapp-vlab-docker` (`DOCKER_CONFIG`),
+  constructed root-private (`0700` directory, `0600` file) and kept root-owned for
+  its entire lifetime. After writing, root grants only read/search to the actual
+  `ubuntu` primary group: root:ubuntu directory `0750`, config `0640`. The primary
+  group must be named `ubuntu`, have no other named members and be no other
+  account's primary group. The reader receives no directory or file write access,
+  so it cannot rename, replace or chmod the original objects. No ACL dependency or
+  writable Docker login store is needed: this is a read-only client config.
+  Paths are created without following links, `mkdir` refusing preexisting paths. The directory identity
+  (device, inode, intended reader identity) is recorded in root-private `auth-bound.json` BEFORE the
+  secret exists; `auth-file.json` binds the exact file device/inode before the first
+  secret write, including partial writes. File inode and config size are recorded
+  in `auth-ready.json`; no secret value or digest enters root records.
+  Open descriptors are checked against current pathnames, exact device/inode,
+  owner, mode and single link before every secret write, before the read grant and
+  before readiness. Protection covers unprivileged reader mutation, not root or
+  an authorized reader copying credentials elsewhere. `vlab_core.SAFE_ENV`
+  (which replaces the environment) exports only `DOCKER_CONFIG`; the fresh unit sets
+  `LimitCORE=0` for the hhfab readers. These are conventional process limits, not
+  a no-disk guarantee: ordinary exec resets dumpability and piped system core
+  collectors may ignore `RLIMIT_CORE`. No global collector/sysctl policy is changed.
+  Fallback stores Docker/ORAS/containers-image can
+  consult (`~/.docker/config.json`, `~/.dockercfg`, `~/.config/containers/auth.json`,
+  `/run/containers/<uid>/auth.json`, `/run/user/<uid>/containers/auth.json`) must be
+  absent and are never adopted or deleted. tmpfs on a path under `/run` is not a "never
+  on disk" guarantee; the swap/`noswap` check is the enforced control and a later
+  `swapon` is only caught by the repeated pre-`start-fresh` verification.
+* **Cleanup.** Cleanup permanently closes publication before checking absence or
+  waiting at most two seconds for the shared lock, clipped to the original cleanup
+  cutoff. A stopped publisher cannot recreate credentials after verified clean
+  removal. A publisher already holding the lock can finish an in-flight write;
+  cleanup must acquire that lock and remove its output before proving absence.
+  Lock timeout reports uncertainty; cleanup never waits indefinitely. `auth_remove`
+  is idempotent and identity checked: it deletes only the bound
+  directory's single regular, single-link, root-owned `config.json` through the
+  open directory descriptor, after matching the file's exact device/inode receipt
+  and freshly validating current names, then the bound directory. Cleanup accepts
+  the exact private construction modes or final read-only modes. It writes exact
+  nonce/device/inode unlink and directory-removal receipts only after those actions.
+  A known file or directory disappearing without its matching positive receipt is
+  uncertain, including an unexpectedly empty directory; absence alone never proves
+  removal of a published object. Any link, extra entry, replacement,
+  wrong owner/mode/link count or missing binding is NOT deleted; it raises a fixed
+  `credential cleanup uncertain` failure (`cleanup_uncertain`). An interruption
+  before an identity receipt becomes durable leaves an unbound object untouched
+  and uncertain; cleanup never adopts a plausible partial file. The worker removes and
+  verifies absence right after `start-fresh` (checkpoint `auth-remove`), before strict
+  checks, stop, resume or success, and asserts absence again before `start-resume`.
+  Canonical absence checks also refuse newly appeared fallback stores without
+  reading or deleting them. Standalone core
+  `unit-run --mode resume` refuses a present directory. `containment()` (guardian
+  `finally` and `ExecStopPost`) runs the same removal after stopping readers and even if
+  a stop failed; uncertainty withholds `contained` but the primary result code is
+  preserved and VM disposal is independent. Bootstrap failure after arming stops the unit
+  and removes the exact owned config as well.
+* **Not claimed.** No guarantee the registry or Docker daemon memory never held the
+  credential, no secure erase, and no proof that Fabricator 0.43.1 consults only
+  `DOCKER_CONFIG` (fallback absence is enforced instead). The first live trial is
+  separate lead-scoped runtime proof.
+
+Tests: `TransientRegistryAuth` in `test_vlab_trial.py` (synthetic canaries, real
+functions, temporary mount/swap/home/run stand-ins), `RegistryCredentialEnvironment` in
+`test_vlab_core.py` and the owner tests in `build/gcp/test_vlab_trial.py`.
 
 ### Closed failure diagnostics (issue #364)
 

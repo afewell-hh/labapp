@@ -1,8 +1,10 @@
 """Fixed shared trial entrypoints, public temp files and fail-closed spies only.
 
 No real package/systemd/hhfab/QEMU/sudo/network/process invocation. Production
-paths are patched before mutating entrypoints; no credential fixtures exist.
+paths are patched before mutating entrypoints. The only credential fixtures are the
+synthetic non-deployable canaries of the #378 transient-registry-auth tests.
 """
+import base64
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -1368,6 +1370,859 @@ class SharedTrial(unittest.TestCase):
         with self.assertRaises(trial.Failure):
             status.mark('persistence', 'install-docker')
         self.assertEqual(trial.worker_status(json.loads((self.root / 'worker-status.json').read_text()), NONCE)['seq'], 0)
+
+
+CANARY_USER = 'canary-user'
+CANARY_TOKEN = 'ghp_SYNTHETIC_CANARY_0123456789'
+CREDS = {'schema': 1, 'registry': 'ghcr.io', 'username': CANARY_USER, 'token': CANARY_TOKEN}
+REAL_AUTH_READ = trial.auth_read_input
+REAL_AUTH_DIR = trial.AUTH_DIR
+REAL_AUTH_ACCOUNT = trial.auth_account
+
+
+class TransientRegistryAuth(unittest.TestCase):
+    """#378: actual auth functions against synthetic canaries in temporary trees.
+
+    No real credential, /run, /proc, root, Docker or child process is used. The mount table,
+    swap table, home and /run roots are temporary stand-ins for the fixed production paths.
+    """
+    def setUp(self):
+        previous = os.umask(0o077)
+        self.addCleanup(os.umask, previous)
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(trial.subprocess, 'Popen', side_effect=AssertionError('no real child')))
+        self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-auth-offline-')))
+        self.root, self.run, self.home = self.base / 'root', self.base / 'run', self.base / 'home'
+        self.run.mkdir(mode=0o755)
+        self.home.mkdir()
+        self.dir = self.run / 'labapp-vlab-docker'
+        self.mountinfo, self.swaps = self.base / 'mountinfo', self.base / 'swaps'
+        self.mounts()
+        self.swap()
+        self.v = value()
+        self.user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir='/home/ubuntu', pw_shell='/bin/bash')
+        for name, replacement in (('ROOT', self.root), ('AUTH_MOUNT', self.run), ('AUTH_DIR', self.dir),
+                                  ('AUTH_HOME', self.home), ('MOUNTINFO', self.mountinfo), ('SWAPS', self.swaps)):
+            self.stack.enter_context(patch.object(trial, name, replacement))
+        self.stack.enter_context(patch.object(trial, 'auth_account', return_value=self.user))
+        # Native fixtures run unprivileged: only root identity constants are mapped
+        # to the fixture owner; all modes, names, link counts and inode checks run.
+        self.stack.enter_context(patch.object(trial, 'AUTH_OWNER', os.getuid()))
+        self.stack.enter_context(patch.object(trial, 'AUTH_ROOT_GID', os.getgid()))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']))
+        self.stack.enter_context(patch.object(trial, 'guardian_processes', return_value={b'999999'}))
+        self.stack.enter_context(patch.object(trial, 'auth_lock_ok', side_effect=lambda info:
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o600))
+        real_chown = os.fchown
+        self.stack.enter_context(patch.object(trial.os, 'fchown', side_effect=lambda fd, uid, gid:
+            real_chown(fd, os.getuid() if uid == 0 else uid, os.getgid() if gid == 0 else gid)))
+        self.stack.enter_context(patch.object(
+            trial, 'regular', side_effect=lambda p, n, uid=None, mode=None: REAL_REGULAR(p, n)))
+
+    # -- fixtures -------------------------------------------------------------------
+    def mounts(self, fstype='tmpfs', options='rw,nosuid', extra=''):
+        self.mountinfo.write_text('1 0 0:1 / / rw - ext4 /dev/root rw\n'
+                                  '40 1 0:30 / %s %s - %s tmpfs rw,size=1024k\n%s' % (self.run, options, fstype, extra))
+
+    def swap(self, active=False):
+        self.swaps.write_text('Filename\tType\tSize\tUsed\tPriority\n' + ('/swapfile\tfile\t1\t0\t-2\n' if active else ''))
+
+    def arm(self):
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        if (self.root / trial.AUTH_INTENT).exists():
+            return
+        trial.exclusive(self.root / trial.AUTH_INTENT, trial.encoded(
+            {'schema': 1, 'nonce': self.v['nonce'], 'uid': os.getuid(), 'gid': os.getgid(),
+             'until': time.monotonic() + 10, 'cleanup_until': time.monotonic() + 60}))
+        trial.exclusive(self.root / trial.AUTH_LOCK, b'')
+        trial.exclusive(self.root / 'contract.json', trial.encoded(self.v))
+        trial.exclusive(self.root / 'manifest.json', trial.encoded(
+            {'schema': 1, 'source_sha': self.v['source_sha'], 'files': {
+                'contract.json': {'bytes': len(trial.encoded(self.v)), 'sha256': trial.sha(trial.encoded(self.v))}}}))
+        started = {'boot': self.v['boot_uuid'], 'lease': self.v['lease'], 'nonce': self.v['nonce'], 'guardian_pid': 999999}
+        for name in ('started.json', trial.AUTH_GUARDIAN):
+            trial.exclusive(self.root / name, trial.encoded(started))
+        trial.exclusive(self.root / 'heartbeat.json', trial.encoded({'sequence': 0, 'received': time.monotonic()}))
+
+    def install(self):
+        self.arm()
+        with patch.object(trial, 'manifest', side_effect=lambda value: value):
+            trial.auth_install(self.v, trial.auth_credentials(trial.encoded(CREDS)))
+
+    def expected_config(self):
+        pair = base64.b64encode((CANARY_USER + ':' + CANARY_TOKEN).encode()).decode()
+        return {'auths': {'ghcr.io': {'auth': pair}}}
+
+    def assert_secret_only_in_config(self):
+        needles = (CANARY_TOKEN.encode(), base64.b64encode((CANARY_USER + ':' + CANARY_TOKEN).encode()))
+        for path in self.base.rglob('*'):
+            if path.is_file() and path != self.dir / 'config.json':
+                for needle in needles:
+                    self.assertNotIn(needle, path.read_bytes(), str(path.relative_to(self.base)))
+
+    # -- closed input -------------------------------------------------------------
+    def test_input_record_is_closed_bounded_and_refusals_never_echo_input(self):
+        good = trial.encoded(CREDS)
+        self.assertEqual(trial.auth_credentials(good), CREDS)
+        bad = {
+            'missing': {k: v for k, v in CREDS.items() if k != 'token'},
+            'extra field': dict(CREDS, url='https://example.invalid'),
+            'helper': dict(CREDS, credsStore='desktop'),
+            'identity token': dict(CREDS, identitytoken=CANARY_TOKEN),
+            'other registry': dict(CREDS, registry='docker.io'),
+            'registry url': dict(CREDS, registry='https://ghcr.io'),
+            'schema bool': dict(CREDS, schema=True),
+            'schema 2': dict(CREDS, schema=2),
+            'user path': dict(CREDS, username='../' + CANARY_USER),
+            'user newline': dict(CREDS, username=CANARY_USER + '\n'),
+            'token short': dict(CREDS, token='short'),
+            'token colon': dict(CREDS, token=CANARY_TOKEN + ':x'),
+            'token not str': dict(CREDS, token=12345678901234567890123),
+            'token huge': dict(CREDS, token=CANARY_TOKEN + 'a' * 2000)}
+        for name, record in bad.items():
+            with self.subTest(name), self.assertRaises(trial.Failure) as failure:
+                trial.auth_credentials(json.dumps(record).encode())
+            self.assertEqual(str(failure.exception), 'GHCR credential input refused')
+            self.assertNotIn(CANARY_TOKEN, repr(failure.exception))
+            self.assertIsNone(failure.exception.__cause__)
+        for raw in (b'', b'[]', b'null', good + b'x', good[:-1], b'\xff\xfe', b'{"schema":1,"schema":1}',
+                    b'x' * (trial.AUTH_INPUT_LIMIT + 1), CANARY_TOKEN.encode()):
+            with self.subTest(raw[:12]), self.assertRaises(trial.Failure) as failure:
+                trial.auth_credentials(raw)
+            self.assertNotIn(CANARY_TOKEN, str(failure.exception) + repr(failure.exception.__context__))
+
+    def test_stdin_reader_requires_eof_within_bound_and_deadline(self):
+        def feed(raw, close=True):
+            read, write = os.pipe()
+            self.addCleanup(os.close, read)
+            os.write(write, raw)
+            if close:
+                os.close(write)
+            else:
+                self.addCleanup(os.close, write)
+            return read
+        self.assertEqual(REAL_AUTH_READ(feed(trial.encoded(CREDS))), CREDS)
+        with self.assertRaises(trial.Failure):
+            REAL_AUTH_READ(feed(b''))
+        with self.assertRaises(trial.Failure):
+            REAL_AUTH_READ(feed(b'x' * (trial.AUTH_INPUT_LIMIT + 1)))
+        with patch.object(trial.select, 'select', return_value=([], [], [])), self.assertRaises(trial.Failure):
+            REAL_AUTH_READ(feed(trial.encoded(CREDS), close=False), until=time.monotonic() + .2)
+        with self.assertRaises(trial.Failure):
+            REAL_AUTH_READ(feed(b'{"schema":1', close=True))
+
+    def test_docker_config_is_exactly_one_ghcr_basic_auth_entry(self):
+        self.assertEqual(json.loads(trial.auth_config(CREDS)), self.expected_config())
+
+    def test_secret_process_hardening_disables_core_and_dumpability_or_refuses(self):
+        import resource
+        stored = {}
+        libc = Mock()
+        libc.prctl.return_value = 0
+        with patch.object(resource, 'setrlimit', side_effect=lambda which, limits: stored.update({which: limits})), \
+             patch.object(resource, 'getrlimit', side_effect=lambda which: stored[which]), \
+             patch('ctypes.CDLL', return_value=libc):
+            trial.harden_secret_process()
+            libc.prctl.assert_called_once_with(4, 0, 0, 0, 0)
+            self.assertEqual(stored[resource.RLIMIT_CORE], (0, 0))
+            libc.prctl.return_value = -1
+            with self.assertRaises(trial.Failure):
+                trial.harden_secret_process()
+
+    # -- volatile volume, fallbacks, preexisting paths -----------------------------
+    def test_volume_must_be_standard_tmpfs_without_swap_or_with_noswap(self):
+        trial.auth_volatile()
+        self.mounts(fstype='ext4')
+        with self.assertRaises(trial.Failure): trial.auth_volatile()
+        self.mounts(extra='41 40 0:31 / %s rw - tmpfs tmpfs rw\n' % self.dir)  # mount at the target
+        with self.assertRaises(trial.Failure): trial.auth_volatile()
+        self.mounts(extra='42 40 0:32 / %s rw - ext4 /dev/x rw\n' % self.run)  # later overmount of /run
+        with self.assertRaises(trial.Failure): trial.auth_volatile()
+        self.mounts(options='rw,noswap')
+        self.swap(True)
+        trial.auth_volatile()
+        self.mounts()
+        with self.assertRaises(trial.Failure): trial.auth_volatile()  # tmpfs may swap
+        self.mounts()
+        self.mountinfo.write_text('garbage')
+        with self.assertRaises(trial.Failure): trial.auth_volatile()
+
+    def test_fallback_stores_and_preexisting_targets_are_refused_and_never_deleted(self):
+        uid = self.user.pw_uid
+        paths = [self.home / '.docker' / 'config.json', self.home / '.dockercfg',
+                 self.home / '.config' / 'containers' / 'auth.json',
+                 self.run / 'containers' / str(uid) / 'auth.json',
+                 self.run / 'user' / str(uid) / 'containers' / 'auth.json']
+        for path in paths:
+            with self.subTest(path.name):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('PUBLIC-PREEXISTING')
+                with self.assertRaises(trial.Failure): trial.auth_fallbacks_absent(uid)
+                self.arm()
+                with self.assertRaises(trial.Failure): trial.auth_install(self.v, CREDS)
+                self.assertEqual(path.read_text(), 'PUBLIC-PREEXISTING')
+                self.assertFalse(self.dir.exists())
+                path.unlink()
+        trial.auth_fallbacks_absent(uid)
+        (self.home / '.docker' / 'config.json').symlink_to(self.base / 'dangling')  # dangling link counts
+        with self.assertRaises(trial.Failure): trial.auth_fallbacks_absent(uid)
+        (self.home / '.docker' / 'config.json').unlink()
+        for target in ('dir', 'link', 'file'):
+            with self.subTest(target):
+                if target == 'dir': self.dir.mkdir()
+                elif target == 'link': self.dir.symlink_to(self.base / 'elsewhere')
+                else: self.dir.write_text('foreign')
+                self.arm()
+                with self.assertRaises(trial.Failure): trial.auth_install(self.v, CREDS)
+                self.assertTrue(os.path.lexists(self.dir))
+                with self.assertRaises(trial.Failure) as raised: trial.auth_remove()  # no binding: not provably ours
+                self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assertTrue(os.path.lexists(self.dir))
+                if target == 'dir': self.dir.rmdir()
+                else: self.dir.unlink()
+
+    # -- install / verify / remove ------------------------------------------------
+    def test_install_creates_root_controlled_ubuntu_readonly_minimal_config(self):
+        self.install()
+        info, config = self.dir.stat(), self.dir / 'config.json'
+        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid), (0o750, trial.AUTH_OWNER, self.user.pw_gid))
+        file_info = config.stat()
+        self.assertEqual((stat.S_IMODE(file_info.st_mode), file_info.st_nlink, file_info.st_uid), (0o640, 1, trial.AUTH_OWNER))
+        self.assertEqual(file_info.st_gid, self.user.pw_gid)
+        self.assertEqual(stat.S_IMODE(info.st_mode) & 0o027, 0)
+        self.assertEqual(stat.S_IMODE(file_info.st_mode) & 0o137, 0)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ['config.json'])
+        self.assertEqual(json.loads(config.read_bytes()), self.expected_config())
+        for name in (trial.AUTH_INTENT, trial.AUTH_BOUND, trial.AUTH_READY):
+            self.assertTrue((self.root / name).exists())
+        self.assert_secret_only_in_config()
+        trial.auth_verify(self.v)
+
+    def test_account_requires_an_exclusive_ubuntu_primary_group(self):
+        user = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_dir='/home/ubuntu', pw_shell='/bin/bash')
+        group = SimpleNamespace(gr_name='ubuntu', gr_mem=[])
+        with patch.object(trial.pwd, 'getpwnam', return_value=user), \
+             patch.object(trial.grp, 'getgrgid', return_value=group), \
+             patch.object(trial.pwd, 'getpwall', return_value=[user]) as accounts:
+            self.assertIs(REAL_AUTH_ACCOUNT(), user)
+            group.gr_mem = ['other']
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+            group.gr_mem = []
+            accounts.return_value = [user, SimpleNamespace(pw_uid=1002, pw_gid=1001)]
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+            accounts.return_value = [user]
+            group.gr_name = 'shared'
+            with self.assertRaises(trial.Failure): REAL_AUTH_ACCOUNT()
+
+    def test_prewrite_name_or_mode_mutation_is_detected_before_any_secret_write(self):
+        real_config = trial.auth_config
+        for mutation in ('file-rename', 'directory-rename', 'chmod'):
+            with self.subTest(mutation):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                moved = self.base / ('moved-' + mutation)
+                self.arm()
+                def mutate(credentials):
+                    self.assertEqual(stat.S_IMODE(self.dir.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE((self.dir / trial.AUTH_NAME).stat().st_mode), 0o600)
+                    if mutation == 'file-rename':
+                        (self.dir / trial.AUTH_NAME).rename(moved)
+                    elif mutation == 'directory-rename':
+                        self.dir.rename(moved)
+                    else:
+                        (self.dir / trial.AUTH_NAME).chmod(0o666)
+                    return real_config(credentials)
+                with patch.object(trial, 'auth_config', side_effect=mutate), \
+                     patch.object(trial, 'manifest', side_effect=lambda value: value), \
+                     patch.object(trial.os, 'write') as write:
+                    with self.assertRaises((trial.Failure, OSError)):
+                        trial.auth_install(self.v, CREDS)
+                write.assert_not_called()
+                self.assertFalse((self.root / trial.AUTH_READY).exists())
+                with self.assertRaises(trial.Failure) as raised:
+                    trial.auth_remove()
+                self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assert_secret_only_in_config()  # even the moved object has no canary
+
+    def test_known_file_or_directory_disappearance_is_uncertain_without_unlink_receipts(self):
+        for missing in ('file', 'directory'):
+            with self.subTest(missing):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.install()
+                moved = self.base / ('lost-' + missing)
+                source = self.dir / trial.AUTH_NAME if missing == 'file' else self.dir
+                source.rename(moved)
+                for _ in range(2):
+                    with self.assertRaises(trial.Failure) as raised:
+                        trial.auth_remove()
+                    self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assertFalse((self.root / trial.AUTH_UNLINKED).exists())
+                survivor = moved if missing == 'file' else moved / trial.AUTH_NAME
+                self.assertEqual(json.loads(survivor.read_bytes()), self.expected_config())
+                self.assertFalse((self.root / trial.AUTH_DIR_REMOVED).exists())
+
+    def test_verify_fails_closed_on_every_mutable_identity_or_content_change(self):
+        def extra(config): (self.dir / 'extra').write_text('x')
+        def link(config): config.unlink(); config.symlink_to(self.base / 'elsewhere')
+        def replace(config): config.unlink(); config.write_text('{}')  # new identity, plausible owner/mode
+        def hardlink(config): os.link(config, self.base / 'second-name')
+        def mode(config): config.chmod(0o660)
+        def dirmode(config): self.dir.chmod(0o770)
+        def swap(config): self.swap(True)
+        def fallback(config): (self.home / '.dockercfg').write_text('x')
+        def other_nonce(config): self.v['nonce'] = 'f' * 32
+        def removed(config): trial.exclusive(self.root / trial.AUTH_REMOVED, b'{}')
+        def swapped_dir(config):
+            os.rename(self.dir, self.base / 'old')
+            self.dir.mkdir(mode=0o700)
+            shutil.copy(self.base / 'old' / 'config.json', self.dir / 'config.json')
+        for mutate in (extra, link, replace, hardlink, mode, dirmode, swap, fallback, other_nonce, removed, swapped_dir):
+            with self.subTest(mutate.__name__):
+                for leftover in (self.root, self.dir, self.base / 'old', self.base / 'second-name', self.home / '.dockercfg'):
+                    if leftover.is_dir() and not leftover.is_symlink():
+                        shutil.rmtree(leftover)
+                    elif os.path.lexists(leftover):
+                        leftover.unlink()
+                self.swap(False)
+                self.v['nonce'] = 'a' * 32
+                self.install()
+                trial.auth_verify(self.v)
+                mutate(self.dir / 'config.json')
+                with self.assertRaises((trial.Failure, OSError)):
+                    trial.auth_verify(self.v)
+
+    def test_remove_deletes_exact_owned_config_and_directory_and_is_idempotent(self):
+        self.install()
+        trial.auth_remove()
+        trial.auth_absent()
+        for name in (trial.AUTH_UNLINKED, trial.AUTH_DIR_REMOVED):
+            self.assertTrue((self.root / name).exists())
+        trial.auth_remove()  # repeated cleanup is safe
+        trial.auth_absent()
+        self.assert_secret_only_in_config()
+
+    def test_cleanup_during_input_permanently_closes_late_publisher(self):
+        self.arm()
+        trial.auth_remove()  # ingress has not published any directory yet
+        with patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        trial.auth_remove()
+        self.assertFalse(os.path.lexists(self.dir))
+        self.assertTrue((self.root / trial.AUTH_CLOSED).exists())
+
+    def test_new_fallback_after_removal_blocks_strict_and_resume_and_remains_untouched(self):
+        self.install()
+        trial.auth_remove()
+        foreign = self.home / '.dockercfg'
+        foreign.write_text('PUBLIC-FOREIGN')
+        with self.assertRaises(trial.Failure):
+            trial.auth_absent()
+        self.assertEqual(foreign.read_text(), 'PUBLIC-FOREIGN')
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_interruption_after_create_file_write_or_ready_is_exactly_cleanable(self):
+        real_exclusive, real_write, real_chmod = trial.exclusive, os.write, os.fchmod
+        for point in ('directory', 'file', 'write', 'file-grant', 'directory-grant', 'ready'):
+            with self.subTest(point):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.arm()
+                def receipt(path, raw, mode=0o600):
+                    real_exclusive(path, raw, mode)
+                    target = {'directory': trial.AUTH_BOUND, 'file': trial.AUTH_FILE, 'ready': trial.AUTH_READY}.get(point)
+                    if Path(path).name == target:
+                        raise KeyboardInterrupt()
+                def write(fd, raw):
+                    result = real_write(fd, raw)
+                    if point == 'write':
+                        raise KeyboardInterrupt()
+                    return result
+                def chmod(fd, mode):
+                    real_chmod(fd, mode)
+                    if (point == 'file-grant' and mode == 0o640
+                            or point == 'directory-grant' and mode == 0o750):
+                        raise KeyboardInterrupt()
+                with patch.object(trial, 'exclusive', side_effect=receipt), \
+                     patch.object(trial.os, 'write', side_effect=write), \
+                     patch.object(trial.os, 'fchmod', side_effect=chmod), \
+                     patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(KeyboardInterrupt):
+                    trial.auth_install(self.v, CREDS)
+                trial.auth_remove()
+                trial.auth_remove()
+                self.assertFalse(os.path.lexists(self.dir))
+                self.assert_secret_only_in_config()
+
+    def test_unbound_partial_file_is_preserved_as_uncertain(self):
+        self.install()
+        (self.root / trial.AUTH_FILE).unlink()
+        with self.assertRaises(trial.Failure) as raised:
+            trial.auth_remove()
+        self.assertTrue(raised.exception.cleanup_uncertain)
+        self.assertTrue((self.dir / trial.AUTH_NAME).exists())
+
+    def test_closed_state_during_locked_publication_blocks_ready_and_late_retry(self):
+        self.arm()
+        real_config = trial.auth_config
+        def close(credentials):
+            trial.exclusive(self.root / trial.AUTH_CLOSED,
+                            trial.encoded({'schema': 1, 'nonce': self.v['nonce']}))
+            return real_config(credentials)
+        with patch.object(trial, 'auth_config', side_effect=close), \
+             patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse((self.root / trial.AUTH_READY).exists())
+        trial.auth_remove()
+        with self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_shared_lock_expires_without_waiting_past_original_cutoff(self):
+        self.arm()
+        ticks = [100.0]
+        with patch.object(trial.time, 'monotonic', side_effect=lambda: ticks[0]), \
+             patch.object(trial.time, 'sleep', side_effect=lambda seconds: ticks.__setitem__(0, ticks[0] + seconds)), \
+             patch.object(trial.fcntl, 'flock', side_effect=BlockingIOError), self.assertRaises(trial.Failure):
+            with trial.auth_locked(100.1):
+                self.fail('blocked lock acquired')
+        self.assertLessEqual(ticks[0], 100.1)
+
+    def test_fresh_publish_binding_refuses_changed_guardian_boot_contract_source_and_cutoff(self):
+        for mutation in ('guardian', 'missing-guardian', 'boot', 'contract', 'source', 'cutoff'):
+            with self.subTest(mutation):
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.arm()
+                with ExitStack() as local:
+                    local.enter_context(patch.object(trial, 'manifest', side_effect=lambda value: value))
+                    if mutation == 'guardian':
+                        record = json.loads((self.root / 'started.json').read_bytes())
+                        record['guardian_pid'] = 888888
+                        (self.root / 'started.json').write_bytes(trial.encoded(record))
+                    elif mutation == 'missing-guardian':
+                        local.enter_context(patch.object(trial, 'guardian_processes', return_value=set()))
+                    elif mutation == 'boot':
+                        local.enter_context(patch.object(trial, 'kernel_boot', return_value='changed'))
+                    elif mutation == 'contract':
+                        changed = dict(self.v, epoch=self.v['epoch'] + 1)
+                        (self.root / 'contract.json').write_bytes(trial.encoded(changed))
+                    elif mutation == 'source':
+                        table = json.loads((self.root / 'manifest.json').read_bytes())
+                        table['files']['contract.json']['sha256'] = '0' * 64
+                        (self.root / 'manifest.json').write_bytes(trial.encoded(table))
+                    else:
+                        local.enter_context(patch.object(trial.time, 'monotonic', return_value=trial.auth_intent()['until']))
+                    with self.assertRaises(trial.Failure):
+                        trial.auth_install(self.v, CREDS)
+                self.assertFalse(os.path.lexists(self.dir))
+
+    def test_remove_is_noop_when_not_armed_and_never_touches_unarmed_foreign_directory(self):
+        self.dir.mkdir()
+        (self.dir / 'foreign').write_text('keep')
+        trial.auth_remove()
+        self.assertEqual((self.dir / 'foreign').read_text(), 'keep')
+
+    def test_remove_refuses_foreign_entries_links_replacement_and_identity_change(self):
+        for name in ('extra', 'symlink', 'regular-replacement', 'hardlink', 'replaced-dir', 'wrong-mode', 'missing-binding'):
+            with self.subTest(name):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.install()
+                config = self.dir / 'config.json'
+                foreign = self.base / 'foreign-target'
+                foreign.write_text('PUBLIC-FOREIGN')
+                survivors = [foreign]
+                if name == 'extra':
+                    (self.dir / 'extra').write_text('x')
+                    survivors.append(self.dir / 'extra')
+                elif name == 'symlink':
+                    config.unlink()
+                    config.symlink_to(foreign)
+                    survivors.append(config)
+                elif name == 'hardlink':
+                    os.link(config, self.base / 'alias')
+                    survivors.append(self.base / 'alias')
+                elif name == 'regular-replacement':
+                    config.rename(self.base / 'old-config')  # keep old inode allocated
+                    config.write_text('PUBLIC-FOREIGN-CONFIG')
+                    config.chmod(0o640)
+                    survivors.append(config)
+                elif name == 'replaced-dir':
+                    os.rename(self.dir, self.base / 'old-dir')
+                    self.dir.mkdir(mode=0o700)
+                    (self.dir / 'config.json').write_text('PUBLIC-FOREIGN-CONFIG')
+                    survivors.append(self.dir / 'config.json')
+                elif name == 'wrong-mode':
+                    config.chmod(0o644)
+                    survivors.append(config)
+                else:
+                    (self.root / trial.AUTH_BOUND).unlink()
+                    survivors.append(config)
+                with self.assertRaises(trial.Failure) as raised:
+                    trial.auth_remove()
+                self.assertTrue(raised.exception.cleanup_uncertain)
+                self.assertEqual(str(raised.exception), 'credential cleanup uncertain')
+                self.assertTrue(all(os.path.lexists(path) for path in survivors), name)
+                self.assertEqual(foreign.read_text(), 'PUBLIC-FOREIGN')
+
+    # -- containment / ExecStopPost / guardian ------------------------------------
+    def test_actual_containment_and_execstoppost_remove_after_service_stop_and_stay_repeatable(self):
+        self.install()
+        calls = []
+        def bounded(args, seconds, **kwargs):
+            calls.append(args)
+            return 0, b'ActiveState=inactive\nSubState=dead\n'
+        (self.root / 'daemon-intent.json').write_text('{}')
+        with patch.object(hhfab_release, 'bounded', side_effect=bounded), \
+             patch.object(trial.Path, 'exists', lambda p: str(p).endswith('daemon-intent.json')), \
+             patch.object(trial.os, 'geteuid', return_value=0):
+            # The core path is absent here; the daemon stop and auth removal are real.
+            trial.containment()
+            self.assertFalse(os.path.lexists(self.dir))
+            self.assertEqual(trial.main(['contain']), 0)  # ExecStopPost repeat
+        self.assertTrue(any('docker.socket' in str(c) for c in calls))
+
+    def test_containment_cleanup_uncertainty_withholds_containment(self):
+        self.install()
+        (self.dir / 'extra').write_text('foreign')
+        with patch.object(hhfab_release, 'bounded', return_value=(0, b'')):
+            with self.assertRaises(trial.Failure):
+                trial.containment()
+        self.assertTrue((self.dir / 'extra').exists())
+        self.assertFalse((self.dir / 'config.json').exists())  # exact owned file is still removed
+
+    def test_containment_removes_credentials_even_when_service_stop_fails(self):
+        self.install()
+        (self.root / 'daemon-intent.json').write_text('{}')
+        with patch.object(hhfab_release, 'bounded', return_value=(1, b'')), \
+             patch.object(trial.Path, 'exists', lambda p: str(p).endswith('daemon-intent.json')):
+            with self.assertRaises(trial.Failure): trial.containment()
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def guardian_run(self, poll=17, gate=None):
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
+        trial.exclusive(self.root / 'phase.json', b'{"phase":"stage"}')
+        (self.root / 'heartbeat.json').write_bytes(trial.encoded({'sequence': 0, 'received': time.monotonic()}))
+        (self.root / 'started.json').unlink(missing_ok=True)
+        child = Mock(pid=999999)
+        child.poll.return_value = poll
+        with patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']), \
+             patch.object(trial, 'guardian_processes', return_value={str(os.getpid()).encode()}), \
+             patch.object(trial, 'oom_count', return_value=0), patch.object(trial.os, 'geteuid', return_value=0), \
+             patch.object(trial.os, 'killpg'), patch.object(trial.subprocess, 'Popen', return_value=child) as spawn, \
+             patch.object(trial, 'resources', return_value={'free_bytes': 300 * trial.GIB, 'available_memory': 100 * trial.GIB}), \
+             patch.object(trial, 'containment') as contain:
+            if gate:
+                gate()
+            code = trial.main(['guardian'])
+        return code, spawn, contain, json.loads((self.root / 'result.json').read_text())
+
+    def test_guardian_never_spawns_worker_before_auth_ready_and_expiry_contains(self):
+        self.arm()  # armed, but bootstrap never published readiness (lost channel/invalid input)
+        now = time.monotonic()
+        ticks = [now]
+        with patch.object(trial.time, 'monotonic', side_effect=lambda: ticks[0]), \
+             patch.object(trial.time, 'sleep', side_effect=lambda seconds: ticks.__setitem__(0, ticks[0] + 11)):
+            code, spawn, contain, result = self.guardian_run()
+        spawn.assert_not_called()
+        contain.assert_called_once_with()
+        self.assertEqual(code, 124)
+        self.assertEqual((result['code'], result['diagnostic']['category'], result['diagnostic']['operation']),
+                         (124, 'phase-cutoff', 'guardian-init'))
+
+    def test_guardian_gate_releases_worker_only_after_verified_ready_and_races_fail_closed(self):
+        self.install()
+        code, spawn, contain, result = self.guardian_run()
+        self.assertEqual(code, 17)
+        spawn.assert_called_once()
+        self.assertTrue(os.path.lexists(self.dir))  # guardian never removes on its own happy path before containment
+
+    def test_guardian_gate_waits_for_late_ready_within_bound(self):
+        self.arm()
+        def late():
+            def publish(seconds):  # readiness appears while the guardian is blocked at its gate
+                if not (self.root / trial.AUTH_READY).exists():
+                    current = (self.root / 'started.json').read_bytes()
+                    (self.root / trial.AUTH_GUARDIAN).write_bytes(current)
+                    with patch.object(trial, 'manifest', side_effect=lambda value: value):
+                        trial.auth_install(self.v, CREDS)
+            self.stack.enter_context(patch.object(trial.time, 'sleep', side_effect=publish))
+        code, spawn, _, _ = self.guardian_run(gate=late)
+        self.assertEqual(code, 17)
+        spawn.assert_called_once()
+
+    def test_guardian_gate_refuses_credentials_already_marked_removed(self):
+        self.install()
+        trial.exclusive(self.root / trial.AUTH_REMOVED, b'{}')  # credentials already marked removed
+        code, spawn, contain, _ = self.guardian_run()
+        spawn.assert_not_called()
+        self.assertNotEqual(code, 0)
+
+    def test_guardian_rechecks_boot_and_heartbeat_after_ready_before_spawn(self):
+        real_gate = trial.auth_gate
+        for change in ('boot', 'heartbeat'):
+            with self.subTest(change):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.install()
+                with ExitStack() as local:
+                    def after_ready(value, clock):
+                        real_gate(value, clock)
+                        if change == 'boot':
+                            local.enter_context(patch.object(trial, 'kernel_boot', return_value='changed'))
+                        else:
+                            (self.root / 'heartbeat.json').write_bytes(trial.encoded(
+                                {'sequence': 0, 'received': time.monotonic() - 31}))
+                    with patch.object(trial, 'auth_gate', side_effect=after_ready):
+                        code, spawn, contain, result = self.guardian_run()
+                spawn.assert_not_called()
+                contain.assert_called_once_with()
+                self.assertNotEqual(code, 0)
+                self.assertEqual(result['diagnostic']['category'], 'boot-change' if change == 'boot' else 'heartbeat-loss')
+
+    # -- bootstrap ordering --------------------------------------------------------
+    def bootstrap_fixture(self, secret, started_pid=999999, mounts_ok=True):
+        v = self.v
+        incoming = self.base / ('labapp-vlab-' + v['nonce'])
+        incoming.mkdir(mode=0o700)
+        names = {'vlab_trial.py', trial.UNIT, 'contract.json', 'fab.yaml'}
+        raw_files = {'vlab_trial.py': b'PUBLIC_SOURCE_NOT_EXECUTED', trial.UNIT: b'[Service]\n',
+                     'contract.json': trial.encoded(v), 'fab.yaml': b'PUBLIC_FAB'}
+        table = {'schema': 1, 'source_sha': v['source_sha'], 'files': {}}
+        for name, raw in raw_files.items():
+            (incoming / name).write_bytes(raw)
+            table['files'][name] = {'bytes': len(raw), 'sha256': trial.sha(raw)}
+        (incoming / 'manifest.json').write_bytes(trial.encoded(table))
+        unit_base, runtime_base = self.base / 'units', self.base / 'runtime'
+        unit_base.mkdir()
+        runtime_base.mkdir()
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        os.write(write, secret)
+        os.close(write)
+        events = []
+        def run(args, clock, phase, cap=30, **kwargs):
+            events.append(args[1])
+            if args[1] == 'start':
+                # Armed before the guardian can run; no credential and no readiness exists yet.
+                self.assertTrue((self.root / trial.AUTH_INTENT).exists())
+                self.assertFalse(os.path.lexists(self.dir))
+                self.assertFalse((self.root / trial.AUTH_READY).exists())
+                trial.exclusive(self.root / 'started.json', trial.encoded({'boot': v['boot_uuid'],
+                          'lease': v['lease'], 'nonce': v['nonce'], 'guardian_pid': 999999}))
+            if args[1] == 'show':
+                return ('MainPID=%d\nActiveState=active\n' % started_pid).encode()
+            return b''
+        def read_secret(*, until):
+            events.append('read-secret')
+            self.assertFalse(os.path.lexists(self.dir))
+            self.assertEqual(until, trial.auth_intent()['until'])
+            return REAL_AUTH_READ(read, until=until)
+        original_match = trial.re.fullmatch
+        def match(pattern, text, *args):
+            return True if pattern == '/tmp/labapp-vlab-[a-f0-9]{32}' else original_match(pattern, text, *args)
+        patches = (patch.object(trial.os, 'geteuid', return_value=0),
+                   patch.object(trial, 'UNIT_PATH', unit_base / trial.UNIT), patch.object(trial, 'UNIT_BASES', (unit_base, runtime_base)),
+                   patch.object(trial, 'RUNTIME_DROPIN', runtime_base / (trial.UNIT + '.d')),
+                   patch.object(trial, 'FILES', names), patch.object(trial, 'PAYLOADS', {}),
+                   patch.object(trial.re, 'fullmatch', side_effect=match),
+                   patch.object(trial, 'kernel_boot', return_value=v['boot_uuid']),
+                   patch.object(trial, 'run', side_effect=run), patch.object(trial.sys, 'path', list(trial.sys.path)),
+                   patch.object(trial, 'harden_secret_process'), patch.object(trial, 'auth_read_input', side_effect=read_secret))
+        return incoming, table, events, patches
+
+    def bootstrap(self, secret, **kwargs):
+        incoming, table, events, patches = self.bootstrap_fixture(secret, **kwargs)
+        with ExitStack() as local:
+            for item in patches:
+                local.enter_context(item)
+            outcome = None
+            try:
+                trial.bootstrap(incoming, trial.sha(trial.encoded(table)), ('ghcr-auth',))
+            except trial.Failure as error:
+                outcome = error
+        return events, outcome
+
+    def test_bootstrap_arms_guardian_then_accepts_secret_then_publishes_ready(self):
+        events, outcome = self.bootstrap(trial.encoded(CREDS))
+        self.assertIsNone(outcome)
+        self.assertEqual(events, ['daemon-reload', 'start', 'show', 'read-secret'])
+        trial.auth_verify(self.v)
+        self.assertEqual(json.loads((self.dir / 'config.json').read_bytes()), self.expected_config())
+        self.assert_secret_only_in_config()
+        self.assertEqual(json.loads((self.root / trial.AUTH_INTENT).read_bytes())['nonce'], self.v['nonce'])
+
+    def test_bootstrap_input_failures_refuse_stop_unit_and_leave_no_credential(self):
+        for name, secret in (('malformed', b'{"schema":1'), ('extra', trial.encoded(dict(CREDS, url='x'))),
+                             ('oversize', b'x' * 2000), ('foreign registry', trial.encoded(dict(CREDS, registry='docker.io'))),
+                             ('empty', b'')):
+            with self.subTest(name):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.base / ('labapp-vlab-' + self.v['nonce']), ignore_errors=True)
+                shutil.rmtree(self.base / 'units', ignore_errors=True)
+                shutil.rmtree(self.base / 'runtime', ignore_errors=True)
+                events, outcome = self.bootstrap(secret)
+                self.assertIsInstance(outcome, trial.Failure)
+                self.assertEqual(str(outcome), 'GHCR credential input refused')
+                self.assertEqual(events[:4], ['daemon-reload', 'start', 'show', 'read-secret'])
+                self.assertEqual(events[-1], 'stop')
+                self.assertFalse(os.path.lexists(self.dir))
+                self.assertFalse((self.root / trial.AUTH_READY).exists())
+
+    def test_bootstrap_never_reads_secret_when_guardian_binding_is_not_proven(self):
+        events, outcome = self.bootstrap(trial.encoded(CREDS), started_pid=123456)
+        self.assertIsInstance(outcome, trial.Failure)
+        self.assertNotIn('read-secret', events)
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_bootstrap_channel_interruption_closes_publication_preserving_primary(self):
+        incoming, table, events, patches = self.bootstrap_fixture(trial.encoded(CREDS))
+        with ExitStack() as local:
+            for item in patches:
+                local.enter_context(item)
+            local.enter_context(patch.object(trial, 'auth_read_input', side_effect=KeyboardInterrupt))
+            with self.assertRaises(KeyboardInterrupt):
+                trial.bootstrap(incoming, trial.sha(trial.encoded(table)), ('ghcr-auth',))
+        self.assertEqual(events[-1], 'stop')
+        self.assertTrue((self.root / trial.AUTH_CLOSED).exists())
+        with self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_bootstrap_refuses_before_any_state_for_wrong_volume_swap_or_fallback(self):
+        for name, setup in (('ext4', lambda: self.mounts(fstype='ext4')), ('swap', lambda: self.swap(True)),
+                            ('fallback', lambda: (self.home / '.dockercfg').write_text('x')),
+                            ('preexisting', lambda: self.dir.mkdir())):
+            with self.subTest(name):
+                shutil.rmtree(self.base / ('labapp-vlab-' + self.v['nonce']), ignore_errors=True)
+                shutil.rmtree(self.base / 'units', ignore_errors=True)
+                shutil.rmtree(self.base / 'runtime', ignore_errors=True)
+                setup()
+                events, outcome = self.bootstrap(trial.encoded(CREDS))
+                self.assertIsInstance(outcome, trial.Failure)
+                self.assertEqual(events, [])
+                self.assertFalse(self.root.exists())
+                self.mounts()
+                self.swap(False)
+                for leftover in (self.home / '.dockercfg',):
+                    if leftover.exists(): leftover.unlink()
+                if self.dir.exists(): self.dir.rmdir()
+
+    def test_bootstrap_rejects_unknown_options_and_default_path_never_touches_credentials(self):
+        with patch.object(trial.os, 'geteuid', return_value=0):
+            for options in (('other',), ('ghcr-auth', 'x'), ('--ghcr-credentials',)):
+                with self.subTest(options), self.assertRaises(trial.Failure):
+                    trial.bootstrap(self.base / 'unused', 'a' * 64, options)
+        self.assertFalse(trial.auth_armed())
+        self.assertFalse(self.root.exists())
+
+    def test_default_bootstrap_refuses_preexisting_auth_directory_before_state_or_read(self):
+        incoming, table, events, patches = self.bootstrap_fixture(b'')
+        self.dir.mkdir(mode=0o700)
+        (self.dir / 'foreign').write_text('PUBLIC-FOREIGN')
+        with ExitStack() as local:
+            for item in patches:
+                local.enter_context(item)
+            with self.assertRaises(trial.Failure):
+                trial.bootstrap(incoming, trial.sha(trial.encoded(table)))
+        self.assertEqual(events, [])
+        self.assertFalse(self.root.exists())
+        self.assertEqual((self.dir / 'foreign').read_text(), 'PUBLIC-FOREIGN')
+
+    # -- worker ordering -----------------------------------------------------------
+    def worker_run(self, fault=None):
+        self.install()
+        v = self.v
+        for name, raw in {'contract.json': trial.encoded(v), 'fab.yaml': b'PUBLIC_FAB', 'manifest.json': b'PUBLIC_MANIFEST',
+                          'started.json': trial.encoded({'lease': v['lease'], 'nonce': v['nonce'], 'boot': v['boot_uuid'],
+                                                        'guardian_pid': os.getppid()})}.items():
+            (self.root / name).write_bytes(raw)
+        user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=1000, pw_dir='/home/ubuntu', pw_shell='/bin/bash')
+        core = SimpleNamespace(WIRING_SHA='b' * 64, validate_fab=Mock())
+        receipt = {'schema': 1, 'source_sha256': 'a' * 64, 'packages': {}, 'commands': {}}
+        events = []
+        def command(args, clock, phase, cap=30, **kwargs):
+            if len(args) > 1 and args[0] == trial.PYTHON and args[1].endswith('vlab_core.py'):
+                action = args[2]
+                events.append(action)
+                if action in ('prepare', 'start-fresh'):
+                    self.assertTrue((self.dir / 'config.json').exists(), action)
+                    if action == 'start-fresh' and fault == 'extra':
+                        (self.dir / 'extra').write_text('foreign')
+                else:
+                    self.assertFalse(os.path.lexists(self.dir), 'credentials visible to ' + action)
+            return b''
+        def strict(*args, **kwargs):
+            events.append('strict')
+            self.assertFalse(os.path.lexists(self.dir), 'credentials visible to strict checks')
+            return {'ca_sha256': 'c' * 64, 'cluster_uid': 'public'}
+        def packages(clock, selected):
+            trial.exclusive(self.root / 'packages.json', trial.encoded(receipt))
+            return receipt
+        nonce = Mock()
+        nonce.objects = []
+        with patch.object(trial.os, 'geteuid', return_value=0), \
+             patch.object(trial, 'own_cgroup', return_value='0::/system.slice/' + trial.UNIT), \
+             patch.object(trial.pwd, 'getpwnam', return_value=user), patch.object(trial.grp, 'getgrnam', side_effect=KeyError), \
+             patch.object(hhfab_release, 'bounded', return_value=(1, b'LoadState=not-found\n')), \
+             patch.object(trial, 'run', side_effect=command), patch.object(trial, 'provision_aux'), \
+             patch.object(trial, 'docker_account'), patch.object(trial, 'guest_devices'), \
+             patch.object(trial, 'load_sibling', return_value=core), patch.object(trial, 'package_receipt', side_effect=packages), \
+             patch.object(trial, 'resources'), patch.object(trial, 'offline_observations'), \
+             patch.object(trial, 'strict_checks', side_effect=strict), patch.object(trial, 'Nonce', return_value=nonce):
+            try:
+                code = trial.main(['worker'])
+                error = None
+            except trial.Failure as caught:
+                code, error = None, caught
+        return code, error, events
+
+    def test_worker_removes_and_verifies_credentials_before_strict_stop_resume_and_success(self):
+        code, error, events = self.worker_run()
+        self.assertEqual((code, error), (0, None))
+        self.assertEqual(events[:3], ['prepare', 'start-fresh', 'strict'])
+        self.assertEqual(events[3:], ['stop', 'activate-resume', 'start-resume', 'strict', 'stop'])
+        self.assertTrue((self.root / trial.AUTH_REMOVED).exists())
+        self.assertFalse(os.path.lexists(self.dir))
+        self.assertTrue((self.root / 'success.json').exists())
+        self.assert_secret_only_in_config()
+
+    def test_worker_removal_uncertainty_is_the_primary_failure_before_strict_or_resume(self):
+        code, error, events = self.worker_run(fault='extra')
+        self.assertIsNone(code)
+        self.assertEqual(str(error), 'credential cleanup uncertain')
+        self.assertEqual(events, ['prepare', 'start-fresh'])
+        status = json.loads((self.root / 'worker-status.json').read_text())
+        self.assertEqual((status['state'], status['phase'], status['operation']), ('failed', 'fresh', 'auth-remove'))
+        self.assertTrue((self.dir / 'extra').exists())  # foreign entry never deleted
+        self.assertFalse((self.root / trial.AUTH_REMOVED).exists())
+
+    def test_worker_refuses_provisioning_without_verified_credential_when_armed(self):
+        self.arm()
+        v = self.v
+        for name, raw in {'contract.json': trial.encoded(v), 'fab.yaml': b'x', 'manifest.json': b'x',
+                          'started.json': trial.encoded({'lease': v['lease'], 'nonce': v['nonce'], 'boot': v['boot_uuid'],
+                                                        'guardian_pid': os.getppid()})}.items():
+            (self.root / name).write_bytes(raw)
+        with patch.object(trial.os, 'geteuid', return_value=0), \
+             patch.object(trial, 'own_cgroup', return_value='0::/system.slice/' + trial.UNIT), \
+             patch.object(trial, 'run') as run, patch.object(trial, 'provision_aux') as aux:
+            with self.assertRaises((trial.Failure, OSError)):
+                trial.main(['worker'])
+        run.assert_not_called()
+        aux.assert_not_called()
+
+    def test_core_location_unit_limit_and_operation_vocabulary_agree(self):
+        import vlab_core as core
+        self.assertEqual(core.DOCKER_CONFIG, str(REAL_AUTH_DIR))
+        self.assertEqual(core.SAFE_ENV['DOCKER_CONFIG'], str(REAL_AUTH_DIR))
+        self.assertEqual(REAL_AUTH_DIR.parent, Path('/run'))
+        unit = (Path(trial.__file__).parent / 'labapp-vlab-fresh.service').read_text()
+        self.assertIn('\nLimitCORE=0\n', unit)
+        self.assertIn('auth-check', trial.OPERATIONS['stage'])
+        self.assertIn('auth-remove', trial.OPERATIONS['fresh'])
 
 
 class FirstFailureExport(unittest.TestCase):

@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 from build.gcp import vlab_trial as host
 from build.provision import vlab_trial as guest
+REAL_HARDEN = guest.harden_secret_process
 
 
 def snapshot():
@@ -55,6 +56,7 @@ class OwnerTrial(unittest.TestCase):
         self.addCleanup(os.umask, original_umask)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(guest, 'harden_secret_process'))
         self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
         self.temp = self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-owner-offline-'))
         self.directory = Path(self.temp)
@@ -331,7 +333,8 @@ class OwnerTrial(unittest.TestCase):
         self.assertIs(trial.call_args.kwargs['login'], login)
 
     def owner_pipeline(self, *, heartbeat_alive=None, containment_error=None, start_error=None,
-                       observed_code=0, observed_contained=True):
+                       observed_code=0, observed_contained=True, ghcr=None):
+        self.remote_inputs = []
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
         registration, records = Mock(), Mock()
@@ -381,8 +384,9 @@ class OwnerTrial(unittest.TestCase):
                 if 'manifest.json' in names:
                     table = guest.manifest(guest.data((output / 'manifest.json').read_bytes()))
                     self_test.assertEqual(set(table['files']), guest.FILES)
-            def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
+            def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536, input_bytes=None):
                 trace.append(('remote', tuple(args), phase))
+                self_test.remote_inputs.append((tuple(args), input_bytes))
                 if cleanup and containment_error is not None:
                     raise containment_error
                 if args[:2] == ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']: return boot.encode()
@@ -418,8 +422,153 @@ class OwnerTrial(unittest.TestCase):
              patch.object(host, 'cleanup_own_key', side_effect=removed), patch.object(host, 'cleanup_dispatch', side_effect=cancel), \
              (patch.object(host.threading, 'Thread', return_value=heartbeat) if heartbeat_alive is not None else nullcontext()), \
              patch('builtins.print') as printed:
-            code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login)
+            code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
+                              **({} if ghcr is None else {'ghcr': ghcr}))
+        self.printed_text = printed.call_args.args[0]
         return code, json.loads(printed.call_args.args[0]), trace, importer, trust, heartbeat, output
+
+    GHCR = {'schema': 1, 'registry': 'ghcr.io', 'username': 'canary-user', 'token': 'ghp_SYNTHETIC_CANARY_0123456789'}
+
+    def test_default_bootstrap_command_and_stdin_are_unchanged_without_credentials(self):
+        code, receipt, trace, _, _, _, _ = self.owner_pipeline()
+        self.assertEqual(code, 0)
+        boots = [(args, data) for args, data in self.remote_inputs if host.BOOTSTRAP in args]
+        self.assertEqual(len(boots), 1)
+        args, data = boots[0]
+        self.assertIsNone(data)
+        self.assertEqual(len(args), 9)
+        self.assertNotIn('ghcr-auth', args)
+
+    def test_ghcr_record_travels_only_as_bootstrap_stdin_and_never_in_argv_receipt_or_files(self):
+        record = guest.encoded(self.GHCR)
+        code, receipt, trace, _, _, _, output = self.owner_pipeline(ghcr=record)
+        self.assertEqual(code, 0)
+        carriers = [(args, data) for args, data in self.remote_inputs if data is not None]
+        self.assertEqual(len(carriers), 1)
+        args, data = carriers[0]
+        self.assertIn(host.BOOTSTRAP, args)
+        self.assertEqual((args[-1], data), ('ghcr-auth', record))
+        canary = self.GHCR['token']
+        self.assertNotIn(canary, repr(trace))
+        self.assertNotIn(canary, self.printed_text)
+        self.assertNotIn(canary, json.dumps(receipt))
+        self.assertFalse(any(output.iterdir()))
+        self.assertEqual([args for args, data in self.remote_inputs if data is not None and args != carriers[0][0]], [])
+
+    def test_actual_master_remote_forwards_stdin_only_when_given(self):
+        master = self.master()
+        with patch.object(host, 'command', return_value=b'public') as run:
+            master.remote(['/usr/bin/true'], 'stage')
+            self.assertNotIn('input_bytes', run.call_args.kwargs)
+            master.remote(['/usr/bin/true'], 'stage', input_bytes=b'PUBLIC-FIXTURE')
+            self.assertEqual(run.call_args.kwargs['input_bytes'], b'PUBLIC-FIXTURE')
+        self.assertNotIn('PUBLIC-FIXTURE', ' '.join(run.call_args.args[0]))
+
+    def test_actual_command_refuses_oversize_stdin_without_spawning(self):
+        with patch.object(host.subprocess, 'Popen', side_effect=AssertionError('must not spawn')):
+            with self.assertRaises(guest.Failure):
+                host.command(['/usr/bin/true'], 5, input_bytes=b'x' * 4097)
+
+    def credential_file(self, raw, mode=0o600, name='ghcr.json'):
+        path = self.directory / 'creds' / name
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(mode)
+        return path
+
+    def test_protected_ghcr_input_is_canonicalized_from_an_explicit_owner_private_file(self):
+        output = self.directory / 'out'
+        output.mkdir(mode=0o700)
+        spaced = json.dumps(self.GHCR, indent=2).encode() + b'\n'
+        self.assertEqual(host.ghcr_credentials(self.credential_file(spaced), output), guest.encoded(self.GHCR))
+
+    def test_owner_hardens_before_first_secret_read_and_refuses_without_read_on_failure(self):
+        import resource
+        events = []
+        path = self.credential_file(guest.encoded(self.GHCR))
+        libc = Mock()
+        libc.prctl.side_effect = lambda *args: events.append('dumpability') or 0
+        real_read = guest.regular
+        with patch.object(guest, 'harden_secret_process', side_effect=REAL_HARDEN), \
+             patch.object(resource, 'setrlimit', side_effect=lambda *a: events.append('core-limit')), \
+             patch.object(resource, 'getrlimit', return_value=(0, 0)), \
+             patch('ctypes.CDLL', return_value=libc), \
+             patch.object(guest, 'regular', side_effect=lambda *a, **k: events.append('read') or real_read(*a, **k)):
+            self.assertEqual(host.ghcr_credentials(path, self.directory / 'out'), guest.encoded(self.GHCR))
+        self.assertEqual(events, ['core-limit', 'dumpability', 'read'])
+        with patch.object(guest, 'harden_secret_process', side_effect=OSError('PRIVATE')), \
+             patch.object(guest, 'regular') as read, self.assertRaises(guest.Failure) as raised:
+            host.ghcr_credentials(path, self.directory / 'out')
+        read.assert_not_called()
+        self.assertEqual(str(raised.exception), 'GHCR credential input refused')
+
+    def test_protected_ghcr_input_refuses_every_unsafe_or_malformed_source_with_fixed_text(self):
+        output = self.directory / 'out'
+        output.mkdir(mode=0o700)
+        good = guest.encoded(self.GHCR)
+        canary = self.GHCR['token']
+        cases = {
+            'group readable': (self.credential_file(good, 0o640, 'a'), None),
+            'world readable': (self.credential_file(good, 0o644, 'b'), None),
+            'extra field': (self.credential_file(guest.encoded(dict(self.GHCR, helper='x')), name='c'), None),
+            'other registry': (self.credential_file(guest.encoded(dict(self.GHCR, registry='docker.io')), name='d'), None),
+            'oversize': (self.credential_file(good + b' ' * 2000, name='e'), None),
+            'dotenv style': (self.credential_file(('GITHUB_USERNAME=u\nGITHUB_TOKEN=' + canary + '\n').encode(), name='f'), None),
+            'missing': (self.directory / 'creds' / 'absent', None),
+            'directory': (self.directory / 'creds', None)}
+        link = self.directory / 'creds' / 'link'
+        link.symlink_to(self.credential_file(good, name='target'))
+        cases['symlink'] = (link, None)
+        inside = output / 'ghcr.json'
+        inside.write_bytes(good)
+        inside.chmod(0o600)
+        cases['inside output'] = (inside, None)
+        for name, (path, _) in cases.items():
+            with self.subTest(name), self.assertRaises(guest.Failure) as failure:
+                host.ghcr_credentials(path, output)
+            self.assertEqual(str(failure.exception), 'GHCR credential input refused')
+            self.assertNotIn(canary, repr(failure.exception))
+            self.assertIsNone(failure.exception.__cause__)
+        with patch.object(host.os, 'geteuid', return_value=os.geteuid() + 1), self.assertRaises(guest.Failure):
+            host.ghcr_credentials(self.credential_file(good, name='g'), output)  # foreign owner
+        loose = self.directory / 'loose'
+        loose.mkdir()
+        loose.chmod(0o777)
+        shared = loose / 'ghcr.json'
+        shared.write_bytes(good)
+        shared.chmod(0o600)
+        with self.assertRaises(guest.Failure):  # group/world-writable parent could replace the file
+            host.ghcr_credentials(shared, output)
+
+    def test_main_reads_protected_input_before_cloud_work_and_passes_it_only_to_trial(self):
+        value = snapshot()
+        output = self.directory / 'out'
+        output.mkdir(mode=0o700)
+        good = guest.encoded(self.GHCR)
+        path = self.credential_file(good)
+        bad = self.credential_file(guest.encoded(dict(self.GHCR, helper='x')), name='bad')
+        served = {path: good, bad: guest.encoded(dict(self.GHCR, helper='x'))}
+        with patch.object(guest, 'regular', side_effect=lambda p, n, uid=None, mode=None: (
+                served.get(Path(p), guest.encoded(value)))), \
+             patch.object(host, 'private_directory', return_value=output), \
+             patch.object(host, 'GcsAccessRecords'), patch.object(host, 'GcsSlotStore'), \
+             patch.object(host, 'OwnerRegistration'), patch.object(host, 'PolicyCloud'), \
+             patch.object(host, 'ComputeRestTransport'), patch.object(host.SelfLogin, 'for_owner'), \
+             patch.object(host, 'trial', return_value=0) as run:
+            self.assertEqual(host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', str(output),
+                                        '--ghcr-credentials', str(path)]), 0)
+            self.assertEqual(run.call_args.kwargs['ghcr'], good)
+            self.assertEqual(host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', str(output)]), 0)
+            self.assertIsNone(run.call_args.kwargs['ghcr'])
+            with self.assertRaises(guest.Failure):
+                host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', str(output),
+                           '--ghcr-credentials', str(bad)])
+        self.assertEqual(run.call_count, 2)
+
+    def test_owner_source_never_discovers_or_sources_ambient_credentials(self):
+        source = Path(host.__file__).read_text()
+        for forbidden in ('local.env', 'GITHUB_TOKEN', 'GITHUB_USERNAME', 'os.environ.get(\'GH', 'dotenv', '.docker/config'):
+            self.assertNotIn(forbidden, source)
 
     def test_actual_owner_pipeline_stages_fixed_inputs_then_closes_before_key_receipt(self):
         code, receipt, trace, importer, trust, _, _ = self.owner_pipeline()

@@ -6,7 +6,9 @@ No cloud authority is supplied to workers. Input snapshot is a private captured
 creator correlation, checked against GitHub/main, occupied ledger and immutable
 cloud identity. It cannot select a command/profile/path/ref for remote work.
 Only owner registration CAS/own-key evidence are mutations here; independent
-fixed trusted workflows own creation/deletion. No credential files leave host.
+fixed trusted workflows own creation/deletion. No cloud/SDK/private credential files leave
+host. The ONE narrow exception is an explicit owner-protected GHCR record (#378) sent over
+the original bootstrap stdin; see ``ghcr_credentials``.
 """
 from __future__ import annotations
 
@@ -287,6 +289,25 @@ def source_files(snapshot, output):
     return result
 
 
+def ghcr_credentials(path, output):
+    """Protected owner-supplied GHCR record -> canonical validated bytes (<=1KiB).
+
+    Explicit path only: nothing is sourced, discovered or read from the environment or any
+    credential store. Owner-private 0600 regular file, no links, not under the output tree.
+    Only the four validated fields survive canonicalization. Refusal text is fixed.
+    """
+    try:
+        guest.harden_secret_process()
+        path = guest.no_links(path)
+        parent = path.parent.lstat()
+        guest.require(parent.st_uid == os.geteuid() and not parent.st_mode & 0o022
+                      and output.resolve() not in path.resolve().parents and path.resolve() != output.resolve())
+        raw = guest.regular(path, guest.AUTH_INPUT_LIMIT, os.geteuid(), 0o600)
+        return guest.encoded(guest.auth_credentials(raw))
+    except BaseException:
+        raise guest.Failure('GHCR credential input refused') from None
+
+
 def candidate_fab(public_key, password_hash, token):
     return guest.candidate_fab(public_key, password_hash, token)
 
@@ -370,7 +391,7 @@ class Master:
         command(['/usr/bin/ssh', *self.options, '-o', 'ProxyCommand=/usr/bin/false', '-O', 'check', self.target],
                 self.slice(5, until), until=until)
 
-    def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536):
+    def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536, input_bytes=None):
         phase_end = owned_process.monotonic() + (self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase))
         until = phase_end if until is None else min(until, phase_end)
         self.check(until)
@@ -378,7 +399,8 @@ class Master:
         # is mandatory on EVERY subordinate invocation, including cleanup/SFTP.
         seconds = self.slice(min(cap, self.clock.cleanup_remaining() if cleanup else self.clock.remaining(phase)), until)
         raw = command(['/usr/bin/ssh', *self.options, '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false',
-                       self.target, shlex.join(args)], seconds, limit=limit, failed=None if cleanup else self.failed, until=until)
+                       self.target, shlex.join(args)], seconds, limit=limit, failed=None if cleanup else self.failed, until=until,
+                      **({} if input_bytes is None else {'input_bytes': input_bytes}))
         self.check(until)
         return raw
 
@@ -434,7 +456,7 @@ b=os.read(f,262145); os.close(f)
 assert len(b)==s.st_size and hashlib.sha256(b).hexdigest()==expected
 n={'__name__':'labapp_root_bootstrap','__file__':str(p/'vlab_trial.py')}
 exec(compile(b,str(p/'vlab_trial.py'),'exec'),n)
-n['bootstrap'](p,sys.argv[3])
+n['bootstrap'](p,sys.argv[3],sys.argv[4:])
 """
 
 
@@ -648,7 +670,7 @@ def cleanup_dispatch(snapshot):
     # 202 means accepted cancellation, never observed resource cleanup/FREE.
 
 
-def trial(snapshot, payloads, output, *, registration, records, login, private=None):
+def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None):
     expected_snapshot(snapshot)
     rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
     nonce = secrets.token_hex(16)
@@ -737,8 +759,14 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         trusted_source(snapshot)
         master.transfer(incoming, [*sorted(guest.FILES), 'manifest.json'])
         registration.current()
-        master.remote(['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', BOOTSTRAP, incoming,
-                       source['vlab_trial.py']['sha256'], guest.sha(canonical(table))], 'stage', cap=60)
+        bootstrap = ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', BOOTSTRAP, incoming,
+                     source['vlab_trial.py']['sha256'], guest.sha(canonical(table))]
+        if ghcr is None:
+            master.remote(bootstrap, 'stage', cap=60)
+        else:
+            # The record travels only on the original master's stdin (never argv/SFTP/files);
+            # bootstrap accepts it only after the guardian is running and cleanup is armed.
+            master.remote([*bootstrap, 'ghcr-auth'], 'stage', cap=60, input_bytes=ghcr)
         # Heartbeat starts immediately after bounded root bootstrap. Startup
         # grace is thirty seconds; worker cannot extend it or update itself.
         def heartbeat():
@@ -900,6 +928,9 @@ def main(argv=None):
     # Optional lead-owned retention directory for the fixed private first-failure capture.
     # Without it the capture is `skipped`. It must be outside `output` (which stays empty).
     parser.add_argument('--private-diagnostics', type=Path)
+    # Optional owner-protected GHCR record {"schema":1,"registry":"ghcr.io","username":..,"token":..};
+    # prepared by the lead outside repository code. Never sourced, discovered or echoed.
+    parser.add_argument('--ghcr-credentials', type=Path)
     args = parser.parse_args(argv)
     os.umask(0o077)
     snapshot = guest.data(guest.regular(args.snapshot, MAX_JSON, os.geteuid()))
@@ -914,13 +945,14 @@ def main(argv=None):
                       and output not in private.parents and private not in output.parents,
                       'private diagnostic directory must be outside output')
     expected_snapshot(snapshot)
+    ghcr = None if args.ghcr_credentials is None else ghcr_credentials(args.ghcr_credentials, output)
     token = gcloud_token  # existing owner identity only; never impersonates
     records = GcsAccessRecords(BUCKET, token_provider=token)
     registration = OwnerRegistration(GcsSlotStore(BUCKET, token_provider=token),
                      PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
-                 private=private)
+                 private=private, ghcr=ghcr)
 
 
 if __name__ == '__main__':
