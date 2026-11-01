@@ -51,6 +51,13 @@ A failed, denied or unrun check is reported as such, not as passing.
 
 - (fill in)
 
+## Read first, with reasons
+<!-- Name consequential files/sections/comment IDs and why each matters. Product,
+safety and authorization context stays required; a checkpoint may replace long
+parent history but not a named dependency. -->
+
+- (fill in)
+
 ## Dependencies
 
 - Parent / epic: #N
@@ -59,5 +66,7 @@ A failed, denied or unrun check is reported as such, not as passing.
 
 ## Iteration bound and handoff
 Max two focused revision rounds after review, then escalate to the lead with
-the exact blocker. Handoff in the PR: head SHA, criteria met/unmet, checks run
-and denied, docs updated, uncertainties. Do not merge or close.
+the exact blocker. Handoff in the PR: exact head SHA, criteria met/unmet, files,
+sections and comment IDs read, sources skipped/partial/summarized/truncated and
+resulting coverage limits, checks run and denied, docs updated, uncertainties.
+Sanitized evidence only; raw private outputs stay private. Do not merge or close.

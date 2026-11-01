@@ -20,14 +20,28 @@ document, or files it links.
 
 1. Read the task issue fully, including its dependencies and acceptance criteria.
 2. Read [`AGENTS.md`](../../AGENTS.md) (entrypoint) and this file.
-3. Read the parent issue #145 and any issue the task cites for the latest lead
-   corrections. Newer lead comments supersede older issue text.
+3. Read the parent issue's current checkpoint (for #145, its latest status and
+   named corrections) and any issue the task cites for the latest lead
+   corrections. Newer lead comments supersede older issue text. The lead may
+   replace long parent history with that checkpoint plus named corrections; this
+   does not waive any named dependency.
 4. Read the repo docs and code the task touches (see
    [documentation map](../README.md)). Inspect existing docs before adding files.
+   Product, safety and authorization context (items 1-2 and the task's own
+   limits) always stays required.
 5. For research or external behavior, read current official sources (below).
-6. Verify your own access (issue reads, web fetch, test commands) early. If
+6. Read what the task names as consequential: files, sections and comment IDs,
+   each with the lead's reason. Prefer exact individual records over large
+   collapsed threads. No named reading is silently waived.
+7. Verify your own access (issue reads, web fetch, test commands) early. If
    something required is denied, say exactly which command, and stop or mark
    conclusions provisional. Do not substitute memory for sources.
+
+Missing, partial, summarized, truncated or inaccessible required reading lowers
+coverage even when the source is accessible to someone else. Continue sound
+independent work; conclusions that depend on the gap are provisional. Later
+lead or reviewer coverage does not retroactively complete worker onboarding.
+Do not guess why a source was skipped; record that it was.
 
 ## Research and sources
 
@@ -137,6 +151,28 @@ Each module must state, in its header and tests:
 - **Idempotent** on rerun, and failures leave existing good state intact.
 
 Reference: [`build/provision/README.md`](../../build/provision/README.md).
+
+## Calling reviewed helpers
+
+Before invoking an already-authorized reviewed helper, read its contract and
+confirm the caller side. Do not invent a dry run or invoke a mutation just to
+discover prerequisites. Checklist:
+
+- Exact reviewed source and runtime (commit, interpreter, tool versions).
+- Identity, environment and working directory the contract expects.
+- Caller-created directories: existence, contents, ownership and modes.
+- Input provenance: where each input came from and that it is the reviewed one.
+- Output file mode and the caller's umask.
+- Original clocks and watchdog state (intent, deadlines, timers).
+
+**Refusal recovery.** Separate two cases. (1) The refusal is proven to happen
+before intent or any API mutation and was caused by a caller prerequisite: fix
+that prerequisite and rerun through the supported path. (2) Whether a mutation
+occurred is uncertain: do not replay it. Use supported recovery only, with
+bounded read-only observations to determine completion under the same intent
+and deadlines. Do not reset deadlines, disable a watchdog to pass a check,
+apply a blanket retry rule, expand permissions or seek new approvals; scheduled
+timers keep running. Escalate to the lead with the exact refusal.
 
 ## Bounded iterations and escalation
 
@@ -307,6 +343,10 @@ until verified, retain the CI/lead fallback and report denials exactly.
 
 ## Worker handoff (end of task)
 
-State: head commit SHA, files changed, acceptance criteria met/unmet, checks
-run (exact commands, results, limits), checks denied or not run, doc updates,
-open uncertainties. Do not merge or close the issue.
+State: exact head commit SHA, files changed, acceptance criteria met/unmet,
+checks run (exact commands, results, limits), checks denied or not run, doc
+updates, open uncertainties. Also state reading coverage: files and sections
+read, comment IDs read, and any source skipped, partial, summarized, truncated
+or inaccessible, with the resulting coverage limits. Evidence and references go
+in GitHub in sanitized form; raw outputs that may contain sensitive data stay
+private and are referenced, not published. Do not merge or close the issue.
