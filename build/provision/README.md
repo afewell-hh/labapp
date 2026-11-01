@@ -1163,27 +1163,74 @@ GPG/provenance, installed baseline metadata, runtime or full image/course equiva
 
 ## Pinned public serializer/default asymmetry fixture
 
-`fixtures/pinned-api/main.go` embeds four public objects across three kinds:
-two Switches (including an omitted VLAN namespace list), one Server and one
-Connection. The actual upstream loader receives copies of preserved originals;
-the installer printer strips generated metadata; a fresh loader reloads the
-printed YAML. Separate deep copies then receive typed `Default()` calls and ordinary
-`encoding/json` serialization. The producer checks originals and pre-default
-objects remain unchanged. It accepts only an existing owned empty mode-0700
-output directory and creates exactly `expected.yaml`, `observed.json`, `meta.json`
-exclusively as owned regular single-link mode-0600 files, totaling at most 1 MiB.
-Input objects and output names are fixed; no private configuration is accepted.
+`fixtures/pinned-api/main.go` (#394, extended by #400) runs three public inputs
+through the pinned upstream code:
 
-`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual `api_ready`
-with all 45 expected canonical objects and the original per-kind query counts.
-Upstream representatives replace matching Switch/Server names and one Connection;
-remaining objects, kubeconfig, VM NICs and command fakes come from the existing
-public suite. The independently printed/defaulted pair must refuse at
-`canonical API objects differ`. Matched controls explicitly copy observed data;
-each drift case verifies that control passes before changing one field. Duplicate
-tests arrange equal collapsed maps to exercise both production uniqueness guards,
-with actual query counts preserved. No production readiness rule is duplicated or
-changed. Missing, extra, insecure or oversized fixture files fail rather than skip.
+- the unchanged canonical `wiringd.yaml` (43 objects: 1 VLANNamespace, 1
+  IPv4Namespace, 3 SwitchGroups, 7 Switches, 10 Servers, 21 Connections covering
+  all six variants: mclagDomain 1, mclag 2, unbundled 3, bundled 3, eslag 2,
+  fabric 10), read only from the fixed read-only mount `/repo/wiringd.yaml` and
+  refused unless its SHA-256 equals the pinned value (no caller override);
+- the four hardcoded public synthetic controls from #394 (empty VLAN list,
+  group/speed ordering, stale labels, original-copy safety);
+- a hardcoded public installer-shaped Fabricator and ControlNode, using the field
+  shape of the production candidate renderer with only public placeholders (no
+  environment, `.env` or private data), plus a separate public control with a
+  non-default `spineASN`.
+
+Wiring path: `apiutil` loader (strict decode) on preserved originals; copies are
+added to the fake client; `PrintInclude`; a fresh loader reloads the printed YAML;
+separate deep copies receive typed `Default()` and ordinary `encoding/json`.
+Fabricator path: loader, then `fab.GetFabAndNodes` (DefaultConfig merge, `Validate`
+which itself calls `Fabricator.Default`, `CalculateVersions`, control/node
+listing with `AllowNotHydrated`), `apiutil.PrintFab`, reload and the same merge
+again. The producer records the merge deltas (added/changed/removed config paths),
+whether the printed Fabricator is a fixed point of reload+merge+print, and whether
+a further typed `Default()` changes it; separate controls prove a set non-default
+value survives the merge and that `Fabricator.Default` resets
+`LoopbackWorkaroundDisable`. FabNode count is explicitly 0 and ControlNode 1.
+`loadedBeforeMerge` and `reloadLoadedBeforeMerge` are independent strict-decoded
+typed snapshots captured before each `GetFabAndNodes` call. The
+`afterReloadMergeBeforeExplicitDefault` snapshot is already merged, defaulted
+by validation and versioned; it precedes only the extra explicit `Default()`.
+Originals and the sources of explicit-default copies are checked unchanged.
+The raw public ControlNode renderer input omits `dummy`; its pinned value-struct
+field survives `encoding/json`'s `omitempty` as `dummy: {}` in typed snapshots,
+printed YAML and observed JSON. Tests assert that exact named serialization
+delta while preserving every raw input field. Output remains exactly
+`expected.yaml` (printed Fabricator, ControlNode and 43 wiring objects),
+`observed.json` (`canonical` 45 defaulted objects and `synthetic` 4) and
+`meta.json`, created exclusively as owned regular single-link mode-0600 files in
+an owned empty mode-0700 directory, totaling at most 1 MiB. The producer prints
+each file's size and the total, so whether the full vectors fit is measured, not
+assumed; the 1 MiB aggregate and three-file interface are unchanged.
+
+`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual, unchanged
+`api_ready` with the independently produced 45 public objects and actual per-kind
+query counts (Fabricator 1, ControlNode 1, FabNode 0, Switch 7, Server 10,
+Connection 21, SwitchGroup 3, VLANNamespace 1, IPv4Namespace 1); readiness, node,
+kubeconfig and VM-config fakes come from the existing public suite. Expected
+metadata is asserted from hand-written endpoint/type tables (cross-checked against
+ports in the raw source): per-Connection type and switch/server endpoint labels,
+per-Switch profile, group and `default` VLAN-namespace labels and the
+`vlanNamespaces: [default]` delta, unchanged values and link order against the raw
+canonical YAML, namespaces, and exact ControlNode namespace/spec. The independently
+printed/defaulted pair must refuse at `canonical API objects differ`. A matched
+baseline passes before each isolated negative (missing/wrong/extra endpoint and
+generated labels, annotations, specs, link order, namespaces, identities,
+Fabricator/ControlNode drift, unknown spec fields injected after typed decoding).
+Duplicate tests keep equal collapsed maps to exercise both production uniqueness
+guards. No production readiness rule is duplicated or changed. Missing, extra,
+insecure or oversized fixture files, or zero discovered tests, fail rather than skip.
+
+Not implemented and still unknown: a full expected projection, Fabricator
+hydration (management/dummy IPs), full migration-branch coverage and `hhfab`
+build behavior; what live webhooks, deployed CRDs, OCI bytes or the controller
+do. The actual VLAN helper fills zero `to` from `from` and sorts ranges in place;
+`Default()` assigns the returned ranges only on error and discards the merged
+return on success. The canonical singleton stays unchanged; no generic merging
+is presumed. Execution evidence belongs in the associated PR and CI runs;
+these assertions do not establish effective deployed behavior.
 
 Source provenance, independently read as raw primary code on 2026-11-01:
 [Fabricator v0.43.1](https://github.com/githedgehog/fabricator/tree/65254ebab3cb7173598985dfb9f3f358e08769ca),
@@ -1199,6 +1246,9 @@ removes generated labels and last-applied annotations. Fabric's
 [Switch defaults](https://github.com/githedgehog/fabric/blob/8b0aefa0937a95e51cc04ec3ea33fadb06782a99/api/wiring/v1beta1/switch_types.go#L183)
 and Connection/Server defaults define the asserted transformations. Source webhook
 registration invokes those defaults; the fake client does not run admission.
+The pinned [ControlNode value struct](https://github.com/githedgehog/fabricator/blob/65254ebab3cb7173598985dfb9f3f358e08769ca/api/fabricator/v1beta1/controlnode_types.go#L18)
+and [Go 1.25.9 JSON omission rules](https://github.com/golang/go/blob/go1.25.9/src/encoding/json/encode.go#L113)
+explain the explicit empty `dummy` serialization expectation.
 
 The hosted wrapper compiles only this helper in a temporary command directory
 inside the immutable Fabricator checkout, using its unchanged module/vendor tree
