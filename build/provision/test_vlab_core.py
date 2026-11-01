@@ -950,7 +950,9 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(bundle['primary'], {'message': 'synthetic ready failure', 'code': 17,
                                              'status': 'unavailable', 'output': ''})
         self.assertEqual([d[0] for d in self.diagnostics], [
-            [core.SYSTEMCTL, 'show', core.UNIT['fresh'], '--no-pager', '--property=' + core.MANAGER_PROPERTIES],
+            [core.SYSTEMCTL, 'show', core.UNIT['fresh'], '--no-pager', '--timestamp=us+utc',
+             '--property=ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,'
+             'ExecMainPID,ExecMainExitTimestamp,ExecStartPost'],
             self.journal_argv('a' * 32)])
         self.assertEqual([d[2] for d in self.diagnostics], [2048, 8192])
         self.assertTrue(all(d[1] <= before + core.SNAPSHOT_SECONDS + 1 for d in self.diagnostics))
@@ -959,6 +961,46 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(stat.S_IMODE((core.ROOT / core.FIRST_FAILURE).stat().st_mode), 0o600)
         self.assertEqual(core.state()['containment'], 'verified')
         self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_manager_exit_observations_are_retained_as_opaque_bytes_without_inference(self):
+        # Offline fixtures: representative text only. Not native systemd output, scheduling or
+        # ordering proof. Dates are never parsed; every case must round-trip byte for byte.
+        def post(start, stop, code, status):
+            return ('ExecStartPost={ path=/usr/bin/python3 ;'
+                    ' argv[]=/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py unit-ready --mode fresh ;'
+                    ' ignore_errors=no ; start_time=[%s] ; stop_time=[%s] ; pid=4321 ; code=%s ;'
+                    ' status=%s }\n' % (start, stop, code, status))
+        early, late = 'Sun 2026-11-01 17:00:01.000001 UTC', 'Sun 2026-11-01 17:00:02.000002 UTC'
+        cases = {
+            'ordinary-exit-main-first': ('1', '1', early, post(early, late, 'exited', '1')),
+            'timeout-like-124-post-first': ('1', '124', late, post(early, early, 'exited', '124')),
+            'signal-143-equal': ('1', '143', early, post(early, early, 'exited', '143')),
+            'signal-130-reversed': ('1', '130', early, post(late, early, 'exited', '130')),
+            'signaled-child': ('2', '9', late, post(early, late, 'killed', '9/KILL')),
+            'zero-unset-observations': ('1', '0', 'n/a', post('n/a', 'n/a', 'exited', '0')),
+            'missing-new-properties': ('', '', None, ''),
+        }
+        for name, (code, status, exit_ts, start_post) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                body = ('ActiveState=failed\nSubState=failed\nResult=exit-code\nInvocationID=' + 'a' * 32 +
+                        '\nExecMainCode=' + code + '\nExecMainStatus=' + status + '\nExecMainPID=4300\n')
+                if exit_ts is not None:
+                    body += 'ExecMainExitTimestamp=' + exit_ts + '\n' + start_post
+                raw = body.encode()
+                self.diag = lambda argv, raw=raw: (
+                    ('ok', raw, False, 'confirmed') if argv[0] == core.SYSTEMCTL
+                    else ('ok', b'JOURNAL-TAIL', False, 'confirmed'))
+                with self.ready_failure():
+                    self.assertEqual(self.call('start-fresh'), 17)  # primary status unchanged
+                bundle = self.bundle()
+                self.assertEqual(bundle['manager']['status'], 'ok')  # capture status, not completeness
+                self.assertEqual(self.raw_section('manager'), raw)
+                self.assertEqual(len(self.diagnostics), 2)  # one manager + one unchanged journal query
+                self.assertEqual([d[2] for d in self.diagnostics], [2048, 8192])
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual(bundle['query_cleanup'], 'confirmed')
 
     def test_bundle_precedes_cleanup_and_survives_overwrite_or_cleanup_failure(self):
         self.prepared()

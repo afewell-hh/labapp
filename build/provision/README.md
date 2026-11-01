@@ -1717,8 +1717,21 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   readiness/containment authority. `state` is a fixed token subset. Without a
   proven frozen invocation, manager execution evidence stays `unavailable` with
   empty output and no query, even if this call has a reserved operation. `manager` is one
-  `systemctl show` of the fixed unit for `ActiveState,SubState,Result,InvocationID,
-  ExecMainCode,ExecMainStatus,ExecMainPID` (at most 2 KiB, 2 s). A different
+  `systemctl show --no-pager --timestamp=us+utc` of the fixed unit for `ActiveState,
+  SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,ExecMainPID,
+  ExecMainExitTimestamp,ExecStartPost` (at most 2 KiB, 2 s; same single query,
+  the last two properties and the timestamp option were added for #387). The raw
+  bytes are kept opaque: no timestamp parsing, ordering or cause label. `manager.status=ok`
+  means a bounded capture with the matching frozen `InvocationID`, not that every
+  requested property is present or meaningful; missing, `n/a`, zero or truncated
+  values stay unknown. `ExecStartPost` code/status shows only that command's reported
+  outcome, not who initiated a failure; exit timestamps are manager reaping
+  observations subject to clock changes, ties, notification/reaping order and
+  cancellation races. Neither proves the sender of a SIGKILL or excludes an earlier
+  fault. Sources (systemd v255, read 2026-11-01): `src/systemctl/systemctl-show.c`,
+  `src/systemctl/systemctl.c`, `src/basic/time-util.c`, `src/core/dbus-service.c`,
+  `src/core/dbus-execute.c`. This is source reading only: there is no native runtime
+  proof, and Ubuntu's patched behavior is unvalidated. Offline tests use fixture text. A different
   `InvocationID` makes it `invalid` (output dropped); a forgotten unit makes it
   `unavailable`. `journal` runs only with a frozen invocation: `journalctl --no-pager
   --namespace=labapp-vlab --lines=64 --output=short-monotonic _BOOT_ID=<boot without
