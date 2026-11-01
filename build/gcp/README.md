@@ -1421,6 +1421,18 @@ survive finally-cleanup without printing exception text or server data.
 Existing cleanup booleans separately report cleanup outcomes; these statuses
 neither attest cloud deletion nor authorize release of an occupied lease.
 
+The same final receipt includes `host_operation`, a closed source literal from
+`HOST_OPERATIONS`. It marks the existing host callsite group: preflight/source/
+registration/owner checks, key generation/registration/import, host-key/master/
+boot/probe access, source/payload staging, candidate/manifest generation, source
+transfer, bootstrap, heartbeat startup, poll checks, result read/validation or
+service observation. It is set before work and frozen during supplemental
+diagnostics and cleanup, preserving the primary code/category even when cleanup
+fails. It supplies context for an unexpected host failure, not its cause or the
+guest's progress. No exception text, exception-type label, argv, path or secret
+enters it; no calls, retries or deadline allowance are added. A successful result
+ends at `result-validate`; the existing success/containment checks still apply.
+
 The owner Cloud SDK pin is575.0.0; workflow SDK remains540.0.0. The fixed IAP
 proxy uses `compute start-iap-tunnel ... 22 --listen-on-stdin`. Local installed
 SDK575 source declares this hidden flag and chooses `IapTunnelStdinHelper`;
@@ -1543,6 +1555,13 @@ no mode/operation/invocation)
 (see the [core bundle](../provision/README.md#root-private-first-failure-bundle-issue-368));
 `absent`, `invalid`, transport loss or timeout, and an exhausted budget are explicit
 statuses, never a cleanup exemption.
+
+After the original contract/nonce/live-boot checks, a missing core state root
+returns `absent`: no bundle is available. This does not distinguish a root that
+was never created from one moved or deleted. Links (including dangling links),
+wrong type/owner/mode and malformed or foreign bundle/state bindings still
+refuse. The one-shot export also remains available after a host-origin failure:
+a concurrent guest failure can legitimately have produced a bundle.
 
 * One absolute `until` covers both master checks, transport and nested cleanup, and
   `EXPORT_TEARDOWN_RESERVE` (12 s) is held back for the existing master close; with

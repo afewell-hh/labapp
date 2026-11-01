@@ -1756,6 +1756,11 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   null reservation requires legitimate prepared state. The strict validator (`first_failure_bundle`) is shared with
   the owner host. A root-compromised guest could forge both records; the check detects
   stale, foreign or replaced data, not a hostile root, and all bytes remain untrusted.
+  Only after contract, nonce and live-boot validation, a missing core root also
+  returns `absent` (no available bundle); it cannot distinguish never-created
+  from moved/deleted state. Dangling or live links, wrong type/owner/mode and
+  malformed or foreign bindings remain refusals. A host-origin failure still
+  permits the existing one-shot export because a guest failure may be concurrent.
 
 The diagnostic runner fixtures (`test_vlab_core.py`) mock Popen, waitid, killpg,
 selector/I/O and monotonic time while exercising the actual runner and unchanged
