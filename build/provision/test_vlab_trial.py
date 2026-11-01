@@ -2253,8 +2253,12 @@ class FirstFailureExport(unittest.TestCase):
         self.stack.enter_context(patch.object(core, 'diagnostic_run', side_effect=self.query))
         self.v = v
         self.operation, self.invocation = 'e' * 32, 'f' * 32
+        started = time.monotonic()
         self.value = {'schema': 1, 'nonce': NONCE, 'mode': 'fresh', 'operation': self.operation,
-                      'phase': 'starting', 'invocation': self.invocation}
+                      'phase': 'starting', 'invocation': self.invocation, 'boot': v['boot_uuid'],
+                      'started': started, 'deadline': started + core.START_SECONDS['fresh']}
+        # reserve() returns before unit_gate publishes the invocation in current state.
+        self.reserved = {key: item for key, item in self.value.items() if key != 'invocation'}
         core.atomic(self.state_root / 'state.json', self.value)
 
     def query(self, argv, end, keep):
@@ -2265,12 +2269,13 @@ class FirstFailureExport(unittest.TestCase):
 
     def capture(self, value=True, error=None):
         error = error or self.core.Failure('child command failed', 1, b'primary ' + SENTINEL.encode())
-        self.core.capture_first_failure('fresh', self.value if value else None, error, time.monotonic() + 60)
+        self.core.capture_first_failure('fresh', self.reserved if value else None, error, time.monotonic() + 60)
 
     def export(self):
         return trial.export_failure(NONCE)
 
     def test_real_writer_roundtrip_validates_and_binds_independent_envelope(self):
+        self.assertNotIn('invocation', self.reserved)
         self.capture()
         raw = self.export()
         first, _, rest = raw.partition(b'\n')
@@ -2282,6 +2287,37 @@ class FirstFailureExport(unittest.TestCase):
         self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']),
                          ('unit', self.operation, self.invocation))
         self.assertLessEqual(len(rest), trial.FAILURE_LIMIT)
+        # Bundle schema 2; the envelope/state/public schemas above are unchanged (1).
+        self.assertEqual((bundle['schema'], bundle['unit_ready']),
+                         (2, {'status': 'unavailable', 'message': None, 'code': None}))
+
+    def test_real_unit_ready_record_roundtrips_through_capture_export_and_validator(self):
+        core = self.core
+        value = self.value
+
+        def publish(message, code):
+            record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
+                      'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
+                      'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
+                      'message': message, 'code': code}
+            core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
+
+        publish('synthetic readiness refusal', 17)
+        self.assertNotIn('invocation', self.reserved)
+        self.capture(error=core.Failure('child command failed', 1, b'x'))
+        bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17})
+        self.assertLessEqual(len((self.state_root / self.core.FIRST_FAILURE).read_bytes()), trial.FAILURE_LIMIT)
+
+    def test_missing_current_clock_authority_invalidates_only_readiness_section(self):
+        current = {key: item for key, item in self.value.items() if key != 'started'}
+        self.core.atomic(self.state_root / 'state.json', current)
+        self.capture()
+        bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertEqual(len(self.queries), 2)
 
     def test_absent_and_every_binding_mismatch_is_refused_not_trusted(self):
         self.assertEqual(self.export(), b'absent')
@@ -2400,6 +2436,27 @@ class FirstFailureExport(unittest.TestCase):
             'context cap': dict(good, command_context=dict(good['command_context'], status='ok',
                                output=base64.b64encode(b'x' * 2049).decode())),
             'extra state field': dict(good, state=dict(good['state'], text=SENTINEL)),
+            'legacy schema 1': dict(good, schema=1), 'future schema 3': dict(good, schema=3),
+            'missing unit_ready': {k: v for k, v in good.items() if k != 'unit_ready'},
+            'null unit_ready': dict(good, unit_ready=None),
+            'unit_ready extra key': dict(good, unit_ready=dict(good['unit_ready'], extra=1)),
+            'unit_ready missing key': dict(good, unit_ready={'status': 'unavailable', 'message': None}),
+            'unit_ready bad status': dict(good, unit_ready={'status': 'captured', 'message': None, 'code': None}),
+            'ok null message': dict(good, unit_ready={'status': 'ok', 'message': None, 'code': 1}),
+            'ok null code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': None}),
+            'ok bool code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': True}),
+            'ok float code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': 1.0}),
+            'ok negative code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': -1}),
+            'ok long message': dict(good, unit_ready={'status': 'ok', 'message': 'x' * 129, 'code': 1}),
+            'ok empty message': dict(good, unit_ready={'status': 'ok', 'message': '', 'code': 1}),
+            'ok non-ascii message': dict(good, unit_ready={'status': 'ok', 'message': 'café', 'code': 1}),
+            'unavailable with message': dict(good, unit_ready={'status': 'unavailable', 'message': 'x', 'code': None}),
+            'invalid with code': dict(good, unit_ready={'status': 'invalid', 'message': None, 'code': 0}),
+            'ok on reservation': dict(good, operation=None, invocation=None, stage='reserve',
+                                      manager={'status': 'unavailable', 'output': ''},
+                                      journal={'status': 'unavailable', 'output': ''},
+                                      command_context=dict(good['command_context'], status='unavailable', output=''),
+                                      unit_ready={'status': 'ok', 'message': 'x', 'code': 1}),
         }
         for name, bad in cases.items():
             with self.subTest(name), self.assertRaises(trial.Failure):

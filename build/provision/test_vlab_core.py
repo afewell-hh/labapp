@@ -949,6 +949,9 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                          ('unit', 'fresh', 'b' * 32, value['operation'], 'a' * 32, core.boot(), 'confirmed'))
         self.assertEqual(bundle['primary'], {'message': 'synthetic ready failure', 'code': 17,
                                              'status': 'unavailable', 'output': ''})
+        # unit_ready is patched out here, so no record exists: unknown, not a cause.
+        self.assertEqual((bundle['schema'], bundle['unit_ready']),
+                         (2, {'status': 'unavailable', 'message': None, 'code': None}))
         self.assertEqual([d[0] for d in self.diagnostics], [
             [core.SYSTEMCTL, 'show', core.UNIT['fresh'], '--no-pager', '--timestamp=us+utc',
              '--property=ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,'
@@ -1181,6 +1184,512 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual((bundle['primary']['status'], bundle['manager']['status']), ('truncated', 'unavailable'))
         for name, cap in core.FAILURE_CAPS.items():
             self.assertLessEqual(len(base64.b64decode(bundle[name]['output'], validate=True)), cap)
+
+    # -- #390 observed unit-ready refusal. Offline fixtures drive the REAL unit_ready/start/main
+    #    paths with fake commands, clock and files. They are not native systemd scheduling and not
+    #    filesystem-preemption proof, and the observed refusal is never an initiating cause.
+    def ready_path(self):
+        return core.ROOT / core.UNIT_READY_FAILURE
+
+    def ready_record(self):
+        return json.loads(self.ready_path().read_bytes())
+
+    def fail_inspection(self, hook=None):
+        def failure(args):
+            if args[:3] != [core.HHFAB, 'vlab', 'inspect-switches']:
+                return False
+            if hook is not None:
+                hook()
+            return True
+        self.failure = failure
+
+    def test_unit_ready_refusal_is_recorded_with_every_original_binding_and_typed_in_bundle(self):
+        self.prepared()
+        self.fail_inspection()
+        with patch.object(core, 'read_unit_ready', wraps=core.read_unit_ready) as spy:
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(spy.call_count, 1)  # one read, no wait or reread
+        state, record, bundle = core.state(), self.ready_record(), self.bundle()
+        self.assertEqual(len(record), 12)
+        self.assertEqual(record, {
+            'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+            'operation': state['operation'], 'invocation': 'a' * 32, 'boot': core.boot(),
+            'started': state['started'], 'deadline': state['deadline'],
+            'message': 'synthetic command failure', 'code': 17})
+        info = self.ready_path().stat()
+        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_nlink), (0o600, 1))
+        self.assertLessEqual(info.st_size, core.UNIT_READY_LIMIT)
+        self.assertFalse((core.ROOT / (core.UNIT_READY_FAILURE + '.new')).exists())
+        self.assertEqual(bundle['schema'], 2)
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic command failure', 'code': 17})
+        self.assertEqual(len(self.diagnostics), 2)  # exactly one manager and one journal query
+        self.assertEqual([d[2] for d in self.diagnostics], [2048, 8192])
+        self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_ready_refusal_survives_later_cancellation_and_outer_wrapper_failure(self):
+        self.prepared()
+        # Change the API identity after strict inspection: the actual ready_body
+        # require(...) refuses it, without injecting a synthetic child Failure.
+        def change_identity(argv):
+            if argv[:3] == [core.HHFAB, 'vlab', 'inspect-switches']:
+                self.cluster_uid = 'different-public-cluster'
+            return False
+        self.failure = change_identity
+        actual = self.command
+        def wrapped(argv, *args, **kwargs):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                try:
+                    return actual(argv, *args, **kwargs)
+                except core.Failure:
+                    raise core.Failure('child command failed', 1,
+                                       b'hhfab: context canceled ' + SENTINEL.encode()) from None
+            return actual(argv, *args, **kwargs)
+        with patch.object(core, 'execute', side_effect=wrapped):
+            self.assertEqual(self.call('start-fresh'), 1)  # outer primary, unchanged
+        bundle = self.bundle()
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'post-inspection identity differs', 'code': 1})
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
+        self.assertIn(SENTINEL.encode(), self.raw_section('primary'))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertEqual(bundle['command_context']['label'], core.FAILURE_CONTEXT)
+        self.assertEqual(bundle['command_context']['status'], 'unavailable')
+        self.assertEqual(self.ready_record()['message'], 'post-inspection identity differs')
+        self.assertEqual(len(self.diagnostics), 2)
+        self.assertEqual(core.state()['containment'], 'verified')
+        self.assertNotIn(SENTINEL.encode(), self.ready_path().read_bytes())
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_outer_capture_correlates_current_boot_and_clocks_with_invocation_free_reserve(self):
+        for mutation in ('unchanged', 'boot', 'clocks'):
+            with self.subTest(mutation):
+                self.setUp()
+                self.prepared()
+                self.fail_inspection()
+                capture, observations = core.capture_first_failure, []
+                def mutate_then_capture(mode, reserved, primary, deadline):
+                    self.assertNotIn('invocation', reserved)
+                    original = core.state()
+                    record = self.ready_record()
+                    self.assertEqual(record['boot'], original['boot'])
+                    self.assertEqual(record['started'], original['started'])
+                    changed = dict(original)
+                    if mutation == 'boot':
+                        changed['boot'] = ('0' if original['boot'][0] != '0' else '1') + original['boot'][1:]
+                    elif mutation == 'clocks':
+                        changed['started'] += 1
+                        changed['deadline'] += 1
+                        self.assertEqual(changed['deadline'] - changed['started'], core.START_SECONDS[mode])
+                    core.save(changed)
+                    try:
+                        capture(mode, reserved, primary, deadline)
+                        observations.append(self.bundle())
+                    finally:
+                        core.save(original)  # keep this capture-only mutation out of cleanup
+                with patch.object(core, 'capture_first_failure', side_effect=mutate_then_capture), \
+                     patch.object(core, 'read_unit_ready', wraps=core.read_unit_ready) as reader:
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual(len(observations), 1)
+                bundle = observations[0]
+                expected = ({'status': 'ok', 'message': 'synthetic command failure', 'code': 17}
+                            if mutation == 'unchanged' else {'status': 'invalid', 'message': None, 'code': None})
+                self.assertEqual(bundle['unit_ready'], expected)
+                self.assertEqual(reader.call_count, 1 if mutation == 'unchanged' else 0)
+                self.assertEqual(bundle['invocation'], 'a' * 32)
+                self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+                self.assertEqual(bundle['primary']['code'], 17)
+                self.assertEqual(len(self.diagnostics), 2)
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    def test_readiness_descriptor_close_error_or_signal_preserves_full_capture_and_cleanup(self):
+        for secondary in (OSError(SENTINEL), KeyboardInterrupt()):
+            with self.subTest(type(secondary).__name__):
+                self.setUp()
+                self.prepared()
+                self.fail_inspection()
+                opened, closed = [], []
+                actual_open, actual_close, actual_cleanup = core.os.open, core.os.close, core.cleanup_start
+                cleanup = []
+                def opening(path, flags, *args, **kwargs):
+                    fd = actual_open(path, flags, *args, **kwargs)
+                    if path == self.ready_path() and flags & os.O_NONBLOCK:
+                        opened.append(fd)
+                    return fd
+                def closing(fd):
+                    actual_close(fd)
+                    if opened and fd == opened[0] and not closed:
+                        closed.append(fd)
+                        raise secondary
+                def cleaning(value, deadline):
+                    cleanup.append(deadline - time.monotonic())
+                    return actual_cleanup(value, deadline)
+                with patch.object(core.os, 'open', side_effect=opening), \
+                     patch.object(core.os, 'close', side_effect=closing), \
+                     patch.object(core, 'cleanup_start', side_effect=cleaning):
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual(len(opened), 1)
+                self.assertEqual(closed, opened)
+                bundle = self.bundle()
+                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+                self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                                 ('synthetic command failure', 17))
+                self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+                self.assertEqual(bundle['query_cleanup'], 'confirmed')
+                self.assertEqual(len(self.diagnostics), 2)
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual(len(cleanup), 1)
+                self.assertTrue(34 < cleanup[0] <= 35)
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+                self.assertNotIn('first-failure capture unverified', self.stderr.getvalue())
+
+    def test_late_record_publication_after_open_miss_is_not_reread(self):
+        self.prepared()
+        self.fail_inspection()
+        actual_write, actual_open = core.write_first_failure, core.os.open
+        pending, attempts = [], []
+        def delay_record(raw, name=core.FIRST_FAILURE):
+            if name == core.UNIT_READY_FAILURE:
+                pending.append(raw)
+                return
+            return actual_write(raw, name)
+        def publish_after_miss(path, flags, *args, **kwargs):
+            if path == self.ready_path() and flags & os.O_NONBLOCK:
+                attempts.append(path)
+                try:
+                    return actual_open(path, flags, *args, **kwargs)
+                except FileNotFoundError:
+                    self.assertEqual(len(pending), 1)
+                    actual_write(pending[0], core.UNIT_READY_FAILURE)
+                    raise
+            return actual_open(path, flags, *args, **kwargs)
+        with patch.object(core, 'write_first_failure', side_effect=delay_record), \
+             patch.object(core.os, 'open', side_effect=publish_after_miss):
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(attempts, [self.ready_path()])
+        self.assertEqual(self.ready_record()['message'], 'synthetic command failure')
+        bundle = self.bundle()
+        self.assertEqual(bundle['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None})
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                         ('synthetic command failure', 17))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertEqual(len(self.diagnostics), 2)
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_unit_ready_record_text_is_sanitized_to_fixed_values(self):
+        cases = (('unexpected exception', RuntimeError(SENTINEL), 1),
+                 ('oversize text', core.Failure('x' * 129, 17), 17),
+                 ('non-ascii text', core.Failure('café ' + SENTINEL, 17), 17),
+                 ('control text', core.Failure('bad\nline', 17), 17),
+                 ('bool code', core.Failure('synthetic refusal', True), True),
+                 ('large code', core.Failure('synthetic refusal', 256), 256))
+        for name, error, status in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                with patch.object(core, 'api_ready', side_effect=error):
+                    self.assertEqual(self.call('start-fresh'), status)
+                record = self.ready_record()
+                self.assertEqual((record['message'], record['code']), ('operational failure', 1))
+                self.assertNotIn(SENTINEL.encode(), self.ready_path().read_bytes())
+                self.assertEqual(self.bundle()['unit_ready'],
+                                 {'status': 'ok', 'message': 'operational failure', 'code': 1})
+        self.setUp()
+        self.prepared()
+        with patch.object(core, 'api_ready', side_effect=core.Failure('x' * 128, 0)):
+            self.call('start-fresh')
+        self.assertEqual(self.ready_record()['message'], 'x' * 128)
+
+    def test_genuine_child_130_143_are_recorded_but_handled_signals_are_not(self):
+        cases = (('child 130', core.Failure('child command failed', 130), True, 130),
+                 ('child 143', core.Failure('child command failed', 143), True, 143),
+                 ('handled SIGINT', core.Failure('terminated', 130), False, 130),
+                 ('handled SIGTERM', core.Failure('terminated', 143), False, 143),
+                 ('keyboard interrupt', KeyboardInterrupt(), False, 130))
+        for name, error, recorded, status in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                with patch.object(core, 'api_ready', side_effect=error):
+                    self.assertEqual(self.call('start-fresh'), status)
+                self.assertEqual(self.ready_path().exists(), recorded)
+                self.assertEqual(self.bundle()['unit_ready']['status'], 'ok' if recorded else 'unavailable')
+                if recorded:
+                    self.assertEqual((self.ready_record()['message'], self.ready_record()['code']),
+                                     ('child command failed', status))
+        self.setUp()
+        self.prepared()
+        with patch.object(core, 'api_ready', side_effect=SystemExit(3)), self.assertRaises(SystemExit):
+            self.call('start-fresh')
+        self.assertFalse(self.ready_path().exists())
+
+    def test_presnapshot_failure_never_reconstructs_authority_from_later_state(self):
+        self.prepared()
+        real, calls = core.startup_snapshot, [0]
+        def snapshot(mode):
+            calls[0] += 1
+            if calls[0] == 2:  # unit-run took the first; this is unit-ready's own snapshot
+                raise core.Failure('startup invocation refused', 17)
+            return real(mode)
+        with patch.object(core, 'startup_snapshot', side_effect=snapshot):
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertFalse(self.ready_path().exists())
+        self.assertEqual(self.bundle()['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None})
+
+    def test_expired_owned_stop_and_every_binding_change_prevent_authoritative_write(self):
+        def mutate(field, change):
+            def hook():
+                value = core.state()
+                value[field] = change(value[field])
+                core.save(value)
+            return hook
+        def stop():
+            value = core.state()
+            value['stopping'] = {'operation': value['operation'], 'invocation': value['invocation']}
+            core.save(value)
+        def environment():
+            os.environ['INVOCATION_ID'] = 'c' * 32
+        offset = [0]
+        real = time.monotonic
+        def expire():
+            offset[0] = 10 ** 6
+        def other_boot():
+            self.stack.enter_context(patch.object(core, 'boot', return_value='9' * 8 + core.boot()[8:]))
+        cases = {'nonce': mutate('nonce', lambda _: '9' * 32), 'mode': mutate('mode', lambda _: 'resume'),
+                 'operation': mutate('operation', lambda _: '9' * 32),
+                 'invocation': mutate('invocation', lambda _: '9' * 32),
+                 'boot': mutate('boot', lambda old: '9' * 8 + old[8:]),
+                 'started': mutate('started', lambda old: old + 1),
+                 'deadline': mutate('deadline', lambda old: old + 1),
+                 'owned stop': stop, 'environment invocation': environment,
+                 'live boot': other_boot, 'expired clock': expire}
+        for name, hook in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                offset[0] = 0
+                self.prepared()
+                self.fail_inspection(hook)
+                with patch.object(core.time, 'monotonic', lambda: real() + offset[0]):
+                    self.call('start-fresh')
+                self.assertFalse(self.ready_path().exists())
+                self.assertFalse((core.ROOT / (core.UNIT_READY_FAILURE + '.new')).exists())
+
+    def test_secondary_diagnostic_error_or_signal_preserves_exact_primary_status_and_cleanup(self):
+        for name, secondary in (('error', OSError(SENTINEL)), ('handled term', core.Failure('terminated', 143)),
+                                ('interrupt', KeyboardInterrupt()), ('exit', SystemExit(9))):
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                self.fail_inspection()
+                with patch.object(core, 'record_unit_ready_failure', side_effect=secondary):
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+                self.assertEqual(self.bundle()['unit_ready']['status'], 'unavailable')
+                self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+        self.setUp()
+        self.prepared()
+        self.fail_inspection()
+        with patch.object(core, 'write_first_failure', side_effect=OSError(SENTINEL)):
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertFalse(self.ready_path().exists())
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_preplaced_stale_or_unsafe_record_is_never_overwritten_adopted_or_deleted(self):
+        foreign = self.base / 'foreign'
+        stale = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+                 'operation': 'd' * 32, 'invocation': 'a' * 32, 'boot': core.boot(), 'started': 1.5,
+                 'deadline': 1.5 + core.START_SECONDS['fresh'], 'message': 'stale refusal', 'code': 3}
+        def regular():
+            self.ready_path().write_bytes(b'FOREIGN')
+            self.ready_path().chmod(0o600)
+        def symlink():
+            foreign.write_bytes(b'FOREIGN')
+            self.ready_path().symlink_to(foreign)
+        def hardlink():
+            regular()
+            os.link(self.ready_path(), self.base / 'alias')
+        def stale_binding():
+            self.ready_path().write_bytes(json.dumps(stale).encode())
+            self.ready_path().chmod(0o600)
+        def stale_temp():
+            (core.ROOT / (core.UNIT_READY_FAILURE + '.new')).write_bytes(b'STALE-TEMP')
+        for name, place, status in (('regular', regular, 'invalid'), ('symlink', symlink, 'invalid'),
+                                    ('hardlink', hardlink, 'invalid'), ('stale binding', stale_binding, 'invalid'),
+                                    ('stale temp', stale_temp, 'unavailable')):
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                place()
+                before = {p.name: p.read_bytes() for p in core.ROOT.iterdir()
+                          if p.name.startswith(core.UNIT_READY_FAILURE) and not p.is_symlink()}
+                self.fail_inspection()
+                self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual(self.bundle()['unit_ready'], {'status': status, 'message': None, 'code': None})
+                after = {p.name: p.read_bytes() for p in core.ROOT.iterdir()
+                         if p.name.startswith(core.UNIT_READY_FAILURE) and not p.is_symlink()}
+                self.assertEqual(after, before)
+                if name == 'symlink':
+                    self.assertTrue(self.ready_path().is_symlink())
+                    self.assertEqual(foreign.read_bytes(), b'FOREIGN')
+
+    def ready_inputs(self):
+        self.prepared()
+        value = {'nonce': 'b' * 32, 'mode': 'fresh', 'operation': 'e' * 32, 'boot': core.boot(),
+                 'started': 100.5, 'deadline': 100.5 + core.START_SECONDS['fresh']}
+        record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+                  'operation': 'e' * 32, 'invocation': 'a' * 32, 'boot': value['boot'],
+                  'started': value['started'], 'deadline': value['deadline'],
+                  'message': 'synthetic readiness refusal', 'code': 17}
+        return value, record
+
+    def place_ready(self, content, mode=0o600):
+        raw = content if isinstance(content, bytes) else json.dumps(content, sort_keys=True).encode()
+        self.ready_path().write_bytes(raw)
+        self.ready_path().chmod(mode)
+
+    def read_ready(self, value, invocation='a' * 32, boot=None):
+        return core.read_unit_ready('fresh', value, invocation, value['boot'] if boot is None else boot)
+
+    def test_outer_reader_accepts_only_exact_record_and_rejects_every_original_binding_change(self):
+        value, record = self.ready_inputs()
+        self.assertEqual(self.read_ready(value), ('unavailable', None, None))  # missing
+        self.place_ready(record)
+        self.assertEqual(self.read_ready(value), ('ok', 'synthetic readiness refusal', 17))
+        invalid = ('invalid', None, None)
+        cases = {
+            'schema 2': dict(record, schema=2), 'bool schema': dict(record, schema=True),
+            'source': dict(record, source='vlab_trial'), 'action': dict(record, action='unit_ready'),
+            'nonce': dict(record, nonce='9' * 32), 'mode': dict(record, mode='resume'),
+            'operation': dict(record, operation='9' * 32), 'invocation': dict(record, invocation='9' * 32),
+            'boot': dict(record, boot='9' * 8 + record['boot'][8:]),
+            'started': dict(record, started=record['started'] + 1),
+            'deadline': dict(record, deadline=record['deadline'] + 1),
+            'started bool': dict(record, started=True), 'deadline null': dict(record, deadline=None),
+            'duration': dict(record, started=record['started'] + 1, deadline=record['deadline'] + 1),
+            'extra key': dict(record, step='x'), 'timestamp key': dict(record, wall='x'),
+            'missing key': {k: v for k, v in record.items() if k != 'code'},
+            'bool code': dict(record, code=True), 'float code': dict(record, code=17.0),
+            'string code': dict(record, code='17'), 'high code': dict(record, code=256),
+            'negative code': dict(record, code=-1), 'null message': dict(record, message=None),
+            'empty message': dict(record, message=''), 'long message': dict(record, message='x' * 129),
+            'non-ascii message': dict(record, message='café'), 'control message': dict(record, message='a\nb'),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.place_ready(bad)
+                self.assertEqual(self.read_ready(value), invalid)
+        text = json.dumps(record, sort_keys=True)
+        for name, raw in (('duplicate key', text[:-1].encode() + b',"code":18}'),
+                          ('NaN constant', text.replace('100.5', 'NaN', 1).encode()),
+                          ('oversize', text.encode() + b' ' * core.UNIT_READY_LIMIT),
+                          ('not an object', b'[]'), ('garbage', b'\xff\x00')):
+            with self.subTest(name):
+                self.place_ready(raw)
+                self.assertEqual(self.read_ready(value), invalid)
+        # The frozen invocation argument is independent of whatever the record claims.
+        self.place_ready(record)
+        self.assertEqual(self.read_ready(value, invocation='d' * 32), invalid)
+        self.assertEqual(self.read_ready(value, boot='9' * 8 + value['boot'][8:]), invalid)
+        self.assertEqual(self.read_ready(dict(value, operation='9' * 32)), invalid)
+        self.assertEqual(self.read_ready(dict(value, deadline=value['deadline'] + 1)), invalid)
+
+    def test_outer_reader_refuses_unsafe_paths_and_changed_descriptors(self):
+        value, record = self.ready_inputs()
+        invalid = ('invalid', None, None)
+        self.place_ready(record, 0o640)
+        self.assertEqual(self.read_ready(value), invalid)
+        self.place_ready(record)
+        alias = self.base / 'alias'
+        os.link(self.ready_path(), alias)
+        self.assertEqual(self.read_ready(value), invalid)
+        alias.unlink()
+        with patch.object(core, 'stable_stat', side_effect=[1, 2]):
+            self.assertEqual(self.read_ready(value), invalid)
+        with patch.object(core, 'ROOT_UID', os.getuid() + 1):
+            self.assertEqual(self.read_ready(value), invalid)
+        self.ready_path().unlink()
+        target = self.base / 'foreign'
+        target.write_bytes(json.dumps(record).encode())
+        target.chmod(0o600)
+        self.ready_path().symlink_to(target)
+        self.assertEqual(self.read_ready(value), invalid)
+        self.ready_path().unlink()
+        self.ready_path().symlink_to(self.base / 'dangling')
+        self.assertEqual(self.read_ready(value), invalid)
+        self.ready_path().unlink()
+        self.ready_path().mkdir()
+        self.assertEqual(self.read_ready(value), invalid)
+        self.ready_path().rmdir()
+        self.place_ready(b'')
+        self.assertEqual(self.read_ready(value), invalid)
+        self.ready_path().unlink()
+        core.ROOT.chmod(0o750)
+        self.assertEqual(self.read_ready(value), invalid)
+        core.ROOT.chmod(0o700)
+
+    def test_outer_reader_does_not_read_without_original_operation_invocation_and_boot(self):
+        value, record = self.ready_inputs()
+        self.place_ready(record)
+        with patch.object(core.os, 'open', side_effect=AssertionError('no authoritative read')):
+            self.assertEqual(core.read_unit_ready('fresh', None, 'a' * 32, value['boot']), ('unavailable', None, None))
+            self.assertEqual(core.read_unit_ready('fresh', value, None, value['boot']), ('unavailable', None, None))
+            self.assertEqual(core.read_unit_ready('fresh', value, 'a' * 32, None), ('unavailable', None, None))
+
+    def test_first_record_wins_and_later_failures_cannot_overwrite_it(self):
+        self.prepared()
+        self.fail_inspection()
+        self.assertEqual(self.call('start-fresh'), 17)
+        first = self.ready_path().read_bytes()
+        core.write_first_failure(b'{"second":1}', core.UNIT_READY_FAILURE)
+        self.assertEqual(self.ready_path().read_bytes(), first)
+        # Even with fully valid original bindings, a second attempt links nothing over the winner.
+        core.record_unit_ready_failure('fresh', dict(core.state()), core.Failure('second refusal', 5))
+        self.assertEqual(self.ready_path().read_bytes(), first)
+        self.assertFalse((core.ROOT / (core.UNIT_READY_FAILURE + '.new')).exists())
+
+    def test_record_lifetime_follows_prepared_state_and_first_failure(self):
+        self.fresh()
+        self.assertFalse(self.ready_path().exists())  # a successful fresh start writes no failure
+        self.assertEqual(self.call('activate-resume'), 0, self.stderr.getvalue())
+        self.fail_inspection()
+        self.assertEqual(self.call('start-resume'), 17)
+        record = self.ready_record()
+        self.assertEqual((record['mode'], record['operation'], record['code']),
+                         ('resume', core.state()['operation'], 17))
+        self.assertEqual(self.bundle()['unit_ready']['status'], 'ok')
+        first = self.ready_path().read_bytes()
+        self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)  # prepare refuses existing root
+        self.assertEqual(self.ready_path().read_bytes(), first)
+
+    def test_failed_fresh_record_is_not_supported_resume_and_stays_unknown_for_other_operations(self):
+        self.prepared()
+        self.fail_inspection()
+        self.assertEqual(self.call('start-fresh'), 17)
+        first = self.ready_path().read_bytes()
+        self.assertEqual(self.call('start-resume'), 1)  # failed fresh cannot be resumed
+        self.assertEqual(self.ready_path().read_bytes(), first)
+        value = core.state()
+        self.assertEqual(core.read_unit_ready('fresh', dict(value, operation='9' * 32), 'a' * 32, value['boot']),
+                         ('invalid', None, None))
+
+    def test_serialized_cap_still_bounds_bundle_with_maximum_unit_ready_text(self):
+        self.prepared()
+        actual = self.command
+        def wrapped(argv, *args, **kwargs):
+            if argv[:2] == [core.SYSTEMCTL, 'start']:
+                try:
+                    return actual(argv, *args, **kwargs)
+                except core.Failure:
+                    raise core.Failure('child command failed "\\ \\u0000"', 1, b'\xff"\\\x00' * (1 << 18)) from None
+            return actual(argv, *args, **kwargs)
+        self.diag = lambda argv: ('ok', b'\xff"\\\x00' * 50000, False, 'confirmed')
+        with patch.object(core, 'api_ready', side_effect=core.Failure('m' * 128, 17)), \
+             patch.object(core, 'execute', side_effect=wrapped):
+            self.assertEqual(self.call('start-fresh'), 1)
+        raw = (core.ROOT / core.FIRST_FAILURE).read_bytes()
+        self.assertLessEqual(len(raw), core.FIRST_FAILURE_LIMIT)
+        self.assertLessEqual(self.ready_path().stat().st_size, core.UNIT_READY_LIMIT)
+        self.assertEqual(json.loads(raw)['unit_ready'], {'status': 'ok', 'message': 'm' * 128, 'code': 17})
 
     @contextmanager
     def diagnostic_fixture(self, *, late=None, code=0, ownership='owned', persistent=False,
