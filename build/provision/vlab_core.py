@@ -1494,10 +1494,16 @@ def object_value(doc):
 
 # Expected-only projection of the pinned Fabric v0.96.2 typed Default() output for
 # Switch and Connection. Bound to the pinned Fabricator v0.43.1 hhfab binary
-# identity (size, SHA-256); that release selects Fabric API/controller/agent
-# v0.96.2 when the Fabricator spec carries no overrides. This is not proof of the
+# identity (size, SHA-256), verified by the existing prerequisite/contract path,
+# and the installer Fabricator's actual selected Fabric API/controller/agent
+# versions. This is not proof of the
 # deployed CRD/OCI identity. Observed objects are never projected or normalized.
 PROJECTION_HHFAB_PIN = (170709176, 'b5c7e0265339b9b95fa1073967bfb6c6fede6086755c85eca24cb80637b04e37')
+PROJECTION_FABRIC_VERSION = 'v0.96.2'
+# These value structs survive encoding/json omitempty and PrintFab unchanged.
+# This is one named typed-empty representation, not recursive empty pruning.
+PROJECTION_EMPTY_OVERRIDES = {'versions': {'platform': {}, 'fabricator': {}, 'fabric': {},
+                                          'gateway': {}, 'vlab': {}}}
 FABRIC_LABELS = 'fabric.githedgehog.com/'
 CONNECTION_TYPE_LABELS = {'unbundled': 'unbundled', 'bundled': 'bundled', 'mclag': 'mclag',
                           'eslag': 'eslag', 'mclagDomain': 'mclag-domain', 'fabric': 'fabric'}
@@ -1509,7 +1515,7 @@ def projection_refused():
 
 
 def projection_binding(expected):
-    """Refuse unless the pinned hhfab identity and an override-free Fabricator are present."""
+    """Bind to the trusted hhfab pin and actual affected installer version fields."""
     require(TOOL_PINS.get(HHFAB) == PROJECTION_HHFAB_PIN, 'expected projection version binding refused')
     fabricators = [d for d in expected if d.get('kind') == 'Fabricator']
     if len(fabricators) != 1:
@@ -1520,11 +1526,17 @@ def projection_binding(expected):
             or type(spec.get('config')) is not dict):
         raise projection_refused()
     overrides = spec.get('overrides', {})
-    if overrides is None or overrides == {'versions': {}}:
-        overrides = {}
-    # Any Fabric/Fabricator version override voids the v0.96.2 selection.
-    if overrides != {}:
+    if type(overrides) is not dict or overrides not in ({}, {'versions': {}}, PROJECTION_EMPTY_OVERRIDES):
         raise projection_refused()
+    status = fab.get('status')
+    versions = status.get('versions') if type(status) is dict else None
+    fabric = versions.get('fabric') if type(versions) is dict else None
+    require(type(fabric) is dict and all(type(fabric.get(key)) is str
+            and fabric[key] == PROJECTION_FABRIC_VERSION for key in ('api', 'controller', 'agent')),
+            'expected projection version binding refused')
+    # Fabricator status strings are not binary identity. In particular the public
+    # upstream oracle honestly retains its ordinary Go '(devel)' status; no such
+    # string can substitute for the existing verified production binary pin.
 
 
 def label_name(value):
@@ -1575,15 +1587,22 @@ def project_switch(doc):
     add_labels(doc, derived)
 
 
-def link_endpoint(link, roles):
+def link_endpoint(link, roles, used_ports, *, fabric=False):
     if type(link) is not dict or set(link) != set(roles):
         raise projection_refused()
     names = []
     for role in roles:
         port = link[role]
-        if type(port) is not dict or type(port.get('port')) is not str or port['port'].count('/') < 1:
+        allowed = {'port', 'ip'} if fabric else {'port'}
+        if (type(port) is not dict or not set(port) <= allowed
+                or type(port.get('port')) is not str or '/' not in port['port']
+                or ('ip' in port and type(port['ip']) is not str)):
             raise projection_refused()
-        names.append(label_name(port['port'].split('/', 1)[0]))
+        name, local = port['port'].split('/', 1)
+        if not local or port['port'] in used_ports:
+            raise projection_refused()
+        used_ports.add(port['port'])
+        names.append(label_name(name))
     return names
 
 
@@ -1596,7 +1615,7 @@ def project_connection(doc):
     body = spec[variant]
     if type(body) is not dict:
         raise projection_refused()
-    switches, servers = [], []
+    switches, servers, used_ports = [], [], set()
 
     def lists(key):
         value = body.get(key)
@@ -1606,15 +1625,16 @@ def project_connection(doc):
 
     if variant == 'unbundled':
         require(set(body) == {'link'}, 'expected projection refused')
-        server, switch = link_endpoint(body['link'], ('server', 'switch'))
+        server, switch = link_endpoint(body['link'], ('server', 'switch'), used_ports)
         servers.append(server)
         switches.append(switch)
     elif variant in ('bundled', 'mclag', 'eslag'):
         if not set(body) <= {'links', 'fallback'} or 'links' not in body or (
-                variant == 'bundled' and 'fallback' in body):
+                variant == 'bundled' and 'fallback' in body) or (
+                'fallback' in body and type(body['fallback']) is not bool):
             raise projection_refused()
         for link in lists('links'):
-            server, switch = link_endpoint(link, ('server', 'switch'))
+            server, switch = link_endpoint(link, ('server', 'switch'), used_ports)
             servers.append(server)
             switches.append(switch)
     elif variant == 'mclagDomain':
@@ -1622,12 +1642,21 @@ def project_connection(doc):
             raise projection_refused()
         for key in ('peerLinks', 'sessionLinks'):
             for link in lists(key):
-                switches.extend(link_endpoint(link, ('switch1', 'switch2')))
+                switches.extend(link_endpoint(link, ('switch1', 'switch2'), used_ports))
     else:
         if set(body) != {'links'}:
             raise projection_refused()
         for link in lists('links'):
-            switches.extend(link_endpoint(link, ('spine', 'leaf')))
+            switches.extend(link_endpoint(link, ('spine', 'leaf'), used_ports, fabric=True))
+    # ConnectionLabels returns only its type label when Endpoints refuses.
+    # Reject those unsupported inputs rather than inventing endpoint labels.
+    switch_count, server_count = len(set(switches)), len(set(servers))
+    if variant in ('unbundled', 'bundled', 'mclag', 'eslag'):
+        maximum = {'unbundled': 1, 'bundled': 1, 'mclag': 2, 'eslag': 4}[variant]
+        if server_count != 1 or not 1 <= switch_count <= maximum:
+            raise projection_refused()
+    elif switch_count != 2:
+        raise projection_refused()
     derived = {FABRIC_LABELS + 'connection-type': CONNECTION_TYPE_LABELS[variant]}
     derived.update({'switch.' + FABRIC_LABELS + n: 'true' for n in switches})
     derived.update({'server.' + FABRIC_LABELS + n: 'true' for n in servers})

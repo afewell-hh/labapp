@@ -1205,7 +1205,7 @@ an owned empty mode-0700 directory, totaling at most 1 MiB. The producer prints
 each file's size and the total, so whether the full vectors fit is measured, not
 assumed; the 1 MiB aggregate and three-file interface are unchanged.
 
-`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual, unchanged
+`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual
 `api_ready` with the independently produced 45 public objects and actual per-kind
 query counts (Fabricator 1, ControlNode 1, FabNode 0, Switch 7, Server 10,
 Connection 21, SwitchGroup 3, VLANNamespace 1, IPv4Namespace 1); readiness, node,
@@ -1219,12 +1219,14 @@ canonical YAML, namespaces, and exact ControlNode namespace/spec. The raw
 (21) objects is still asserted. The independently printed expected set now
 passes actual `api_ready` against the independently produced 45 observed objects
 through the expected-only projection below (no monkeypatched projection or
-version guard), and every negative starts from that passing pair (missing/wrong/
+version guard), and projection negatives start from that passing pair (missing/wrong/
 extra endpoint and generated labels, unknown labels, annotations, specs, IP/ASN/
 profile/port drift, link order, identities, counts, version binding, unsupported
 and conflicting expected forms). Duplicate tests keep equal collapsed maps to
 exercise both production uniqueness guards. Missing, extra, insecure or
 oversized fixture files, or zero discovered tests, fail rather than skip.
+Separately named matched synthetic controls preserve the earlier printer branch
+and strict-comparison coverage; they are not independent production positives.
 
 ### Expected-only Switch/Connection projection (issue #406)
 
@@ -1246,18 +1248,32 @@ Projection preserves identity, count and order.
   mclag, eslag, mclagDomain (peerLinks and sessionLinks) and fabric (spine/leaf).
   Derives `fabric.githedgehog.com/connection-type` (`mclag-domain` for
   mclagDomain) and `switch.`/`server.fabric.githedgehog.com/<name>` endpoint labels
-  from link ports. No VPC label for these variants.
+  from link ports. Empty device/port components, repeated full ports and
+  unsupported device cardinalities refuse before label derivation, as required
+  by the upstream `Endpoints` path. Endpoint field shapes are checked; hydrated
+  fabric-link IP strings are preserved. No VPC label for these variants.
 - Fabricator, ControlNode, Server, SwitchGroup, VLANNamespace and IPv4Namespace
   are unchanged.
 
 Version binding: projection is allowed only when `TOOL_PINS[HHFAB]` equals the
 pinned hhfab v0.43.1 size/SHA-256 (already verified by the prerequisite receipt
-and `verify_contract`) and the single expected Fabricator is `v1beta1` with no
-`spec.overrides` (or only empty `versions`). Per the cited source, that release
-selects Fabric v0.96.2 API/controller/agent without overrides. The installer
-`fab.yaml` carries no other version field. This is a binding to the trusted
-binary and absence of overrides, not proof of the deployed CRD/OCI identity.
-No `(devel)` build is accepted and no release provenance is invented in fixtures.
+and `verify_contract`), the single expected Fabricator is `v1beta1`, and each
+actual installer field `status.versions.fabric.api`, `.controller` and `.agent`
+is exactly the string `v0.96.2`. `GetFabAndNodes` calculates these fields and
+`PrintFab` retains Fabricator status in `fab.yaml`. Missing, malformed, stale or
+`(devel)` affected Fabric versions refuse. Overrides must be absent, `{}`,
+`{versions: {}}`, or the exact typed-empty shape `{versions: {platform: {},
+fabricator: {}, fabric: {}, gateway: {}, vlab: {}}}`. Value structs retain that
+last shape through Go serialization; no recursive empty pruning or nonempty
+override is allowed.
+
+The production Fabricator release identity comes from the already verified
+hhfab bytes, never from Fabricator status version strings. The public oracle's
+ordinary Go build honestly retains `(devel)` in its Fabricator status; that
+value is unchanged and supplies no binary provenance or production bypass.
+The selected affected Fabric versions plus trusted hhfab bytes bind these
+rules; they do not prove deployed CRD/OCI identity. Other mutable status remains
+outside the existing identity/labels/annotations/spec comparison.
 
 Not implemented and still unknown: other Fabric versions or general printer forms,
 Fabricator
