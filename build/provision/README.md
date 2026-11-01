@@ -1122,40 +1122,76 @@ cleanup body, and an explicitly synthetic real-installer archive with recomputed
 pins. They never execute Helm or real curl. Checksum-only trust does not prove
 GPG/provenance, installed baseline metadata, runtime or full image/course equivalence.
 
-## Pinned public serializer/default asymmetry fixture (#394, source only)
+## Pinned public serializer/default asymmetry fixture
 
-`fixtures/pinned-api/` (`go.mod`, `main.go`) loads fixed public Switch, Server and
-Connection YAML with the real `apiutil.NewLoader`/`LoadAdd`/`PrintInclude`, reloads
-the printed YAML, deep-copies the typed objects, calls their actual `Default()` and
-encodes with ordinary `encoding/json` (never `PrintKubeObject` again). It writes
-`expected.yaml`, `observed.json` and `meta.json`. `test_pinned_api_fixture.py`
-feeds those independently produced sides to the real `object_identity`/
-`object_value` and the same equality rule `api_ready` uses. Not part of the
-default `test_vlab_core.py` discovery; it fails (never skips) without the fixture.
+`fixtures/pinned-api/main.go` embeds four public objects across three kinds:
+two Switches (including an omitted VLAN namespace list), one Server and one
+Connection. The actual upstream loader receives copies of preserved originals;
+the installer printer strips generated metadata; a fresh loader reloads the
+printed YAML. Separate deep copies then receive typed `Default()` calls and ordinary
+`encoding/json` serialization. The producer checks originals and pre-default
+objects remain unchanged. It accepts only an existing owned empty mode-0700
+output directory and creates exactly `expected.yaml`, `observed.json`, `meta.json`
+exclusively as owned regular single-link mode-0600 files, totaling at most 1 MiB.
+Input objects and output names are fixed; no private configuration is accepted.
 
-Provenance (read 2026-11-01, raw sources): `githedgehog/fabricator` tag `v0.43.1`
-(tag object `3fa6149cd18d5a64c9d3ca40edf35a91276f30b0`; peeled commit NOT yet
-resolved) `go.mod` requires `go.githedgehog.com/fabric v0.96.2`; printer
-`pkg/util/apiutil/printer.go`, loader `loader.go`, `scheme.go` (`FabricGatewayGVKs`),
-fabric `api/wiring/v1beta1/{meta,switch_types,connection_types}.go`. `go.sum` is
-not yet committed: it needs one lead-reviewed public-only module fetch (not offline
-evidence), then commit `go.sum` and run with `-mod=readonly`.
+`test_pinned_api_fixture.py` reuses `GuestEnvironment` and calls actual `api_ready`
+with all 45 expected canonical objects and the original per-kind query counts.
+Upstream representatives replace matching Switch/Server names and one Connection;
+remaining objects, kubeconfig, VM NICs and command fakes come from the existing
+public suite. The independently printed/defaulted pair must refuse at
+`canonical API objects differ`. Matched controls explicitly copy observed data;
+each drift case verifies that control passes before changing one field. Duplicate
+tests arrange equal collapsed maps to exercise both production uniqueness guards,
+with actual query counts preserved. No production readiness rule is duplicated or
+changed. Missing, extra, insecure or oversized fixture files fail rather than skip.
+
+Source provenance, independently read as raw primary code on 2026-11-01:
+[Fabricator v0.43.1](https://github.com/githedgehog/fabricator/tree/65254ebab3cb7173598985dfb9f3f358e08769ca),
+commit `65254ebab3cb7173598985dfb9f3f358e08769ca`, pins Fabric v0.96.2 in
+`go.mod` and `pkg/fab/versions.go`; the corresponding
+[Fabric commit](https://github.com/githedgehog/fabric/tree/8b0aefa0937a95e51cc04ec3ea33fadb06782a99)
+is `8b0aefa0937a95e51cc04ec3ea33fadb06782a99`.
+[Installer output](https://github.com/githedgehog/fabricator/blob/65254ebab3cb7173598985dfb9f3f358e08769ca/pkg/fab/recipe/control_build.go#L180)
+uses `PrintFab`/`PrintInclude`; the
+[printer](https://github.com/githedgehog/fabricator/blob/65254ebab3cb7173598985dfb9f3f358e08769ca/pkg/util/apiutil/printer.go#L77)
+removes generated labels and last-applied annotations. Fabric's
+[label cleanup](https://github.com/githedgehog/fabric/blob/8b0aefa0937a95e51cc04ec3ea33fadb06782a99/api/wiring/v1beta1/meta.go#L99),
+[Switch defaults](https://github.com/githedgehog/fabric/blob/8b0aefa0937a95e51cc04ec3ea33fadb06782a99/api/wiring/v1beta1/switch_types.go#L183)
+and Connection/Server defaults define the asserted transformations. Source webhook
+registration invokes those defaults; the fake client does not run admission.
+
+The hosted wrapper compiles only this helper in a temporary command directory
+inside the immutable Fabricator checkout, using its unchanged module/vendor tree
+with `GOWORK=off`, `GOTOOLCHAIN=local`, `-mod=vendor` and dependency fetching
+disabled. No standalone module or generated lock is needed. The exact compiler is
+[Go 1.25.9 linux-amd64](https://go.dev/dl/#go1.25.9), archive SHA-256
+`00859d7bd6defe8bf84d9db9e57b9a4467b2887c18cd93ae7460e713db774bc1`.
 
 ```bash
-# Separately scoped hosted step only (public module fetch; no credentials, Docker
-# socket, registry, cloud or hhfab build); bounded, then the Python suite:
-out=$(mktemp -d); (cd build/provision/fixtures/pinned-api &&
-  GOTOOLCHAIN=local GOFLAGS=-mod=readonly timeout 300 go run . -out "$out")
-LABAPP_PINNED_API_FIXTURE_DIR="$out" python3 -I -B -m unittest discover -s build/provision \
-  -p test_pinned_api_fixture.py -v   # step must also refuse zero tests
+bash build/provision/fixtures/pinned-api/run-hosted.sh
 ```
 
-Limits: proves the pinned source serializer/default asymmetry for these fixed
-objects, not live admission, OCI bytes, canonical11's actual diff, full readiness or
-VM function. Typed Go decoding drops unknown fields, so the unknown-spec-field case is
-injected into decoded JSON. Spec default/ordering assertions are predictions from the
-source reads and unexecuted; a failure means the prediction, not readiness, is wrong.
-It does not call `api_ready` (fixed counts, kubectl, kubeconfig). Status: UNRUN.
+Public source/toolchain preparation needs network access and is distinct from
+the isolated fixture execution. The latter has no network, host credentials or
+Docker socket, mounts provision sources and canonical wiring read-only, and
+uses a bounded disposable workspace. The wrapper supplies
+`LABAPP_PINNED_API_FIXTURE_DIR`, runs Python 3.12 with `-I -B` and a fixed provision
+import path, and explicitly requires nonzero discovery of `test_pinned_api_fixture.py`.
+The required CI job has a 25-minute limit, a 23-minute outer command bound and
+a 75-second cleanup reserve. Inner limits are 420 seconds for public preparation,
+600 for compilation, 30 for the producer and 90 for Python tests; the outer bound
+still governs their combined runtime. Cleanup verifies the exact named disposable
+containers, committed preparation image and owned host scratch are absent.
+
+Limits: these are typed decoding/defaulting inputs, not a complete validated
+admission topology. The pinned loader enables strict decoding and rejects unknown
+fields; ordinary permissive typed Go decoding can discard them. Unknown-spec-field
+drift is therefore injected into decoded Python JSON. The checks cover source serializer/
+default asymmetry and mocked production comparison behavior; they do not establish
+effective live admission, published OCI bytes, canonical11's actual differing field,
+full VLAB readiness, or VM functionality. A failing fixture never authorizes
+relaxing readiness.
 
 ## Dedicated guest VLAB core assembly and preserved-state resume
 
