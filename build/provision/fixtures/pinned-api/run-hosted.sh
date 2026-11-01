@@ -72,7 +72,7 @@ base=ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff3
 echo 'Public network preparation (not offline proof)'
 env -i HOME="$scratch/home" DOCKER_CONFIG="$scratch/home/docker" PATH=/usr/bin:/bin \
   timeout --kill-after=5s 120s docker pull "$base" >/dev/null
-docker image inspect "$base" --format '{{.Id}} {{join .RepoDigests ","}}'
+docker image inspect "$base" --format '{{.Id}} {{json .RepoDigests}}'
 prep_pending=1
 prep_id=$(docker create --name "$prep" --label "$label" \
   --memory=2g --memory-swap=2g --cpus=2 --pids-limit=256 \
