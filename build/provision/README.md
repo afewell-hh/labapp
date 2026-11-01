@@ -1533,49 +1533,70 @@ Primary sources: [Hedgehog download prerequisite](https://docs.hedgehog.cloud/la
 [docker login](https://docs.docker.com/reference/cli/docker/login/) (config file;
 base64 `auth` storage when no credential store is used) and
 [tmpfs](https://docs.kernel.org/filesystems/tmpfs.html) (pages may be swapped; the
-`noswap` option disables it). Access this session: Docker, tmpfs and Hedgehog pages
-were fetched through a summarizing tool only (summarized, not raw; the Docker page
-summary did not mention `DOCKER_CONFIG`). Fabricator v0.43.1 Docker/ORAS/containers-image
-behavior was NOT re-read by the source worker; it relies on the lead's raw review in #377.
+`noswap` option disables it). Source access on 2026-11-01: the initial worker
+used summaries only; the revision worker read raw Docker CLI `login.md` and Linux
+`tmpfs.rst` from their maintainer repositories, and the raw Hedgehog download
+page's login section. These current documentation pages do not establish guest
+runtime behavior. Fabricator v0.43.1 Docker/ORAS/containers-image behavior relies
+on the lead's pinned raw review in #377.
 
-Contract (all offline-tested, none executed on a guest):
+Source contract (new synthetic tests are written but unrun; no guest proof):
 
 * **Input.** `bootstrap` gains the single fixed option `ghcr-auth`. Only then it
-  hardens itself (no core dump, not dumpable), refuses before creating any state unless
+  applies `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`, refuses before creating any state unless
   `/run` is the standard `tmpfs` with no active swap area (or an explicit `noswap`
   mount), the target is absent and no fallback store exists, and later reads at most
-  1 KiB from stdin (10 s, EOF required). The record has exactly
+  1 KiB from stdin (EOF required). Read and guardian gate share one original cutoff,
+  fixed before guardian startup at at most 10 s and clipped to the original stage
+  clock and startup heartbeat grace. Neither read nor gate appends time. The record has exactly
   `schema=1, registry=ghcr.io, username, token` (bounded character sets); no other
   registry, helper, `identitytoken`/`registrytoken`, URL, command, path or field.
   Refusals use fixed text and never echo input.
 * **Arming before secret.** Root-private `auth-intent.json` (nonce, ubuntu uid/gid; no
   secret) is written before the guardian starts. The secret is read only after the
   guardian is started, bound to the lease/nonce/boot and confirmed as the active main
-  process. The guardian blocks at a bounded (10 s) ready gate: no worker or
+  process. Publication rechecks the original guardian receipt, cgroup liveness,
+  complete contract, source manifest/bytes, boot and original cutoff under a bounded
+  root-private lock. No lock is held across stdin. The guardian blocks at the shared ready gate: no worker or
   provisioning can run until `auth-ready.json` exists and the config verifies; gate
   expiry, lost bootstrap/channel or invalid input fail closed into containment.
+  Before spawning, the guardian rechecks boot, its original clock and heartbeat.
   The worker re-verifies before any package action and again immediately before
   `start-fresh`.
 * **Location and identity.** Fixed `/run/labapp-vlab-docker` (`DOCKER_CONFIG`),
   directory `0700` and `config.json` `0600`, owned by actual `ubuntu` uid/gid, created
   without following links, `mkdir` refusing preexisting paths. The directory identity
   (device, inode, owner) is recorded in root-private `auth-bound.json` BEFORE the
-  secret exists; the file's inode and size are recorded in `auth-ready.json`. No
-  hash/value/length of the secret or config enters root records. `vlab_core.SAFE_ENV`
+  secret exists; `auth-file.json` binds the exact file device/inode before the first
+  secret write, including partial writes. File inode and config size are recorded
+  in `auth-ready.json`; no secret value or digest enters root records. `vlab_core.SAFE_ENV`
   (which replaces the environment) exports only `DOCKER_CONFIG`; the fresh unit sets
-  `LimitCORE=0` for the hhfab readers. Fallback stores Docker/ORAS/containers-image can
+  `LimitCORE=0` for the hhfab readers. These are conventional process limits, not
+  a no-disk guarantee: ordinary exec resets dumpability and piped system core
+  collectors may ignore `RLIMIT_CORE`. No global collector/sysctl policy is changed.
+  Fallback stores Docker/ORAS/containers-image can
   consult (`~/.docker/config.json`, `~/.dockercfg`, `~/.config/containers/auth.json`,
   `/run/containers/<uid>/auth.json`, `/run/user/<uid>/containers/auth.json`) must be
   absent and are never adopted or deleted. tmpfs on a path under `/run` is not a "never
   on disk" guarantee; the swap/`noswap` check is the enforced control and a later
   `swapon` is only caught by the repeated pre-`start-fresh` verification.
-* **Cleanup.** `auth_remove` is idempotent and identity checked: it deletes only the bound
+* **Cleanup.** Cleanup permanently closes publication before checking absence or
+  waiting at most two seconds for the shared lock, clipped to the original cleanup
+  cutoff. A stopped publisher cannot resume publication after that closure.
+  Lock timeout reports uncertainty; cleanup never waits indefinitely. `auth_remove`
+  is idempotent and identity checked: it deletes only the bound
   directory's single regular, single-link, `0600`, exact-owner `config.json` through the
-  open directory descriptor, then the bound directory. Any link, extra entry, replacement,
+  open directory descriptor, after matching the file's exact device/inode receipt
+  and freshly validating current names, then the bound directory. Cleanup revokes
+  the reader's directory write access while removing entries. Any link, extra entry, replacement,
   wrong owner/mode/link count or missing binding is NOT deleted; it raises a fixed
-  `credential cleanup uncertain` failure (`cleanup_uncertain`). The worker removes and
+  `credential cleanup uncertain` failure (`cleanup_uncertain`). An interruption
+  before an identity receipt becomes durable leaves an unbound object untouched
+  and uncertain; cleanup never adopts a plausible partial file. The worker removes and
   verifies absence right after `start-fresh` (checkpoint `auth-remove`), before strict
-  checks, stop, resume or success, and asserts absence again before `start-resume`; core
+  checks, stop, resume or success, and asserts absence again before `start-resume`.
+  Canonical absence checks also refuse newly appeared fallback stores without
+  reading or deleting them. Standalone core
   `unit-run --mode resume` refuses a present directory. `containment()` (guardian
   `finally` and `ExecStopPost`) runs the same removal after stopping readers and even if
   a stop failed; uncertainty withholds `contained` but the primary result code is

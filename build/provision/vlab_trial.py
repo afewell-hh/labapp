@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
+import fcntl
 import grp
 from datetime import datetime, timezone
 import hashlib
@@ -446,9 +448,9 @@ def run(argv, clock, phase, cap=30, user=False):
 # over the original bootstrap stdin; bootstrap builds the minimal Docker config in
 # a fixed volatile directory readable only by the actual ``ubuntu`` hhfab user and
 # the worker removes it right after fresh acquisition. Nothing derived from the
-# secret (value, hash, length, config bytes) enters argv, manifest, receipts, the
-# root tree, diagnostics or any image. Root-private records below hold identities
-# and sizes only.
+# secret value, digest or config bytes enters argv, manifest, receipts, the
+# root tree, diagnostics or any image. Root-private records below hold identities,
+# cutoffs and config file size only.
 AUTH_REGISTRY = 'ghcr.io'
 AUTH_MOUNT = Path('/run')
 AUTH_DIR = AUTH_MOUNT / 'labapp-vlab-docker'
@@ -456,6 +458,10 @@ AUTH_NAME = 'config.json'
 AUTH_HOME = Path('/home/ubuntu')
 AUTH_INPUT_LIMIT = 1024
 AUTH_GATE_SECONDS = 10
+AUTH_LOCK = 'auth.lock'
+AUTH_CLOSED = 'auth-closed.json'
+AUTH_FILE = 'auth-file.json'
+AUTH_GUARDIAN = 'auth-guardian.json'
 AUTH_INTENT, AUTH_BOUND, AUTH_READY, AUTH_REMOVED = (
     'auth-intent.json', 'auth-bound.json', 'auth-ready.json', 'auth-removed.json')
 AUTH_USER = r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}'
@@ -483,9 +489,9 @@ def auth_credentials(raw):
     return {key: value[key] for key in ('schema', 'registry', 'username', 'token')}
 
 
-def auth_read_input(fd=0, seconds=10.0):
+def auth_read_input(fd=0, seconds=10.0, *, until=None):
     """Bounded read of the one stdin record; EOF is required (no unbounded wait)."""
-    end = time.monotonic() + seconds
+    end = time.monotonic() + seconds if until is None else until
     raw = b''
     try:
         while len(raw) <= AUTH_INPUT_LIMIT:
@@ -510,13 +516,15 @@ def auth_config(credentials):
 
 
 def harden_secret_process():
-    """No core dump and not dumpable for the root process that briefly holds the record."""
-    import ctypes
-    import resource
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
-            and ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0,  # PR_SET_DUMPABLE
-            'secret process hardening refused')
+    """Conventional process protection; exec/pipe collectors have separate semantics."""
+    try:
+        import ctypes
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+                and ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0)
+    except Exception:
+        raise Failure('secret process hardening refused') from None
 
 
 def auth_account():
@@ -566,19 +574,79 @@ def auth_armed():
 
 def auth_intent():
     item = data(regular(ROOT / AUTH_INTENT, 4096, 0))
-    require(type(item) is dict and set(item) == {'schema', 'nonce', 'uid', 'gid'} and item['schema'] == 1
+    require(type(item) is dict and set(item) == {'schema', 'nonce', 'uid', 'gid', 'until', 'cleanup_until'} and item['schema'] == 1
             and type(item['nonce']) is str and re.fullmatch('[a-f0-9]{32}', item['nonce'])
-            and all(type(item[k]) is int and item[k] > 0 for k in ('uid', 'gid')), 'credential intent refused')
+            and all(type(item[k]) is int and item[k] > 0 for k in ('uid', 'gid'))
+            and all(type(item[k]) in (int, float) and 0 < item[k] < float('inf')
+                    for k in ('until', 'cleanup_until')), 'credential intent refused')
     return item
 
 
-def auth_bound(intent, info):
+@contextmanager
+def auth_locked(until):
+    """One never-replaced root-private lock; no stdin or child wait under it."""
+    fd = os.open(ROOT / AUTH_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(auth_lock_ok(info), 'credential lock refused')
+        while True:
+            require(time.monotonic() < until, 'credential lock expired')
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(.05, max(0, until - time.monotonic())))
+        current = os.stat(ROOT / AUTH_LOCK, follow_symlinks=False)
+        require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino), 'credential lock changed')
+        yield
+    finally:
+        os.close(fd)
+
+
+def auth_lock_ok(info):
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o600)
+
+
+def auth_open(intent):
+    require(not os.path.lexists(ROOT / AUTH_CLOSED) and not os.path.lexists(ROOT / AUTH_REMOVED)
+            and time.monotonic() < intent['until'], 'credential publication closed')
+
+
+def auth_publish_check(value, intent):
+    """Fresh original binding after ingress, while serialized against cleanup."""
+    auth_open(intent)
+    current = contract(data(regular(ROOT / 'contract.json', MAX_SOURCE, 0)))
+    require(current == value and kernel_boot() == value['boot_uuid'], 'credential binding refused')
+    # ``until`` was clipped using the ORIGINAL bootstrap Clock's remaining
+    # stage time. Check that monotonic bound plus the current wall cutoff;
+    # constructing a new Clock here would re-anchor its monotonic protection.
+    require(time.time() < phase_end(value, 'stage'), 'absolute phase cutoff', 'phase-cutoff')
+    table = manifest(data(regular(ROOT / 'manifest.json', MAX_SOURCE, 0)))
+    require(table['source_sha'] == value['source_sha'], 'credential source refused')
+    for name, item in table['files'].items():
+        auth_open(intent)
+        require(sha(regular(ROOT / name, item['bytes'], 0)) == item['sha256'], 'credential source refused')
+    started = data(regular(ROOT / 'started.json', 4096, 0))
+    original = data(regular(ROOT / AUTH_GUARDIAN, 4096, 0))
+    require(started == original and started['boot'] == value['boot_uuid'] and started['lease'] == value['lease']
+            and started['nonce'] == value['nonce'] and type(started['guardian_pid']) is int
+            and str(started['guardian_pid']).encode() in guardian_processes()
+            and not os.path.lexists(ROOT / 'result.json'), 'original guardian unavailable')
+    beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
+    require(beat['sequence'] == 0 and 0 <= time.monotonic() - beat['received'] < 30,
+            'heartbeat lost', 'heartbeat-loss')
+    auth_open(intent)
+
+
+def auth_bound(intent, info, cleaning=False):
     """The directory is the exact one this run created: recorded identity, owner, mode, volume."""
     bound = data(regular(ROOT / AUTH_BOUND, 4096, 0))
     require(type(bound) is dict and set(bound) == {'schema', 'dev', 'ino', 'uid', 'gid'}
-            and (info.st_dev, info.st_ino, info.st_uid, info.st_gid) ==
-            (bound['dev'], bound['ino'], bound['uid'], bound['gid'])
-            and (info.st_uid, info.st_gid) == (intent['uid'], intent['gid'])
+            and (info.st_dev, info.st_ino) == (bound['dev'], bound['ino'])
+            and (bound['uid'], bound['gid']) == (intent['uid'], intent['gid'])
+            and ((info.st_uid, info.st_gid) == (intent['uid'], intent['gid'])
+                 or cleaning and (info.st_uid, info.st_gid) == (0, 0))
             and stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
             and info.st_dev == os.stat(AUTH_MOUNT).st_dev, 'credential directory identity refused')
 
@@ -589,8 +657,14 @@ def auth_config_ok(info, intent):
 
 
 def auth_install(value, credentials):
-    """Create the exact volatile config. Only reachable after the guardian is armed."""
     intent = auth_intent()
+    with auth_locked(intent['until']):
+        auth_publish_check(value, intent)
+        auth_install_locked(value, credentials, intent)
+
+
+def auth_install_locked(value, credentials, intent):
+    """Create the exact volatile config. Only reachable after the guardian is armed."""
     user = auth_account()
     require(intent['nonce'] == value['nonce'] and (user.pw_uid, user.pw_gid) == (intent['uid'], intent['gid']),
             'credential binding refused')
@@ -598,29 +672,39 @@ def auth_install(value, credentials):
     auth_fallbacks_absent(user.pw_uid)
     require(not os.path.lexists(AUTH_DIR) and not os.path.lexists(ROOT / AUTH_BOUND)
             and not os.path.lexists(ROOT / AUTH_READY), 'preexisting credential path refused')
+    auth_publish_check(value, intent)
     os.mkdir(AUTH_DIR, 0o700)
     descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
     try:
-        os.fchown(descriptor, user.pw_uid, user.pw_gid)
-        os.fchmod(descriptor, 0o700)
         info = os.fstat(descriptor)
         # Identity is recorded BEFORE any secret exists, so cleanup can prove ownership.
         exclusive(ROOT / AUTH_BOUND, encoded({'schema': 1, 'dev': info.st_dev, 'ino': info.st_ino,
-                                              'uid': info.st_uid, 'gid': info.st_gid}))
+                                              'uid': user.pw_uid, 'gid': user.pw_gid}))
+        os.fchown(descriptor, user.pw_uid, user.pw_gid)
+        os.fchmod(descriptor, 0o700)
+        info = os.fstat(descriptor)
         auth_bound(intent, info)
         fd = os.open(AUTH_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=descriptor)
         try:
+            file_info = os.fstat(fd)
+            exclusive(ROOT / AUTH_FILE, encoded({'schema': 1, 'dev': file_info.st_dev,
+                                                 'ino': file_info.st_ino}))
             os.fchown(fd, user.pw_uid, user.pw_gid)  # ownership/mode fixed while still empty
             os.fchmod(fd, 0o600)
+            auth_publish_check(value, intent)
             raw = auth_config(credentials)
             view = memoryview(raw)
             while view:
-                view = view[os.write(fd, view):]
+                auth_open(intent)
+                written = os.write(fd, view)
+                require(written > 0, 'credential write refused')
+                view = view[written:]
             os.fsync(fd)
             file_info = os.fstat(fd)
         finally:
             os.close(fd)
+        auth_publish_check(value, intent)
         exclusive(ROOT / AUTH_READY, encoded({'schema': 1, 'nonce': value['nonce'],
                                               'file_ino': file_info.st_ino, 'size': len(raw)}))
     finally:
@@ -633,7 +717,8 @@ def auth_verify(value):
     intent = auth_intent()
     user = auth_account()
     require(intent['nonce'] == value['nonce'] and (user.pw_uid, user.pw_gid) == (intent['uid'], intent['gid'])
-            and not os.path.lexists(ROOT / AUTH_REMOVED), 'credential binding refused')
+            and not os.path.lexists(ROOT / AUTH_REMOVED)
+            and not os.path.lexists(ROOT / AUTH_CLOSED), 'credential binding refused')
     ready = data(regular(ROOT / AUTH_READY, 4096, 0))
     require(type(ready) is dict and set(ready) == {'schema', 'nonce', 'file_ino', 'size'}
             and ready['schema'] == 1 and ready['nonce'] == value['nonce']
@@ -645,7 +730,9 @@ def auth_verify(value):
         auth_bound(intent, os.fstat(descriptor))
         require(os.listdir(descriptor) == [AUTH_NAME], 'credential directory contents refused')
         info = os.stat(AUTH_NAME, dir_fd=descriptor, follow_symlinks=False)
+        receipt = data(regular(ROOT / AUTH_FILE, 4096, 0))
         require(auth_config_ok(info, intent) and info.st_ino == ready['file_ino']
+                and (info.st_dev, info.st_ino) == (receipt['dev'], receipt['ino'])
                 and info.st_size == ready['size'], 'credential file identity refused')
     finally:
         os.close(descriptor)
@@ -656,11 +743,13 @@ def auth_gate(value, clock):
     if not auth_armed():
         return
     require(auth_intent()['nonce'] == value['nonce'], 'credential binding refused')
-    until = time.monotonic() + min(AUTH_GATE_SECONDS, clock.remaining('stage'))
+    intent = auth_intent()
+    until = min(intent['until'], time.monotonic() + clock.remaining('stage'))
     while not os.path.lexists(ROOT / AUTH_READY):
         if time.monotonic() >= until:
             raise Failure('credential ready gate expired', 124, 'phase-cutoff')
         time.sleep(.05)
+    require(time.monotonic() < until, 'credential ready gate expired')
     auth_verify(value)
 
 
@@ -675,36 +764,68 @@ def auth_remove():
         return
     try:
         intent = auth_intent()
+        # Close BEFORE waiting: even a stopped publisher holding the lock cannot
+        # resume publication after cleanup reports absence or times out.
         try:
-            descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
-        except FileNotFoundError:
-            require(not os.path.lexists(AUTH_DIR))
-            return
-        try:
-            info = os.fstat(descriptor)
-            auth_bound(intent, info)
-            foreign = False
-            for name in os.listdir(descriptor):
-                entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False) if name == AUTH_NAME else None
-                if entry is not None and auth_config_ok(entry, intent):
-                    os.unlink(name, dir_fd=descriptor)
-                else:
-                    foreign = True
-            require(not foreign and not os.listdir(descriptor))
-            current = os.stat(AUTH_DIR, follow_symlinks=False)
-            require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino))
-            os.rmdir(AUTH_DIR)
-        finally:
-            os.close(descriptor)
-        require(not os.path.lexists(AUTH_DIR))
+            exclusive(ROOT / AUTH_CLOSED, encoded({'schema': 1, 'nonce': intent['nonce']}))
+        except FileExistsError:
+            closed = data(regular(ROOT / AUTH_CLOSED, 4096, 0))
+            require(closed == {'schema': 1, 'nonce': intent['nonce']})
+        with auth_locked(min(intent['cleanup_until'], time.monotonic() + 2)):
+            auth_remove_locked(intent)
     except Exception:
         failure = Failure('credential cleanup uncertain')
         failure.cleanup_uncertain = True
         raise failure from None
 
 
+def auth_remove_locked(intent):
+    try:
+        descriptor = os.open(AUTH_DIR, AUTH_DIR_FLAGS)
+    except FileNotFoundError:
+        require(not os.path.lexists(AUTH_DIR))
+        return
+    try:
+        info = os.fstat(descriptor)
+        auth_bound(intent, info, cleaning=True)
+        # Revoke the reader's directory write permission before examining names.
+        # Retain the bound inode even across a crash during this cleanup.
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o700)
+        foreign = False
+        for name in os.listdir(descriptor):
+            if name != AUTH_NAME:
+                foreign = True
+                continue
+            receipt = data(regular(ROOT / AUTH_FILE, 4096, 0))
+            require(type(receipt) is dict and set(receipt) == {'schema', 'dev', 'ino'}
+                    and receipt['schema'] == 1)
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            owned = auth_config_ok(entry, intent) or (
+                stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+                and stat.S_IMODE(entry.st_mode) == 0o600 and entry.st_uid == 0 and entry.st_size == 0)
+            if owned and (entry.st_dev, entry.st_ino) == (receipt['dev'], receipt['ino']):
+                current = os.stat(AUTH_DIR, follow_symlinks=False)
+                fresh = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino)
+                        and (fresh.st_dev, fresh.st_ino, fresh.st_ctime_ns) ==
+                        (entry.st_dev, entry.st_ino, entry.st_ctime_ns))
+                os.unlink(name, dir_fd=descriptor)
+            else:
+                foreign = True
+        require(not foreign and not os.listdir(descriptor))
+        current = os.stat(AUTH_DIR, follow_symlinks=False)
+        require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino))
+        os.rmdir(AUTH_DIR)
+    finally:
+        os.close(descriptor)
+    require(not os.path.lexists(AUTH_DIR))
+
+
 def auth_absent():
     require(not os.path.lexists(AUTH_DIR), 'credential still present')
+    if auth_armed():
+        auth_fallbacks_absent(auth_account().pw_uid)
 
 
 def bootstrap(incoming, expected_manifest, options=()):
@@ -740,6 +861,7 @@ def bootstrap(incoming, expected_manifest, options=()):
     require(all(not (base / name).exists() and not (base / name).is_symlink()
                 for base in UNIT_BASES for name in (UNIT, UNIT + '.d')), 'guardian unit override refused')
     no_links(ROOT.parent)
+    require(not os.path.lexists(AUTH_DIR), 'preexisting credential path refused')
     account = None
     if authenticated:
         # Refuse before ANY state exists: wrong volume/swap, preexisting target or fallback
@@ -759,8 +881,12 @@ def bootstrap(incoming, expected_manifest, options=()):
     exclusive(ROOT / 'phase.json', encoded({'phase': 'stage'}))
     if authenticated:
         # Arms guardian gate and every cleanup path BEFORE a credential can exist.
+        exclusive(ROOT / AUTH_LOCK, b'')
+        now = time.monotonic()
         exclusive(ROOT / AUTH_INTENT, encoded({'schema': 1, 'nonce': value['nonce'],
-                                               'uid': account.pw_uid, 'gid': account.pw_gid}))
+                  'uid': account.pw_uid, 'gid': account.pw_gid,
+                  'until': now + min(AUTH_GATE_SECONDS, clock.remaining('stage'), 30),
+                  'cleanup_until': now + clock.cleanup_remaining()}))
     exclusive(UNIT_PATH, regular(ROOT / UNIT, MAX_SOURCE, 0), 0o644)
     no_links(RUNTIME_DROPIN.parent)
     RUNTIME_DROPIN.mkdir(mode=0o755)
@@ -791,7 +917,8 @@ def bootstrap(incoming, expected_manifest, options=()):
         if authenticated:
             # The guardian is running, bound and blocked at its ready gate, and its
             # ExecStopPost cleanup is armed: only now is the secret accepted/usable.
-            auth_install(value, auth_read_input())
+            exclusive(ROOT / AUTH_GUARDIAN, encoded(started))
+            auth_install(value, auth_read_input(until=auth_intent()['until']))
     except BaseException:
         # The fixed unit's ExecStopPost owns containment even if startup reply
         # was lost. Do not delete the reservation or retry a bootstrap.
@@ -1039,6 +1166,11 @@ def guardian():
         # Armed credential gate: no worker/provisioning until bootstrap published the
         # verified credential, within a bounded wait. Expiry fails closed into cleanup.
         auth_gate(value, clock)
+        if auth_armed():
+            require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
+            clock.remaining('stage')
+            beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
+            require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
         operation = 'worker-spawn'
         child = subprocess.Popen([PYTHON, str(ROOT / 'vlab_trial.py'), 'worker'],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

@@ -1463,6 +1463,10 @@ credential store.
   registry, helper/identitytoken/URL, link, foreign-owner or loose-mode input is
   refused before any cloud action with fixed text. Without the option the trial is
   unchanged and sends nothing (a build needing GHCR will then fail at acquisition).
+  The optional owner reader applies `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`
+  before its first secret read; failure refuses the input. These conventional
+  controls do not guarantee no disk capture: ordinary exec resets dumpability,
+  and piped core collectors may ignore the core size limit.
 * **Delivery.** The canonical record (<=1 KiB, validated again in the guest) is
   sent only as stdin of the ONE existing one-shot bootstrap command over the pinned
   original SSH master (bootstrap gets the extra argument `ghcr-auth`). It is never
@@ -1474,12 +1478,15 @@ credential store.
   intent -> guardian started and bound -> stdin read -> volatile config created ->
   readiness published -> guardian releases the worker -> removal and verified
   absence right after fresh acquisition, before strict checks, stop, resume or success.
+  Stdin and the gate share one original cutoff. Cleanup permanently closes
+  publication before bounded lock acquisition; a late bootstrap cannot recreate
+  auth after clean absence. Exact file device/inode receipts precede secret writes.
 * **Receipt/limits.** The receipt format is unchanged: cleanup uncertainty surfaces as
   the guardian's `contained: false` (withholding clean success) and never skips VM
   disposal or the independent cleanup dispatch. Removal does not prove the registry
   could not see the credential, and tmpfs removal is not secure erasure.
 * Real credentials, activation and executable verification are lead-only. The
-  offline tests use synthetic canaries only.
+  new offline tests use synthetic canaries only and are written but unrun by the source worker.
 
 The guest result is read by a fixed stdlib-only reader (`READ_RESULT`) that does
 not import the guest module and has no path/command selector. It checks the

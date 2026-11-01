@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 from build.gcp import vlab_trial as host
 from build.provision import vlab_trial as guest
+REAL_HARDEN = guest.harden_secret_process
 
 
 def snapshot():
@@ -55,6 +56,7 @@ class OwnerTrial(unittest.TestCase):
         self.addCleanup(os.umask, original_umask)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(guest, 'harden_secret_process'))
         self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
         self.temp = self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-owner-offline-'))
         self.directory = Path(self.temp)
@@ -479,6 +481,26 @@ class OwnerTrial(unittest.TestCase):
         output.mkdir(mode=0o700)
         spaced = json.dumps(self.GHCR, indent=2).encode() + b'\n'
         self.assertEqual(host.ghcr_credentials(self.credential_file(spaced), output), guest.encoded(self.GHCR))
+
+    def test_owner_hardens_before_first_secret_read_and_refuses_without_read_on_failure(self):
+        import resource
+        events = []
+        path = self.credential_file(guest.encoded(self.GHCR))
+        libc = Mock()
+        libc.prctl.side_effect = lambda *args: events.append('dumpability') or 0
+        real_read = guest.regular
+        with patch.object(guest, 'harden_secret_process', side_effect=REAL_HARDEN), \
+             patch.object(resource, 'setrlimit', side_effect=lambda *a: events.append('core-limit')), \
+             patch.object(resource, 'getrlimit', return_value=(0, 0)), \
+             patch('ctypes.CDLL', return_value=libc), \
+             patch.object(guest, 'regular', side_effect=lambda *a, **k: events.append('read') or real_read(*a, **k)):
+            self.assertEqual(host.ghcr_credentials(path, self.directory / 'out'), guest.encoded(self.GHCR))
+        self.assertEqual(events, ['core-limit', 'dumpability', 'read'])
+        with patch.object(guest, 'harden_secret_process', side_effect=OSError('PRIVATE')), \
+             patch.object(guest, 'regular') as read, self.assertRaises(guest.Failure) as raised:
+            host.ghcr_credentials(path, self.directory / 'out')
+        read.assert_not_called()
+        self.assertEqual(str(raised.exception), 'GHCR credential input refused')
 
     def test_protected_ghcr_input_refuses_every_unsafe_or_malformed_source_with_fixed_text(self):
         output = self.directory / 'out'

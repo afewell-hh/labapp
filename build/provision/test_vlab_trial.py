@@ -1405,6 +1405,14 @@ class TransientRegistryAuth(unittest.TestCase):
                                   ('AUTH_HOME', self.home), ('MOUNTINFO', self.mountinfo), ('SWAPS', self.swaps)):
             self.stack.enter_context(patch.object(trial, name, replacement))
         self.stack.enter_context(patch.object(trial, 'auth_account', return_value=self.user))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']))
+        self.stack.enter_context(patch.object(trial, 'guardian_processes', return_value={b'999999'}))
+        self.stack.enter_context(patch.object(trial, 'auth_lock_ok', side_effect=lambda info:
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o600))
+        real_chown = os.fchown
+        self.stack.enter_context(patch.object(trial.os, 'fchown', side_effect=lambda fd, uid, gid:
+            real_chown(fd, os.getuid() if uid == 0 else uid, os.getgid() if gid == 0 else gid)))
         self.stack.enter_context(patch.object(
             trial, 'regular', side_effect=lambda p, n, uid=None, mode=None: REAL_REGULAR(p, n)))
 
@@ -1421,11 +1429,22 @@ class TransientRegistryAuth(unittest.TestCase):
         if (self.root / trial.AUTH_INTENT).exists():
             return
         trial.exclusive(self.root / trial.AUTH_INTENT, trial.encoded(
-            {'schema': 1, 'nonce': self.v['nonce'], 'uid': os.getuid(), 'gid': os.getgid()}))
+            {'schema': 1, 'nonce': self.v['nonce'], 'uid': os.getuid(), 'gid': os.getgid(),
+             'until': time.monotonic() + 10, 'cleanup_until': time.monotonic() + 60}))
+        trial.exclusive(self.root / trial.AUTH_LOCK, b'')
+        trial.exclusive(self.root / 'contract.json', trial.encoded(self.v))
+        trial.exclusive(self.root / 'manifest.json', trial.encoded(
+            {'schema': 1, 'source_sha': self.v['source_sha'], 'files': {
+                'contract.json': {'bytes': len(trial.encoded(self.v)), 'sha256': trial.sha(trial.encoded(self.v))}}}))
+        started = {'boot': self.v['boot_uuid'], 'lease': self.v['lease'], 'nonce': self.v['nonce'], 'guardian_pid': 999999}
+        for name in ('started.json', trial.AUTH_GUARDIAN):
+            trial.exclusive(self.root / name, trial.encoded(started))
+        trial.exclusive(self.root / 'heartbeat.json', trial.encoded({'sequence': 0, 'received': time.monotonic()}))
 
     def install(self):
         self.arm()
-        trial.auth_install(self.v, trial.auth_credentials(trial.encoded(CREDS)))
+        with patch.object(trial, 'manifest', side_effect=lambda value: value):
+            trial.auth_install(self.v, trial.auth_credentials(trial.encoded(CREDS)))
 
     def expected_config(self):
         pair = base64.b64encode((CANARY_USER + ':' + CANARY_TOKEN).encode()).decode()
@@ -1484,8 +1503,8 @@ class TransientRegistryAuth(unittest.TestCase):
             REAL_AUTH_READ(feed(b''))
         with self.assertRaises(trial.Failure):
             REAL_AUTH_READ(feed(b'x' * (trial.AUTH_INPUT_LIMIT + 1)))
-        with self.assertRaises(trial.Failure):  # no EOF: bounded, never an unbounded wait
-            REAL_AUTH_READ(feed(trial.encoded(CREDS), close=False), seconds=.2)
+        with patch.object(trial.select, 'select', return_value=([], [], [])), self.assertRaises(trial.Failure):
+            REAL_AUTH_READ(feed(trial.encoded(CREDS), close=False), until=time.monotonic() + .2)
         with self.assertRaises(trial.Failure):
             REAL_AUTH_READ(feed(b'{"schema":1', close=True))
 
@@ -1611,6 +1630,113 @@ class TransientRegistryAuth(unittest.TestCase):
         trial.auth_absent()
         self.assert_secret_only_in_config()
 
+    def test_cleanup_during_input_permanently_closes_late_publisher(self):
+        self.arm()
+        trial.auth_remove()  # ingress has not published any directory yet
+        with patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        trial.auth_remove()
+        self.assertFalse(os.path.lexists(self.dir))
+        self.assertTrue((self.root / trial.AUTH_CLOSED).exists())
+
+    def test_new_fallback_after_removal_blocks_strict_and_resume_and_remains_untouched(self):
+        self.install()
+        trial.auth_remove()
+        foreign = self.home / '.dockercfg'
+        foreign.write_text('PUBLIC-FOREIGN')
+        with self.assertRaises(trial.Failure):
+            trial.auth_absent()
+        self.assertEqual(foreign.read_text(), 'PUBLIC-FOREIGN')
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_interruption_after_create_file_write_or_ready_is_exactly_cleanable(self):
+        real_exclusive, real_write = trial.exclusive, os.write
+        for point in ('directory', 'file', 'write', 'ready'):
+            with self.subTest(point):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.arm()
+                def receipt(path, raw, mode=0o600):
+                    real_exclusive(path, raw, mode)
+                    target = {'directory': trial.AUTH_BOUND, 'file': trial.AUTH_FILE, 'ready': trial.AUTH_READY}.get(point)
+                    if Path(path).name == target:
+                        raise KeyboardInterrupt()
+                def write(fd, raw):
+                    result = real_write(fd, raw)
+                    if point == 'write':
+                        raise KeyboardInterrupt()
+                    return result
+                with patch.object(trial, 'exclusive', side_effect=receipt), \
+                     patch.object(trial.os, 'write', side_effect=write), \
+                     patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(KeyboardInterrupt):
+                    trial.auth_install(self.v, CREDS)
+                trial.auth_remove()
+                trial.auth_remove()
+                self.assertFalse(os.path.lexists(self.dir))
+                self.assert_secret_only_in_config()
+
+    def test_unbound_partial_file_is_preserved_as_uncertain(self):
+        self.install()
+        (self.root / trial.AUTH_FILE).unlink()
+        with self.assertRaises(trial.Failure) as raised:
+            trial.auth_remove()
+        self.assertTrue(raised.exception.cleanup_uncertain)
+        self.assertTrue((self.dir / trial.AUTH_NAME).exists())
+
+    def test_closed_state_during_locked_publication_blocks_ready_and_late_retry(self):
+        self.arm()
+        real_config = trial.auth_config
+        def close(credentials):
+            trial.exclusive(self.root / trial.AUTH_CLOSED,
+                            trial.encoded({'schema': 1, 'nonce': self.v['nonce']}))
+            return real_config(credentials)
+        with patch.object(trial, 'auth_config', side_effect=close), \
+             patch.object(trial, 'manifest', side_effect=lambda value: value), self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse((self.root / trial.AUTH_READY).exists())
+        trial.auth_remove()
+        with self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse(os.path.lexists(self.dir))
+
+    def test_shared_lock_expires_without_waiting_past_original_cutoff(self):
+        self.arm()
+        ticks = [100.0]
+        with patch.object(trial.time, 'monotonic', side_effect=lambda: ticks[0]), \
+             patch.object(trial.time, 'sleep', side_effect=lambda seconds: ticks.__setitem__(0, ticks[0] + seconds)), \
+             patch.object(trial.fcntl, 'flock', side_effect=BlockingIOError), self.assertRaises(trial.Failure):
+            with trial.auth_locked(100.1):
+                self.fail('blocked lock acquired')
+        self.assertLessEqual(ticks[0], 100.1)
+
+    def test_fresh_publish_binding_refuses_changed_guardian_boot_contract_source_and_cutoff(self):
+        for mutation in ('guardian', 'missing-guardian', 'boot', 'contract', 'source', 'cutoff'):
+            with self.subTest(mutation):
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.arm()
+                with ExitStack() as local:
+                    local.enter_context(patch.object(trial, 'manifest', side_effect=lambda value: value))
+                    if mutation == 'guardian':
+                        record = json.loads((self.root / 'started.json').read_bytes())
+                        record['guardian_pid'] = 888888
+                        (self.root / 'started.json').write_bytes(trial.encoded(record))
+                    elif mutation == 'missing-guardian':
+                        local.enter_context(patch.object(trial, 'guardian_processes', return_value=set()))
+                    elif mutation == 'boot':
+                        local.enter_context(patch.object(trial, 'kernel_boot', return_value='changed'))
+                    elif mutation == 'contract':
+                        changed = dict(self.v, epoch=self.v['epoch'] + 1)
+                        (self.root / 'contract.json').write_bytes(trial.encoded(changed))
+                    elif mutation == 'source':
+                        table = json.loads((self.root / 'manifest.json').read_bytes())
+                        table['files']['contract.json']['sha256'] = '0' * 64
+                        (self.root / 'manifest.json').write_bytes(trial.encoded(table))
+                    else:
+                        local.enter_context(patch.object(trial.time, 'monotonic', return_value=trial.auth_intent()['until']))
+                    with self.assertRaises(trial.Failure):
+                        trial.auth_install(self.v, CREDS)
+                self.assertFalse(os.path.lexists(self.dir))
+
     def test_remove_is_noop_when_not_armed_and_never_touches_unarmed_foreign_directory(self):
         self.dir.mkdir()
         (self.dir / 'foreign').write_text('keep')
@@ -1618,7 +1744,7 @@ class TransientRegistryAuth(unittest.TestCase):
         self.assertEqual((self.dir / 'foreign').read_text(), 'keep')
 
     def test_remove_refuses_foreign_entries_links_replacement_and_identity_change(self):
-        for name in ('extra', 'symlink', 'hardlink', 'replaced-dir', 'wrong-mode', 'missing-binding'):
+        for name in ('extra', 'symlink', 'regular-replacement', 'hardlink', 'replaced-dir', 'wrong-mode', 'missing-binding'):
             with self.subTest(name):
                 shutil.rmtree(self.root, ignore_errors=True)
                 shutil.rmtree(self.dir, ignore_errors=True)
@@ -1637,6 +1763,11 @@ class TransientRegistryAuth(unittest.TestCase):
                 elif name == 'hardlink':
                     os.link(config, self.base / 'alias')
                     survivors.append(self.base / 'alias')
+                elif name == 'regular-replacement':
+                    config.rename(self.base / 'old-config')  # keep old inode allocated
+                    config.write_text('PUBLIC-FOREIGN-CONFIG')
+                    config.chmod(0o600)
+                    survivors.append(config)
                 elif name == 'replaced-dir':
                     os.rename(self.dir, self.base / 'old-dir')
                     self.dir.mkdir(mode=0o700)
@@ -1691,9 +1822,10 @@ class TransientRegistryAuth(unittest.TestCase):
 
     def guardian_run(self, poll=17, gate=None):
         self.root.mkdir(mode=0o700, exist_ok=True)
-        trial.exclusive(self.root / 'contract.json', trial.encoded(self.v))
+        (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
         trial.exclusive(self.root / 'phase.json', b'{"phase":"stage"}')
-        trial.exclusive(self.root / 'heartbeat.json', trial.encoded({'sequence': 1, 'received': time.monotonic()}))
+        (self.root / 'heartbeat.json').write_bytes(trial.encoded({'sequence': 0, 'received': time.monotonic()}))
+        (self.root / 'started.json').unlink(missing_ok=True)
         child = Mock(pid=999999)
         child.poll.return_value = poll
         with patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']), \
@@ -1701,7 +1833,7 @@ class TransientRegistryAuth(unittest.TestCase):
              patch.object(trial, 'oom_count', return_value=0), patch.object(trial.os, 'geteuid', return_value=0), \
              patch.object(trial.os, 'killpg'), patch.object(trial.subprocess, 'Popen', return_value=child) as spawn, \
              patch.object(trial, 'resources', return_value={'free_bytes': 300 * trial.GIB, 'available_memory': 100 * trial.GIB}), \
-             patch.object(trial, 'AUTH_GATE_SECONDS', .3), patch.object(trial, 'containment') as contain:
+             patch.object(trial, 'containment') as contain:
             if gate:
                 gate()
             code = trial.main(['guardian'])
@@ -1709,7 +1841,11 @@ class TransientRegistryAuth(unittest.TestCase):
 
     def test_guardian_never_spawns_worker_before_auth_ready_and_expiry_contains(self):
         self.arm()  # armed, but bootstrap never published readiness (lost channel/invalid input)
-        code, spawn, contain, result = self.guardian_run()
+        now = time.monotonic()
+        ticks = [now]
+        with patch.object(trial.time, 'monotonic', side_effect=lambda: ticks[0]), \
+             patch.object(trial.time, 'sleep', side_effect=lambda seconds: ticks.__setitem__(0, ticks[0] + 11)):
+            code, spawn, contain, result = self.guardian_run()
         spawn.assert_not_called()
         contain.assert_called_once_with()
         self.assertEqual(code, 124)
@@ -1728,7 +1864,10 @@ class TransientRegistryAuth(unittest.TestCase):
         def late():
             def publish(seconds):  # readiness appears while the guardian is blocked at its gate
                 if not (self.root / trial.AUTH_READY).exists():
-                    trial.auth_install(self.v, CREDS)
+                    current = (self.root / 'started.json').read_bytes()
+                    (self.root / trial.AUTH_GUARDIAN).write_bytes(current)
+                    with patch.object(trial, 'manifest', side_effect=lambda value: value):
+                        trial.auth_install(self.v, CREDS)
             self.stack.enter_context(patch.object(trial.time, 'sleep', side_effect=publish))
         code, spawn, _, _ = self.guardian_run(gate=late)
         self.assertEqual(code, 17)
@@ -1740,6 +1879,28 @@ class TransientRegistryAuth(unittest.TestCase):
         code, spawn, contain, _ = self.guardian_run()
         spawn.assert_not_called()
         self.assertNotEqual(code, 0)
+
+    def test_guardian_rechecks_boot_and_heartbeat_after_ready_before_spawn(self):
+        real_gate = trial.auth_gate
+        for change in ('boot', 'heartbeat'):
+            with self.subTest(change):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.install()
+                with ExitStack() as local:
+                    def after_ready(value, clock):
+                        real_gate(value, clock)
+                        if change == 'boot':
+                            local.enter_context(patch.object(trial, 'kernel_boot', return_value='changed'))
+                        else:
+                            (self.root / 'heartbeat.json').write_bytes(trial.encoded(
+                                {'sequence': 0, 'received': time.monotonic() - 31}))
+                    with patch.object(trial, 'auth_gate', side_effect=after_ready):
+                        code, spawn, contain, result = self.guardian_run()
+                spawn.assert_not_called()
+                contain.assert_called_once_with()
+                self.assertNotEqual(code, 0)
+                self.assertEqual(result['diagnostic']['category'], 'boot-change' if change == 'boot' else 'heartbeat-loss')
 
     # -- bootstrap ordering --------------------------------------------------------
     def bootstrap_fixture(self, secret, started_pid=999999, mounts_ok=True):
@@ -1774,10 +1935,11 @@ class TransientRegistryAuth(unittest.TestCase):
             if args[1] == 'show':
                 return ('MainPID=%d\nActiveState=active\n' % started_pid).encode()
             return b''
-        def read_secret():
+        def read_secret(*, until):
             events.append('read-secret')
             self.assertFalse(os.path.lexists(self.dir))
-            return REAL_AUTH_READ(read)
+            self.assertEqual(until, trial.auth_intent()['until'])
+            return REAL_AUTH_READ(read, until=until)
         original_match = trial.re.fullmatch
         def match(pattern, text, *args):
             return True if pattern == '/tmp/labapp-vlab-[a-f0-9]{32}' else original_match(pattern, text, *args)
@@ -1835,6 +1997,20 @@ class TransientRegistryAuth(unittest.TestCase):
         self.assertNotIn('read-secret', events)
         self.assertFalse(os.path.lexists(self.dir))
 
+    def test_bootstrap_channel_interruption_closes_publication_preserving_primary(self):
+        incoming, table, events, patches = self.bootstrap_fixture(trial.encoded(CREDS))
+        with ExitStack() as local:
+            for item in patches:
+                local.enter_context(item)
+            local.enter_context(patch.object(trial, 'auth_read_input', side_effect=KeyboardInterrupt))
+            with self.assertRaises(KeyboardInterrupt):
+                trial.bootstrap(incoming, trial.sha(trial.encoded(table)), ('ghcr-auth',))
+        self.assertEqual(events[-1], 'stop')
+        self.assertTrue((self.root / trial.AUTH_CLOSED).exists())
+        with self.assertRaises(trial.Failure):
+            trial.auth_install(self.v, CREDS)
+        self.assertFalse(os.path.lexists(self.dir))
+
     def test_bootstrap_refuses_before_any_state_for_wrong_volume_swap_or_fallback(self):
         for name, setup in (('ext4', lambda: self.mounts(fstype='ext4')), ('swap', lambda: self.swap(True)),
                             ('fallback', lambda: (self.home / '.dockercfg').write_text('x')),
@@ -1861,6 +2037,19 @@ class TransientRegistryAuth(unittest.TestCase):
                     trial.bootstrap(self.base / 'unused', 'a' * 64, options)
         self.assertFalse(trial.auth_armed())
         self.assertFalse(self.root.exists())
+
+    def test_default_bootstrap_refuses_preexisting_auth_directory_before_state_or_read(self):
+        incoming, table, events, patches = self.bootstrap_fixture(b'')
+        self.dir.mkdir(mode=0o700)
+        (self.dir / 'foreign').write_text('PUBLIC-FOREIGN')
+        with ExitStack() as local:
+            for item in patches:
+                local.enter_context(item)
+            with self.assertRaises(trial.Failure):
+                trial.bootstrap(incoming, trial.sha(trial.encoded(table)))
+        self.assertEqual(events, [])
+        self.assertFalse(self.root.exists())
+        self.assertEqual((self.dir / 'foreign').read_text(), 'PUBLIC-FOREIGN')
 
     # -- worker ordering -----------------------------------------------------------
     def worker_run(self, fault=None):

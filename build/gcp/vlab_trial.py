@@ -297,6 +297,7 @@ def ghcr_credentials(path, output):
     Only the four validated fields survive canonicalization. Refusal text is fixed.
     """
     try:
+        guest.harden_secret_process()
         path = guest.no_links(path)
         parent = path.parent.lstat()
         guest.require(parent.st_uid == os.geteuid() and not parent.st_mode & 0o022
