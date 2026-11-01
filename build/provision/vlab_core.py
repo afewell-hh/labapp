@@ -542,12 +542,16 @@ def read_unit_ready(mode, value, invocation, boot_id):
                 and stable_stat(path.lstat()) == stable_stat(before))
         record = json_data(raw)
         valid_unit_ready(record, mode, value, invocation, boot_id)
-        return 'ok', record['message'], record['code']
+        result = 'ok', record['message'], record['code']
     except BaseException:
-        return invalid
+        result = invalid
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except BaseException:
+                result = invalid
+    return result
 
 
 def record_unit_ready_failure(mode, original, error):
@@ -672,8 +676,20 @@ def capture_first_failure(mode, value, primary, deadline):
     parts = {'primary': (primary_status, out[-FAILURE_CAPS['primary']:]),
              'command_context': last_failure_context() if operation is not None else ('unavailable', b''),
              'manager': ('unavailable', b''), 'journal': ('unavailable', b'')}
-    # One non-waiting read, bound to the ORIGINAL reservation (not to later state).
-    ready_status, ready_message, ready_code = read_unit_ready(mode, value, invocation, boot_id)
+    # The reserve snapshot deliberately has no invocation. unit_gate publishes it
+    # once; trust the frozen header invocation for this section only after every
+    # current binding matches that original reservation and the live boot.
+    ready_status, ready_message, ready_code = 'unavailable', None, None
+    if value is not None and current is not None and invocation is not None and boot_id is not None:
+        try:
+            require(all(key in current and key in value
+                        and type(current[key]) is type(value[key]) and current[key] == value[key]
+                        for key in ('nonce', 'operation', 'mode', 'boot', 'started', 'deadline'))
+                    and value['mode'] == mode and value['boot'] == boot_id)
+            # One non-waiting read; no record-supplied invocation authority.
+            ready_status, ready_message, ready_code = read_unit_ready(mode, value, invocation, boot_id)
+        except BaseException:
+            ready_status, ready_message, ready_code = 'invalid', None, None
     cleanup = 'confirmed'
     unit = UNIT[mode]
     if invocation is not None:

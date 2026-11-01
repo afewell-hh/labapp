@@ -1773,9 +1773,14 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   * **Outer read.** The first-failure capture reads the record ONCE (no wait, no reread) with
     descriptor and path identity, no-follow/non-blocking open, regular file, root 0600, single
     link, size, duplicate-key and strict-schema checks, and compares every binding including
-    the clocks to the ORIGINAL reserved operation and the frozen invocation and boot
-    independently (adopting the current invocation alone is not enough). Without all of the
-    original operation, invocation and boot there is no authoritative read. Missing (or late)
+    the clocks to the ORIGINAL reserved operation. Unlike the writer's original
+    `startup_snapshot`, the outer `reserve` snapshot deliberately has no invocation.
+    Current nonce, operation, mode, boot, started and deadline must equal that reserve
+    snapshot, and its boot must equal the live boot, before the current invocation
+    frozen in the bundle header can authorize this section. `unit_gate` publishes that
+    invocation once; the record never supplies invocation authority. Missing current
+    state or a frozen invocation prevents an authoritative read; a mismatch is refused
+    for this section without changing manager/journal selection. Missing (or late)
     is `unavailable`; unsafe, changed, malformed or foreign is `invalid`. A reader error
     never discards the other sections or prevents cleanup.
   * **Lifetime.** Same as the core `prepared` state and the first-failure bundle: `prepare`
@@ -1784,9 +1789,9 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
     unsupported-recovery record stays `invalid`/unknown. There is no cleanup, rotation or
     adoption machinery.
   * **Meaning and limits.** Missing is unknown. The record is the refusal this process
-    observed, never the initiating cause: the canonical-10 manager evidence showed the post
-    process exiting about 1.013 s before the main process, and the truncated journal kept the
-    hhfab cancellation but not the readiness refusal. Nothing here supports a 20-minute
+    observed, never the initiating cause. Independent hhfab failure or cancellation may
+    precede or follow it; manager reaping order does not establish causality, and journal
+    truncation may omit the refusal. Nothing here supports a 20-minute
     inference or a kubeconfig-race assumption, and no readiness, timeout or retry changed.
     Offline fixtures use fake commands, clock and files for the real `unit_ready`/`start`/
     `main`/export/host-accept paths; they are not native systemd scheduling, and filesystem

@@ -1229,7 +1229,13 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
 
     def test_ready_refusal_survives_later_cancellation_and_outer_wrapper_failure(self):
         self.prepared()
-        self.fail_inspection()
+        # Change the API identity after strict inspection: the actual ready_body
+        # require(...) refuses it, without injecting a synthetic child Failure.
+        def change_identity(argv):
+            if argv[:3] == [core.HHFAB, 'vlab', 'inspect-switches']:
+                self.cluster_uid = 'different-public-cluster'
+            return False
+        self.failure = change_identity
         actual = self.command
         def wrapped(argv, *args, **kwargs):
             if argv[:2] == [core.SYSTEMCTL, 'start']:
@@ -1242,13 +1248,133 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         with patch.object(core, 'execute', side_effect=wrapped):
             self.assertEqual(self.call('start-fresh'), 1)  # outer primary, unchanged
         bundle = self.bundle()
-        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic command failure', 'code': 17})
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'post-inspection identity differs', 'code': 1})
         self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
         self.assertIn(SENTINEL.encode(), self.raw_section('primary'))
         self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
         self.assertEqual(bundle['command_context']['label'], core.FAILURE_CONTEXT)
+        self.assertEqual(bundle['command_context']['status'], 'unavailable')
+        self.assertEqual(self.ready_record()['message'], 'post-inspection identity differs')
+        self.assertEqual(len(self.diagnostics), 2)
+        self.assertEqual(core.state()['containment'], 'verified')
         self.assertNotIn(SENTINEL.encode(), self.ready_path().read_bytes())
         self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_outer_capture_correlates_current_boot_and_clocks_with_invocation_free_reserve(self):
+        for mutation in ('unchanged', 'boot', 'clocks'):
+            with self.subTest(mutation):
+                self.setUp()
+                self.prepared()
+                self.fail_inspection()
+                capture, observations = core.capture_first_failure, []
+                def mutate_then_capture(mode, reserved, primary, deadline):
+                    self.assertNotIn('invocation', reserved)
+                    original = core.state()
+                    record = self.ready_record()
+                    self.assertEqual(record['boot'], original['boot'])
+                    self.assertEqual(record['started'], original['started'])
+                    changed = dict(original)
+                    if mutation == 'boot':
+                        changed['boot'] = ('0' if original['boot'][0] != '0' else '1') + original['boot'][1:]
+                    elif mutation == 'clocks':
+                        changed['started'] += 1
+                        changed['deadline'] += 1
+                        self.assertEqual(changed['deadline'] - changed['started'], core.START_SECONDS[mode])
+                    core.save(changed)
+                    try:
+                        capture(mode, reserved, primary, deadline)
+                        observations.append(self.bundle())
+                    finally:
+                        core.save(original)  # keep this capture-only mutation out of cleanup
+                with patch.object(core, 'capture_first_failure', side_effect=mutate_then_capture), \
+                     patch.object(core, 'read_unit_ready', wraps=core.read_unit_ready) as reader:
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual(len(observations), 1)
+                bundle = observations[0]
+                expected = ({'status': 'ok', 'message': 'synthetic command failure', 'code': 17}
+                            if mutation == 'unchanged' else {'status': 'invalid', 'message': None, 'code': None})
+                self.assertEqual(bundle['unit_ready'], expected)
+                self.assertEqual(reader.call_count, 1 if mutation == 'unchanged' else 0)
+                self.assertEqual(bundle['invocation'], 'a' * 32)
+                self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+                self.assertEqual(bundle['primary']['code'], 17)
+                self.assertEqual(len(self.diagnostics), 2)
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    def test_readiness_descriptor_close_error_or_signal_preserves_full_capture_and_cleanup(self):
+        for secondary in (OSError(SENTINEL), KeyboardInterrupt()):
+            with self.subTest(type(secondary).__name__):
+                self.setUp()
+                self.prepared()
+                self.fail_inspection()
+                opened, closed = [], []
+                actual_open, actual_close, actual_cleanup = core.os.open, core.os.close, core.cleanup_start
+                cleanup = []
+                def opening(path, flags, *args, **kwargs):
+                    fd = actual_open(path, flags, *args, **kwargs)
+                    if path == self.ready_path() and flags & os.O_NONBLOCK:
+                        opened.append(fd)
+                    return fd
+                def closing(fd):
+                    actual_close(fd)
+                    if opened and fd == opened[0] and not closed:
+                        closed.append(fd)
+                        raise secondary
+                def cleaning(value, deadline):
+                    cleanup.append(deadline - time.monotonic())
+                    return actual_cleanup(value, deadline)
+                with patch.object(core.os, 'open', side_effect=opening), \
+                     patch.object(core.os, 'close', side_effect=closing), \
+                     patch.object(core, 'cleanup_start', side_effect=cleaning):
+                    self.assertEqual(self.call('start-fresh'), 17)
+                self.assertEqual(len(opened), 1)
+                self.assertEqual(closed, opened)
+                bundle = self.bundle()
+                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+                self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                                 ('synthetic command failure', 17))
+                self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+                self.assertEqual(bundle['query_cleanup'], 'confirmed')
+                self.assertEqual(len(self.diagnostics), 2)
+                self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+                self.assertEqual(len(cleanup), 1)
+                self.assertTrue(34 < cleanup[0] <= 35)
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+                self.assertNotIn('first-failure capture unverified', self.stderr.getvalue())
+
+    def test_late_record_publication_after_open_miss_is_not_reread(self):
+        self.prepared()
+        self.fail_inspection()
+        actual_write, actual_open = core.write_first_failure, core.os.open
+        pending, attempts = [], []
+        def delay_record(raw, name=core.FIRST_FAILURE):
+            if name == core.UNIT_READY_FAILURE:
+                pending.append(raw)
+                return
+            return actual_write(raw, name)
+        def publish_after_miss(path, flags, *args, **kwargs):
+            if path == self.ready_path() and flags & os.O_NONBLOCK:
+                attempts.append(path)
+                try:
+                    return actual_open(path, flags, *args, **kwargs)
+                except FileNotFoundError:
+                    self.assertEqual(len(pending), 1)
+                    actual_write(pending[0], core.UNIT_READY_FAILURE)
+                    raise
+            return actual_open(path, flags, *args, **kwargs)
+        with patch.object(core, 'write_first_failure', side_effect=delay_record), \
+             patch.object(core.os, 'open', side_effect=publish_after_miss):
+            self.assertEqual(self.call('start-fresh'), 17)
+        self.assertEqual(attempts, [self.ready_path()])
+        self.assertEqual(self.ready_record()['message'], 'synthetic command failure')
+        bundle = self.bundle()
+        self.assertEqual(bundle['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None})
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                         ('synthetic command failure', 17))
+        self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
+        self.assertEqual(len(self.diagnostics), 2)
+        self.assertEqual(core.state()['containment'], 'verified')
 
     def test_unit_ready_record_text_is_sanitized_to_fixed_values(self):
         cases = (('unexpected exception', RuntimeError(SENTINEL), 1),
