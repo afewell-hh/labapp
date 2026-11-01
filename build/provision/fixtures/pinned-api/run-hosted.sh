@@ -76,7 +76,7 @@ docker image inspect "$base" --format '{{.Id}} {{json .RepoDigests}}'
 prep_pending=1
 prep_id=$(docker create --name "$prep" --label "$label" \
   --memory=2g --memory-swap=2g --cpus=2 --pids-limit=256 \
-  --security-opt=no-new-privileges --log-driver=local --log-opt max-size=1m --log-opt max-file=1 \
+  --security-opt=no-new-privileges --log-driver=local --log-opt max-size=1m --log-opt max-file=1 --log-opt compress=false \
   --ulimit fsize=268435456:268435456 \
   --mount "type=bind,src=$here,dst=/fixture,readonly" \
   "$base" env -i HOME=/root PATH=/usr/bin:/bin \
@@ -98,7 +98,7 @@ runtime_pending=1
 runtime_id=$(docker create --name "$runtime" --label "$label" \
   --network=none --read-only --user=1000:1000 --cap-drop=ALL \
   --security-opt=no-new-privileges --memory=6g --memory-swap=6g --cpus=2 --pids-limit=512 \
-  --log-driver=local --log-opt max-size=1m --log-opt max-file=1 \
+  --log-driver=local --log-opt max-size=1m --log-opt max-file=1 --log-opt compress=false \
   --ulimit fsize=134217728:134217728 --ulimit nofile=1024:1024 \
   --tmpfs /work:rw,exec,nosuid,nodev,size=8g,uid=1000,gid=1000,mode=700 \
   --mount "type=bind,src=$here,dst=/fixture,readonly" \
