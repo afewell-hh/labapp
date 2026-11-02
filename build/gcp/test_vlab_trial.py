@@ -1737,11 +1737,12 @@ class GuestDiagnostics(unittest.TestCase):
     def failure_bundle(self, **changes):
         def section(status='unavailable', raw=b''):
             return {'status': status, 'output': base64.b64encode(raw).decode()}
-        bundle = {'schema': 2, 'source': 'vlab_core', 'nonce': self.nonce, 'mode': 'fresh', 'operation': 'e' * 32,
+        bundle = {'schema': 3, 'source': 'vlab_core', 'nonce': self.nonce, 'mode': 'fresh', 'operation': 'e' * 32,
                   'invocation': 'f' * 32, 'boot': self.boot_uuid, 'stage': 'unit', 'query_cleanup': 'confirmed',
                   'state': {'status': 'ok', 'phase': 'failed', 'containment': 'verified', 'service_result': None},
                   'primary': {**section(), 'message': 'synthetic ready failure', 'code': 17},
-                  'unit_ready': {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17},
+                  'unit_ready': {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17,
+                                 'route': 'api-final-switches'},
                   'command_context': {**section(), 'label': guest.FAILURE_CONTEXT},
                   'manager': section('ok', b'InvocationID=' + b'f' * 32 + b'\n'),
                   'journal': section('ok', b'native detail ' + SENTINEL.encode())}
@@ -1795,7 +1796,9 @@ class GuestDiagnostics(unittest.TestCase):
     def test_every_binding_mismatch_or_hostile_export_is_invalid_and_retains_nothing(self):
         good = self.failure_bundle()
         other = 'b' * 32
-        missing = {'status': 'unavailable', 'message': None, 'code': None}
+        missing = {'status': 'unavailable', 'message': None, 'code': None, 'route': None}
+        def ready(status, message=None, code=None, route=None, **extra):
+            return {'status': status, 'message': message, 'code': code, 'route': route, **extra}
         cases = {
             'foreign source': self.export_bytes(source_sha='b' * 40), 'foreign nonce': self.export_bytes(nonce=other),
             'resume mode': self.export_bytes(mode='resume'), 'other boot': self.export_bytes(boot='3' * 8 + self.boot_uuid[8:]),
@@ -1807,24 +1810,40 @@ class GuestDiagnostics(unittest.TestCase):
                 self.failure_bundle(invocation=None, stage='manager', unit_ready=missing,
                                     journal={'status': 'unavailable', 'output': ''}), invocation=None),
             'legacy schema 1': self.export_bytes(self.failure_bundle(schema=1)),
+            'legacy schema 2': self.export_bytes(self.failure_bundle(schema=2)),
             'bool schema': self.export_bytes(self.failure_bundle(schema=True)),
             'missing unit_ready': self.export_bytes(self.failure_bundle(unit_ready=None)),
-            'unit_ready ok with null text': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'ok', 'message': None, 'code': None})),
+            'unit_ready legacy three keys': self.export_bytes(self.failure_bundle(
+                unit_ready={'status': 'ok', 'message': 'x', 'code': 1})),
+            'unit_ready ok with null text': self.export_bytes(self.failure_bundle(unit_ready=ready('ok'))),
             'unit_ready ok bool code': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'ok', 'message': 'x', 'code': True})),
+                self.failure_bundle(unit_ready=ready('ok', 'x', True))),
             'unit_ready ok bad code': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'ok', 'message': 'x', 'code': 256})),
+                self.failure_bundle(unit_ready=ready('ok', 'x', 256))),
             'unit_ready ok control text': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'ok', 'message': 'x\ny', 'code': 1})),
+                self.failure_bundle(unit_ready=ready('ok', 'x\ny', 1))),
             'unit_ready unavailable with text': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'unavailable', 'message': 'x', 'code': 1})),
+                self.failure_bundle(unit_ready=ready('unavailable', 'x', 1))),
             'unit_ready invalid with code': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'invalid', 'message': None, 'code': 0})),
+                self.failure_bundle(unit_ready=ready('invalid', None, 0))),
             'unit_ready extra field': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'unavailable', 'message': None, 'code': None, 'x': 1})),
+                self.failure_bundle(unit_ready=ready('unavailable', x=1))),
             'unit_ready bad status': self.export_bytes(
-                self.failure_bundle(unit_ready={'status': 'captured', 'message': None, 'code': None})),
+                self.failure_bundle(unit_ready=ready('captured'))),
+            'route unknown': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('ok', 'x', 1, 'api-final-pods'))),
+            'route generic': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('ok', 'x', 1, 'kubectl-list'))),
+            'route wrong type': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('ok', 'x', 1, 7))),
+            'route free text': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('ok', 'x', 1, '/usr/local/bin/hhfab vlab wait-switches'))),
+            'route list': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('ok', 'x', 1, ['svc-entry']))),
+            'route on unavailable': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('unavailable', route='svc-entry'))),
+            'route on invalid': self.export_bytes(
+                self.failure_bundle(unit_ready=ready('invalid', route='api-initial-nodes'))),
             'unit_ready ok without invocation': self.export_bytes(
                 self.failure_bundle(invocation=None, stage='manager',
                                     journal={'status': 'unavailable', 'output': ''}), invocation=None),
@@ -1844,12 +1863,15 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual(list(private.iterdir()), [])
                 self.assertNotIn(SENTINEL, text)
 
-    def test_schema2_unit_ready_section_is_typed_and_diagnostic_only(self):
+    def test_schema3_unit_ready_section_is_typed_and_diagnostic_only(self):
         # Observed refusal, never the initiating cause: every typed state keeps the trial result.
-        for section in ({'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 0},
-                        {'status': 'unavailable', 'message': None, 'code': None},
-                        {'status': 'invalid', 'message': None, 'code': None}):
-            with self.subTest(section['status']):
+        sections = [{'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 0, 'route': None},
+                    {'status': 'unavailable', 'message': None, 'code': None, 'route': None},
+                    {'status': 'invalid', 'message': None, 'code': None, 'route': None}]
+        sections += [{'status': 'ok', 'message': 'child deadline exceeded', 'code': 124, 'route': route}
+                     for route in guest.FAILURE_ROUTES]
+        for section in sections:
+            with self.subTest(section['status'], route=section['route']):
                 self.setUp()
                 bundle = self.failure_bundle(unit_ready=section)
                 private, (code, receipt, _, _) = self.private_drive(self.export_bytes(bundle))
@@ -1858,7 +1880,8 @@ class GuestDiagnostics(unittest.TestCase):
 
     def test_reservation_style_null_bundle_and_absent_are_accepted_or_explicit(self):
         null = self.failure_bundle(stage='reserve', operation=None, invocation=None,
-                                   unit_ready={'status': 'unavailable', 'message': None, 'code': None},
+                                   unit_ready={'status': 'unavailable', 'message': None, 'code': None,
+                                               'route': None},
                                    manager={'status': 'unavailable', 'output': ''},
                                    journal={'status': 'unavailable', 'output': ''})
         private, (code, receipt, _, _) = self.private_drive(self.export_bytes(null, operation=None, invocation=None))

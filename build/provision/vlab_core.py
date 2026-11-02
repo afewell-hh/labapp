@@ -87,12 +87,29 @@ AUX = {'/usr/bin/sudo': 'sudo', '/usr/bin/qemu-img': 'qemu-utils',
 # #368 first-failure bundle: fixed root-private diagnostic, never readiness authority.
 FIRST_FAILURE = 'first-failure.json'
 FIRST_FAILURE_LIMIT = 32 * 1024  # SERIALIZED bytes, enforced after JSON/base64 encoding
-FIRST_FAILURE_SCHEMA = 2         # bundle schema only; state/envelope/public schemas are unchanged
+FIRST_FAILURE_SCHEMA = 3         # bundle schema only (#430 adds unit_ready.route); no legacy fallback
 # #390 observed unit-ready refusal: its own fixed root-private record, never an initiating cause.
 UNIT_READY_FAILURE = 'unit-ready-failure.json'
 UNIT_READY_LIMIT = 1024
+UNIT_READY_SCHEMA = 2            # record schema (#430 adds ``route``); no legacy schema-1 fallback
 UNIT_READY_KEYS = frozenset(('schema', 'source', 'action', 'nonce', 'mode', 'operation', 'invocation',
-                             'boot', 'started', 'deadline', 'message', 'code'))
+                             'boot', 'started', 'deadline', 'message', 'code', 'route'))
+# #430 closed readiness-child route enum: which fixed executed child's ORIGINAL Failure escaped
+# unit-ready. Fixed literals only (never argv, path or output); null = genuinely unlabeled.
+UNIT_READY_ROUTES = (
+    'svc-entry', 'svc-bridge-wait', 'svc-api-loop', 'svc-post-inspect', 'svc-post-critical',
+    'svc-final-lock',
+    'bridge-wait-probe', 'bridge-initial-helper', 'bridge-initial-verify',
+    'bridge-final-helper', 'bridge-final-verify',
+    'hhfab-wait-switches', 'hhfab-inspect-strict',
+    'api-initial-readyz', 'api-initial-nodes', 'api-initial-kube-system-ns',
+    'api-initial-fabricators', 'api-initial-controlnodes', 'api-initial-fabnodes',
+    'api-initial-switches', 'api-initial-servers', 'api-initial-connections',
+    'api-initial-switchgroups', 'api-initial-vlannamespaces', 'api-initial-ipv4namespaces',
+    'api-final-readyz', 'api-final-nodes', 'api-final-kube-system-ns',
+    'api-final-fabricators', 'api-final-controlnodes', 'api-final-fabnodes',
+    'api-final-switches', 'api-final-servers', 'api-final-connections',
+    'api-final-switchgroups', 'api-final-vlannamespaces', 'api-final-ipv4namespaces')
 UNIT_READY_FALLBACK = ('operational failure', 1)
 FAILURE_CAPS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
 FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
@@ -114,6 +131,7 @@ class Failure(Exception):
         super().__init__(message)
         self.code = code
         self.private_output = private_output
+        self.route = None  # #430: set only by routed() on an ORIGINAL executed-child failure
 
 
 class Parser(argparse.ArgumentParser):
@@ -322,59 +340,82 @@ def execute(argv, deadline, cap=30, user=False, *, retain=True):
     child = subprocess.Popen(argv, cwd='/', env=SAFE_ENV, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True, **kwargs)
-    raw = bytearray()
-    primary = None
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(child.stdout, selectors.EVENT_READ)
-            while True:
-                if not selector.select(remaining(end)):
-                    raise Failure('child deadline exceeded', 124)
-                chunk = os.read(child.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                raw.extend(chunk)
-                require(len(raw) <= LIMIT, 'private child output overflow')
+        raw = bytearray()
+        primary = None
         try:
-            code = child.wait(timeout=remaining(end))
-        except subprocess.TimeoutExpired:
-            raise Failure('child deadline exceeded', 124) from None
-        if code:
-            raise Failure('child command failed', code if 0 < code < 256 else 1, bytes(raw))
-        return bytes(raw)
-    except BaseException as exc:
-        primary = exc
-        if retain:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    if not selector.select(remaining(end)):
+                        raise Failure('child deadline exceeded', 124)
+                    chunk = os.read(child.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                    require(len(raw) <= LIMIT, 'private child output overflow')
             try:
-                retain_failure_output(bytes(raw))
-            except BaseException:
-                print('vlab-core: private diagnostics unverified', file=sys.stderr)
-        raise
-    finally:
-        try:
-            # The direct process can exit while descendants retain the pipe.
-            # The new session/PGID is ours even after that direct child exits.
-            if primary is not None or child.poll() is None:
+                code = child.wait(timeout=remaining(end))
+            except subprocess.TimeoutExpired:
+                raise Failure('child deadline exceeded', 124) from None
+            if code:
+                raise Failure('child command failed', code if 0 < code < 256 else 1, bytes(raw))
+            return bytes(raw)
+        except BaseException as exc:
+            primary = exc
+            if retain:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            child.wait(timeout=2)
-            if primary is None:
-                try:
-                    os.killpg(child.pid, 0)
-                except ProcessLookupError:
-                    pass
-                else:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    raise Failure('unexpected child group remains')
-        except (OSError, subprocess.TimeoutExpired):
-            if primary is None:
-                raise Failure('child containment unverified') from None
-            primary.cleanup_uncertain = True
-            print('vlab-core: child group containment unverified', file=sys.stderr)
+                    retain_failure_output(bytes(raw))
+                except BaseException:
+                    print('vlab-core: private diagnostics unverified', file=sys.stderr)
+            raise
         finally:
-            child.stdout.close()
+            try:
+                # The direct process can exit while descendants retain the pipe.
+                # The new session/PGID is ours even after that direct child exits.
+                if primary is not None or child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                child.wait(timeout=2)
+                if primary is None:
+                    try:
+                        os.killpg(child.pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        raise Failure('unexpected child group remains')
+            except (OSError, subprocess.TimeoutExpired):
+                if primary is None:
+                    raise Failure('child containment unverified') from None
+                primary.cleanup_uncertain = True
+                print('vlab-core: child group containment unverified', file=sys.stderr)
+            finally:
+                child.stdout.close()
+    except Failure as error:
+        # Popen returned successfully: only this call's post-spawn failures prove
+        # an executed child. Identity validation and failed spawn never reach here.
+        error._executed_child = True
+        raise
+
+
+def routed(route, *args, **kwargs):
+    """Execute with identical arguments; label only an original, proven executed-child Failure.
+
+    Same exception object, message, code, private output and cleanup uncertainty. Only a
+    Failure proven to escape AFTER successful Popen is labeled, never a handled signal or an
+    already-labeled one; there is no global last-child state. ``route`` None labels nothing.
+    """
+    try:
+        return execute(*args, **kwargs)
+    except Failure as error:
+        handled = str(error) == 'terminated' and type(error.code) is int and error.code in (130, 143)
+        if route is not None and error.route is None and not handled \
+                and getattr(error, '_executed_child', False) is True:
+            error.route = route
+        raise
 
 
 def diagnostic_run(argv, end, keep):
@@ -493,9 +534,9 @@ def last_failure_context():
 
 
 def valid_unit_ready(record, mode, expected, invocation, boot_id):
-    """Strict closed 12-key record check against ORIGINAL frozen bindings; raises Failure."""
+    """Strict closed 13-key record check against ORIGINAL frozen bindings; raises Failure."""
     require(type(record) is dict and set(record) == UNIT_READY_KEYS
-            and type(record['schema']) is int and record['schema'] == 1
+            and type(record['schema']) is int and record['schema'] == UNIT_READY_SCHEMA
             and record['source'] == 'vlab_core' and record['action'] == 'unit-ready'
             and record['mode'] == mode and mode in START_SECONDS, 'unit-ready record refused')
     for key, wanted in (('nonce', expected.get('nonce')), ('operation', expected.get('operation')),
@@ -511,16 +552,18 @@ def valid_unit_ready(record, mode, expected, invocation, boot_id):
     require(record['deadline'] - record['started'] == START_SECONDS[mode], 'unit-ready clock refused')
     require(type(record['message']) is str and re.fullmatch(r'[ -~]{1,128}', record['message'])
             and type(record['code']) is int and 0 <= record['code'] < 256, 'unit-ready text refused')
+    route = record['route']
+    require(route is None or type(route) is str and route in UNIT_READY_ROUTES, 'unit-ready route refused')
 
 
 def read_unit_ready(mode, value, invocation, boot_id):
-    """-> (status, message, code). ONE read of the fixed record, never a wait or reread.
+    """-> (status, message, code, route). ONE read of the fixed record, never a wait or reread.
 
     Authority comes only from the ORIGINAL reserved operation (``value``) plus the frozen
     invocation and boot; without all of them nothing is read. Missing is ``unavailable``;
-    unsafe, changed, malformed or foreign is ``invalid`` (message/code are then null).
+    unsafe, changed, malformed or foreign is ``invalid`` (message/code/route are then null).
     """
-    unavailable, invalid = ('unavailable', None, None), ('invalid', None, None)
+    unavailable, invalid = ('unavailable', None, None, None), ('invalid', None, None, None)
     if value is None or invocation is None or boot_id is None:
         return unavailable
     fd = None
@@ -543,7 +586,7 @@ def read_unit_ready(mode, value, invocation, boot_id):
                 and stable_stat(path.lstat()) == stable_stat(before))
         record = json_data(raw)
         valid_unit_ready(record, mode, value, invocation, boot_id)
-        result = 'ok', record['message'], record['code']
+        result = 'ok', record['message'], record['code'], record['route']
     except BaseException:
         result = invalid
     finally:
@@ -581,10 +624,11 @@ def record_unit_ready_failure(mode, original, error):
     require(invocation_env() == original['invocation'], 'unit invocation changed')
     require(original['mode'] == mode and operation_deadline(current) == original['deadline'],
             'operation clock refused')  # same boot, same duration, not yet expired
-    record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': original['nonce'],
+    route = getattr(error, 'route', None) if isinstance(error, Failure) else None
+    record = {'schema': UNIT_READY_SCHEMA, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': original['nonce'],
               'mode': mode, 'operation': original['operation'], 'invocation': original['invocation'],
               'boot': original['boot'], 'started': original['started'], 'deadline': original['deadline'],
-              'message': message, 'code': code}
+              'message': message, 'code': code, 'route': route}
     valid_unit_ready(record, mode, original, original['invocation'], original['boot'])
     raw = json.dumps(record, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
     require(len(raw) <= UNIT_READY_LIMIT, 'unit-ready record overflow')
@@ -680,7 +724,7 @@ def capture_first_failure(mode, value, primary, deadline):
     # The reserve snapshot deliberately has no invocation. unit_gate publishes it
     # once; trust the frozen header invocation for this section only after every
     # current binding matches that original reservation and the live boot.
-    ready_status, ready_message, ready_code = 'unavailable', None, None
+    ready_status, ready_message, ready_code, ready_route = 'unavailable', None, None, None
     if value is not None and current is not None and invocation is not None and boot_id is not None:
         try:
             require(all(key in current and key in value
@@ -688,9 +732,10 @@ def capture_first_failure(mode, value, primary, deadline):
                         for key in ('nonce', 'operation', 'mode', 'boot', 'started', 'deadline'))
                     and value['mode'] == mode and value['boot'] == boot_id)
             # One non-waiting read; no record-supplied invocation authority.
-            ready_status, ready_message, ready_code = read_unit_ready(mode, value, invocation, boot_id)
+            ready_status, ready_message, ready_code, ready_route = read_unit_ready(
+                mode, value, invocation, boot_id)
         except BaseException:
-            ready_status, ready_message, ready_code = 'invalid', None, None
+            ready_status, ready_message, ready_code, ready_route = 'invalid', None, None, None
     cleanup = 'confirmed'
     unit = UNIT[mode]
     if invocation is not None:
@@ -725,7 +770,8 @@ def capture_first_failure(mode, value, primary, deadline):
               'state': {'status': state_status, 'phase': token('phase'),
                         'containment': token('containment'), 'service_result': token('service_result')},
               'primary': {'message': message, 'code': code},
-              'unit_ready': {'status': ready_status, 'message': ready_message, 'code': ready_code},
+              'unit_ready': {'status': ready_status, 'message': ready_message, 'code': ready_code,
+                             'route': ready_route},
               'command_context': {'label': FAILURE_CONTEXT}, 'manager': {}, 'journal': {}}
     rendered = render_failure(header, parts)
     for name in ('journal', 'primary', 'command_context', 'manager'):
@@ -740,9 +786,9 @@ def capture_first_failure(mode, value, primary, deadline):
     write_first_failure(rendered)
 
 
-def hhfab(command, deadline, extra=(), cap=30):
-    return execute([HHFAB, *command, '--workdir', str(WORK), '--cache-dir', str(CACHE), *extra],
-                   deadline, cap, user=True)
+def hhfab(command, deadline, extra=(), cap=30, route=None):
+    return routed(route, [HHFAB, *command, '--workdir', str(WORK), '--cache-dir', str(CACHE), *extra],
+                  deadline, cap, user=True)
 
 
 def atomic(path, value):
@@ -858,10 +904,10 @@ def verify_sources(value):
         require(not directory.exists() or not list(directory.iterdir()), 'journal overrides refused')
 
 
-def system_show(mode, deadline):
-    raw = execute([SYSTEMCTL, 'show', UNIT[mode], '--no-pager',
-                   '--property=Id,LoadState,ActiveState,SubState,InvocationID,MainPID,ControlGroup,FragmentPath,DropInPaths,NeedDaemonReload'],
-                  deadline, 5)
+def system_show(mode, deadline, route=None):
+    raw = routed(route, [SYSTEMCTL, 'show', UNIT[mode], '--no-pager',
+                         '--property=Id,LoadState,ActiveState,SubState,InvocationID,MainPID,ControlGroup,FragmentPath,DropInPaths,NeedDaemonReload'],
+                 deadline, 5)
     try:
         fields = pairs([line.split('=', 1) for line in raw.decode().splitlines() if line])
     except (UnicodeError, ValueError):
@@ -887,8 +933,8 @@ def service_identity(fields):
     return {'invocation': invocation, 'group': group, 'pid': int(pid), 'start': start}
 
 
-def check_live(value, deadline):
-    fields = system_show(value['mode'], deadline)
+def check_live(value, deadline, route=None):
+    fields = system_show(value['mode'], deadline, route)
     require(fields['ActiveState'] in ('activating', 'active'), 'service is not running')
     observed = service_identity(fields)
     require(observed['invocation'] == value['invocation']
@@ -1464,10 +1510,10 @@ def kubeconfig():
     return digest(ca)
 
 
-def kubectl(args, deadline):
+def kubectl(args, deadline, route=None):
     try:
-        return execute([KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
-                        '--request-timeout=10s', *args], deadline, 10, user=True)
+        return routed(route, [KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
+                              '--request-timeout=10s', *args], deadline, 10, user=True)
     except Failure as error:
         # v1.35.0 kubectl cmd/util/helpers.go formats these known cases. Never
         # treat arbitrary exit1/authentication/x509 failures as startup pending.
@@ -1676,44 +1722,48 @@ def project_expected(expected):
     return projected
 
 
-def api_objects(resource, namespace, deadline):
+def api_objects(resource, namespace, deadline, route=None):
     args = ['get', resource, '-o', 'json']
     args += ['-A'] if namespace is None else ['-n', namespace]
-    data = json_data(kubectl(args, deadline))
+    data = json_data(kubectl(args, deadline, route))
     require(type(data) is dict and type(data.get('items')) is list and len(data['items']) <= 128,
             'API object list refused')
     return data['items']
 
 
-def api_ready(deadline):
+def api_ready(deadline, stage=None):
+    """``stage`` ('initial'/'final') only selects the fixed #430 route names; None labels nothing."""
+    def route(name):
+        return None if stage is None else 'api-%s-%s' % (stage, name)
     ca = kubeconfig()
-    if kubectl(['get', '--raw=/readyz'], deadline).strip() != b'ok':
+    if kubectl(['get', '--raw=/readyz'], deadline, route('readyz')).strip() != b'ok':
         raise Pending('API not ready')
-    nodes = api_objects('nodes', None, deadline)
+    nodes = api_objects('nodes', None, deadline, route('nodes'))
     if not nodes:
         raise Pending('control node pending')
     require(len(nodes) == 1 and nodes[0]['metadata']['name'] == 'control-1', 'control node identity differs')
     if not any(c.get('type') == 'Ready' and c.get('status') == 'True'
                for c in nodes[0].get('status', {}).get('conditions', [])):
         raise Pending('control node not ready')
-    ns = json_data(kubectl(['get', 'namespace', 'kube-system', '-o', 'json'], deadline))
+    ns = json_data(kubectl(['get', 'namespace', 'kube-system', '-o', 'json'], deadline,
+                           route('kube-system-ns')))
     cluster_uid = ns['metadata']['uid']
     require(type(cluster_uid) is str and 0 < len(cluster_uid) <= 128, 'cluster UID refused')
     installer = WORK / 'result' / RESULT
     expected = yaml_documents(read(installer / 'fab.yaml')) + yaml_documents(read(installer / 'include.yaml'))
-    kinds = {'Fabricator': ('fabricators.fabricator.githedgehog.com', 1),
-             'ControlNode': ('controlnodes.fabricator.githedgehog.com', 1),
-             'FabNode': ('fabnodes.fabricator.githedgehog.com', 0),
-             'Switch': ('switches.wiring.githedgehog.com', 7),
-             'Server': ('servers.wiring.githedgehog.com', 10),
-             'Connection': ('connections.wiring.githedgehog.com', 21),
-             'SwitchGroup': ('switchgroups.wiring.githedgehog.com', 3),
-             'VLANNamespace': ('vlannamespaces.wiring.githedgehog.com', 1),
-             'IPv4Namespace': ('ipv4namespaces.vpc.githedgehog.com', 1)}
+    kinds = {'Fabricator': ('fabricators.fabricator.githedgehog.com', 1, 'fabricators'),
+             'ControlNode': ('controlnodes.fabricator.githedgehog.com', 1, 'controlnodes'),
+             'FabNode': ('fabnodes.fabricator.githedgehog.com', 0, 'fabnodes'),
+             'Switch': ('switches.wiring.githedgehog.com', 7, 'switches'),
+             'Server': ('servers.wiring.githedgehog.com', 10, 'servers'),
+             'Connection': ('connections.wiring.githedgehog.com', 21, 'connections'),
+             'SwitchGroup': ('switchgroups.wiring.githedgehog.com', 3, 'switchgroups'),
+             'VLANNamespace': ('vlannamespaces.wiring.githedgehog.com', 1, 'vlannamespaces'),
+             'IPv4Namespace': ('ipv4namespaces.vpc.githedgehog.com', 1, 'ipv4namespaces')}
     require(all(d.get('kind') in kinds for d in expected), 'unexpected installer kind')
     observed = []
-    for kind, (resource, count) in kinds.items():
-        items = api_objects(resource, None, deadline)
+    for kind, (resource, count, short) in kinds.items():
+        items = api_objects(resource, None, deadline, route(short))
         if len(items) < count:
             raise Pending('canonical API objects pending')
         require(len(items) == count and all(d.get('kind') == kind for d in items),
@@ -1751,19 +1801,19 @@ def bridge_link(raw):
     return link
 
 
-def bridge_live(value, deadline):
+def bridge_live(value, deadline, route=None):
     """Every poll step rereads the exact published snapshot, clock and main pin."""
     require(state() == value, 'readiness state changed')
     require(operation_deadline(value) == deadline, 'operation clock refused')
-    check_live(value, deadline)
+    check_live(value, deadline, route)
 
 
-def bridge_probe(deadline):
+def bridge_probe(deadline, route=None):
     """One read-only query. Only the exact ordinary missing-device failure is Pending."""
     raw = b''
     try:
-        raw = execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'],
-                      deadline, 3, retain=False)
+        raw = routed(route, ['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'],
+                     deadline, 3, retain=False)
         return bridge_link(raw)['ifindex']
     except Failure as exc:
         if (exc.code == 1 and str(exc) == 'child command failed'
@@ -1784,18 +1834,23 @@ def bridge_probe(deadline):
 def bridge_prerequisite(value, deadline):
     """Wait only for genuine hhbr absence, inside the ORIGINAL operation deadline."""
     while True:
-        bridge_live(value, deadline)
-        index = bridge_probe(deadline)
+        bridge_live(value, deadline, 'svc-bridge-wait')
+        index = bridge_probe(deadline, 'bridge-wait-probe')
         if index is not None:
-            bridge_live(value, deadline)
+            bridge_live(value, deadline, 'svc-bridge-wait')
             return index
         time.sleep(min(BRIDGE_POLL_SECONDS, remaining(deadline)))
 
 
-def bridge_ready(deadline, expected=None):
-    execute([PYTHON, str(BRIDGE), '--bridge', 'hhbr', '--cidr', '172.30.0.2/21',
-             '--wait-seconds', '60', '--poll-ms', '250'], deadline, 60)
-    link = bridge_link(execute(['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'], deadline, 3))
+BRIDGE_INITIAL = ('bridge-initial-helper', 'bridge-initial-verify')
+BRIDGE_FINAL = ('bridge-final-helper', 'bridge-final-verify')
+
+
+def bridge_ready(deadline, expected=None, routes=(None, None)):
+    routed(routes[0], [PYTHON, str(BRIDGE), '--bridge', 'hhbr', '--cidr', '172.30.0.2/21',
+                       '--wait-seconds', '60', '--poll-ms', '250'], deadline, 60)
+    link = bridge_link(routed(routes[1], ['/usr/sbin/ip', '-j', '-d', 'link', 'show', 'dev', 'hhbr'],
+                              deadline, 3))
     info = link['linkinfo'].get('info_data', {})
     require(all(info.get(key) == 0 for key in ('nf_call_iptables', 'nf_call_ip6tables', 'nf_call_arptables')),
             'bridge filtering differs')
@@ -1822,35 +1877,37 @@ def unit_ready(mode):
 def ready_body(mode, original, deadline):
     with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         value = state()
-        pin = check_live(original, deadline)
+        pin = check_live(original, deadline, 'svc-entry')
         same_start(value, original, pin)
         value['service'] = pin
         save(value)
-    bridge_index = bridge_ready(deadline, bridge_prerequisite(value, deadline))
+    bridge_index = bridge_ready(deadline, bridge_prerequisite(value, deadline), BRIDGE_INITIAL)
     # Only file/API-discovery refusal may poll; strict inspection never retries.
     while True:
         remaining(deadline)
-        check_live(value, deadline)
+        check_live(value, deadline, 'svc-api-loop')
         try:
-            observed = api_ready(deadline)
+            observed = api_ready(deadline, 'initial')
             break
         except (Pending, FileNotFoundError):
             time.sleep(min(5, remaining(deadline)))
     if mode == 'resume':
         require(observed == value['cluster'], 'resumed cluster identity differs')
-    hhfab(['vlab', 'wait-switches'], deadline, cap=600)
-    hhfab(['vlab', 'inspect-switches'], deadline, ['--strict=true', '--wait-applied-for', '30'], cap=600)
-    require(api_ready(deadline) == observed and bridge_ready(deadline) == bridge_index,
+    hhfab(['vlab', 'wait-switches'], deadline, cap=600, route='hhfab-wait-switches')
+    hhfab(['vlab', 'inspect-switches'], deadline, ['--strict=true', '--wait-applied-for', '30'], cap=600,
+          route='hhfab-inspect-strict')
+    require(api_ready(deadline, 'final') == observed
+            and bridge_ready(deadline, routes=BRIDGE_FINAL) == bridge_index,
             'post-inspection identity differs')
-    check_live(value, deadline)
+    check_live(value, deadline, 'svc-post-inspect')
     critical = critical_snapshot(deadline)
     if mode == 'resume':
         require(critical == value['critical'], 'resume changed critical state')
-    check_live(value, deadline)
+    check_live(value, deadline, 'svc-post-critical')
     with locked(SIBLING_LOCK_SECONDS, deadline=deadline):
         current = state()
         require(current == value, 'readiness state changed')
-        check_live(current, deadline)
+        check_live(current, deadline, 'svc-final-lock')
         operation_deadline(current)
         current.update(phase='ready', critical=critical, cluster=observed)
         save(current)

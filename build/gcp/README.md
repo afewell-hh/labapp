@@ -1580,6 +1580,10 @@ initial boot UUID. The expected mode is `fresh` unless the owner's already valid
 primary terminal guest result is a failed `worker` diagnostic with phase `resume`
 and operation `core-start-resume` (issue #412); it is frozen at that validation,
 before supplemental observation or cleanup, and never read from guest export bytes.
+The shared validator accepts only bundle schema 3, whose `unit_ready` section carries a
+closed readiness-child `route` (null or one of 37 fixed values; see the core bundle
+contract); unknown, wrong-type, missing, extra, legacy-schema or status-incoherent values are
+`invalid` and retain nothing, while the trial result and cleanup are unchanged.
 It also compares the envelope with the bundle's operation/invocation
 (including null equality; a reservation export requires prepared guest state with
 no mode/operation/invocation)

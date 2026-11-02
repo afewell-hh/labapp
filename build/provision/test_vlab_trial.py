@@ -20,7 +20,7 @@ import stat
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import hhfab_release
 import vlab_trial as trial
@@ -3012,6 +3012,7 @@ class FirstFailureExport(unittest.TestCase):
     def setUp(self):
         import vlab_core as core
         self.core = core
+        self.real_ubuntu = core.ubuntu
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-export-')))
@@ -3069,34 +3070,183 @@ class FirstFailureExport(unittest.TestCase):
         self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']),
                          ('unit', self.operation, self.invocation))
         self.assertLessEqual(len(rest), trial.FAILURE_LIMIT)
-        # Bundle schema 2; the envelope/state/public schemas above are unchanged (1).
+        # Bundle schema 3 (#430 route); the envelope/state/public schemas above are unchanged (1).
         self.assertEqual((bundle['schema'], bundle['unit_ready']),
-                         (2, {'status': 'unavailable', 'message': None, 'code': None}))
+                         (3, {'status': 'unavailable', 'message': None, 'code': None, 'route': None}))
 
     def test_real_unit_ready_record_roundtrips_through_capture_export_and_validator(self):
         core = self.core
         value = self.value
 
-        def publish(message, code):
-            record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
+        def publish(message, code, route=None):
+            record = {'schema': 2, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
                       'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
                       'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
-                      'message': message, 'code': code}
+                      'message': message, 'code': code, 'route': route}
             core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
 
-        publish('synthetic readiness refusal', 17)
+        publish('synthetic readiness refusal', 17, 'api-final-switches')
         self.assertNotIn('invocation', self.reserved)
         self.capture(error=core.Failure('child command failed', 1, b'x'))
         bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
-        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17})
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal',
+                                                'code': 17, 'route': 'api-final-switches'})
         self.assertLessEqual(len((self.state_root / self.core.FIRST_FAILURE).read_bytes()), trial.FAILURE_LIMIT)
+
+    def readiness_chain(self, mode, *, prelaunch=False, uncertain=False):
+        """Actual executor -> unit_ready recorder -> capture -> export -> host, no staged records."""
+        import importlib
+        core = self.core
+        for name in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+            (self.state_root / name).unlink(missing_ok=True)
+        original = dict(self.value, mode=mode,
+                        deadline=self.value['started'] + core.START_SECONDS[mode])
+        reserved = {key: item for key, item in original.items() if key != 'invocation'}
+        core.atomic(self.state_root / 'state.json', original)
+        primary = core.Failure('child command failed', 1, b'PRIMARY_UNCHANGED')
+        primary.cleanup_uncertain = True
+        child = MagicMock()
+        child.pid = 424242
+        child.stdout.fileno.return_value = 123
+        child.wait.return_value = 19
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.select.return_value = [True]
+        observed = []
+        def body(*_):
+            # Restore child-only observations before unit_ready reads/writes real files.
+            with ExitStack() as child_scope:
+                spawn = child_scope.enter_context(patch.object(core.subprocess, 'Popen', return_value=child))
+                child_scope.enter_context(patch.object(core.selectors, 'DefaultSelector', return_value=selector))
+                child_scope.enter_context(patch.object(core.os, 'read', side_effect=[b'CHILD_PRIVATE', b'']))
+                kill = child_scope.enter_context(patch.object(core.os, 'killpg', side_effect=(
+                    OSError('synthetic uncertainty') if uncertain else ProcessLookupError())))
+                if prelaunch:
+                    child_scope.enter_context(patch.object(core, 'ubuntu', self.real_ubuntu))
+                    child_scope.enter_context(patch.object(core.pwd, 'getpwnam', return_value=SimpleNamespace(
+                        pw_uid=0, pw_gid=0, pw_dir='/home/ubuntu')))
+                else:
+                    child_scope.enter_context(patch.object(core, 'ubuntu', return_value=SimpleNamespace(
+                        pw_uid=os.getuid(), pw_gid=os.getgid())))
+                    child_scope.enter_context(patch.object(core.os, 'getgrouplist', return_value=[os.getgid()]))
+                try:
+                    core.kubectl(['get', '--raw=/readyz'], original['deadline'], 'api-final-readyz')
+                except core.Failure as error:
+                    observed.append(error)
+                    if prelaunch:
+                        spawn.assert_not_called()
+                        kill.assert_not_called()
+                    else:
+                        spawn.assert_called_once()
+                        kill.assert_called_once_with(child.pid, core.signal.SIGKILL)
+                        child.stdout.close.assert_called_once()
+                    raise
+        with patch.dict(os.environ, {'INVOCATION_ID': self.invocation}), \
+             patch.object(core, 'startup_snapshot', return_value=(original, original['deadline'])), \
+             patch.object(core, 'ready_body', side_effect=body):
+            with self.assertRaises(core.Failure) as raised:
+                core.unit_ready(mode)
+        error = raised.exception
+        self.assertIs(error, observed[0])
+        expected = ('ubuntu identity refused', 1, b'', None) if prelaunch else (
+            'child command failed', 19, b'CHILD_PRIVATE', 'api-final-readyz')
+        self.assertEqual((str(error), error.code, error.private_output, error.route), expected)
+        self.assertEqual(getattr(error, 'cleanup_uncertain', False), uncertain)
+        record_raw = (self.state_root / core.UNIT_READY_FAILURE).read_bytes()
+        record = core.json_data(record_raw)
+        self.assertEqual((record['message'], record['code'], record['route']), (expected[0], expected[1], expected[3]))
+        self.assertLessEqual(len(record_raw), core.UNIT_READY_LIMIT)
+        core.capture_first_failure(mode, reserved, primary, original['deadline'])
+        written = (self.state_root / core.FIRST_FAILURE).read_bytes()
+        bundle = trial.first_failure_bundle(written)
+        self.assertEqual(bundle['unit_ready'], dict(status='ok', message=expected[0], code=expected[1], route=expected[3]))
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
+        self.assertEqual(base64.b64decode(bundle['primary']['output']), b'PRIMARY_UNCHANGED')
+        self.assertEqual((str(primary), primary.code, primary.private_output, primary.cleanup_uncertain),
+                         ('child command failed', 1, b'PRIMARY_UNCHANGED', True))
+        self.assertLessEqual(len(written), trial.FAILURE_LIMIT)
+        detail = {'origin': 'worker', 'phase': mode, 'operation': 'core-start-' + mode,
+                  'category': 'child-exit', 'child_status': 1}
+        trial.atomic(self.root / 'result.json', {'schema': 2, 'code': 1, 'contained': True,
+                                               'nonce': NONCE, 'diagnostic': detail})
+        raw = trial.export_failure(NONCE)
+        first, _, rest = raw.partition(b'\n')
+        self.assertEqual(rest, written)  # exact writer bytes reach the host, no reconstructed bundle
+        envelope = trial.data(first)
+        self.assertEqual(envelope, {'schema': 1, 'source_sha': self.v['source_sha'], 'nonce': NONCE,
+                                    'mode': mode, 'operation': self.operation, 'invocation': self.invocation,
+                                    'boot': original['boot']})
+        with patch.object(sys, 'path', [str(Path(__file__).resolve().parents[2]), *sys.path]):
+            host = importlib.import_module('build.gcp.vlab_trial')
+        args = (self.v['source_sha'], NONCE, original['boot'], mode)
+        self.assertEqual(host.accept_failure(raw, *args), ('captured', raw))
+        # Same genuine bytes refuse each independent host binding; mode's fresh default remains strict.
+        for index, foreign in ((0, '9' * 40), (1, '9' * 32),
+                               (2, '33333333-3333-4333-8333-333333333333'),
+                               (3, 'resume' if mode == 'fresh' else 'fresh')):
+            changed = list(args)
+            changed[index] = foreign
+            self.assertEqual(host.accept_failure(raw, *changed), ('invalid', None))
+        for key in ('operation', 'invocation'):
+            foreign = dict(envelope, **{key: '9' * 32})
+            self.assertEqual(host.accept_failure(trial.encoded(foreign) + b'\n' + rest, *args), ('invalid', None))
+        self.assertEqual((self.state_root / core.UNIT_READY_FAILURE).read_bytes(), record_raw)
+        self.assertEqual((self.state_root / core.FIRST_FAILURE).read_bytes(), written)
+
+    def test_real_executed_readiness_failure_whole_chain_fresh_and_resume(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode)
+
+    def test_real_prelaunch_identity_refusal_whole_chain_has_null_route_in_both_modes(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode, prelaunch=True)
+
+    def test_real_executed_cleanup_uncertainty_whole_chain_preserves_primary_in_both_modes(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode, uncertain=True)
+
+    def test_every_closed_route_and_null_roundtrip_writer_to_export_and_unknown_routes_are_not_exported(self):
+        core = self.core
+        value = self.value
+        def publish(route, schema=2):
+            record = {'schema': schema, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
+                      'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
+                      'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
+                      'message': 'synthetic readiness refusal', 'code': 124, 'route': route}
+            core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
+        self.assertEqual(tuple(trial.FAILURE_ROUTES), tuple(core.UNIT_READY_ROUTES))
+        for route in (*core.UNIT_READY_ROUTES, None):
+            with self.subTest(route=route):
+                for name in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+                    (self.state_root / name).unlink(missing_ok=True)
+                publish(route)
+                self.capture(error=core.Failure('child deadline exceeded', 124))
+                bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+                self.assertEqual(bundle['unit_ready']['route'], route)
+                self.assertEqual(bundle['unit_ready']['status'], 'ok')
+        # Writer-side refusals reach the bundle as a null, status-coherent invalid/unavailable section.
+        for name, route, schema in (('unknown', 'api-final-pods', 2), ('wrong type', 7, 2),
+                                    ('legacy schema', 'svc-entry', 1)):
+            with self.subTest(name):
+                for fixed in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+                    (self.state_root / fixed).unlink(missing_ok=True)
+                publish(route, schema)
+                self.capture(error=core.Failure('child deadline exceeded', 124))
+                bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None,
+                                                        'route': None})
+                self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                                 ('child deadline exceeded', 124))
 
     def test_missing_current_clock_authority_invalidates_only_readiness_section(self):
         current = {key: item for key, item in self.value.items() if key != 'started'}
         self.core.atomic(self.state_root / 'state.json', current)
         self.capture()
         bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
-        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None, 'route': None})
         self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
         self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
         self.assertEqual(len(self.queries), 2)
@@ -3198,6 +3348,8 @@ class FirstFailureExport(unittest.TestCase):
         self.capture()
         good = json.loads((self.state_root / self.core.FIRST_FAILURE).read_bytes())
         import base64
+        def ready(status, message=None, code=None, route=None):
+            return {'status': status, 'message': message, 'code': code, 'route': route}
         cases = {
             'extra key': dict(good, extra=1), 'missing key': {k: v for k, v in good.items() if k != 'journal'},
             'bool schema': dict(good, schema=True), 'wrong source': dict(good, source='other'),
@@ -3218,28 +3370,48 @@ class FirstFailureExport(unittest.TestCase):
             'context cap': dict(good, command_context=dict(good['command_context'], status='ok',
                                output=base64.b64encode(b'x' * 2049).decode())),
             'extra state field': dict(good, state=dict(good['state'], text=SENTINEL)),
-            'legacy schema 1': dict(good, schema=1), 'future schema 3': dict(good, schema=3),
+            'legacy schema 1': dict(good, schema=1), 'legacy schema 2': dict(good, schema=2),
+            'future schema 4': dict(good, schema=4),
             'missing unit_ready': {k: v for k, v in good.items() if k != 'unit_ready'},
             'null unit_ready': dict(good, unit_ready=None),
             'unit_ready extra key': dict(good, unit_ready=dict(good['unit_ready'], extra=1)),
-            'unit_ready missing key': dict(good, unit_ready={'status': 'unavailable', 'message': None}),
-            'unit_ready bad status': dict(good, unit_ready={'status': 'captured', 'message': None, 'code': None}),
-            'ok null message': dict(good, unit_ready={'status': 'ok', 'message': None, 'code': 1}),
-            'ok null code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': None}),
-            'ok bool code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': True}),
-            'ok float code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': 1.0}),
-            'ok negative code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': -1}),
-            'ok long message': dict(good, unit_ready={'status': 'ok', 'message': 'x' * 129, 'code': 1}),
-            'ok empty message': dict(good, unit_ready={'status': 'ok', 'message': '', 'code': 1}),
-            'ok non-ascii message': dict(good, unit_ready={'status': 'ok', 'message': 'café', 'code': 1}),
-            'unavailable with message': dict(good, unit_ready={'status': 'unavailable', 'message': 'x', 'code': None}),
-            'invalid with code': dict(good, unit_ready={'status': 'invalid', 'message': None, 'code': 0}),
+            'unit_ready missing key': dict(good, unit_ready={'status': 'unavailable', 'message': None,
+                                                             'route': None}),
+            'unit_ready legacy three keys': dict(good, unit_ready={'status': 'unavailable', 'message': None,
+                                                                    'code': None}),
+            'unit_ready missing route': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': 1}),
+            'unit_ready bad status': dict(good, unit_ready=ready('captured')),
+            'ok null message': dict(good, unit_ready=ready('ok', None, 1)),
+            'ok null code': dict(good, unit_ready=ready('ok', 'x', None)),
+            'ok bool code': dict(good, unit_ready=ready('ok', 'x', True)),
+            'ok float code': dict(good, unit_ready=ready('ok', 'x', 1.0)),
+            'ok negative code': dict(good, unit_ready=ready('ok', 'x', -1)),
+            'ok long message': dict(good, unit_ready=ready('ok', 'x' * 129, 1)),
+            'ok empty message': dict(good, unit_ready=ready('ok', '', 1)),
+            'ok non-ascii message': dict(good, unit_ready=ready('ok', 'café', 1)),
+            'unavailable with message': dict(good, unit_ready=ready('unavailable', 'x', None)),
+            'invalid with code': dict(good, unit_ready=ready('invalid', None, 0)),
+            'unknown route': dict(good, unit_ready=ready('ok', 'x', 1, 'api-final-pods')),
+            'generic route': dict(good, unit_ready=ready('ok', 'x', 1, 'kubectl-list')),
+            'route wrong case': dict(good, unit_ready=ready('ok', 'x', 1, 'SVC-ENTRY')),
+            'route empty': dict(good, unit_ready=ready('ok', 'x', 1, '')),
+            'route int': dict(good, unit_ready=ready('ok', 'x', 1, 1)),
+            'route bool': dict(good, unit_ready=ready('ok', 'x', 1, True)),
+            'route list': dict(good, unit_ready=ready('ok', 'x', 1, ['svc-entry'])),
+            'route dict': dict(good, unit_ready=ready('ok', 'x', 1, {'svc-entry': 1})),
+            'route free text': dict(good, unit_ready=ready('ok', 'x', 1, '/usr/local/bin/kubectl get nodes')),
+            'unavailable with route': dict(good, unit_ready=ready('unavailable', None, None, 'svc-entry')),
+            'invalid with route': dict(good, unit_ready=ready('invalid', None, None, 'api-final-nodes')),
             'ok on reservation': dict(good, operation=None, invocation=None, stage='reserve',
                                       manager={'status': 'unavailable', 'output': ''},
                                       journal={'status': 'unavailable', 'output': ''},
                                       command_context=dict(good['command_context'], status='unavailable', output=''),
-                                      unit_ready={'status': 'ok', 'message': 'x', 'code': 1}),
+                                      unit_ready=ready('ok', 'x', 1)),
         }
+        # Positive controls: the same shapes with exact closed values are accepted.
+        for route in (None, *trial.FAILURE_ROUTES):
+            accepted = trial.first_failure_bundle(trial.encoded(dict(good, unit_ready=ready('ok', 'x', 1, route))))
+            self.assertEqual(accepted['unit_ready']['route'], route)
         for name, bad in cases.items():
             with self.subTest(name), self.assertRaises(trial.Failure):
                 trial.first_failure_bundle(trial.encoded(bad))
