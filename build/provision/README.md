@@ -964,9 +964,10 @@ method children. It fails closed on unknown census/identity, and never kills
 unrelated processes. The helper source change also invalidates earlier hashed
 module identities; existing captures and bundles are not rewritten.
 
-The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
+The full Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
 containers, then runs the unchanged QEMU module twice in each and checks actual
-signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. Base manifest digest is
+unavailable-pin/hold/drift refusal and unchanged APT configuration. Signature
+controls are required separately as described above. Base manifest digest is
 `68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`;
 Python pins are `3.12.3-0ubuntu2.1`/`3.12.3-1ubuntu0.17`, CA certificates
 `20240203`. Bootstrap transitive inputs come from current official mirrors and

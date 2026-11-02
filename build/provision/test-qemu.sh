@@ -24,8 +24,6 @@ auth_id=
 auth_runs=0
 image_id=
 workdir="$(mktemp -d /tmp/labapp-qemu-test.XXXXXXXX)"
-mkdir -m 700 "$workdir/home" "$workdir/docker"
-printf '{}\n' > "$workdir/docker/config.json"
 docker_timeout() {
   local kill_after=$1 seconds=$2
   shift 2
@@ -84,6 +82,8 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+mkdir -m 700 "$workdir/home" "$workdir/docker"
+printf '{}\n' > "$workdir/docker/config.json"
 [[ -x /usr/bin/docker ]]
 docker_timeout 1s 5s version --format 'Docker server {{.Server.Version}}'
 lane_failed=0
