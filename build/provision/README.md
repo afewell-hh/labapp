@@ -1673,6 +1673,25 @@ SSH-facing process disappears; killing a client alone is insufficient. A lost
 receipt or uncertain containment never becomes clean success. Primary124/130/
 143/nonzero survives secondary cleanup errors.
 
+Replaced guardian state (#422). `phase.json` and `heartbeat.json` are published by
+exclusive temp file plus `os.replace`. An open descriptor remains usable after replacement,
+but its old inode can lose its last link between `regular()`'s two `fstat` calls.
+Only the exact observed signature (initial guards passed, byte count equals the
+initial size, dev/ino/size/mtime/uid/gid/full mode unchanged, link count exactly 1 to 0,
+ctime changed) is a private `Failure` subtype with the unchanged "file changed"
+message/code/category. Four guardian sites (initial and post-auth heartbeat, supervision
+phase and heartbeat) go through `guardian_state()`: the first such failure's bytes are
+DISCARDED, the original `Clock` is checked, one more complete `regular()` runs (at most two
+application-level reads of 4097 bytes, no sleep, third attempt or renewal), and the clock is
+checked again. Any other change, a second failure, expiry or signal is the terminal primary.
+Parsing, age, boot, resource and OOM checks apply to the consumed bytes unchanged.
+Phase recovery checks the original persistence cutoff, then the consumed phase's cutoff;
+heartbeat recovery uses the original stage or consumed phase cutoff. The loop checks that
+same consumed phase cutoff after heartbeat parsing and freshness, before continuing.
+Strict readers (`result.json`, auth/credential, contract, writer sequence,
+`auth_publish_check`) never recover. This proves neither legitimate publication, ordering
+nor interference-free history, and does not establish the cause of canonical13.
+
 All cutoffs are absolute from durable admission, with wall AND monotonic bounds:
 
 | Phase | Cutoff in minutes |
