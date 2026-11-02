@@ -492,13 +492,17 @@ def run(argv, clock, phase, cap=30, user=False, on_failure=None):
 
 
 # ---- Private bounded installer failure evidence (#439) ---------------------------
-# Only the original install-docker.py nonzero (code, output) tuple returned by call_bounded
-# is captured, before those bytes disappear. Timeout/overflow/spawn/cleanup exceptions carry
+# Only the original nonzero (code, output) tuple returned by call_bounded for exactly two
+# operations (install-docker.py, and the auxiliary APT ``update``) is captured, before those
+# bytes disappear. Timeout/overflow/spawn/cleanup exceptions carry
 # no tuple and create no record; absence never proves non-execution. Raw bytes are never
 # decoded, repr'd or truncated twice. The record stays in the root-0700 trial root.
 INSTALLER_FAILURE = 'installer-failure.json'
 INSTALLER_SCHEMA = 1
-INSTALLER_OPERATION = 'install-docker'
+INSTALLER_OPERATION = 'install-docker'  # default operation; unchanged Docker call behavior
+# Separate closed allowance (not a replacement of the scalar default). Body, envelope and the
+# host-validated terminal must all name the SAME one of these two operations.
+INSTALLER_OPERATIONS = ('install-docker', 'aux-update')
 INSTALLER_HEAD = 1024
 INSTALLER_TAIL = 12288
 INSTALLER_WHOLE = INSTALLER_HEAD + INSTALLER_TAIL
@@ -517,10 +521,10 @@ def exact_int(value):
 
 
 def installer_terminal(detail):
-    """True only for a validated failed worker/stage/install-docker child exit/signal diagnostic."""
+    """True only for a validated failed worker/stage child exit/signal diagnostic of install-docker or aux-update."""
     return (type(detail) is dict and detail.get('category') in ('child-exit', 'child-signal')
-            and (detail.get('origin'), detail.get('phase'), detail.get('operation'))
-            == ('worker', 'stage', INSTALLER_OPERATION)
+            and (detail.get('origin'), detail.get('phase')) == ('worker', 'stage')
+            and type(detail.get('operation')) is str and detail['operation'] in INSTALLER_OPERATIONS
             and exact_int(detail.get('child_status'))
             and child_status_ok(detail['category'], detail['child_status']))
 
@@ -545,7 +549,8 @@ def installer_body(raw):
         raise Failure('installer evidence refused') from None
     require(type(item) is dict and set(item) == INSTALLER_FIELDS, 'installer evidence refused')
     require(exact_int(item['schema']) and item['schema'] == INSTALLER_SCHEMA and item['kind'] == 'installer'
-            and item['phase'] == 'stage' and item['operation'] == INSTALLER_OPERATION, 'installer evidence refused')
+            and item['phase'] == 'stage' and type(item['operation']) is str
+            and item['operation'] in INSTALLER_OPERATIONS, 'installer evidence refused')
     require(type(item['source_sha']) is str and re.fullmatch('[a-f0-9]{40}', item['source_sha'])
             and type(item['nonce']) is str and re.fullmatch(HEX32, item['nonce'])
             and type(item['lease']) is str and re.fullmatch(UUID, item['lease'])
@@ -571,7 +576,7 @@ def installer_body(raw):
     return dict(item)
 
 
-def installer_bound(item, value, boot, outcome=None, status=None):
+def installer_bound(item, value, boot, outcome=None, status=None, operation=None):
     """Binding to the trusted contract + live boot (+ validated terminal), admission/stage bounds.
 
     The stage window is absolute from admission; no renewal, nothing here reads the clock.
@@ -581,6 +586,9 @@ def installer_bound(item, value, boot, outcome=None, status=None):
             'installer evidence binding refused')
     captured = item['captured_at']
     require(stamp(value['admitted_at']) <= captured < phase_end(value, 'stage'), 'installer evidence time refused')
+    if operation is not None:
+        require(operation in INSTALLER_OPERATIONS and item['operation'] == operation,
+                'installer evidence operation refused')
     if outcome is not None:
         require(item['outcome'] == outcome and item['status'] == status and exact_int(status),
                 'installer evidence terminal refused')
@@ -590,12 +598,13 @@ def installer_bound(item, value, boot, outcome=None, status=None):
 def installer_envelope(value, boot, detail):
     return {'schema': INSTALLER_ENVELOPE_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
             'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
-            'operation': INSTALLER_OPERATION, 'outcome': detail['category'].removeprefix('child-'),
+            'operation': detail['operation'], 'outcome': detail['category'].removeprefix('child-'),
             'status': detail['child_status']}
 
 
-def installer_record(value, boot, code, out, now):
+def installer_record(value, boot, code, out, now, operation=INSTALLER_OPERATION):
     """Construct the exact record body from one returned nonzero (code, output) tuple."""
+    require(type(operation) is str and operation in INSTALLER_OPERATIONS, 'installer evidence refused')
     require(exact_int(code) and code != 0 and type(out) is bytes and len(out) <= INSTALLER_OBSERVED_LIMIT,
             'installer evidence refused')
     observed = len(out)
@@ -606,14 +615,14 @@ def installer_record(value, boot, code, out, now):
         omitted, status = observed - INSTALLER_WHOLE, 'truncated'
     body = {'schema': INSTALLER_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
             'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
-            'operation': INSTALLER_OPERATION,
+            'operation': operation,
             'captured_at': int(now),
             'outcome': 'exit' if code > 0 else 'signal', 'status': code,
             'observed': observed, 'kept_head': len(head), 'kept_tail': len(tail), 'omitted': omitted,
             'output_status': status, 'head': base64.b64encode(head).decode(),
             'tail': base64.b64encode(tail).decode()}
     raw = encoded(body)
-    installer_bound(installer_body(raw), value, boot)
+    installer_bound(installer_body(raw), value, boot, operation=operation)
     return raw
 
 
@@ -648,10 +657,11 @@ def write_installer_failure(raw, clock):
             pass
 
 
-def capture_installer_failure(value, clock, code, out):
-    """Diagnostic-only hook body for install-docker.py. Creates no subprocess and renews nothing."""
+def capture_installer_failure(value, clock, code, out, operation=INSTALLER_OPERATION):
+    """Diagnostic-only hook body for install-docker.py (default) or the aux-update APT call.
+    Creates no subprocess and renews nothing."""
     clock.remaining('stage')
-    raw = installer_record(value, kernel_boot(), code, out, time.time())
+    raw = installer_record(value, kernel_boot(), code, out, time.time(), operation)
     write_installer_failure(raw, clock)
 
 
@@ -1325,7 +1335,8 @@ def export_installer(value, nonce, detail):
     except FileNotFoundError:
         return b'absent'
     envelope = installer_envelope(value, boot, detail)
-    item = installer_bound(installer_body(raw), value, boot, detail['category'].removeprefix('child-'), detail['child_status'])
+    item = installer_bound(installer_body(raw), value, boot, detail['category'].removeprefix('child-'), detail['child_status'],
+                          detail['operation'])
     require(time.time() < stamp(value['deadline']), 'installer export after original deadline')
     require({k: item[k] for k in INSTALLER_ENVELOPE_FIELDS - {'schema'}} == {k: v for k, v in envelope.items()
                                                                               if k != 'schema'})
@@ -1670,11 +1681,13 @@ def auxiliary_plan(raw, before):
     return plan
 
 
-def provision_aux(clock):
+def provision_aux(clock, value=None):
     """Reuse authenticated fixed Ubuntu APT setup, preserving satisfactory stock.
 
     Selected auxiliary full versions are candidate facts, never recovered pins.
     No source edits, global upgrade, removals, downgrades or repair are allowed.
+    ``value`` (the trusted contract) enables private failure evidence for the aux-update
+    invocation ONLY; without it nothing is captured.
     """
     mark('stage', 'aux-inventory')
     import qemu_offline
@@ -1697,14 +1710,25 @@ def provision_aux(clock):
     for name in ('fixed.conf', 'sources.list'):
         (public_apt / name).chmod(0o644)
     apt_env = dict(ENV, APT_CONFIG=config)
-    def apt_run(args):
+    def apt_run(args, on_failure=None):
         code, out = call_bounded(args, min(180, clock.remaining('stage')), apt_env)
         if code:
-            raise child_failure(code, 'authenticated auxiliary APT refused')
+            # The original primary Failure is built BEFORE any diagnostic hook; whatever the
+            # hook raises (even an interruption) is discarded and this identical object is raised.
+            failure = child_failure(code, 'authenticated auxiliary APT refused')
+            if on_failure is not None:
+                try:
+                    on_failure(code, out)
+                except BaseException:
+                    pass
+            raise failure
         return out
+    update_hook = None if value is None else (
+        lambda code, raw, value=value, clock=clock: capture_installer_failure(
+            value, clock, code, raw, 'aux-update'))
     try:
         mark('stage', 'aux-update')
-        apt_run([*apt, '-o', 'APT::Update::Error-Mode=any', 'update'])
+        apt_run([*apt, '-o', 'APT::Update::Error-Mode=any', 'update'], update_hook)
         mark('stage', 'aux-check')
         apt_run([*apt, 'check'])
         mark('stage', 'aux-simulate')
@@ -1936,7 +1960,7 @@ def provision(value):
         require(code in (0, 1, 5))
         require(raw == b'LoadState=not-found\n', 'preexisting daemon refused')
     exclusive(ROOT / 'daemon-intent.json', encoded({'units': ['docker.socket', 'docker.service', 'containerd.service']}))
-    provision_aux(clock)
+    provision_aux(clock, value)
     for script, args, cap in (
             ('install-qemu.py', ['--selection', 'baseline-20260114'], 235),
             ('install-docker.py', ['--receipt', str(ROOT / 'docker-receipt.json')], 235),

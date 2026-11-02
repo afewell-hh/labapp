@@ -4287,3 +4287,195 @@ class InstallerFailureEvidence(unittest.TestCase):
                 self.assertFalse(trial.installer_terminal(detail))
         self.assertTrue(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker',
                                                   'category': 'child-signal', 'child_status': -9}))
+
+    # -- auxiliary APT update uses the same private record, bound to its own exact operation ----
+    def aux_run(self, faults=None, capture=None):
+        """Run the ACTUAL provision_aux; only the bounded child and package inventory are faked.
+
+        -> (raised exception or None, ordered list of the apt step names that were launched).
+        """
+        faults, seen = faults or {}, []
+        before = {name: '1' for name in trial.AUX if name != 'socat'}
+        after = dict(before, socat='1.8.0.0-4ubuntu0.1')
+        def bounded(args, seconds, **kwargs):
+            step = 'update' if 'update' in args else 'check' if 'check' in args else 'other'
+            seen.append(step)
+            fault = faults.get(step)
+            if isinstance(fault, BaseException):
+                raise fault
+            if fault is not None:
+                return fault
+            if '--simulate' in args:
+                return 0, b'Inst socat (1.8.0.0-4ubuntu0.1 Ubuntu:24.04/noble [amd64])\n'
+            return 0, b''
+        error = None
+        with ExitStack() as local:
+            local.enter_context(patch.object(trial, 'APT_TMP', self.base))
+            local.enter_context(patch.object(trial, 'installed', side_effect=[before, after]))
+            local.enter_context(patch.object(trial, 'run', return_value=b''))
+            local.enter_context(patch.object(hhfab_release, 'bounded', side_effect=bounded))
+            if capture is not None:
+                local.enter_context(patch.object(trial, 'capture_installer_failure', side_effect=capture))
+            try:
+                trial.provision_aux(self.clock, self.v)
+            except BaseException as caught:
+                error = caught
+        return error, seen
+
+    def test_actual_aux_update_exit_failure_writes_the_private_record_for_that_exact_operation(self):
+        output = b'E: Failed to fetch https://example.invalid/ 503\n\xff\x00'
+        error, seen = self.aux_run({'update': (100, output)})
+        self.assertIsInstance(error, trial.Failure)
+        self.assertEqual((str(error), error.code, error.category, error.child_status),
+                         ('authenticated auxiliary APT refused', 100, 'child-exit', 100))
+        self.assertEqual(seen, ['update'])  # the later steps never ran
+        item = trial.installer_body(self.final.read_bytes())
+        self.assertEqual((item['operation'], item['outcome'], item['status'], item['observed']),
+                         ('aux-update', 'exit', 100, len(output)))
+        self.assertEqual(base64.b64decode(item['head']), output)
+        self.assertFalse(self.temp.exists())
+        self.assertFalse(list(self.base.glob('labapp-vlab-aux-*')))  # cleanup still ran
+        # the guest exporter binds the SAME operation from the validated terminal
+        self.terminal('child-exit', 100, 'aux-update')
+        exported = trial.export_failure(NONCE)
+        self.assertEqual(json.loads(exported.partition(b'\n')[0])['operation'], 'aux-update')
+        self.assertEqual(exported.partition(b'\n')[2], self.final.read_bytes())
+        # signal exit from update is captured as a signal
+        self.final.unlink()
+        error, _ = self.aux_run({'update': (-9, b'')})
+        self.assertEqual((error.code, error.category, error.child_status), (137, 'child-signal', -9))
+        self.assertEqual(trial.installer_body(self.final.read_bytes())['outcome'], 'signal')
+
+    def test_aux_update_capture_is_attached_only_to_the_update_invocation(self):
+        calls = []
+        for step in ('check', 'other'):
+            calls.clear()
+            error, seen = self.aux_run({step: (100, b'x')}, capture=lambda *a, **k: calls.append(a))
+            self.assertIsInstance(error, trial.Failure)
+            self.assertIn(step, seen)
+            self.assertEqual(calls, [])
+            self.assertFalse(self.final.exists())
+        error, seen = self.aux_run(capture=lambda *a, **k: calls.append(a))
+        self.assertIsNone(error)  # success captures nothing
+        self.assertEqual(calls, [])
+        self.assertFalse(self.final.exists())
+        error, _ = self.aux_run({'update': (100, b'x')}, capture=lambda *a, **k: calls.append((a, k)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0][0][2], calls[0][0][3]), (100, b'x'))
+        self.assertIn('aux-update', calls[0][0][4:] + tuple(calls[0][1].values()))
+        # without the trusted contract nothing can be captured
+        with ExitStack() as local:
+            local.enter_context(patch.object(trial, 'APT_TMP', self.base))
+            local.enter_context(patch.object(trial, 'installed', return_value={}))
+            local.enter_context(patch.object(trial, 'run', return_value=b''))
+            local.enter_context(patch.object(hhfab_release, 'bounded', return_value=(100, b'x')))
+            local.enter_context(patch.object(trial, 'capture_installer_failure', side_effect=AssertionError('no hook')))
+            with self.assertRaises(trial.Failure):
+                trial.provision_aux(self.clock)
+
+    def test_aux_update_no_tuple_exceptions_create_no_record(self):
+        for name, fault, expected in (
+                ('timeout', hhfab_release.Refusal('command timeout'), (124, 'child-timeout')),
+                ('overflow', hhfab_release.Refusal('command output overflow'), (1, 'output-overflow')),
+                ('other refusal', hhfab_release.Refusal(SENTINEL), (1, 'exception')),
+                ('spawn failure', OSError(SENTINEL), None)):
+            with self.subTest(name):
+                calls = []
+                error, seen = self.aux_run({'update': fault}, capture=lambda *a, **k: calls.append(a))
+                self.assertEqual(calls, [])
+                self.assertFalse(self.final.exists() or self.temp.exists())
+                if expected is None:
+                    self.assertIsInstance(error, OSError)
+                else:
+                    self.assertEqual((error.code, error.category), expected)
+                    self.assertNotIn(SENTINEL, str(error))
+
+    def test_aux_update_hook_faults_never_replace_the_identical_original_failure(self):
+        real_child, built = trial.child_failure, []
+        def make(code, message):
+            built.append(real_child(code, message))
+            return built[-1]
+        for fault in (OSError(SENTINEL), KeyboardInterrupt(), SystemExit(143), trial.Failure('signal', 143, 'interrupted'),
+                      RuntimeError(SENTINEL)):
+            with self.subTest(type(fault).__name__):
+                built.clear()
+                with patch.object(trial, 'child_failure', side_effect=make):
+                    error, _ = self.aux_run({'update': (100, b'x')}, capture=fault)
+                self.assertEqual(len(built), 1)
+                self.assertIs(error, built[0])  # the SAME object, constructed before the hook ran
+                self.assertIsNone(error.__context__)
+                self.assertEqual((str(error), error.code, error.category, error.child_status),
+                                 ('authenticated auxiliary APT refused', 100, 'child-exit', 100))
+        # real writer I/O faults reached through the real hook
+        real_capture, attempted = trial.capture_installer_failure, []
+        for name in ('open', 'link', 'fsync'):
+            def capture(v, clock, code, out, operation, name=name):
+                # Inject only while the real aux-update capture runs; APT setup/cleanup stay real.
+                with patch.object(os, name, side_effect=OSError(SENTINEL)) as injected:
+                    try:
+                        real_capture(v, clock, code, out, operation)
+                    finally:
+                        attempted.append((name, operation, injected.called))
+            with self.subTest('writer ' + name):
+                built.clear()
+                with patch.object(trial, 'child_failure', side_effect=make):
+                    error, _ = self.aux_run({'update': (100, b'x')}, capture=capture)
+                self.assertEqual(attempted[-1], (name, 'aux-update', True))  # reached the real writer
+                self.assertIs(error, built[0])
+                self.assertEqual((error.code, error.category, error.child_status), (100, 'child-exit', 100))
+                self.assertFalse(self.final.exists() or self.temp.exists())
+        # a stage cutoff passed before capture: primary stays, no record
+        expired = Mock()
+        expired.remaining.side_effect = [100, trial.Failure('deadline', 124, 'phase-cutoff')] + [100] * 20
+        with ExitStack() as local:
+            local.enter_context(patch.object(trial, 'APT_TMP', self.base))
+            local.enter_context(patch.object(trial, 'installed', return_value={}))
+            local.enter_context(patch.object(trial, 'run', return_value=b''))
+            local.enter_context(patch.object(hhfab_release, 'bounded', return_value=(100, b'x')))
+            with self.assertRaises(trial.Failure) as raised:
+                trial.provision_aux(expired, self.v)
+        self.assertEqual((raised.exception.code, raised.exception.category), (100, 'child-exit'))
+        self.assertFalse(self.final.exists())
+
+    def test_operation_is_a_separate_closed_allowance_bound_identically_by_body_envelope_and_terminal(self):
+        self.assertEqual(trial.INSTALLER_OPERATION, 'install-docker')  # scalar default unchanged
+        self.assertEqual(trial.INSTALLER_OPERATIONS, ('install-docker', 'aux-update'))
+        docker, aux = self.record(b'd', 100), trial.installer_record(
+            self.v, self.v['boot_uuid'], 100, b'a', time.time(), 'aux-update')
+        self.assertEqual(trial.installer_body(docker)['operation'], 'install-docker')
+        self.assertEqual(trial.installer_body(aux)['operation'], 'aux-update')
+        for operation in ('aux-check', 'install-hhfab', '', None, ['aux-update'], 'AUX-UPDATE'):
+            with self.subTest(operation=operation), self.assertRaises(trial.Failure):
+                trial.installer_record(self.v, self.v['boot_uuid'], 100, b'a', time.time(), operation)
+            body = dict(json.loads(aux), operation=operation)
+            with self.subTest(body=operation), self.assertRaises((trial.Failure, TypeError)):
+                trial.installer_body(trial.encoded(body))
+        for item_op, bound_op in (('install-docker', 'aux-update'), ('aux-update', 'install-docker')):
+            item = trial.installer_body(docker if item_op == 'install-docker' else aux)
+            with self.subTest(item=item_op, bound=bound_op), self.assertRaises(trial.Failure):
+                trial.installer_bound(item, self.v, self.v['boot_uuid'], operation=bound_op)
+        # exporter: stored body vs validated terminal, both directions, even though each is self-consistent
+        for stored, terminal_op in ((docker, 'aux-update'), (aux, 'install-docker')):
+            with self.subTest(stored=json.loads(stored)['operation'], terminal=terminal_op):
+                self.final.unlink(missing_ok=True)
+                self.final.write_bytes(stored)
+                self.final.chmod(0o600)
+                self.terminal('child-exit', 100, terminal_op)
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+        for stored, terminal_op in ((docker, 'install-docker'), (aux, 'aux-update')):
+            self.final.unlink(missing_ok=True)
+            self.final.write_bytes(stored)
+            self.final.chmod(0o600)
+            self.terminal('child-exit', 100, terminal_op)
+            first = json.loads(trial.export_failure(NONCE).partition(b'\n')[0])
+            self.assertEqual(first['operation'], terminal_op)
+        # other auxiliary terminals never select the file-only installer mode
+        for operation in ('aux-check', 'aux-download', 'aux-install', 'aux-setup'):
+            self.assertFalse(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': operation,
+                                                       'category': 'child-exit', 'child_status': 100}))
+        self.assertTrue(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': 'aux-update',
+                                                  'category': 'child-exit', 'child_status': 100}))
+        for operation in (['aux-update'], None, b'aux-update'):
+            self.assertFalse(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': operation,
+                                                       'category': 'child-exit', 'child_status': 100}))

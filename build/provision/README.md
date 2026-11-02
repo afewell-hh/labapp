@@ -2389,6 +2389,21 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   operation, outcome, status}\n<record bytes>` built from the contract, live boot and
   that terminal result. It additionally requires `captured_at` within the contract's
   admission/stage window and the current time before the original deadline.
+* **Auxiliary `update` failure evidence (issue #471).** The same private record and
+  export now also cover exactly one more operation: the `aux-update` invocation inside
+  `provision_aux` (`apt ... update`, same command/options/environment and 180 s cap).
+  A separate closed allowance `INSTALLER_OPERATIONS = ('install-docker', 'aux-update')`
+  sits beside the unchanged scalar `INSTALLER_OPERATION` default, so Docker callers and
+  the wire schemas (record schema 1, envelope schema 2) are unchanged. The stored
+  `operation`, the export envelope and the independently validated terminal
+  `worker`/`stage` diagnostic must all name the SAME one of the two operations; a
+  mutually consistent body and envelope for the other operation is still refused. The
+  hook is attached only to that `update` call (not `check`, simulate, download, install
+  or any other APT call), the original `child_failure` object is built before the hook
+  and re-raised unchanged whatever the hook raises, and success, timeout, overflow, spawn
+  and cleanup-uncertain paths create no record. Output stays untrusted, possibly
+  sensitive and private; nothing about the cause of any failure is inferred, and no
+  snapshot, mirror, retry, budget, policy or IAM behavior changed.
 * **Mode binding (issue #412).** The remote command is unchanged and takes no mode.
   The expected mode is `fresh` unless the nonce-bound terminal `result.json` (read once
   through the existing `result_record` validator and 4096-byte bound) is a failed
