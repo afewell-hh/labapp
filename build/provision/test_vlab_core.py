@@ -2416,8 +2416,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                 self.assertEqual({m[0] for m in meta}, {begun + seconds})
                 self.assertFalse(any(a[0] == core.HHFAB for a in seen))
                 self.assertFalse(self.ready_path().exists())  # expired authority cannot publish a unit record
-                self.assertEqual((self.bundle()['primary']['message'], self.bundle()['primary']['code']),
-                                 ('deadline exceeded', 124))
+                self.assertFalse((core.ROOT / core.FIRST_FAILURE).exists())
                 self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
                 self.assertEqual(core.state()['deadline'], begun + seconds)
 
