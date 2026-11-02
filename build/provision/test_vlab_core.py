@@ -2399,7 +2399,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
             with self.subTest(mode=mode):
                 self.setUp()
                 self.prepared() if mode == 'fresh' else self.resumable()
-                clock, pauses, polls = [core.time.monotonic()], [], []
+                clock, pauses, polls = [100.0], [], []  # exact synthetic clock: no fractional real-monotonic remainder
                 def sleep(duration):
                     pauses.append(duration)
                     clock[0] += duration
