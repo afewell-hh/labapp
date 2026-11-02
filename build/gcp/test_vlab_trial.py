@@ -1921,13 +1921,13 @@ class GuestDiagnostics(unittest.TestCase):
     # -- #412 terminal-result-bound resume export (host side) ---------------------
     RESUME = {'phase': 'resume', 'operation': 'core-start-resume'}
 
-    def resume_drive(self, export, detail=None, **kwargs):
+    def resume_drive(self, export, detail=None, result_code=17, **kwargs):
         """Like private_drive but the primary validated guest result is a chosen worker diagnostic."""
         self.exports = []
         private = self.directory / 'private'
         private.mkdir(mode=0o700, exist_ok=True)
-        detail = worker_detail(**(detail or self.RESUME))
-        return private, self.drive([self.encoded(result_value(self.nonce, 17, True, detail))],
+        detail = worker_detail(**{'status': result_code, **(detail or self.RESUME)})
+        return private, self.drive([self.encoded(result_value(self.nonce, result_code, True, detail))],
                                    private=private, export=export, **kwargs)
 
     def test_accept_failure_expected_mode_is_host_held_and_never_taken_from_guest_bytes(self):
@@ -2342,10 +2342,10 @@ class GuestDiagnostics(unittest.TestCase):
     def test_aux_update_trial_drive_leaves_public_receipt_cleanup_order_and_no_core_query_unchanged(self):
         raw, snap, terminal = self.installer_export(b'E: Failed to fetch\n', 100, operation='aux-update')
         with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')):
-            private, (code, receipt, trace, text) = self.resume_drive(raw, self.AUX)
+            private, (code, receipt, trace, text) = self.resume_drive(raw, self.AUX, result_code=100)
         self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
-                         (17, 17, 'captured', True))
-        self.assertEqual(receipt['guest_diagnostic'], worker_detail(operation='aux-update'))
+                         (100, 100, 'captured', True))
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(status=100, operation='aux-update'))
         self.assertEqual(len(self.exports), 1)
         self.assertEqual([f.name for f in private.iterdir()], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
         self.assertLess(trace.index('export'), trace.index('master-close'))
