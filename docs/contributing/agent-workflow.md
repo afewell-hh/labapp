@@ -451,6 +451,83 @@ and merges, and no review grants automatic merge or broader permissions.
   exists unless one is configured and verified.
 - Temporary task status stays in GitHub issues and PRs.
 
+## Lead takeover and crash recovery
+
+A replacement lead (new account, session or crash) needs no prior chat or
+in-memory state. A single prompt suffices: "Read `AGENTS.md` and the lead
+takeover section of `docs/contributing/agent-workflow.md`, then take over."
+Discover the permanent handover hub, [#476](https://github.com/afewell-hh/labapp/issues/476),
+and the parent, [#145](https://github.com/afewell-hh/labapp/issues/145). Their
+values are as-of statements on GitHub, never repo prose, and are not live
+evidence. Previously authorized scope stays authorized; no ritual permission
+question or new approval ceremony is needed.
+
+### Orient
+
+1. Verify the repo, default branch and its actual remote HEAD. Keep any dirty or
+   stale checkout untouched and work in an isolated fresh checkout.
+2. Load the instruction hierarchy (`AGENTS.md`, this file, and the runbooks they
+   cite) from the verified default branch.
+3. Read the #476 and #145 BODY checkpoints, then the corrections, active
+   issues, PRs, reports and runs they name (see
+   [raw reading recipes](#raw-github-reading-recipes)). Record any denied or
+   partial read.
+4. Separate accepted code from candidates, and CI, review and failure facts:
+   exact SHA, run and attempt, outcome, reviewer session and actual model.
+5. Choose the smallest next authorized step. Summarize readiness and gaps to
+   the owner, then continue; ask only for missing authority, access or a
+   material decision, and keep doing independent work meanwhile.
+
+### Roles after takeover
+
+The lead keeps orchestration, scope, budget, acceptance and merge. Ephemeral
+Claude workers implement; independent reviews follow
+[review routing](#independent-review-routing). Give each fresh worker exact
+reading, acceptance, test and documentation scope, with full reports accessible
+to it. A tagged handoff counts as delivered only after an acknowledgement or run
+appears (see "Confirm bot handoffs").
+
+### Crash and in-flight work
+
+Before any new admission, reconcile in-flight mutations, jobs, immutable
+resource IDs, original clocks and watchdogs, cleanup ownership, and the current
+authenticated ledger and project census, using the
+[GCP access runbook](../runbooks/gcp-build-access.md) and
+[runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner), together with
+the applicable named, reviewed lead operation/caller contracts. Do not replay
+uncertain operations, reset deadlines,
+reconstruct the ledger or bypass supported recovery. Issue assertions are as-of
+history; obtain fresh read-only evidence where an operation requires it, but do
+not rerun accepted history that no operation depends on.
+
+### Access and private evidence
+
+Credentials, cloud access and private local artifacts must not be assumed to
+transfer or remain available between accounts. Verify actual access, existence
+and integrity before use, without printing credentials. Missing private evidence
+is never fabricated or replaced by a summary where a live prerequisite needs
+it; recover through supported read-only paths, record the exact blocker and
+continue independent work.
+
+### Handover upkeep
+
+Update #476 and the relevant parents after meaningful decisions and before and
+after live operations or handoff. Preserve attributable history. Record:
+
+- accepted and candidate SHAs;
+- review task/session, actual model and final accessible report;
+- CI run, attempt and outcome;
+- blocker, dependency and next action;
+- delegated work and its acknowledgement;
+- live resources, ownership, deadlines and cleanup;
+- protected assets;
+- private evidence locators, integrity and recovery if unavailable;
+- dirty work and explicit unknowns.
+
+Keep this state in GitHub, never in repo files. Local timers monitor only while
+a session is active; claim persistent monitoring only with a verified mechanism
+(see "Lead follow-up").
+
 ## Worker handoff (end of task)
 
 State: exact head commit SHA, files changed, acceptance criteria met/unmet,
