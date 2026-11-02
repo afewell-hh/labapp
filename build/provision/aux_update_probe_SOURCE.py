@@ -8,7 +8,8 @@ and trusted stdlib RO mounts; verify loader/library compatibility BEFORE imports
 Mount trusted system CA RO at /etc/ssl/certs/ca-certificates.crt (base lacks CA).
 Bind public accepted source RO /repo and public Root-authored /bindings.json RO:
 source_sha = BASE below, driver_sha256 = extracted derivative SHA256, files =
-{relative build/**/*.py path: SHA256}, complete including this inert artifact.
+{relative build/**/*.py path: SHA256}, complete for BASE production source only.
+The inert artifact is absent from /repo; /driver.py is separately derivative-hash-bound.
 Root externally binds actual Git head/tree, original blob, derivative, manifest,
 TCB and mount paths; these checks do NOT approve their own supplied hashes.
 
@@ -18,14 +19,15 @@ then --network none. No mode flag changes code/argv. Ubuntu amd64 digest
 (inspected image6277ab668b2ad3c3ab851d370faa1690d324b30db29d342527f61fed28f20f36).
 Root0, --cap-drop ALL plus CHOWN,DAC_OVERRIDE,FOWNER,SETUID,SETGID;
 no-new-privileges; root/source RO, 1GiB/2CPU/128PID; total writable
-tmpfs budget320MiB across /out,/state,/tmp,/var/tmp, fresh empty each.
+application scratch tmpfs budget320MiB across /out,/state,/tmp,/var/tmp, fresh empty each.
+Default namespaced /dev/shm is separately bounded and charged to the 1GiB cgroup.
 /var/tmp MUST be traversable0755 for _apt42:65534; private dirs below0700.
 No host private inputs/config, credentials, socket, host networking, proxy,
 package bootstrap, guardian/full CLI, workflows or VM. Launch env cleared.
 Root verifies original signed-source/CA/redirect controls; no policy overrides.
 No hard request-count/wire-byte claim. Container outer cap300s, finite stop/remove
 and independent exact owned-ID/nonce absence confirmation remain Root duties.
-Only after stopped: Docker cp /out/summary.json, /out/child-output.bin (if any),
+Only after stopped: Docker cp /out/summary.json
 and /out/retained/installer-failure-00000000-0000-0000-0000-000000000472.bin
 (if any) to fresh owner-private0600 storage. Never publish raw files/errors.
 UID0 inside outputs is legitimate; do not require host-user ownership inside.
@@ -149,9 +151,6 @@ def main():
     code, category, status = (0, 'none', None) if stopped else g.failure_fields(primary, 'worker')
     diagnostic_state = 'not-attempted'
     try:
-        output = update or failed
-        if output:
-            g.exclusive(OUT / 'child-output.bin', output[0][1])
         if isinstance(primary, g.Failure) and update and update[0][0] != 0:
             need(built and primary is built[-1])
             detail = g.diagnostic(dict(origin='worker', phase='stage', operation='aux-update',
