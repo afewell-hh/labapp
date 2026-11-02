@@ -612,7 +612,7 @@ def accept_installer(raw, source_sha, nonce, boot, installer):
                       and type(envelope['schema']) is int and envelope['schema'] == guest.INSTALLER_ENVELOPE_SCHEMA)
         expected = {'schema': guest.INSTALLER_ENVELOPE_SCHEMA, 'kind': 'installer', 'source_sha': source_sha,
                     'nonce': nonce, 'lease': installer['lease'], 'boot': boot, 'phase': 'stage',
-                    'operation': guest.INSTALLER_OPERATION, 'outcome': detail['category'].removeprefix('child-'),
+                    'operation': detail['operation'], 'outcome': detail['category'].removeprefix('child-'),
                     'status': detail['child_status']}
         guest.require(first == guest.encoded(expected) and envelope == expected)
         body = guest.installer_body(rest)

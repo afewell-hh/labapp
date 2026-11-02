@@ -1747,6 +1747,15 @@ credential-bearing (root package scripts can read the armed stored GHCR config):
 print, upload, image or post it. A missing record is `absent`, which never proves the
 installer did not run. No reconnect, recovery or retry exists.
 
+*Auxiliary update (issue #471).* The same mode, export command, budgets, retention name
+and receipt also serve a failed `worker`/`stage` terminal whose operation is exactly
+`aux-update` (the auxiliary APT `update`). The host expects the envelope and body
+`operation` to equal the operation of its OWN validated terminal result, so install-docker
+bytes under an `aux-update` terminal (and the reverse) are `invalid` even when body and
+envelope agree with each other; any other stage operation keeps the unchanged
+core-bundle path. The retained bytes are untrusted and possibly sensitive; the public
+receipt, cleanup order and the absence of a core query are unchanged.
+
 Owned process cleanup is one shared primitive, `owned_process.OwnedGroup`, used
 by `command()` and every `Master` start/check/close path. The exact returned
 `Popen` leader (`start_new_session=True`) stays an unreaped child, so its numeric

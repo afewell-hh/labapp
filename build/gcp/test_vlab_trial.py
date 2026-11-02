@@ -2080,15 +2080,44 @@ class GuestDiagnostics(unittest.TestCase):
     # The ACTUAL guest writer + guest exporter produce the bytes; the host side is the real
     # accepter/extractor/retention driven through a fake ORIGINAL master. No Docker/APT/VM.
     INSTALLER = {'phase': 'stage', 'operation': 'install-docker'}
+    AUX = {'phase': 'stage', 'operation': 'aux-update'}
 
-    def installer_export(self, out=b'native installer output \xff\x00', code=17, snap=None):
+    def aux_update_failure(self, contract, code, out):
+        """Drive the ACTUAL guest auxiliary orchestration to its failing `update` (no APT/network).
+
+        Only the bounded child, the package inventory and the fixed APT tree helper are faked;
+        the real apt_run -> hook -> capture_installer_failure -> private writer chain runs.
+        """
+        def setup(directory, snapshot_name):
+            for name in ('lists', 'lists/partial', 'archives', 'archives/partial', 'parts', 'preferences'):
+                (directory / name).mkdir(parents=True, exist_ok=True)
+            for name in ('fixed.conf', 'sources.list'):
+                (directory / name).write_bytes(b'')
+            return ['/usr/bin/apt-get'], str(directory / 'fixed.conf')
+        apt_tmp = Path(tempfile.mkdtemp(dir=self.directory, prefix='apt-tmp-'))
+        with ExitStack() as local:
+            local.enter_context(patch.dict(sys.modules, {'qemu_offline': SimpleNamespace(setup=setup)}))
+            local.enter_context(patch.object(guest, 'APT_TMP', apt_tmp))
+            local.enter_context(patch.object(guest, 'installed', return_value={}))
+            local.enter_context(patch.object(guest, 'run', return_value=b''))
+            local.enter_context(patch.object(guest, 'call_bounded', side_effect=(
+                lambda args, seconds, env=None: (code, out) if 'update' in args else (0, b''))))
+            local.enter_context(patch.object(os, 'geteuid', return_value=os.getuid()))
+            with self.assertRaises(guest.Failure) as raised:
+                guest.provision_aux(guest.Clock(contract), contract)
+        self.assertEqual((raised.exception.code, raised.exception.category, raised.exception.child_status),
+                         (code, 'child-exit', code))
+
+    def installer_export(self, out=b'native installer output \xff\x00', code=17, snap=None,
+                         operation='install-docker'):
         """-> (raw export, snapshot, terminal diagnostic). Real writer, real exporter."""
         snap = snap or snapshot()
         contract = {'schema': 1, 'nonce': self.nonce, 'lease': snap['request_id'], 'epoch': 1, 'run_id': 1,
                     'attempt': 1, 'body_sha256': 'b' * 64, 'vm_id': '1234', 'boot_id': '5678',
                     'image_id': '4575951068918267275', 'admitted_at': snap['reserved_at'],
                     'deadline': snap['deadline'], 'boot_uuid': self.boot_uuid, 'source_sha': snap['source_sha']}
-        terminal = worker_detail('child-exit' if code > 0 else 'child-signal', code, **self.INSTALLER)
+        terminal = worker_detail('child-exit' if code > 0 else 'child-signal', code, phase='stage',
+                                 operation=operation)
         root = Path(tempfile.mkdtemp(dir=self.directory, prefix='guest-root-'))
         reader = guest.regular
         with ExitStack() as local:
@@ -2102,7 +2131,10 @@ class GuestDiagnostics(unittest.TestCase):
                 {'schema': 2, 'code': code if code > 0 else 128 - code, 'contained': True,
                  'nonce': self.nonce, 'diagnostic': terminal}))
             (root / 'result.json').chmod(0o600)
-            guest.capture_installer_failure(contract, guest.Clock(contract), code, out)
+            if operation == 'aux-update':
+                self.aux_update_failure(contract, code, out)
+            else:
+                guest.capture_installer_failure(contract, guest.Clock(contract), code, out)
             raw = guest.export_failure(self.nonce)
         return raw, snap, terminal
 
@@ -2270,6 +2302,86 @@ class GuestDiagnostics(unittest.TestCase):
                                         'guest_diagnostic', 'guest_service', 'private_diagnostic'})
         for forbidden in ('native installer output', str(private)):
             self.assertNotIn(forbidden, text)
+
+    # -- aux-update uses the SAME private export; operation is bound three ways ------------
+    def test_aux_update_actual_orchestration_writer_guest_export_host_accept_extract_and_retention(self):
+        for out, code in ((b'E: Failed to fetch \xff\x00\n', 100), (b'', 100), (b'U' * (guest.INSTALLER_WHOLE + 7), 100)):
+            with self.subTest(size=len(out)):
+                self.setUp()
+                raw, snap, terminal = self.installer_export(out, code, operation='aux-update')
+                envelope = json.loads(raw.partition(b'\n')[0])
+                self.assertEqual(envelope, {
+                    'schema': 2, 'kind': 'installer', 'source_sha': 'a' * 40, 'nonce': self.nonce,
+                    'lease': snap['request_id'], 'boot': self.boot_uuid, 'phase': 'stage',
+                    'operation': 'aux-update', 'outcome': 'exit', 'status': 100})
+                body = json.loads(raw.partition(b'\n')[2])
+                self.assertEqual((body['operation'], body['status'], body['observed']), ('aux-update', 100, len(out)))
+                if len(out) <= guest.INSTALLER_WHOLE:
+                    self.assertEqual(base64.b64decode(body['head']), out)
+                args, installer = self.installer_args(snap, terminal)
+                self.assertEqual(host.accept_failure(raw, *args, installer), ('captured', raw))
+                private = self.directory / 'private'
+                private.mkdir(mode=0o700)
+                calls = []
+                class Master:
+                    def remote(self, argv, phase, cap=30, cleanup=False, until=None, limit=65536):
+                        calls.append((list(argv), phase, cap, cleanup))
+                        return raw
+                uncertain = threading.Event()
+                clock = guest.Clock({'admitted_at': snap['reserved_at'], 'deadline': snap['deadline']})
+                with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')):
+                    status = host.extract_failure(Master(), clock, self.nonce, snap, self.boot_uuid, private,
+                                                  snap['request_id'], uncertain, 'installer', installer)
+                self.assertEqual(status, 'captured')
+                self.assertFalse(uncertain.is_set())
+                self.assertEqual(calls, [(host.export_command(self.nonce), 'persistence', host.EXPORT_CAP_SECONDS, True)])
+                kept = list(private.iterdir())
+                self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
+                self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode)), (raw, 0o600))
+
+    def test_aux_update_trial_drive_leaves_public_receipt_cleanup_order_and_no_core_query_unchanged(self):
+        raw, snap, terminal = self.installer_export(b'E: Failed to fetch\n', 100, operation='aux-update')
+        with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')):
+            private, (code, receipt, trace, text) = self.resume_drive(raw, self.AUX)
+        self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
+                         (17, 17, 'captured', True))
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(operation='aux-update'))
+        self.assertEqual(len(self.exports), 1)
+        self.assertEqual([f.name for f in private.iterdir()], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertLess(trace.index('export'), trace.index('master-close'))
+        self.assertLess(trace.index('master-close'), trace.index('remove-key'))
+        self.assertIn('dispatch-cleanup', trace)
+        self.assertTrue(receipt['process_absent'] and receipt['local_files_absent'] and receipt['own_key_absent'])
+        self.assertNotIn('Failed to fetch', text)
+        self.assertNotIn(str(private), text)
+
+    def test_aux_update_and_docker_operations_cannot_be_substituted_in_either_direction(self):
+        docker, snap, docker_terminal = self.installer_export()
+        aux, _, aux_terminal = self.installer_export(b'E: x', 100, snap, 'aux-update')
+        put = lambda **kw: (lambda d: {**d, **kw})
+        same = lambda raw, op: self.remade(raw, envelope=put(operation=op), body=put(operation=op))
+        for name, raw, terminal in (
+                ('docker bytes, aux terminal', docker, aux_terminal),
+                ('aux bytes, docker terminal', aux, docker_terminal),
+                ('docker bytes relabelled aux, docker terminal', same(docker, 'aux-update'), docker_terminal),
+                ('aux bytes relabelled docker, aux terminal', same(aux, 'install-docker'), aux_terminal),
+                ('docker bytes relabelled aux, aux terminal (status/outcome differ)', same(docker, 'aux-update'), aux_terminal),
+                ('aux bytes relabelled docker, docker terminal (status differs)', same(aux, 'install-docker'), docker_terminal),
+                ('envelope only swapped', self.remade(aux, envelope=put(operation='install-docker')), aux_terminal),
+                ('body only swapped', self.remade(aux, body=put(operation='install-docker')), aux_terminal),
+                ('other stage operation', same(aux, 'aux-check'), aux_terminal)):
+            with self.subTest(name):
+                args, installer = self.installer_args(snap, terminal)
+                self.assertEqual(host.accept_failure(raw, *args, installer), ('invalid', None))
+        for name, raw, terminal in (('docker', docker, docker_terminal), ('aux', aux, aux_terminal)):
+            with self.subTest('control ' + name):
+                args, installer = self.installer_args(snap, terminal)
+                self.assertEqual(host.accept_failure(raw, *args, installer)[0], 'captured')
+        # a non-installer stage operation never selects the installer mode
+        for operation in ('aux-check', 'aux-install', 'aux-download'):
+            self.assertFalse(guest.installer_terminal(worker_detail(operation=operation, phase='stage')))
+        self.assertTrue(guest.installer_terminal(worker_detail(operation='aux-update', phase='stage')))
+        self.assertFalse(guest.installer_terminal(worker_detail(operation='aux-update', phase='fresh')))
 
     def test_installer_mode_is_frozen_from_validated_terminal_never_from_payload_or_other_terminals(self):
         raw, _, _ = self.installer_export()
