@@ -1521,7 +1521,10 @@ def kubectl(args, deadline, route=None):
         refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
                    b'did you specify the right host or port?\n')
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
-        if error.code == 1 and str(error) == 'child command failed' and (raw == refused or unavailable):
+        # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
+        # original Failure propagates and can never lead to another readiness poll.
+        if (error.code == 1 and str(error) == 'child command failed' and (raw == refused or unavailable)
+                and not getattr(error, 'cleanup_uncertain', False)):
             raise Pending('API discovery pending') from None
         raise
 
