@@ -1184,6 +1184,11 @@ class SharedTrial(unittest.TestCase):
                     self.assertEqual(result['diagnostic'], {'origin': 'unknown', 'phase': 'fresh',
                                      'operation': 'worker-supervision', 'category': 'status-invalid', 'child_status': 17})
                     mocks['containment'].assert_called_once_with()
+                # Validate the guardian's published bytes through the host's independent gate.
+                from build.gcp.vlab_trial import guest_result
+                raw = (self.root / 'result.json').read_bytes()
+                self.assertEqual(json.loads(raw), result)
+                self.assertEqual(guest_result(raw, NONCE), ('valid', result))
 
     def test_guardian_policy_primary_survives_cleanup_interruption_and_failed_final_write(self):
         def bogus_phase(root):
