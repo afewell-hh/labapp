@@ -60,13 +60,18 @@ SENSITIVE = re.compile(rb'(?i)authorization|bearer|password|passwd|secret|token|
                        rb'cookie|://[^/\s@]*@')
 
 
-def diagnostic_tail(output, limit=4096, lines=40):
-    """Finite text-only tail of APT output: last lines, credential-looking lines dropped."""
+def diagnostic_tail(output):
+    """Controlled APT tail: <=4096 ASCII bytes; repr publication <=8194 bytes."""
     if not isinstance(output, (bytes, bytearray)):
-        return f'<non-bytes output: {type(output).__name__}>'
-    kept = [line for line in bytes(output).splitlines()[-lines:] if not SENSITIVE.search(line)]
-    text = b'\n'.join(kept).decode('utf-8', 'replace')
-    text = ''.join(ch if ch == '\n' or ch.isprintable() else '?' for ch in text)[-limit:]
+        return '<non-bytes output>'
+    kept = []
+    for line in bytes(output).split(b'\n')[-40:]:
+        decoded = line.decode('utf-8', 'replace')
+        # Drop whole lines before replacement can hide a credential keyword.
+        if any(not ch.isprintable() for ch in decoded) or SENSITIVE.search(line):
+            continue
+        kept.append(decoded.encode('ascii', 'replace').decode('ascii'))
+    text = '\n'.join(kept)[-4096:]
     return text if text.strip() else '<empty>'
 
 
@@ -82,7 +87,8 @@ def missing_pin_proof(log, name, version):
         raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}{detail}')
     output = log[-1][2]
     if f"Version '{version}' for '{name}' was not found".encode() not in output:
-        raise AssertionError(f'simulation failure was not the invalid-pin outcome: output_tail={diagnostic_tail(output)!r}')
+        raise AssertionError('simulation failure was not the invalid-pin outcome: '
+                             f'failed_stage=simulate exit={trail[2][1]!r} output_tail={diagnostic_tail(output)!r}')
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
