@@ -166,6 +166,17 @@ class Context:
             raise AccessError('stale access producer')
         return slot
 
+    def producer_current(self, slot):
+        """Require prospective disposal room for new access, not key cleanup."""
+        self.current(slot)
+        if slot['schema'] == 2:
+            from .inline_history import HistoryError, cleanup_budget
+            try:
+                cleanup_budget(slot)
+            except HistoryError as exc:
+                raise AccessError(str(exc)) from exc
+        return slot
+
 
 def validate_record(record, context, kind):
     base = {'schema', 'kind', 'binding'}
@@ -309,7 +320,10 @@ class GcsAccessRecords:
 
     def _create(self, context, kind, value):
         validate_record(value, context, kind)
-        context.current(self.slot())
+        if kind == 'removed':
+            context.current(self.slot())
+        else:
+            context.producer_current(self.slot())
         path = context.path(kind)
         payload = canonical(value)
         url = f'https://storage.googleapis.com/upload/storage/v1/b/{self.bucket}/o?' + urlencode({

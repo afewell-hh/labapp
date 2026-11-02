@@ -244,7 +244,7 @@ class OwnKeyImport:
             if self._started:
                 raise AccessError('import producer already started')
             self._started = True
-        self.context.current(self.records.slot())
+        self.context.producer_current(self.records.slot())
         canonical_key, sha = public_key(key)
         if sha != self.context.binding['key_sha256']:
             raise AccessError('public key differs from registered lease')
@@ -272,10 +272,11 @@ class OwnKeyImport:
         if self._permit is None:
             raise AccessError('one-shot import capability unavailable')
         intent, gen = self._permit.take()
-        self.context.current(self.records.slot())
+        self.context.producer_current(self.records.slot())
         actual, current_gen = read_intent(self.records, self.context)
         if actual != intent or current_gen != gen:
             raise AccessError('durable intent changed')
+        self.context.producer_current(self.records.slot())
         now = self.now()
         if (now >= timestamp(self.context.binding['work_deadline']) or
                 int(now.timestamp()*1_000_000) >= int(intent['expiration_usec'])):

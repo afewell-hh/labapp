@@ -866,6 +866,16 @@ the producer charges the actual old array plus all missing facts and framing.
 New facts are appended once; every existing entry, including historical duplicates
 and escaped bytes, stays in order unchanged. This prospective check is a producer
 gate in addition to, not a relaxation of, the readers' actual 4096-byte cap.
+Access producers recheck the current slot's prospective reserve before intent
+preparation, access-record uploads (intent/import/seal), and OS Login import,
+including after reading the durable intent. `Context.from_slot` and `current`
+remain reading/identity gates: own-key removal and its terminal `removed`
+receipt do not require new-producer reserve. Already-invalid prospective
+accounting therefore blocks new access, not independently verified key deletion.
+`test_access_producer_capacity.py` exercises these actual adapters with changed
+4096-byte opaque evidence and checks cleanup remains available without unsafe
+FREE. The normal-release boundary reserves missing facts separately from actual
+evidence; the failed-proof boundary still exercises actual 65491-byte proof media.
 
 The physical CAS checks that same evidence/live reserve, immutable IDs and
 append-only fixed fact vocabulary independently of history semantics. Pending

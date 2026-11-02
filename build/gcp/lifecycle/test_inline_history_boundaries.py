@@ -146,6 +146,7 @@ class InlineBoundaries(unittest.TestCase):
             self.assertEqual(plan['replacement'], record)
 
     def fill_occupied(self, record):
+        # Actual-byte proof/reader envelope, not a prospective producer fixture.
         record['evidence'] = [TEXT, '']
         record['evidence'][-1] = 'x' * (
             inline.EVIDENCE_BYTES - len(canonical(record['evidence'])))
@@ -155,6 +156,30 @@ class InlineBoundaries(unittest.TestCase):
         self.assertEqual(len(canonical(record['evidence'])), 4096)
         inline.validate(record, reserve=True, adding=True)
         Context.from_slot(record)
+
+    def fill_producer_occupied(self, record):
+        # Charge opaque existing evidence AND all still-unobserved facts. Do not
+        # insert hypothetical observations just to deduplicate their reserve.
+        original = copy.deepcopy(record['evidence'])
+        record['evidence'] = original + [TEXT, '']
+        amount = inline.EVIDENCE_BYTES - inline.cleanup_evidence_bound(record)
+        self.assertGreater(amount, 0)
+        record['evidence'][-1] = 'x' * amount
+        record.update(state='CLEANUP_FAILED', reason='')
+        record['reason'] = 'x' * (inline.LIVE_BYTES - len(canonical(live(record))))
+        self.assertEqual(len(canonical(live(record))), inline.LIVE_BYTES)
+        self.assertEqual(record['evidence'][:len(original)], original)
+        self.assertLess(len(canonical(record['evidence'])), inline.EVIDENCE_BYTES)
+        self.assertEqual(inline.cleanup_evidence_bound(record), inline.EVIDENCE_BYTES)
+        inline.validate(record, reserve=True, adding=True)
+        inline.cleanup_budget(record)
+        Context.from_slot(record).producer_current(record)
+        over = copy.deepcopy(record)
+        over['evidence'][-1] += 'x'
+        inline.validate(over, reserve=True, adding=True)
+        self.assertEqual(inline.cleanup_evidence_bound(over), inline.EVIDENCE_BYTES + 1)
+        with self.assertRaisesRegex(inline.HistoryError, 'cleanup facts'):
+            inline.cleanup_budget(over)
 
     def assert_failed_release(self, f, case, proof):
         stored_proof, proof_generation = f.proofs.read(f.context)
@@ -270,8 +295,13 @@ class InlineBoundaries(unittest.TestCase):
         self.write(f, candidate)
         f.begin(3)
         occupied = f.w.record()
-        self.fill_occupied(occupied)
+        self.fill_producer_occupied(occupied)
         self.write(f, occupied)
+        evidence = copy.deepcopy(occupied['evidence'])
+        # Actual bytes and prospective allocation are deliberately different.
+        future_bytes = inline.cleanup_evidence_bound(occupied) - len(canonical(evidence))
+        self.assertGreater(future_bytes, 0)
+        self.assertEqual(len(canonical(evidence)) + future_bytes, 4096)
         history = copy.deepcopy(occupied['access_history'])
         f.session.import_once()
         cleanup_own_key(f.records, f.context, f.login, now=f.w.clock.now)
@@ -282,6 +312,11 @@ class InlineBoundaries(unittest.TestCase):
         self.assertEqual(free['access_history'][:-1], history)
         self.assertEqual(free['legacy_history'], occupied['legacy_history'])
         self.assertEqual(free['used_capture_ids'], occupied['used_capture_ids'])
+        expected_facts = [
+            inline.cleanup_fact('instance', occupied['names']['instance'], occupied['ids']['instance']),
+            inline.cleanup_fact('boot', occupied['names']['boot'])]
+        self.assertEqual(free['last_release']['evidence'], evidence + expected_facts)
+        self.assertLessEqual(len(canonical(free['last_release']['evidence'])), 4096)
         for kind, (value, generation) in receipts.items():
             self.assertEqual(free['access_history'][-1]['archive'][kind],
                              dict(path=f.context.path(kind), generation=generation,
