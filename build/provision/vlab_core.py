@@ -340,73 +340,80 @@ def execute(argv, deadline, cap=30, user=False, *, retain=True):
     child = subprocess.Popen(argv, cwd='/', env=SAFE_ENV, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True, **kwargs)
-    raw = bytearray()
-    primary = None
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(child.stdout, selectors.EVENT_READ)
-            while True:
-                if not selector.select(remaining(end)):
-                    raise Failure('child deadline exceeded', 124)
-                chunk = os.read(child.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                raw.extend(chunk)
-                require(len(raw) <= LIMIT, 'private child output overflow')
+        raw = bytearray()
+        primary = None
         try:
-            code = child.wait(timeout=remaining(end))
-        except subprocess.TimeoutExpired:
-            raise Failure('child deadline exceeded', 124) from None
-        if code:
-            raise Failure('child command failed', code if 0 < code < 256 else 1, bytes(raw))
-        return bytes(raw)
-    except BaseException as exc:
-        primary = exc
-        if retain:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    if not selector.select(remaining(end)):
+                        raise Failure('child deadline exceeded', 124)
+                    chunk = os.read(child.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                    require(len(raw) <= LIMIT, 'private child output overflow')
             try:
-                retain_failure_output(bytes(raw))
-            except BaseException:
-                print('vlab-core: private diagnostics unverified', file=sys.stderr)
-        raise
-    finally:
-        try:
-            # The direct process can exit while descendants retain the pipe.
-            # The new session/PGID is ours even after that direct child exits.
-            if primary is not None or child.poll() is None:
+                code = child.wait(timeout=remaining(end))
+            except subprocess.TimeoutExpired:
+                raise Failure('child deadline exceeded', 124) from None
+            if code:
+                raise Failure('child command failed', code if 0 < code < 256 else 1, bytes(raw))
+            return bytes(raw)
+        except BaseException as exc:
+            primary = exc
+            if retain:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            child.wait(timeout=2)
-            if primary is None:
-                try:
-                    os.killpg(child.pid, 0)
-                except ProcessLookupError:
-                    pass
-                else:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    raise Failure('unexpected child group remains')
-        except (OSError, subprocess.TimeoutExpired):
-            if primary is None:
-                raise Failure('child containment unverified') from None
-            primary.cleanup_uncertain = True
-            print('vlab-core: child group containment unverified', file=sys.stderr)
+                    retain_failure_output(bytes(raw))
+                except BaseException:
+                    print('vlab-core: private diagnostics unverified', file=sys.stderr)
+            raise
         finally:
-            child.stdout.close()
+            try:
+                # The direct process can exit while descendants retain the pipe.
+                # The new session/PGID is ours even after that direct child exits.
+                if primary is not None or child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                child.wait(timeout=2)
+                if primary is None:
+                    try:
+                        os.killpg(child.pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        raise Failure('unexpected child group remains')
+            except (OSError, subprocess.TimeoutExpired):
+                if primary is None:
+                    raise Failure('child containment unverified') from None
+                primary.cleanup_uncertain = True
+                print('vlab-core: child group containment unverified', file=sys.stderr)
+            finally:
+                child.stdout.close()
+    except Failure as error:
+        # Popen returned successfully: only this call's post-spawn failures prove
+        # an executed child. Identity validation and failed spawn never reach here.
+        error._executed_child = True
+        raise
 
 
 def routed(route, *args, **kwargs):
-    """``execute`` unchanged; a Failure escaping it also records which fixed readiness child ran.
+    """Execute with identical arguments; label only an original, proven executed-child Failure.
 
     Same exception object, message, code, private output and cleanup uncertainty. Only a
-    Failure that escaped THIS call is labeled, never a handled SIGTERM/SIGINT and never an
+    Failure proven to escape AFTER successful Popen is labeled, never a handled signal or an
     already-labeled one; there is no global last-child state. ``route`` None labels nothing.
     """
     try:
         return execute(*args, **kwargs)
     except Failure as error:
         handled = str(error) == 'terminated' and type(error.code) is int and error.code in (130, 143)
-        if route is not None and error.route is None and not handled:
+        if route is not None and error.route is None and not handled \
+                and getattr(error, '_executed_child', False) is True:
             error.route = route
         raise
 
@@ -527,7 +534,7 @@ def last_failure_context():
 
 
 def valid_unit_ready(record, mode, expected, invocation, boot_id):
-    """Strict closed 12-key record check against ORIGINAL frozen bindings; raises Failure."""
+    """Strict closed 13-key record check against ORIGINAL frozen bindings; raises Failure."""
     require(type(record) is dict and set(record) == UNIT_READY_KEYS
             and type(record['schema']) is int and record['schema'] == UNIT_READY_SCHEMA
             and record['source'] == 'vlab_core' and record['action'] == 'unit-ready'

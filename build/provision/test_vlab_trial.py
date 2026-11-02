@@ -20,7 +20,7 @@ import stat
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import hhfab_release
 import vlab_trial as trial
@@ -3012,6 +3012,7 @@ class FirstFailureExport(unittest.TestCase):
     def setUp(self):
         import vlab_core as core
         self.core = core
+        self.real_ubuntu = core.ubuntu
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-export-')))
@@ -3091,6 +3092,121 @@ class FirstFailureExport(unittest.TestCase):
         self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal',
                                                 'code': 17, 'route': 'api-final-switches'})
         self.assertLessEqual(len((self.state_root / self.core.FIRST_FAILURE).read_bytes()), trial.FAILURE_LIMIT)
+
+    def readiness_chain(self, mode, *, prelaunch=False, uncertain=False):
+        """Actual executor -> unit_ready recorder -> capture -> export -> host, no staged records."""
+        import importlib
+        core = self.core
+        for name in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+            (self.state_root / name).unlink(missing_ok=True)
+        original = dict(self.value, mode=mode,
+                        deadline=self.value['started'] + core.START_SECONDS[mode])
+        reserved = {key: item for key, item in original.items() if key != 'invocation'}
+        core.atomic(self.state_root / 'state.json', original)
+        primary = core.Failure('child command failed', 1, b'PRIMARY_UNCHANGED')
+        primary.cleanup_uncertain = True
+        child = MagicMock()
+        child.pid = 424242
+        child.stdout.fileno.return_value = 123
+        child.wait.return_value = 19
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.select.return_value = [True]
+        observed = []
+        def body(*_):
+            # Restore child-only observations before unit_ready reads/writes real files.
+            with ExitStack() as child_scope:
+                spawn = child_scope.enter_context(patch.object(core.subprocess, 'Popen', return_value=child))
+                child_scope.enter_context(patch.object(core.selectors, 'DefaultSelector', return_value=selector))
+                child_scope.enter_context(patch.object(core.os, 'read', side_effect=[b'CHILD_PRIVATE', b'']))
+                kill = child_scope.enter_context(patch.object(core.os, 'killpg', side_effect=(
+                    OSError('synthetic uncertainty') if uncertain else ProcessLookupError())))
+                if prelaunch:
+                    child_scope.enter_context(patch.object(core, 'ubuntu', self.real_ubuntu))
+                    child_scope.enter_context(patch.object(core.pwd, 'getpwnam', return_value=SimpleNamespace(
+                        pw_uid=0, pw_gid=0, pw_dir='/home/ubuntu')))
+                else:
+                    child_scope.enter_context(patch.object(core, 'ubuntu', return_value=SimpleNamespace(
+                        pw_uid=os.getuid(), pw_gid=os.getgid())))
+                    child_scope.enter_context(patch.object(core.os, 'getgrouplist', return_value=[os.getgid()]))
+                try:
+                    core.kubectl(['get', '--raw=/readyz'], original['deadline'], 'api-final-readyz')
+                except core.Failure as error:
+                    observed.append(error)
+                    if prelaunch:
+                        spawn.assert_not_called()
+                        kill.assert_not_called()
+                    else:
+                        spawn.assert_called_once()
+                        kill.assert_called_once_with(child.pid, core.signal.SIGKILL)
+                        child.stdout.close.assert_called_once()
+                    raise
+        with patch.dict(os.environ, {'INVOCATION_ID': self.invocation}), \
+             patch.object(core, 'startup_snapshot', return_value=(original, original['deadline'])), \
+             patch.object(core, 'ready_body', side_effect=body):
+            with self.assertRaises(core.Failure) as raised:
+                core.unit_ready(mode)
+        error = raised.exception
+        self.assertIs(error, observed[0])
+        expected = ('ubuntu identity refused', 1, b'', None) if prelaunch else (
+            'child command failed', 19, b'CHILD_PRIVATE', 'api-final-readyz')
+        self.assertEqual((str(error), error.code, error.private_output, error.route), expected)
+        self.assertEqual(getattr(error, 'cleanup_uncertain', False), uncertain)
+        record_raw = (self.state_root / core.UNIT_READY_FAILURE).read_bytes()
+        record = core.json_data(record_raw)
+        self.assertEqual((record['message'], record['code'], record['route']), (expected[0], expected[1], expected[3]))
+        self.assertLessEqual(len(record_raw), core.UNIT_READY_LIMIT)
+        core.capture_first_failure(mode, reserved, primary, original['deadline'])
+        written = (self.state_root / core.FIRST_FAILURE).read_bytes()
+        bundle = trial.first_failure_bundle(written)
+        self.assertEqual(bundle['unit_ready'], dict(status='ok', message=expected[0], code=expected[1], route=expected[3]))
+        self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
+        self.assertEqual(base64.b64decode(bundle['primary']['output']), b'PRIMARY_UNCHANGED')
+        self.assertEqual((str(primary), primary.code, primary.private_output, primary.cleanup_uncertain),
+                         ('child command failed', 1, b'PRIMARY_UNCHANGED', True))
+        self.assertLessEqual(len(written), trial.FAILURE_LIMIT)
+        detail = {'origin': 'worker', 'phase': mode, 'operation': 'core-start-' + mode,
+                  'category': 'child-exit', 'child_status': 1}
+        trial.atomic(self.root / 'result.json', {'schema': 2, 'code': 1, 'contained': True,
+                                               'nonce': NONCE, 'diagnostic': detail})
+        raw = trial.export_failure(NONCE)
+        first, _, rest = raw.partition(b'\n')
+        self.assertEqual(rest, written)  # exact writer bytes reach the host, no reconstructed bundle
+        envelope = trial.data(first)
+        self.assertEqual(envelope, {'schema': 1, 'source_sha': self.v['source_sha'], 'nonce': NONCE,
+                                    'mode': mode, 'operation': self.operation, 'invocation': self.invocation,
+                                    'boot': original['boot']})
+        with patch.object(sys, 'path', [str(Path(__file__).resolve().parents[2]), *sys.path]):
+            host = importlib.import_module('build.gcp.vlab_trial')
+        args = (self.v['source_sha'], NONCE, original['boot'], mode)
+        self.assertEqual(host.accept_failure(raw, *args), ('captured', raw))
+        # Same genuine bytes refuse each independent host binding; mode's fresh default remains strict.
+        for index, foreign in ((0, '9' * 40), (1, '9' * 32),
+                               (2, '33333333-3333-4333-8333-333333333333'),
+                               (3, 'resume' if mode == 'fresh' else 'fresh')):
+            changed = list(args)
+            changed[index] = foreign
+            self.assertEqual(host.accept_failure(raw, *changed), ('invalid', None))
+        for key in ('operation', 'invocation'):
+            foreign = dict(envelope, **{key: '9' * 32})
+            self.assertEqual(host.accept_failure(trial.encoded(foreign) + b'\n' + rest, *args), ('invalid', None))
+        self.assertEqual((self.state_root / core.UNIT_READY_FAILURE).read_bytes(), record_raw)
+        self.assertEqual((self.state_root / core.FIRST_FAILURE).read_bytes(), written)
+
+    def test_real_executed_readiness_failure_whole_chain_fresh_and_resume(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode)
+
+    def test_real_prelaunch_identity_refusal_whole_chain_has_null_route_in_both_modes(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode, prelaunch=True)
+
+    def test_real_executed_cleanup_uncertainty_whole_chain_preserves_primary_in_both_modes(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.readiness_chain(mode, uncertain=True)
 
     def test_every_closed_route_and_null_roundtrip_writer_to_export_and_unknown_routes_are_not_exported(self):
         core = self.core

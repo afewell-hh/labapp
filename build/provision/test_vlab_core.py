@@ -111,6 +111,13 @@ def installer_versions(docs):
     return docs
 
 
+def executed_failure(*args):
+    """Synthetic executed boundary only; real executor provenance has separate tests."""
+    error = core.Failure(*args)
+    error._executed_child = True
+    return error
+
+
 class GuestEnvironment:
     """All fixed production paths are patched to one owned ephemeral fixture."""
     def setUp(self):
@@ -260,7 +267,7 @@ class GuestEnvironment:
         self.calls.append((list(argv), deadline, cap, user))
         core.remaining(deadline)
         if self.failure and self.failure(argv):
-            raise core.Failure('synthetic command failure', 17)
+            raise executed_failure('synthetic command failure', 17)
         if argv[0] == core.SYSTEMCTL:
             action = argv[1]
             if action == 'daemon-reload' or action == 'enable':
@@ -1338,7 +1345,11 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
             if armed[0]:
                 seen.append(list(argv))
                 meta.append((deadline, cap, user))
-                replaced = injector(len(seen) - 1, list(argv)) if injector is not None else None
+                try:
+                    replaced = injector(len(seen) - 1, list(argv)) if injector is not None else None
+                except core.Failure as error:
+                    error._executed_child = True  # fixture injects at the executed-child boundary
+                    raise
                 if replaced is not None:
                     return replaced
             return actual(argv, deadline, cap, user, retain=retain)
@@ -3082,16 +3093,48 @@ class FormatAndSourceTests(unittest.TestCase):
         self.assertIn('child group containment unverified', errors.getvalue())
         self.assertNotIn('SYNTHETIC_PRIVATE_DETAIL', errors.getvalue())
 
+    def test_real_executor_prelaunch_identity_refusal_has_no_route_or_child(self):
+        local = core.Failure('ubuntu identity refused', 1)
+        original_require = core.require
+        def require(condition, message='contract refused'):
+            if message == 'ubuntu identity refused' and not condition:
+                raise local
+            return original_require(condition, message)
+        invalid = SimpleNamespace(pw_uid=0, pw_gid=0, pw_dir='/home/ubuntu')
+        with patch.object(core.pwd, 'getpwnam', return_value=invalid), \
+             patch.object(core, 'require', side_effect=require), \
+             patch.object(core.subprocess, 'Popen') as spawn:
+            with self.assertRaises(core.Failure) as raised:
+                core.routed('api-initial-readyz', ['/synthetic'], core.time.monotonic() + 3,
+                            user=True, retain=False)
+        spawn.assert_not_called()
+        self.assertIs(raised.exception, local)
+        self.assertEqual((str(local), local.code, local.private_output, local.route),
+                         ('ubuntu identity refused', 1, b'', None))
+        self.assertFalse(hasattr(local, 'cleanup_uncertain'))
+        self.assertFalse(hasattr(local, '_executed_child'))
+
+    def test_real_executor_failed_spawn_preserves_local_error_without_route(self):
+        local = core.Failure('synthetic spawn refused', 17, b'PRIVATE')
+        with patch.object(core.subprocess, 'Popen', side_effect=local) as spawn:
+            with self.assertRaises(core.Failure) as raised:
+                core.routed('svc-entry', ['/synthetic'], core.time.monotonic() + 3, retain=False)
+        spawn.assert_called_once()
+        self.assertIs(raised.exception, local)
+        self.assertEqual((str(local), local.code, local.private_output, local.route),
+                         ('synthetic spawn refused', 17, b'PRIVATE', None))
+        self.assertFalse(hasattr(local, '_executed_child'))
+
     def test_route_is_never_applied_to_handled_signals_other_exceptions_or_a_second_label(self):
         for code in (130, 143):
             with self.subTest(handled=code), patch.object(core, 'execute',
-                                                          side_effect=core.Failure('terminated', code)):
+                                                          side_effect=executed_failure('terminated', code)):
                 with self.assertRaises(core.Failure) as raised:
                     core.routed('svc-entry', ['/synthetic'], 1)
                 self.assertIsNone(raised.exception.route)
             # A genuine child exit with the same code is a child failure and is labeled.
             with self.subTest(child=code), patch.object(core, 'execute',
-                                                        side_effect=core.Failure('child command failed', code)):
+                                                        side_effect=executed_failure('child command failed', code)):
                 with self.assertRaises(core.Failure) as raised:
                     core.routed('svc-entry', ['/synthetic'], 1)
                 self.assertEqual(raised.exception.route, 'svc-entry')
@@ -3101,26 +3144,26 @@ class FormatAndSourceTests(unittest.TestCase):
                     core.routed('svc-entry', ['/synthetic'], 1)
                 self.assertIs(raised.exception, error)
                 self.assertFalse(hasattr(error, 'route'))
-        first = core.Failure('child command failed', 7)
+        first = executed_failure('child command failed', 7)
         first.route = 'bridge-wait-probe'
         with patch.object(core, 'execute', side_effect=first):
             with self.assertRaises(core.Failure) as raised:
                 core.routed('svc-entry', ['/synthetic'], 1)
         self.assertIs(raised.exception, first)
         self.assertEqual(first.route, 'bridge-wait-probe')
-        with patch.object(core, 'execute', side_effect=core.Failure('child command failed', 7)):
+        with patch.object(core, 'execute', side_effect=executed_failure('child command failed', 7)):
             with self.assertRaises(core.Failure) as raised:
                 core.routed(None, ['/synthetic'], 1)
         self.assertIsNone(raised.exception.route)
 
     def test_pending_rewrite_carries_no_route_but_other_kubectl_failures_do(self):
         known = b'The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?\n'
-        with patch.object(core, 'execute', side_effect=core.Failure('child command failed', 1, known)):
+        with patch.object(core, 'execute', side_effect=executed_failure('child command failed', 1, known)):
             with self.assertRaises(core.Pending) as raised:
                 core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-initial-readyz')
         self.assertIsNone(raised.exception.route)
         self.assertIsNone(raised.exception.__cause__)
-        for failure in (core.Failure('child deadline exceeded', 124), core.Failure('child command failed', 1, b'other')):
+        for failure in (executed_failure('child deadline exceeded', 124), executed_failure('child command failed', 1, b'other')):
             with self.subTest(str(failure)), patch.object(core, 'execute', side_effect=failure):
                 with self.assertRaises(core.Failure) as raised:
                     core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-final-readyz')

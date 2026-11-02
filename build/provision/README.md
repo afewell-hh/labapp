@@ -2032,9 +2032,10 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
     `Failure` escaped `unit_ready`; it identifies the next failing child and says nothing
     about why it failed. `routed()` wraps the existing `execute` call with identical
     arguments and sets one optional label on the same exception object (message, code,
-    private output and `cleanup_uncertain` are untouched). Only a `Failure` escaping that
-    child call is labeled: the exact handled `terminated` 130/143 signal, a non-`Failure`
-    exception, an already-labeled failure, the `Pending` that `kubectl` raises for a known
+    private output and `cleanup_uncertain` are untouched). Only a `Failure` proven to escape
+    after `Popen` successfully returned is labeled; an existing label is never overwritten.
+    Local Ubuntu identity refusals, failed spawns, the exact handled `terminated` 130/143 signal,
+    a non-`Failure` exception, the `Pending` that `kubectl` raises for a known
     transient (a new exception), and every local `require`/JSON/identity/critical-snapshot
     failure carry no label. There is no global last-child state. Non-readiness callers pass
     no route. Repeated polling attempts reuse the same fixed value; there is no counter and no
@@ -2057,8 +2058,10 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
     equal inner/outer caps (kubectl `--request-timeout=10s` against the 10 s cap, the bridge
     helper's 60 s against the 60 s cap) are possible races that this field does not resolve.
     Offline tests run the real executor with small stdlib children and the real readiness
-    path with injected child failures; they do not show native hhfab, kubectl or systemd
-    behavior and no resume cause is established.
+    path with injected child failures. Fresh and resume fixtures carry real executor failures
+    and prelaunch identity refusals through the actual record writer, bundle capture, guest
+    export and host acceptance without reconstructing intermediate records. They do not show
+    native hhfab, kubectl or systemd behavior and no resume cause is established.
   * **When.** Only at the actual `unit_ready` failure boundary, after the ORIGINAL
     `startup_snapshot` succeeded and after the readiness locks unwound. Before publishing it
     revalidates the original nonce, mode, operation, invocation, boot, started and deadline
