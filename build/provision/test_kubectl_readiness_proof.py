@@ -420,6 +420,75 @@ class VerdictAndCaseTests(unittest.TestCase):
         self.assertEqual(record['elapsed'], 2.0)
 
 
+class UnauthorizedFormatterTests(unittest.TestCase):
+    CANONICAL = b'error: You must be logged in to the server (synthetic fixture response)\n'
+
+    def classify(self, raw, code=1, message='child command failed'):
+        error = core.Failure(message, code, raw)
+        error._executed_child = True
+        with patch.object(core, 'execute', side_effect=error):
+            return proof.attempt(core, core.kubectl, 1000.0, clock=lambda: 990.0)
+
+    def verdict(self, record, request_changes=None, cleanup_changes=None, **changes):
+        item = next(c for c in proof.build_cases() if c['name'] == '401-unauthorized')
+        request = {'method': 'GET', 'path': '/readyz', 'query': 'timeout=10s', 'client_cn': proof.CLIENT_CN,
+                   'step': item['steps'][0]['name'], 'headers_sent': True,
+                   'body_bytes_sent': len(item['steps'][0]['body']), **(request_changes or {})}
+        evidence = {'elapsed': 1.0, 'request_count': 1, 'owned_uid_processes_after': 0,
+                    'cleanup': {'listener_closed': True, 'threads_alive': 0, 'sockets_closed': True,
+                                'connections_accepted': 1, 'handshakes_completed': 1,
+                                **(cleanup_changes or {})}, **changes}
+        return proof.verdict(item, [record], {'requests': [request]}, evidence)
+
+    def test_source_backed_canonical_and_existing_unauthorized_forms_remain_fatal(self):
+        self.assertEqual(len(self.CANONICAL), 72)
+        for raw in (self.CANONICAL, b'error: You must be logged in to the server (Unauthorized)\n'):
+            with self.subTest(raw=raw):
+                record = self.classify(raw)
+                self.assertEqual((record['kind'], record['code'], record['route']),
+                                 ('failure', 1, 'api-initial-readyz'))
+                self.assertTrue(record['flags']['unauthorized'])
+                self.assertEqual(self.verdict(record), ('passed', []))
+                self.assertNotIn(raw.decode().strip(), json.dumps(record))
+
+    def test_near_miss_and_unrelated_401_diagnostics_do_not_supply_cause(self):
+        for raw in (self.CANONICAL.rstrip(b'\n'), self.CANONICAL + b'\n',
+                    b'prefix ' + self.CANONICAL, self.CANONICAL + b'extra',
+                    self.CANONICAL.lower(), self.CANONICAL.replace(b'response', b'responses'),
+                    b'error: You must be logged in to the server (expired token)\n',
+                    b'error: server returned status 401\n', b'unknown fixture error'):
+            with self.subTest(raw=raw):
+                record = self.classify(raw)
+                self.assertEqual(record['kind'], 'failure')
+                self.assertFalse(record['flags']['unauthorized'])
+                outcome, reasons = self.verdict(record)
+                self.assertEqual(outcome, 'failed')
+                self.assertIn('missing cause-specific child evidence', reasons)
+
+    def test_canonical_requires_matching_server_request_response_and_clean_peers(self):
+        record = self.classify(self.CANONICAL)
+        for change in ({'method': 'POST'}, {'path': '/other'}, {'query': ''}, {'client_cn': None},
+                       {'step': '403'}, {'headers_sent': False}, {'body_bytes_sent': 0}):
+            with self.subTest(request=change):
+                self.assertEqual(self.verdict(record, request_changes=change)[0], 'failed')
+        for change in ({'connections_accepted': 0}, {'handshakes_completed': 0},
+                       {'listener_closed': False}, {'sockets_closed': False}, {'threads_alive': 1}):
+            with self.subTest(cleanup=change):
+                self.assertEqual(self.verdict(record, cleanup_changes=change)[0], 'failed')
+        for change in ({'request_count': 0}, {'request_count': 2}, {'owned_uid_processes_after': 1}):
+            with self.subTest(evidence=change):
+                self.assertEqual(self.verdict(record, **change)[0], 'failed')
+
+    def test_canonical_cannot_override_timeout_route_message_or_cleanup_failure(self):
+        for record in (self.classify(self.CANONICAL, code=124, message='child deadline exceeded'),
+                       self.classify(self.CANONICAL, message='child containment unverified'),
+                       {**self.classify(self.CANONICAL), 'route': None},
+                       {**self.classify(self.CANONICAL), 'cleanup_uncertain': True}):
+            with self.subTest(record=record):
+                self.assertEqual(record['kind'], 'failure')
+                self.assertEqual(self.verdict(record)[0], 'failed')
+
+
 class RunTests(unittest.TestCase):
     def ident(self, **kubectl):
         pinned = {'size': proof.KUBECTL_PIN['size'], 'sha256': proof.KUBECTL_PIN['sha256'], **kubectl}

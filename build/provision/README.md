@@ -478,7 +478,7 @@ The manual workflow fixes a 700s outer bound with 30s kill grace and a 13-minute
 these enclose the 600s work plus 60s cleanup envelope without renewing it. Cancellation
 grace consumes that same fixed envelope; cleanup receives at most 60s of its remainder.
 
-### Real kubectl readiness timing proof (issue #452, source only)
+### Real kubectl readiness timing proof (issue #452)
 
 `test-kubectl-readiness.sh` and `kubectl_readiness_proof.py` measure how the **real pinned kubectl
 1.35.0** behaves under the **unchanged** `vlab_core.kubectl()` (so the real `routed`/`execute`, uid/group
@@ -498,7 +498,7 @@ env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/timeout --kill-after=30s 10m \
   /usr/bin/bash /absolute/path/build/provision/test-kubectl-readiness.sh /absolute/path/to/kubectl
 # Offline harness tests (loopback plain-socket fixture, fake production callables; no kubectl,
 # Docker, TLS or external network). Needs distribution python3-yaml/libyaml.
-# 46 test methods by source inspection, NOT executed. ROOT adds the separate CI hook.
+# CI separately requires nonzero discovery and no skips; this is not real-client evidence.
 python3 -B -m unittest discover -s /absolute/path/build/provision -p test_kubectl_readiness_proof.py -v
 ```
 
@@ -546,6 +546,12 @@ request and the appropriate absent-header/partial-body send evidence, plus origi
 either deadline124 or a specific client-timeout exit1. Timer winner/timing remain observations,
 not guaranteed conclusions. Auth/TLS cases require the corresponding fixed child signature and
 request or rejected-handshake counts; generic exit1 is insufficient.
+For the fixed 401 Status message, the harness recognizes the exact kubectl 1.35.0 formatter line
+`error: You must be logged in to the server (synthetic fixture response)` followed by one newline,
+as well as the existing `Unauthorized` form. This signature alone cannot pass: the single verified
+mTLS GET, matching 401 fixture response delivery, original failure route and clean child/server
+peers remain required. The canonical bytes are derived from pinned source, not retained native
+client output; only a separately authorized real-client run can confirm actual behavior.
 
 Quick cases have a **2s caller operation deadline**, delayed startup 6s, explicit exhaustion 3s,
 and stalls 10s; the production request-timeout10/cap10 arguments are unchanged. Reservations
@@ -593,12 +599,17 @@ signals remain unproved. The deferred eight observations were 429 absent/malform
 The matching-transient cleanup control and unknown-error/124 classifier controls are synthetic only;
 existing production-executor tests cover process-group cleanup only as source evidence. The kubectl
 compiler identity is not inspected. Container results do not substitute for later VM validation.
-Official sources (accessed 2026-11-02, per #448 comment 6573335502): kubectl
+The 401 call chain (official v0.35.0 sources, accessed 2026-11-02) is `get.Run` →
+`rawhttp.RawGet` → client-go `Request.Stream` → `transformResponse`/`Result.Error` →
+apimachinery [`errors.FromObject`](https://github.com/kubernetes/apimachinery/blob/v0.35.0/pkg/api/errors/errors.go)
+→ kubectl [`CheckErr`/`StandardErrorMessage`/`fatal`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/util/helpers.go).
+The Unauthorized reason selects the login formatter with the Status message; `fatal` adds the newline
+and exits 1. Other timing sources (per #448 comment 6573335502): kubectl
 [`get.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/get/get.go),
 [`rawhttp/raw.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/rawhttp/raw.go), client-go
 [`rest/request.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go) and
-[`rest/with_retry.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/with_retry.go) (read by
-the #448 reviewer, not re-read by this worker).
+[`rest/with_retry.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/with_retry.go)
+(retry policy coverage remains the #448 reviewer's; the 401 chain above was read directly).
 
 ## Offline-delivered guest prerequisite probe
 

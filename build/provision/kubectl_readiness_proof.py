@@ -79,7 +79,8 @@ FLAG_PATTERNS = {
     'unknown_authority': rb'x509: certificate signed by unknown authority',
     'wrong_san': rb'x509: certificate is valid for 127\.0\.0\.2, not 127\.0\.0\.1',
     'client_timeout': rb'Client\.Timeout|context deadline exceeded|i/o timeout|timed out',
-    'unauthorized': rb'Unauthorized',
+    'unauthorized': (rb'Unauthorized|'
+                     rb'\Aerror: You must be logged in to the server \(synthetic fixture response\)\n\Z'),
     'forbidden': rb'Forbidden',
     'too_many_requests': rb'TooManyRequests',
     'service_unavailable': rb'ServiceUnavailable',
