@@ -79,6 +79,9 @@ Codex does not document an import mechanism, so this file uses plain links;
   selects the fixed disposable canonical Ubuntu trial); see the [GCP access runbook](docs/runbooks/gcp-build-access.md).
   Never give general worker jobs cloud credentials. Access setup and lifecycle
   pilots do not authorize routine Packer builds or guest recovery.
+- Independent reviews are lead-routed to Copilot (explicit model, or the distinct
+  built-in review); native Codex review only on explicit owner request. See
+  [review routing](docs/contributing/agent-workflow.md#independent-review-routing).
 - Never commit secrets. Do not merge or close issues; the lead accepts work.
 - A failed, denied or unrun check is not passing evidence; report it exactly.
 - Update this file and the workflow doc when the workflow changes.

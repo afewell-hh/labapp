@@ -9,7 +9,7 @@ assignees: ''
 <!--
 Process rules live in docs/contributing/agent-workflow.md (Roles). Do not write
 a reviewer or agent mention in this body. The lead dispatches the review
-separately.
+separately (routing: docs/contributing/agent-workflow.md#independent-review-routing).
 -->
 
 ## Target
@@ -32,6 +32,12 @@ separately.
 <!-- Provenance/coverage: exact head reviewed, whether the handoff lists read
 files/sections/comment IDs and skipped, partial, summarized or truncated
 sources, and whether conclusions that depend on gaps are marked provisional. -->
+
+- (fill in)
+
+## Reviewer route
+<!-- Lead fills in: Copilot explicit model (requested vs actual per receipt) or
+built-in review (effort level); exact head SHA. Silent fallback to Auto is not accepted. -->
 
 - (fill in)
 
