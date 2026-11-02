@@ -481,11 +481,12 @@ grace consumes that same fixed envelope; cleanup receives at most 60s of its rem
 ### Real kubectl readiness timing proof (issue #452)
 
 `test-kubectl-readiness.sh` and `kubectl_readiness_proof.py` measure how the **real pinned kubectl
-1.35.0** behaves under the **unchanged** `vlab_core.kubectl()` (so the real `routed`/`execute`, uid/group
+1.35.0** behaves under `vlab_core.kubectl()` (so the real `routed`/`execute`, uid/group
 drop to `ubuntu`, accepted kubeconfig reader, `--request-timeout=10s`, execute cap 10s, 1 MiB output
-limit and the exact-refusal/ServiceUnavailable classifier) against a deterministic loopback TLS fixture
+limit and the exact-refusal/ServiceUnavailable/initial-health classifier) against a deterministic loopback TLS fixture
 on `127.0.0.1:6443`. It supports #448 (trial-16 initial-readiness `child deadline exceeded`/124). It is
-**evidence tooling, not a fix**: no timeout, classifier, retry, auth or budget changes; a 124 is never
+**component evidence tooling**: #463 narrowly changes initial plaintext health classification as described
+below; no timeout, retry, auth or budget changes. A 124 is never
 treated as Pending; the harness asserts only deterministic facts and **records** outcomes and windows
 where the same-code 10s request timeout and 10s cap may race (neither is guaranteed to win).
 
@@ -556,29 +557,31 @@ client output; only a separately authorized real-client run can confirm actual b
 Two fixed #461 cases extend, without changing, those original 14 cases:
 `plaintext-readyz-500` sends the public synthetic body
 `[+]ping ok\n[-]informer-sync failed: reason withheld\nreadyz check failed\n`
-as `text/plain; charset=utf-8`, with HTTP500 and `nosniff`. It expects one delivered response,
-the exact pinned formatter candidate, and the original **fatal** exit1/`api-initial-readyz` route.
+as `text/plain; charset=utf-8`, with HTTP500 and `nosniff`, then 200/`ok`.
+It now requires empty/unlabeled **Pending then ready**, with exactly two delivered responses.
+The first Pending's suppressed original exit1 must match the exact pinned formatter candidate and
+`api-initial-readyz` child route. The generic JSON Status500 case remains fatal and unchanged.
 `k3s-prehandler-503-then-ready` sends a JSON Status/ServiceUnavailable with the fixed message
 `apiserver not ready`, then 200/`ok`, with no Retry-After. The k3s prehandler uses negotiated
 Status serialization, **not plaintext503**. This case requires exactly two production calls:
 empty/unlabeled Pending while the listener is already running, then ok, with one matching
-verified mTLS request/response per call. Only this exact case specification may bypass the
+verified mTLS request/response per call. Only these two exact case specifications may bypass the
 before-listener Pending assertion; a name alone, generic ServiceUnavailable, or any missing
 delivery/route/formatter evidence cannot qualify.
 
 Quick cases have a **2s caller operation deadline**, delayed startup 6s, explicit exhaustion 3s,
-the new 503 sequence 3s, and stalls 10s; production request-timeout10/cap10 arguments are unchanged. Reservations
+both fixed health sequences 3s, and stalls 10s; production request-timeout10/cap10 arguments are unchanged. Reservations
 cover work plus the existing 2s executor reap, 1s fixture close and 2s process settle:
-the unchanged original **135s**, plus plaintext500 **7s** and prehandler503→200 **8s**, total **150s**.
-A further 5s report reserve remains inside 170s, leaving 15s for identity/setup/scheduling.
+the unchanged original **135s**, plus plaintext500→200 **8s** and prehandler503→200 **8s**, total **151s**.
+A further 5s report reserve remains inside 170s, leaving 14s for identity/setup/scheduling.
 Admission clips against that same original deadline; each case also clips work/cleanup/settling
 to its reservation, charges actual fixture startup and settling, and refuses a late result.
-The 503 loop retains one original deadline across both calls and its 1s sleep. Failure to fit is failure.
+Each fixed health loop retains one original deadline across both calls and its 1s sleep. Failure to fit is failure.
 These shorter successful-case deadlines are an explicit test seam, not a production policy change.
 
 Pending is a **new exception with empty private bytes and no route**, not a retained refusal
 message. The delayed-start regression injects an ordinary refusal at the child boundary and
-passes through the unchanged classifier. Every observed `cleanup_uncertain` is fatal, even
+passes through the production classifier. Every observed `cleanup_uncertain` is fatal, even
 on earlier attempts or observations. The production classifier preserves cleanup-uncertain
 failures instead of converting them to Pending. The harness also rejects uncertainty found in
 a suppressed exception's context (a synthetic matching-transient negative control). Only the two
@@ -602,7 +605,7 @@ byte count. The sole exception is an exact whole-output allowlist for the two fi
 #461 formatter candidates: after executed-child/exit1/message/original-route/cleanup checks, the report
 includes the constant candidate text, byte count and SHA256. A mismatch emits only `matches: false`,
 never the unmatched bytes or their hash. Other cases cannot opt in; no private/VM output is restored.
-The 503 Pending remains empty and unlabeled; its separate receipt binds the suppressed original
+Each health Pending remains empty and unlabeled; its separate receipt binds the suppressed original
 Failure's route and formatter. Verdicts additionally require matching status/content-type/body hash,
 complete delivery, ordered request-to-attempt association, mTLS and clean peers. These are source-derived
 candidates, not recovered native diagnostics or verified real-client results until separately executed.
@@ -653,7 +656,41 @@ For negotiated503, the Status message survives, yielding exactly
 `Error from server (ServiceUnavailable): apiserver not ready\n`.
 The fixed candidates are bounded whole byte strings, not a generic InternalError whitelist.
 Missing Retry-After avoids the pinned client's header-driven retry path; all eight deferred
-observations remain deferred. No production health/timeout policy or canonical16 cause is established.
+observations remain deferred. No timeout-policy or canonical16 cause is established.
+
+**Initial health policy (#463).** Only the exact `['get', '--raw=/readyz']` command with the
+`api-initial-readyz` route may additionally become Pending for source-faithful failed health output.
+The original must be a proven executed-child `child command failed`/exit1 on that same route,
+without `cleanup_uncertain`. The whole kubectl formatter must match: exact InternalError prefix,
+quoted body, request-failure suffix and terminal newline. Within that body, one or more
+`[+]NAME ok` or `[-]NAME failed: reason withheld` lines (literal `\n` escapes) must precede the
+exact `readyz check failed` footer, with at least one failed check. Names are restricted to ASCII
+alphanumeric-leading tokens containing alphanumerics, `.`, `_`, `/`, `-`; the checker inventory,
+order and failed subset are not hardcoded to the two-line fixture. Exclusions, warning lines,
+arbitrary reasons, quotes/other escapes, missing footer, mixed output and generic InternalError
+are not accepted. The reconstructed plaintext including its terminal newline must fit the pinned
+client-go **2048-byte pre-trim limit**; oversized or incomplete forms fail closed. This bound is
+derived from `rest/request.go::maxUnstructuredResponseTextBytes`, not a new output/runtime allowance.
+
+This recognizes only observable formatter semantics, not raw HTTP headers or deployed server identity:
+apimachinery uses the same generic InternalError framing for several ≥500 status codes, and kubectl
+does not expose the original status in these bytes. A different status deliberately carrying identical
+health text cannot be distinguished by this classifier. Native proof verdicts separately require the
+fixed HTTP500/content-type/body and ordered delivery evidence; ordinary JSON500 remains fatal.
+
+The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
+absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
+introduced. Only the initial production loop catches this new Pending, under the original fresh2700s
+or resume900s total deadline and existing 5s sleep. Persistent not-ready expires, never succeeds;
+final-readyz and other commands do not receive this new classification. Strict final objects,
+control-node identity/Ready, switch inspection, CA/UID and persistence checks are unchanged.
+`test_vlab_core.py` exercises the actual start/unit-ready/ready-body/api-ready chain through the
+existing synthetic executed-child/files/service fixture: both modes'500→ready strict completion,
+original total expiry, final-fatal/no-retry and initial124/overflow/generic500/uncertain-cleanup
+controls, plus whole-grammar, size, framing, command and route negatives. These are authored
+offline regressions, not native systemd, TLS, forwarding, eighteen-node or persistence proof.
+ROOT must independently review the exact source, run actual CI and separately authorize one bounded
+native proof with verified disposal. This change does not diagnose canonical16 or authorize VM17.
 
 ## Offline-delivered guest prerequisite probe
 

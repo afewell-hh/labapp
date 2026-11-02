@@ -548,14 +548,14 @@ class PublicHealthFormatterTests(unittest.TestCase):
                                 'connections_accepted': len(requests), 'handshakes_completed': len(requests)}}
         return item, rows, {'requests': requests}, evidence
 
-    def test_exact_candidates_preserve_fatal_500_and_empty_unlabeled_pending_503(self):
+    def test_exact_candidates_bind_empty_unlabeled_pending_then_ready(self):
         pins = ((178, '0e3c3fc0399c911b89b8b73e970cb32bd64be9e0131de8b1d0e8119f0e001dac'),
                 (60, '3f7e946c59f2ab5dcac5f1442315b4cc6c2ddb69b6bd6829f24aa5bb63ac0b95'))
-        for name, kind, pin in zip(self.NAMES, ('failure', 'pending'), pins):
+        for name, pin in zip(self.NAMES, pins):
             with self.subTest(case=name):
                 record = self.classify(name)
                 expected = proof.PUBLIC_FORMATTERS[name]
-                self.assertEqual((record['kind'], record['code']), (kind, 1))
+                self.assertEqual((record['kind'], record['code']), ('pending', 1))
                 receipt = record['public_synthetic_formatter']
                 self.assertTrue(receipt['matches'])
                 self.assertEqual(receipt['text'].encode('ascii'), expected)
@@ -563,11 +563,8 @@ class PublicHealthFormatterTests(unittest.TestCase):
                                  (len(expected), proof.hashlib.sha256(expected).hexdigest()))
                 self.assertEqual((receipt['bytes'], receipt['sha256']), pin)
                 self.assertEqual(receipt['child_route'], 'api-initial-readyz')
-                if kind == 'pending':
-                    self.assertEqual((record['route'], record['private_output_bytes']), (None, 0))
-                    self.assertFalse(any(record['flags'].values()))
-                else:
-                    self.assertEqual(record['route'], 'api-initial-readyz')
+                self.assertEqual((record['route'], record['private_output_bytes']), (None, 0))
+                self.assertFalse(any(record['flags'].values()))
                 self.assertEqual(proof.verdict(*self.data(name)), ('passed', []))
 
     def test_whole_formatter_near_misses_never_release_text_or_hash(self):
@@ -642,21 +639,22 @@ class PublicHealthFormatterTests(unittest.TestCase):
                 changed[0]['public_synthetic_formatter'][key] = value
                 self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
 
-    def test_listener_started_pending_exception_is_only_the_exact_503_case(self):
-        item, rows, fixture, evidence = self.data(self.NAMES[1])
-        for change in ({'name': 'other'}, {'steps': [proof.STATUS(503, 'Service Unavailable',
-                                                               'ServiceUnavailable'), proof.OK()]},
-                       {'deadline': 4.0}):
-            outcome, reasons = proof.verdict({**item, **change}, rows, fixture, evidence)
-            self.assertEqual(outcome, 'failed')
-            self.assertIn('pending was not observed before listener startup', reasons)
-        original = next(c for c in proof.build_cases() if c['name'] == 'refused-then-delayed-start')
-        self.assertEqual(proof.verdict(original, rows, fixture, evidence)[0], 'failed')
-        for changed in ([rows[-1]], [rows[0], rows[0], rows[-1]], list(reversed(rows))):
-            self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
+    def test_listener_started_pending_exception_is_only_the_two_exact_health_cases(self):
+        for name in self.NAMES:
+            item, rows, fixture, evidence = self.data(name)
+            for change in ({'name': 'other'}, {'steps': [proof.STATUS(503, 'Service Unavailable',
+                                                                   'ServiceUnavailable'), proof.OK()]},
+                           {'deadline': 4.0}):
+                outcome, reasons = proof.verdict({**item, **change}, rows, fixture, evidence)
+                self.assertEqual(outcome, 'failed')
+                self.assertIn('pending was not observed before listener startup', reasons)
+            original = next(c for c in proof.build_cases() if c['name'] == 'refused-then-delayed-start')
+            self.assertEqual(proof.verdict(original, rows, fixture, evidence)[0], 'failed')
+            for changed in ([rows[-1]], [rows[0], rows[0], rows[-1]], list(reversed(rows))):
+                self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
 
-    def test_503_run_uses_one_deadline_and_one_delivered_response_per_attempt(self):
-        item, _, scripted, _ = self.data(self.NAMES[1])
+    def check_health_run(self, name):
+        item, _, scripted, _ = self.data(name)
         factory = fake_fixture_factory(cleanup={'listener_closed': True, 'threads_alive': 0,
                                                'sockets_closed': True, 'connections_accepted': 2,
                                                'handshakes_completed': 2})
@@ -687,6 +685,11 @@ class PublicHealthFormatterTests(unittest.TestCase):
         self.assertTrue(all(a['server_started'] for a in record['attempts']))
         self.assertEqual(record['verdict'], 'passed')
         self.assertAlmostEqual(record['elapsed'], 1.6)
+
+    def test_health_runs_use_one_deadline_and_one_delivered_response_per_attempt(self):
+        for name in self.NAMES:
+            with self.subTest(case=name):
+                self.check_health_run(name)
 
 
 class RunTests(unittest.TestCase):
@@ -825,7 +828,7 @@ class StaticContractTests(unittest.TestCase):
 
     def test_reservations_cover_full_case_windows_inside_unchanged_budget(self):
         cases = proof.build_cases()
-        self.assertEqual((len(cases), sum(c['budget'] for c in cases)), (16, 150.0))
+        self.assertEqual((len(cases), sum(c['budget'] for c in cases)), (16, 151.0))
         self.assertEqual((len(cases[:14]), sum(c['budget'] for c in cases[:14])), (14, 135.0))
         self.assertLess(sum(c['budget'] for c in cases) + proof.REPORT_RESERVE, proof.WORK_BUDGET)
         for item in cases:

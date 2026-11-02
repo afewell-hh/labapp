@@ -1510,6 +1510,29 @@ def kubeconfig():
     return digest(ca)
 
 
+def initial_readyz_failed(raw):
+    """Pinned healthz.go -> client-go/apimachinery/kubectl v0.35.0 framing (README)."""
+    prefix = b'Error from server (InternalError): an error on the server ("'
+    suffix = b'") has prevented the request from succeeding\n'
+    # client-go caps the plaintext BEFORE TrimSpace/%q at 2048 bytes. Only
+    # literal \n escapes are possible in the restricted ASCII health-line forms.
+    if (len(raw) > len(prefix) + 2 * 2048 + len(suffix)
+            or not raw.startswith(prefix) or not raw.endswith(suffix)):
+        return False
+    body = raw[len(prefix):-len(suffix)]
+    lines = body.split(b'\\n')
+    if (len(lines) < 2 or lines[-1] != b'readyz check failed'
+            or len(body) - (len(lines) - 1) + 1 > 2048):
+        return False
+    failed = False
+    for line in lines[:-1]:
+        if not re.fullmatch(rb'(?:\[\+\][A-Za-z0-9][A-Za-z0-9._/-]* ok|'
+                            rb'\[-\][A-Za-z0-9][A-Za-z0-9._/-]* failed: reason withheld)', line):
+            return False
+        failed |= line.startswith(b'[-]')
+    return failed
+
+
 def kubectl(args, deadline, route=None):
     try:
         return routed(route, [KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
@@ -1521,9 +1544,13 @@ def kubectl(args, deadline, route=None):
         refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
                    b'did you specify the right host or port?\n')
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
+        health_failed = (route == 'api-initial-readyz' and args == ['get', '--raw=/readyz']
+                         and error.route == route and getattr(error, '_executed_child', False) is True
+                         and initial_readyz_failed(raw))
         # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
         # original Failure propagates and can never lead to another readiness poll.
-        if (error.code == 1 and str(error) == 'child command failed' and (raw == refused or unavailable)
+        if (error.code == 1 and str(error) == 'child command failed'
+                and (raw == refused or unavailable or health_failed)
                 and not getattr(error, 'cleanup_uncertain', False)):
             raise Pending('API discovery pending') from None
         raise
@@ -1735,7 +1762,7 @@ def api_objects(resource, namespace, deadline, route=None):
 
 
 def api_ready(deadline, stage=None):
-    """``stage`` ('initial'/'final') only selects the fixed #430 route names; None labels nothing."""
+    """Fixed stage routes; only initial readyz may classify a plaintext health failure as Pending."""
     def route(name):
         return None if stage is None else 'api-%s-%s' % (stage, name)
     ca = kubeconfig()
@@ -1885,7 +1912,7 @@ def ready_body(mode, original, deadline):
         value['service'] = pin
         save(value)
     bridge_index = bridge_ready(deadline, bridge_prerequisite(value, deadline), BRIDGE_INITIAL)
-    # Only file/API-discovery refusal may poll; strict inspection never retries.
+    # Only file/API-discovery or initial health Pending may poll; strict inspection never retries.
     while True:
         remaining(deadline)
         check_live(value, deadline, 'svc-api-loop')
