@@ -370,9 +370,9 @@ until verified, retain the CI/lead fallback and report denials exactly.
 
 Owner preference: local Codex stays lead, Claude workers implement, and
 independent reviews use company-provided GitHub Copilot credits instead of
-personal Codex credits. The lead requests every review; workers never request or
-self-accept one. This routing is **documented, not yet tested**; the lead records
-the first tested run in GitHub.
+personal Codex credits. Workers proactively request an independent review from
+the lead; the lead dispatches it. Workers never accept their own work. Actual
+integration, model and billing evidence belongs in GitHub issues and PRs.
 
 1. **Model-selected Copilot review (default intent).** The lead starts a
    read-only review through Copilot cloud agent with an explicit model: the
@@ -380,14 +380,28 @@ the first tested run in GitHub.
    (for example `@copilot` in a PR comment) or the
    [agent tasks API](https://docs.github.com/en/enterprise-cloud@latest/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api)
    (`model`, `create_pull_request: false`; user-to-server token only, so
-   lead-run, never a worker or workflow credential). Preferred model: the
-   strongest suitable OpenAI model the account is actually entitled to
-   (currently GPT-6.1 Sol if available). An omitted model or a picker-less
-   entrypoint uses Auto, which is not a model choice. The docs do not say what an
-   unsupported model does or show a response field naming the model used: accept
-   a run only when its receipt shows the requested model, never a silent fallback
-   to Auto. "Read-only" is a prompt instruction to an agent that can write code;
-   discard and report any commit, branch or PR it creates.
+   lead-run, never a worker or workflow credential). Prefer GPT-6.1 Sol among
+   the owner's listed models, and reassess when a stronger suitable entitled
+   OpenAI model is available. An omitted model or a picker-less entrypoint uses
+   Auto. Compare the requested model against the task GET response's
+   `sessions[].model`, retaining the exact returned identifier (for example,
+   `sweagent-capi:gpt-6.1-sol`). Missing or mismatched identity is not a pass;
+   never silently accept a fallback to Auto.
+
+   Retrieve the actual report with
+   `gh agent-task view <SESSION> --repo afewell-hh/labapp --log`. The lead relays
+   attributable findings to the issue or PR, including source SHA, task/session,
+   returned model, coverage and limitations. Do not assume the agent can post
+   issue comments or a formal PR review; no bot write permission or firewall
+   expansion is needed for this relay. Record Copilot AI-credit usage and the
+   session owner when exposed; neither alone proves the company's billing payer.
+
+   Review-only is a prompt instruction to a coding agent, not a security
+   sandbox. No project execution, imports, compilation, private data, credentials,
+   cloud access or permission expansion is authorized by a review task. A
+   platform-generated working branch or `head_ref` alone is normal. Verify no
+   unauthorized file changes, commits or PRs; report any and do not adopt them
+   as worker output.
 2. **Built-in Copilot PR review (distinct option).** Assigning Copilot as PR
    reviewer uses a
    [mix of models with effort levels (Lite/Balanced/Max) and no model switching](https://docs.github.com/en/copilot/concepts/agent-capabilities/agent-powered-workflows-and-operations/code-review).

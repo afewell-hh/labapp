@@ -18,7 +18,8 @@ Codex does not document an import mechanism, so this file uses plain links;
 - **Current priority:** efficient, reproducible, automated VM builds for
   multiple platforms, with GCP as the current production delivery. The lead
   selects tools based on source-backed research and measured fit, using a
-  lead / Claude worker / Codex reviewer workflow. Same-code provisioning
+  lead / Claude worker / independent-reviewer workflow (see
+  [review routing](docs/contributing/agent-workflow.md#independent-review-routing)). Same-code provisioning
   modules and container checks live in `build/provision/`; a complete image
   pipeline remains to be implemented. Additional platform priorities and CPU
   scope are open; compatibility requires validation. GCP Marketplace publication
