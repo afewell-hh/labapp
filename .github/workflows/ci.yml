@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Required pinned API cleanup diagnostics offline controls
         run: |
-          timeout --kill-after=5s 90s python3 -I -B - <<'PY'
+          timeout --kill-after=1s 15s python3 -I -B - <<'PY'
           from pathlib import Path
           import unittest
           root = Path.cwd()

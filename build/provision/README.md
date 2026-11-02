@@ -1342,7 +1342,8 @@ lines are not an absence receipt (only the unchanged final success line is). It
 cannot show what an earlier unlogged run did. The synthetic controls in
 `test_pinned_api_hosted_cleanup.py` run the extracted production cleanup functions
 against a fake `docker` shell function. CI requires all eleven controls without
-skips before public preparation in the same job. Run them separately with
+skips before public preparation in the same job, bounded to 15 seconds plus
+one second kill grace within the existing job budget. Run them separately with
 `python3 -m unittest discover -s build/provision -p test_pinned_api_hosted_cleanup.py -v`.
 
 Limits: these are typed decoding/defaulting inputs, not a complete validated
