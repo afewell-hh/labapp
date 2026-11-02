@@ -381,9 +381,10 @@ def cleanup_evidence_bound(record) -> int:
     Schema2 has exactly instance+boot (spec.kinds), with immutable spec.names
     (15 run digits, 3 attempt digits) and at most one uint64 ID per child.
     Each child emits only absent-404 and deleted-ID-404, so there are at most
-    FOUR lifetime facts, regardless of retries/reasons/operation names. For an
-    unadopted ID charge a full 20-digit fact without deduplicating a placeholder:
-    an old opaque string might equal the placeholder but not the eventual ID.
+    FOUR lifetime facts, regardless of retries/reasons/operation names. Their
+    largest standalone canonical array is 311 bytes (names 34/39, IDs 20).
+    For an unadopted ID charge a full 20-digit fact without deduplicating a
+    placeholder: an old opaque string might equal it but not the eventual ID.
     """
     evidence = record['evidence']
     if type(evidence) is not list or any(not isinstance(item, str) for item in evidence):

@@ -8,7 +8,7 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from . import inline_history as inline, spec, test_access
+from . import inline_history as inline, test_access
 from .access_records import canonical, digest
 from .access_recovery import OWNER_SELF, validate_proof
 from .cloud import ApiError, Uncertain
@@ -165,11 +165,13 @@ class CleanupHistoryBounds(unittest.TestCase):
         record = f.w.record()
         self.assertEqual(len(record['names']), 2)
         unknown_bound = inline.cleanup_evidence_bound(record)
+        self.assertEqual(unknown_bound, 311)
         record['ids'] = {kind: str(inline.UINT64) for kind in record['ids']}
         facts = [inline.cleanup_fact(kind, name) for kind, name in record['names'].items()]
         facts += [inline.cleanup_fact(kind, record['names'][kind], value)
                   for kind, value in record['ids'].items()]
         self.assertEqual(len(set(facts)), 4)
+        self.assertEqual(len(canonical(facts)), 311)
         self.assertLessEqual(len(canonical(facts)), unknown_bound)
         record['evidence'] = list(facts)
         self.assertEqual(inline.cleanup_evidence_bound(record), len(canonical(facts)))

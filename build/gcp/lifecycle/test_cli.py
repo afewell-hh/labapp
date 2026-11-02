@@ -610,7 +610,7 @@ class WorkflowTests(unittest.TestCase):
         if path.name == 'inline_history.py':
             self.assertIn(
                 "ImportError: cannot import name 'inline_history' from 'lifecycle' ("
-                + str(path.with_name('__init__.py')) + ')', result.stderr)
+                + str(path.with_name('__init__.py').resolve()) + ')', result.stderr)
         else:
             self.assertIn(
                 "ModuleNotFoundError: No module named 'lifecycle." + path.stem + "'",

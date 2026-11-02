@@ -860,9 +860,11 @@ fixed names bounded by `spec.names` (15 run digits and 3 attempt digits), and on
 immutable unsigned64 ID per child (at most 20 decimal digits). Each child can
 produce only an absent-404 fact and a deleted-ID/confirmed-404 fact: at most four
 distinct physical facts over arbitrarily many retries. Unknown IDs are charged
-at their full width without deduplicating a hypothetical placeholder. New facts
-are appended once; every existing entry, including historical duplicates and
-escaped bytes, stays in order unchanged. This prospective check is a producer
+at their full width without deduplicating a hypothetical placeholder. The largest
+standalone four-fact canonical array is 311 bytes (names 34/39 bytes, IDs 20);
+the producer charges the actual old array plus all missing facts and framing.
+New facts are appended once; every existing entry, including historical duplicates
+and escaped bytes, stays in order unchanged. This prospective check is a producer
 gate in addition to, not a relaxation of, the readers' actual 4096-byte cap.
 
 The physical CAS checks that same evidence/live reserve, immutable IDs and
