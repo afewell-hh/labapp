@@ -470,7 +470,7 @@ def child_failure(code, message):
     return Failure(message, 128 - code, 'child-signal', code)
 
 
-def run(argv, clock, phase, cap=30, user=False):
+def run(argv, clock, phase, cap=30, user=False, on_failure=None):
     # Existing bounded implementation caps output and kills/reaps exact process
     # groups. The guardian additionally contains independent systemd services.
     args = [str(a) for a in argv]
@@ -478,8 +478,184 @@ def run(argv, clock, phase, cap=30, user=False):
         args = ['/usr/sbin/runuser', '-u', 'ubuntu', '--', *args]
     code, out = call_bounded(args, min(cap, clock.remaining(phase)))
     if code:
-        raise child_failure(code, 'fixed child failed')
+        # The exact original failure is built BEFORE any diagnostic work. The optional hook sees
+        # only a returned nonzero (code, out) tuple; whatever it raises (even an interruption)
+        # is discarded, so this same object, its code/category/child_status stay the primary.
+        failure = child_failure(code, 'fixed child failed')
+        if on_failure is not None:
+            try:
+                on_failure(code, out)
+            except BaseException:
+                pass
+        raise failure
     return out
+
+
+# ---- Private bounded installer failure evidence (#439) ---------------------------
+# Only the original install-docker.py nonzero (code, output) tuple returned by call_bounded
+# is captured, before those bytes disappear. Timeout/overflow/spawn/cleanup exceptions carry
+# no tuple and create no record; absence never proves non-execution. Raw bytes are never
+# decoded, repr'd or truncated twice. The record stays in the root-0700 trial root.
+INSTALLER_FAILURE = 'installer-failure.json'
+INSTALLER_SCHEMA = 1
+INSTALLER_OPERATION = 'install-docker'
+INSTALLER_HEAD = 1024
+INSTALLER_TAIL = 12288
+INSTALLER_WHOLE = INSTALLER_HEAD + INSTALLER_TAIL
+INSTALLER_OBSERVED_LIMIT = 1024**2  # call_bounded's own output limit
+INSTALLER_LIMIT = 20480
+INSTALLER_FIELDS = {'schema', 'kind', 'source_sha', 'nonce', 'lease', 'boot', 'phase', 'operation',
+                    'captured_at', 'outcome', 'status', 'observed', 'kept_head', 'kept_tail',
+                    'omitted', 'output_status', 'head', 'tail'}
+INSTALLER_ENVELOPE_FIELDS = {'schema', 'kind', 'source_sha', 'nonce', 'lease', 'boot', 'phase',
+                             'operation', 'outcome', 'status'}
+INSTALLER_ENVELOPE_SCHEMA = 2
+
+
+def exact_int(value):
+    return type(value) is int
+
+
+def installer_terminal(detail):
+    """True only for a validated failed worker/stage/install-docker child exit/signal diagnostic."""
+    return (type(detail) is dict and detail.get('category') in ('child-exit', 'child-signal')
+            and (detail.get('origin'), detail.get('phase'), detail.get('operation'))
+            == ('worker', 'stage', INSTALLER_OPERATION)
+            and exact_int(detail.get('child_status'))
+            and child_status_ok(detail['category'], detail['child_status']))
+
+
+def installer_part(text):
+    """Canonical padded base64 -> bytes; anything else (whitespace, URL alphabet, bad padding) refused."""
+    require(type(text) is str, 'installer evidence refused')
+    try:
+        raw = base64.b64decode(text.encode('ascii'), validate=True)
+    except (ValueError, TypeError):
+        raise Failure('installer evidence refused') from None
+    require(base64.b64encode(raw).decode() == text, 'installer evidence refused')
+    return raw
+
+
+def installer_body(raw):
+    """Pure strict validator of the exact private record bytes -> fresh dict. No binding, no clock."""
+    require(type(raw) is bytes and 0 < len(raw) <= INSTALLER_LIMIT, 'installer evidence refused')
+    try:
+        item = data(raw)
+    except (ValueError, RecursionError):
+        raise Failure('installer evidence refused') from None
+    require(type(item) is dict and set(item) == INSTALLER_FIELDS, 'installer evidence refused')
+    require(exact_int(item['schema']) and item['schema'] == INSTALLER_SCHEMA and item['kind'] == 'installer'
+            and item['phase'] == 'stage' and item['operation'] == INSTALLER_OPERATION, 'installer evidence refused')
+    require(type(item['source_sha']) is str and re.fullmatch('[a-f0-9]{40}', item['source_sha'])
+            and type(item['nonce']) is str and re.fullmatch(HEX32, item['nonce'])
+            and type(item['lease']) is str and re.fullmatch(UUID, item['lease'])
+            and type(item['boot']) is str and re.fullmatch(UUID, item['boot']), 'installer evidence refused')
+    require(type(item['captured_at']) is str, 'installer evidence refused')
+    try:
+        stamp(item['captured_at'])
+    except ValueError:
+        raise Failure('installer evidence refused') from None
+    require(type(item['outcome']) is str and item['outcome'] in ('child-exit', 'child-signal')
+            and exact_int(item['status']) and child_status_ok(item['outcome'], item['status']),
+            'installer evidence refused')
+    counts = [item[k] for k in ('observed', 'kept_head', 'kept_tail', 'omitted')]
+    require(all(exact_int(c) and c >= 0 for c in counts), 'installer evidence refused')
+    observed, kept_head, kept_tail, omitted = counts
+    head, tail = installer_part(item['head']), installer_part(item['tail'])
+    require(len(head) == kept_head and len(tail) == kept_tail and observed == kept_head + kept_tail + omitted
+            and observed <= INSTALLER_OBSERVED_LIMIT and type(item['output_status']) is str, 'installer evidence refused')
+    if observed == 0:
+        shape = ('ok', 0, 0, 0)
+    elif observed <= INSTALLER_WHOLE:
+        shape = ('ok', observed, 0, 0)
+    else:
+        shape = ('truncated', INSTALLER_HEAD, INSTALLER_TAIL, observed - INSTALLER_WHOLE)
+    require((item['output_status'], kept_head, kept_tail, omitted) == shape, 'installer evidence refused')
+    require(raw == encoded(item), 'installer evidence refused')
+    return dict(item)
+
+
+def installer_bound(item, value, boot, outcome=None, status=None):
+    """Binding to the trusted contract + live boot (+ validated terminal), admission/stage bounds.
+
+    The stage window is absolute from admission; no renewal, nothing here reads the clock.
+    """
+    require(item['source_sha'] == value['source_sha'] and item['nonce'] == value['nonce']
+            and item['lease'] == value['lease'] and item['boot'] == boot == value['boot_uuid'],
+            'installer evidence binding refused')
+    captured = stamp(item['captured_at'])
+    require(stamp(value['admitted_at']) <= captured < phase_end(value, 'stage'), 'installer evidence time refused')
+    if outcome is not None:
+        require(item['outcome'] == outcome and item['status'] == status and exact_int(status),
+                'installer evidence terminal refused')
+    return item
+
+
+def installer_envelope(value, boot, detail):
+    return {'schema': INSTALLER_ENVELOPE_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
+            'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
+            'operation': INSTALLER_OPERATION, 'outcome': detail['category'], 'status': detail['child_status']}
+
+
+def installer_record(value, boot, code, out, now):
+    """Construct the exact record body from one returned nonzero (code, output) tuple."""
+    require(exact_int(code) and code != 0 and type(out) is bytes and len(out) <= INSTALLER_OBSERVED_LIMIT,
+            'installer evidence refused')
+    observed = len(out)
+    if observed <= INSTALLER_WHOLE:
+        head, tail, omitted, status = out, b'', 0, 'ok'
+    else:
+        head, tail = out[:INSTALLER_HEAD], out[-INSTALLER_TAIL:]
+        omitted, status = observed - INSTALLER_WHOLE, 'truncated'
+    body = {'schema': INSTALLER_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
+            'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
+            'operation': INSTALLER_OPERATION,
+            'captured_at': datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'outcome': 'child-exit' if code > 0 else 'child-signal', 'status': code,
+            'observed': observed, 'kept_head': len(head), 'kept_tail': len(tail), 'omitted': omitted,
+            'output_status': status, 'head': base64.b64encode(head).decode(),
+            'tail': base64.b64encode(tail).decode()}
+    raw = encoded(body)
+    installer_bound(installer_body(raw), value, boot)
+    return raw
+
+
+def write_installer_failure(raw, clock):
+    """Exclusive fsynced temp, then link(): the first record wins and nothing is overwritten."""
+    no_links(ROOT)
+    info = ROOT.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+            and stat.S_IMODE(info.st_mode) == 0o700, 'installer evidence root refused')
+    temp, final = ROOT / (INSTALLER_FAILURE + '.new'), ROOT / INSTALLER_FAILURE
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                require(written > 0, 'installer evidence write refused')
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        clock.remaining('stage')  # no publication after the original stage cutoff
+        try:
+            os.link(temp, final)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def capture_installer_failure(value, clock, code, out):
+    """Diagnostic-only hook body for install-docker.py. Creates no subprocess and renews nothing."""
+    clock.remaining('stage')
+    raw = installer_record(value, kernel_boot(), code, out, time.time())
+    write_installer_failure(raw, clock)
 
 
 # ---- Transient GHCR registry authentication (#378) -------------------------------
@@ -1114,21 +1290,49 @@ def terminal_export_mode(detail):
                         == ('worker', 'resume', 'core-start-resume')) else 'fresh'
 
 
+def terminal_detail(nonce):
+    """Validated diagnostic of the fixed nonce-bound terminal result, else None (never raises
+    except for an interruption)."""
+    try:
+        record = result_record(data(regular(ROOT / 'result.json', MAX_RESULT, 0, mode=0o600)), nonce)
+    except Failure as error:
+        if error.category == 'interrupted' and error.code in (130, 143):
+            raise
+        return None
+    except Exception:
+        return None
+    return record['diagnostic']
+
+
 def terminal_mode(nonce):
     """Expected export mode from the fixed nonce-bound terminal result; fresh-only fallback.
 
     Never derived from the bundle, the live core mode or manager output. A missing, unsafe,
     oversize or invalid record yields 'fresh', so no resume export is authorized from it.
     """
+    return terminal_export_mode(terminal_detail(nonce))
+
+
+def export_installer(value, nonce, detail):
+    """File-only export of the private installer record: ``absent`` or <envelope>\\n<exact bytes>.
+
+    Envelope comes from the trusted contract, live boot and the independently validated
+    terminal result, never from the file. No core load, no query subprocess, no other path.
+    """
+    boot = kernel_boot()
+    require(boot == value['boot_uuid'] and installer_terminal(detail))
+    root = ROOT.lstat()
+    require(stat.S_ISDIR(root.st_mode) and root.st_uid == os.geteuid() and stat.S_IMODE(root.st_mode) == 0o700)
     try:
-        record = result_record(data(regular(ROOT / 'result.json', MAX_RESULT, 0, mode=0o600)), nonce)
-    except Failure as error:
-        if error.category == 'interrupted' and error.code in (130, 143):
-            raise
-        return 'fresh'
-    except Exception:
-        return 'fresh'
-    return terminal_export_mode(record['diagnostic'])
+        raw = regular(ROOT / INSTALLER_FAILURE, INSTALLER_LIMIT, os.geteuid(), 0o600)
+    except FileNotFoundError:
+        return b'absent'
+    envelope = installer_envelope(value, boot, detail)
+    item = installer_bound(installer_body(raw), value, boot, detail['category'], detail['child_status'])
+    require(time.time() < stamp(value['deadline']), 'installer export after original deadline')
+    require({k: item[k] for k in INSTALLER_ENVELOPE_FIELDS - {'schema'}} == {k: v for k, v in envelope.items()
+                                                                              if k != 'schema'})
+    return encoded(envelope) + b'\n' + raw
 
 
 def export_failure(nonce):
@@ -1142,6 +1346,9 @@ def export_failure(nonce):
     require(type(nonce) is str and nonce == value['nonce'])
     boot = kernel_boot()
     require(boot == value['boot_uuid'])
+    detail = terminal_detail(nonce)
+    if installer_terminal(detail):
+        return export_installer(value, nonce, detail)
     core = load_sibling('vlab_core')
     try:
         root = core.ROOT.lstat()
@@ -1740,8 +1947,11 @@ def provision(value):
             ('install-kubectl.py', ['--version', '1.35.0', '--platform', 'linux/amd64', '--binary', str(ROOT / 'kubectl')], 30)):
         mark('stage', INSTALL_OPERATIONS[script])
         previous = os.umask(0o022)
+        # Evidence hook for the Docker installer only; other installers/calls are unchanged.
+        hook = None if script != 'install-docker.py' else (
+            lambda code, raw, value=value, clock=clock: capture_installer_failure(value, clock, code, raw))
         try:
-            out = run([PYTHON, str(ROOT / script), *args], clock, 'stage', cap)
+            out = run([PYTHON, str(ROOT / script), *args], clock, 'stage', cap, on_failure=hook)
         finally:
             os.umask(previous)
         exclusive(ROOT / (script + '.receipt'), out)

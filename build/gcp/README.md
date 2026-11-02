@@ -1618,6 +1618,28 @@ a concurrent guest failure can legitimately have produced a bundle.
   removal like any other owned-process uncertainty. The primary result, `contained`
   and the existing stop are never changed by it.
 
+**Private Docker installer failure evidence (issue #439).** The SAME single fixed
+export command carries a second, file-only record kind. The host freezes the mode
+`installer` only from its OWN validated primary terminal result: a failed `worker`
+diagnostic with phase `stage`, operation `install-docker` and category `child-exit` or
+`child-signal` with an integer `child_status`; never from export bytes or payload
+headers. In that mode the guest independently re-validates the terminal result and
+returns `<schema-2 envelope>\n<exact record bytes>` (or `absent`); no core bundle is read
+and no query subprocess runs, so there is no `query_cleanup` to fabricate. The host
+requires the envelope to equal its own source SHA, nonce, lease, initial boot UUID,
+`stage`/`install-docker` and the terminal outcome/status, the body to agree with it,
+and `captured_at` to lie in `[snapshot.reserved_at, reserved_at + PHASES['stage'])`.
+Cross-kind, schema-1/3, extra, duplicate, wrongly typed, bool or oversize input is
+`invalid`. The budgets (15 s cap, 12 s teardown reserve, 6 s minimum, absolute `until`,
+`cleanup=True`), the master close, receipt schema and `private_diagnostic` values are
+unchanged; fresh and resume modes keep their strict core-bundle handling, including
+sticky `query_cleanup` uncertainty. The validated bytes are retained once with
+`O_EXCL` 0600 as `installer-failure-<lease>.bin` in the same private directory (a
+closed two-name choice, never guest or caller text). The output is possibly
+credential-bearing (root package scripts can read the armed stored GHCR config): never
+print, upload, image or post it. A missing record is `absent`, which never proves the
+installer did not run. No reconnect, recovery or retry exists.
+
 Owned process cleanup is one shared primitive, `owned_process.OwnedGroup`, used
 by `command()` and every `Master` start/check/close path. The exact returned
 `Popen` leader (`start_new_session=True`) stays an unreaped child, so its numeric

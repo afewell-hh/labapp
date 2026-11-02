@@ -33,7 +33,9 @@ def snapshot():
     return value
 
 
-def worker_detail(category='child-exit', status=17, phase='stage', operation='install-docker'):
+def worker_detail(category='child-exit', status=17, phase='stage', operation='install-hhfab'):
+    # Default is NOT install-docker: a Docker-installer child exit/signal selects the #439
+    # file-only installer export mode; the core first-failure fixtures below use another stage.
     return {'origin': 'worker', 'phase': phase, 'operation': operation,
             'category': category, 'child_status': status}
 
@@ -1944,10 +1946,10 @@ class GuestDiagnostics(unittest.TestCase):
                 ('resume terminal, fresh bytes', self.RESUME, fresh, 'invalid'),
                 ('resume terminal, mixed envelope', self.RESUME,
                  self.export_bytes(self.failure_bundle(), mode='resume'), 'invalid'),
-                ('fresh terminal, fresh bytes', {'phase': 'stage', 'operation': 'install-docker'}, fresh, 'captured')):
+                ('fresh terminal, fresh bytes', {'phase': 'stage', 'operation': 'install-hhfab'}, fresh, 'captured')):
             with self.subTest(name):
                 self.setUp()
-                private, (code, receipt, _, _) = self.resume_drive(raw, detail or {'phase': 'stage', 'operation': 'install-docker'})
+                private, (code, receipt, _, _) = self.resume_drive(raw, detail or {'phase': 'stage', 'operation': 'install-hhfab'})
                 self.assertEqual((code, receipt['private_diagnostic']), (17, expected))
                 self.assertEqual(len(list(private.iterdir())), 1 if expected == 'captured' else 0)
 
@@ -2050,6 +2052,232 @@ class GuestDiagnostics(unittest.TestCase):
         existing.write_bytes(b'EARLIER')
         _, (code, receipt, _, _) = self.private_drive(self.export_bytes())
         self.assertEqual((receipt['private_diagnostic'], existing.read_bytes()), ('unavailable', b'EARLIER'))
+
+    # -- #439 private bounded installer failure evidence --------------------------------
+    # The ACTUAL guest writer + guest exporter produce the bytes; the host side is the real
+    # accepter/extractor/retention driven through a fake ORIGINAL master. No Docker/APT/VM.
+    INSTALLER = {'phase': 'stage', 'operation': 'install-docker'}
+
+    def installer_export(self, out=b'native installer output \xff\x00', code=17, snap=None):
+        """-> (raw export, snapshot, terminal diagnostic). Real writer, real exporter."""
+        snap = snap or snapshot()
+        contract = {'schema': 1, 'nonce': self.nonce, 'lease': snap['request_id'], 'epoch': 1, 'run_id': 1,
+                    'attempt': 1, 'body_sha256': 'b' * 64, 'vm_id': '1234', 'boot_id': '5678',
+                    'image_id': '4575951068918267275', 'admitted_at': snap['reserved_at'],
+                    'deadline': snap['deadline'], 'boot_uuid': self.boot_uuid, 'source_sha': snap['source_sha']}
+        terminal = worker_detail('child-exit' if code > 0 else 'child-signal', code, **self.INSTALLER)
+        root = Path(tempfile.mkdtemp(dir=self.directory, prefix='guest-root-'))
+        reader = guest.regular
+        with ExitStack() as local:
+            local.enter_context(patch.object(guest, 'ROOT', root))
+            local.enter_context(patch.object(guest, 'kernel_boot', return_value=self.boot_uuid))
+            local.enter_context(patch.object(guest, 'regular', side_effect=(
+                lambda p, n, uid=None, mode=None: reader(p, n, None if uid == 0 else uid, mode))))
+            local.enter_context(patch.object(guest, 'load_sibling', side_effect=AssertionError('no core load')))
+            (root / 'contract.json').write_bytes(guest.encoded(contract))
+            (root / 'result.json').write_bytes(guest.encoded(
+                {'schema': 2, 'code': code if code > 0 else 128 - code, 'contained': True,
+                 'nonce': self.nonce, 'diagnostic': terminal}))
+            (root / 'result.json').chmod(0o600)
+            guest.capture_installer_failure(contract, guest.Clock(contract), code, out)
+            raw = guest.export_failure(self.nonce)
+        return raw, snap, terminal
+
+    def installer_args(self, snap, terminal):
+        return (('a' * 40, self.nonce, self.boot_uuid, 'installer'),
+                {'lease': snap['request_id'], 'admitted_at': snap['reserved_at'], 'detail': terminal})
+
+    def remade(self, raw, envelope=lambda e: e, body=lambda b: b):
+        first, _, rest = raw.partition(b'\n')
+        return guest.encoded(envelope(json.loads(first))) + b'\n' + guest.encoded(body(json.loads(rest)))
+
+    def test_installer_actual_writer_guest_export_host_accept_extract_and_retention(self):
+        for out, code in ((b'', 1), (b'x', 255), (bytes(range(256)) * 80, 17), (b'\x00\xffA' * 2000, 1)):
+            with self.subTest(size=len(out), code=code):
+                self.setUp()
+                raw, snap, terminal = self.installer_export(out, code)
+                envelope = json.loads(raw.partition(b'\n')[0])
+                self.assertEqual(envelope, {
+                    'schema': 2, 'kind': 'installer', 'source_sha': 'a' * 40, 'nonce': self.nonce,
+                    'lease': snap['request_id'], 'boot': self.boot_uuid, 'phase': 'stage',
+                    'operation': 'install-docker', 'outcome': 'child-exit', 'status': code})
+                args, installer = self.installer_args(snap, terminal)
+                self.assertEqual(host.accept_failure(raw, *args, installer), ('captured', raw))
+                private = self.directory / 'private'
+                private.mkdir(mode=0o700)
+                calls = []
+                class Master:
+                    def remote(self, argv, phase, cap=30, cleanup=False, until=None, limit=65536):
+                        calls.append((list(argv), phase, cap, cleanup, limit))
+                        return raw
+                uncertain = threading.Event()
+                clock = guest.Clock({'admitted_at': snap['reserved_at'], 'deadline': snap['deadline']})
+                with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')):
+                    status = host.extract_failure(Master(), clock, self.nonce, snap, self.boot_uuid, private,
+                                                  snap['request_id'], uncertain, 'installer', installer)
+                self.assertEqual(status, 'captured')
+                self.assertFalse(uncertain.is_set())
+                self.assertEqual(len(calls), 1)  # exactly one fixed original-master command
+                self.assertEqual(calls[0][0], host.export_command(self.nonce))
+                self.assertEqual((calls[0][1:4], calls[0][4]), (('persistence', host.EXPORT_CAP_SECONDS, True),
+                                                                 host.EXPORT_READ_LIMIT))
+                kept = list(private.iterdir())
+                self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
+                self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode)), (raw, 0o600))
+                self.assertLessEqual(len(raw), host.EXPORT_READ_LIMIT)
+
+    def test_installer_signal_status_and_truncated_shape_survive_the_whole_chain(self):
+        raw, snap, terminal = self.installer_export(b'S' * (guest.INSTALLER_WHOLE + 1), -9)
+        body = json.loads(raw.partition(b'\n')[2])
+        self.assertEqual((body['outcome'], body['status'], body['output_status'], body['omitted'],
+                          body['kept_head'], body['kept_tail']), ('child-signal', -9, 'truncated', 1, 1024, 12288))
+        args, installer = self.installer_args(snap, terminal)
+        self.assertEqual(host.accept_failure(raw, *args, installer)[0], 'captured')
+
+    def test_installer_acceptance_rejects_every_host_binding_and_shape_mismatch(self):
+        raw, snap, terminal = self.installer_export()
+        args, installer = self.installer_args(snap, terminal)
+        put = lambda **kw: (lambda d: {**d, **kw})
+        drop = lambda key: (lambda d: {k: v for k, v in d.items() if k != key})
+        admitted = guest.stamp(snap['reserved_at'])
+        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        both = lambda **kw: dict(envelope=put(**kw), body=put(**kw))
+        cases = {
+            'foreign source': self.remade(raw, **both(source_sha='b' * 40)),
+            'foreign nonce': self.remade(raw, **both(nonce='9' * 32)),
+            'foreign lease': self.remade(raw, **both(lease='22222222-2222-4222-8222-222222222222')),
+            'foreign boot': self.remade(raw, **both(boot='33333333-3333-4333-8333-333333333333')),
+            'other operation': self.remade(raw, **both(operation='install-hhfab')),
+            'other phase': self.remade(raw, **both(phase='fresh')),
+            'outcome vs terminal': self.remade(raw, **both(outcome='child-signal', status=-9)),
+            'status vs terminal': self.remade(raw, **both(status=18)),
+            'envelope only differs': self.remade(raw, envelope=put(lease='22222222-2222-4222-8222-222222222222')),
+            'body only differs': self.remade(raw, body=put(nonce='9' * 32)),
+            'body status only differs': self.remade(raw, body=put(status=18)),
+            'captured before admission': self.remade(raw, body=put(captured_at=stamp(admitted - 5))),
+            'captured at stage cutoff': self.remade(raw, body=put(captured_at=stamp(admitted + 35 * 60))),
+            'captured long after': self.remade(raw, body=put(captured_at=stamp(admitted + 3600))),
+            'captured malformed': self.remade(raw, body=put(captured_at='2026-01-01 00:00:00')),
+            'envelope schema 1': self.remade(raw, envelope=put(schema=1)),
+            'envelope bool schema': self.remade(raw, envelope=put(schema=True)),
+            'envelope bool status': self.remade(raw, envelope=put(status=True)),
+            'envelope extra': self.remade(raw, envelope=put(extra=1)),
+            'envelope missing': self.remade(raw, envelope=drop('lease')),
+            'envelope cross kind': self.remade(raw, envelope=put(kind='first-failure')),
+            'body bool schema': self.remade(raw, body=put(schema=True)),
+            'body bool count': self.remade(raw, body=put(omitted=False)),
+            'body extra': self.remade(raw, body=put(extra='x')),
+            'body missing': self.remade(raw, body=drop('tail')),
+            'body count lie': self.remade(raw, body=put(observed=99999)),
+            'body status lie': self.remade(raw, body=put(output_status='truncated')),
+            'body noncanonical base64': self.remade(raw, body=put(head='\n' + json.loads(raw.partition(b'\n')[2])['head'])),
+            'body noncanonical json': raw.partition(b'\n')[0] + b'\n ' + raw.partition(b'\n')[2],
+            'duplicate key': raw.replace(b'"tail":', b'"nonce":"' + self.nonce.encode() + b'","tail":', 1),
+            'no separator': raw.replace(b'\n', b'', 1),
+            'trailing bytes': raw + b'\n',
+            'oversize': raw + b' ' * guest.INSTALLER_LIMIT,
+            'invalid token': b'invalid',
+            'legacy first-failure bytes': self.export_bytes(),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.assertEqual(host.accept_failure(bad, *args, installer), ('invalid', None))
+        for name, change in (('source', ('b' * 40, self.nonce, self.boot_uuid)), ('nonce', ('a' * 40, '9' * 32, self.boot_uuid)),
+                             ('boot', ('a' * 40, self.nonce, '3' * 8 + self.boot_uuid[8:])),
+                             ('zero boot', ('a' * 40, self.nonce, host.ZERO_BOOT))):
+            with self.subTest('host expected ' + name):
+                self.assertEqual(host.accept_failure(raw, *change, 'installer', installer), ('invalid', None))
+        for name, bad in (('lease', dict(installer, lease='22222222-2222-4222-8222-222222222222')),
+                          ('admitted later', dict(installer, admitted_at=stamp(admitted + 3600))),
+                          ('signal terminal', dict(installer, detail=worker_detail('child-signal', -9, **self.INSTALLER))),
+                          ('other operation terminal', dict(installer, detail=worker_detail(operation='install-hhfab'))),
+                          ('timeout terminal', dict(installer, detail=worker_detail('child-timeout', None, **self.INSTALLER))),
+                          ('no terminal', dict(installer, detail=None))):
+            with self.subTest('host terminal ' + name):
+                self.assertEqual(host.accept_failure(raw, *args, bad), ('invalid', None))
+        for mode in ('fresh', 'resume', 'other'):
+            with self.subTest('mode ' + mode):
+                self.assertEqual(host.accept_failure(raw, 'a' * 40, self.nonce, self.boot_uuid, mode),
+                                 ('invalid', None))
+        self.assertEqual(host.accept_failure(b'absent', *args, installer), ('absent', None))
+        self.assertEqual(host.accept_failure(raw, *args, None), ('invalid', None))
+
+    def test_installer_trial_drive_retains_private_file_and_leaves_public_receipt_and_cleanup_unchanged(self):
+        raw, snap, terminal = self.installer_export()
+        private, (code, receipt, trace, text) = self.resume_drive(raw, self.INSTALLER)
+        self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
+                         (17, 17, 'captured', True))
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail(operation='install-docker'))
+        self.assertEqual(len(self.exports), 1)
+        self.assertEqual([f.name for f in private.iterdir()], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertLess(trace.index('export'), trace.index('master-close'))
+        self.assertLess(trace.index('master-close'), trace.index('remove-key'))
+        self.assertIn('dispatch-cleanup', trace)
+        self.assertTrue(receipt['process_absent'] and receipt['local_files_absent'] and receipt['own_key_absent'])
+        self.assertEqual(set(receipt), {'schema', 'code', 'contained', 'process_absent', 'phase', 'failure_category',
+                                        'host_operation', 'own_key_absent', 'local_files_absent',
+                                        'independent_cleanup_dispatched', 'lease', 'guest_diagnostic_status',
+                                        'guest_diagnostic', 'guest_service', 'private_diagnostic'})
+        for forbidden in ('native installer output', str(private)):
+            self.assertNotIn(forbidden, text)
+
+    def test_installer_mode_is_frozen_from_validated_terminal_never_from_payload_or_other_terminals(self):
+        raw, _, _ = self.installer_export()
+        fresh = self.export_bytes()
+        for name, export, detail, expected in (
+                ('installer terminal, core bytes', fresh, self.INSTALLER, 'invalid'),
+                ('hhfab terminal, installer bytes', raw, {'phase': 'stage', 'operation': 'install-hhfab'}, 'invalid'),
+                ('resume terminal, installer bytes', raw, self.RESUME, 'invalid'),
+                ('installer terminal, installer bytes', raw, self.INSTALLER, 'captured')):
+            with self.subTest(name):
+                self.setUp()
+                private, (code, receipt, _, _) = self.resume_drive(export, detail)
+                self.assertEqual((code, receipt['private_diagnostic']), (17, expected))
+                self.assertEqual(len(list(private.iterdir())), 1 if expected == 'captured' else 0)
+
+    def test_installer_extraction_failures_budget_collision_and_stickiness_preserve_primary(self):
+        raw, snap, terminal = self.installer_export()
+        args, installer = self.installer_args(snap, terminal)
+        class Abort(BaseException):
+            cleanup_uncertain = True
+        for name, export, expected in (('master lost', guest.Failure('original master lost', 124), 'unavailable'),
+                                       ('generic', RuntimeError(SENTINEL), 'unavailable'),
+                                       ('invalid reply', b'invalid', 'invalid'), ('absent', b'absent', 'absent')):
+            with self.subTest(name):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.resume_drive(export, self.INSTALLER)
+                self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, expected, True))
+                self.assertEqual(list(private.iterdir()), [])
+                self.assertIn('master-close', trace)
+                self.assertNotIn(SENTINEL, text)
+        self.setUp()
+        private, (code, receipt, trace, _) = self.resume_drive(Abort(SENTINEL), self.INSTALLER)
+        self.assertEqual((code, receipt['private_diagnostic'], receipt['process_absent'],
+                          receipt['own_key_absent']), (17, 'unavailable', False, False))  # sticky uncertainty
+        self.setUp()
+        with patch.object(guest.Clock, 'cleanup_remaining', return_value=host.EXPORT_TEARDOWN_RESERVE + 1):
+            private, (code, receipt, trace, _) = self.resume_drive(raw, self.INSTALLER)
+        self.assertEqual((receipt['private_diagnostic'], self.exports), ('skipped', []))
+        self.setUp()
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        existing = private / ('installer-failure-' + snapshot()['request_id'] + '.bin')
+        existing.write_bytes(b'EARLIER')
+        _, (code, receipt, _, _) = self.resume_drive(raw, self.INSTALLER)
+        self.assertEqual((code, receipt['private_diagnostic'], existing.read_bytes()), (17, 'unavailable', b'EARLIER'))
+
+    def test_retention_kind_is_a_closed_source_choice(self):
+        lease = snapshot()['request_id']
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        for kind in ('../escape', 'other', '', None):
+            with self.subTest(kind=kind), self.assertRaises(guest.Failure):
+                host.retain_private(private, lease, b'x', kind)
+        self.assertEqual(list(private.iterdir()), [])
+        host.retain_private(private, lease, b'x', 'installer-failure')
+        with self.assertRaises(FileExistsError):
+            host.retain_private(private, lease, b'y', 'installer-failure')
+        self.assertEqual((private / ('installer-failure-' + lease + '.bin')).read_bytes(), b'x')
 
     def test_export_process_uncertainty_stays_sticky_through_successful_close(self):
         class ExportAbort(BaseException):

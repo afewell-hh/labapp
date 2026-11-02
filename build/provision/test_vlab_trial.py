@@ -1851,6 +1851,31 @@ class SharedTrial(unittest.TestCase):
         self.assertEqual((error.code, error.category, error.child_status), (17, 'child-exit', 17))
         self.assertEqual((status['state'], status['operation']), ('running', 'install-docker'))  # no false terminal
 
+    def test_installer_evidence_hook_is_docker_only_and_failed_capture_never_changes_status(self):
+        calls = []
+        def capture(value, clock, code, out):
+            calls.append((value['nonce'], code, out))
+        with patch.object(trial, 'capture_installer_failure', side_effect=capture):
+            error, baseline = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+            self.assertEqual(calls, [(NONCE, 17, b'native')])
+            for operation in ('install-qemu', 'install-hhfab', 'install-kubectl'):
+                calls.clear()
+                other, _ = self.run_worker(self.fake_bounded({operation: (5, b'other')}, []))
+                self.assertEqual((other.code, other.category, other.child_status), (5, 'child-exit', 5))
+                self.assertEqual(calls, [])  # other installers and every other call are unchanged
+            calls.clear()
+            self.run_worker(self.fake_bounded({'core-prepare': (5, b'other')}, []))
+            self.run_worker(self.fake_bounded({'install-docker': hhfab_release.Refusal('command timeout')}, []))
+            self.assertEqual(calls, [])  # no returned tuple, no capture
+        primary = (error.code, error.category, error.child_status)
+        self.assertEqual(primary, (17, 'child-exit', 17))
+        self.assertEqual((baseline['state'], baseline['operation'], baseline['code']), ('failed', 'install-docker', 17))
+        for fault in (OSError(SENTINEL), KeyboardInterrupt(), SystemExit(143), trial.Failure('signal', 143, 'interrupted')):
+            with self.subTest(type(fault).__name__), patch.object(trial, 'capture_installer_failure', side_effect=fault):
+                again, status = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+                self.assertEqual((again.code, again.category, again.child_status), primary)
+                self.assertEqual(status, baseline)  # public worker status identical to the no-capture baseline
+
     def test_worker_claim_collision_and_binding_failure_never_replace_incumbent_checkpoint(self):
         self.worker_inputs()
         incumbent = trial.encoded(worker_state('running', seq=9))
@@ -3439,7 +3464,8 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
     """
     RESUME = {'origin': 'worker', 'phase': 'resume', 'operation': 'core-start-resume',
               'category': 'child-exit', 'child_status': 17}
-    FRESH = {'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker',
+    # Not install-docker: that child exit/signal is the #439 file-only installer export mode.
+    FRESH = {'origin': 'worker', 'phase': 'stage', 'operation': 'install-hhfab',
              'category': 'child-exit', 'child_status': 17}
     RESUME_INVOCATION = 'd' * 32
 
@@ -3685,3 +3711,403 @@ class ResumeFailureLifecycleExport(unittest.TestCase):
                                  (dict(trial.SUCCESS), 'fresh'), (None, 'fresh'), (guardian, 'fresh')):
             with self.subTest(detail=detail):
                 self.assertEqual(trial.terminal_export_mode(detail), expected)
+
+
+class InstallerFailureEvidence(unittest.TestCase):
+    """#439: pure validators, REAL bounded stdlib child -> hook -> writer -> exporter.
+
+    Offline only: children are `sys.executable` one-liners; no Docker, APT, systemd, network or VM.
+    """
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.base = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-installer-')))
+        self.root = self.base / 'trial'
+        self.root.mkdir(mode=0o700)
+        self.v = value()
+        reader = trial.regular
+        # Production requires euid 0; fixtures are owned by the unprivileged test user.
+        self.stack.enter_context(patch.object(trial, 'regular', side_effect=(
+            lambda p, n, uid=None, mode=None: reader(p, n, None if uid == 0 else uid, mode))))
+        self.stack.enter_context(patch.object(trial, 'ROOT', self.root))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=self.v['boot_uuid']))
+        (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
+        self.clock = trial.Clock(self.v)
+        self.final = self.root / trial.INSTALLER_FAILURE
+        self.temp = self.root / (trial.INSTALLER_FAILURE + '.new')
+
+    def record(self, out=b'x', code=1, now=None, v=None):
+        v = v or self.v
+        return trial.installer_record(v, v['boot_uuid'], code, out, time.time() if now is None else now)
+
+    def terminal(self, category='child-exit', status=17, operation='install-docker'):
+        detail = {'origin': 'worker', 'phase': 'stage', 'operation': operation,
+                  'category': category, 'child_status': status}
+        path = self.root / 'result.json'
+        path.unlink(missing_ok=True)
+        path.write_bytes(trial.encoded({'schema': 2, 'code': status if category == 'child-exit' else 128 - status,
+                                        'contained': True, 'nonce': NONCE, 'diagnostic': detail}))
+        path.chmod(0o600)
+        return detail
+
+    def test_byte_shapes_and_caps_at_every_boundary(self):
+        pattern = b'\x00\xffAB\n'
+        for size, shape in ((0, ('ok', 0, 0, 0)), (1, ('ok', 1, 0, 0)), (13312, ('ok', 13312, 0, 0)),
+                            (13313, ('truncated', 1024, 12288, 1)),
+                            (1048576, ('truncated', 1024, 12288, 1048576 - 13312))):
+            with self.subTest(size=size):
+                out = (pattern * (size // len(pattern) + 1))[:size]
+                raw = self.record(out)
+                item = trial.installer_body(raw)
+                self.assertEqual((item['output_status'], item['kept_head'], item['kept_tail'], item['omitted']), shape)
+                self.assertEqual(item['observed'], size)
+                self.assertEqual(item['observed'], item['kept_head'] + item['kept_tail'] + item['omitted'])
+                self.assertLessEqual(len(raw), trial.INSTALLER_LIMIT)
+                self.assertEqual(base64.b64decode(item['head']), out[:item['kept_head']])
+                self.assertEqual(base64.b64decode(item['tail']), out[size - item['kept_tail']:] if item['kept_tail'] else b'')
+        for name, args in (('oversize', (b'x' * (1048576 + 1), 1)), ('text output', ('text', 1)),
+                           ('zero code', (b'x', 0)), ('bool code', (b'x', True)), ('string code', (b'x', '1')),
+                           ('exit 256', (b'x', 256)), ('signal -65', (b'x', -65))):
+            with self.subTest(name), self.assertRaises(trial.Failure):
+                self.record(*args)
+        for code in (1, 255, -1, -64):
+            with self.subTest(code=code):
+                self.assertEqual(trial.installer_body(self.record(b'x', code))['status'], code)
+
+    def test_strict_validator_rejects_hostile_shapes_types_and_encodings(self):
+        good = json.loads(self.record(b'abc'))
+        self.assertEqual(trial.installer_body(trial.encoded(good))['head'], 'YWJj')
+        wrong = {
+            'bool schema': dict(good, schema=True), 'schema 2': dict(good, schema=2),
+            'float schema': dict(good, schema=1.0), 'kind': dict(good, kind='first-failure'),
+            'phase': dict(good, phase='fresh'), 'operation': dict(good, operation='install-hhfab'),
+            'short source': dict(good, source_sha='c' * 39), 'upper nonce': dict(good, nonce='A' * 32),
+            'lease': dict(good, lease='x'), 'boot': dict(good, boot=None), 'captured fmt': dict(good, captured_at='x'),
+            'captured type': dict(good, captured_at=1), 'outcome': dict(good, outcome='child-timeout'),
+            'outcome vs status': dict(good, outcome='child-signal'), 'status zero': dict(good, status=0),
+            'status bool': dict(good, status=True), 'status 256': dict(good, status=256),
+            'status float': dict(good, status=1.0), 'float count': dict(good, observed=3.0),
+            'bool count': dict(good, kept_tail=False), 'negative omitted': dict(good, omitted=-1),
+            'count sum': dict(good, observed=4), 'tail on whole': dict(good, tail='YQ==', kept_tail=1, observed=4),
+            'status shape': dict(good, output_status='truncated'), 'unknown status': dict(good, output_status='invalid'),
+            'padless base64': dict(good, head='YWJ'), 'whitespace base64': dict(good, head='YWJj\n'),
+            'url alphabet': dict(good, head='YW-_', kept_head=3), 'head type': dict(good, head=1),
+            'head length lie': dict(good, kept_head=2, observed=2), 'extra': dict(good, extra=1),
+            'missing': {k: v for k, v in good.items() if k != 'tail'},
+        }
+        for name, item in wrong.items():
+            with self.subTest(name), self.assertRaises(trial.Failure):
+                trial.installer_body(trial.encoded(item))
+        text = trial.encoded(good)
+        for name, raw in (('empty', b''), ('str', text.decode()), ('spaced', text.replace(b',"', b', "', 1)),
+                          ('duplicate', text.replace(b'"tail":', b'"nonce":"' + b'a' * 32 + b'","tail":', 1)),
+                          ('nan', text.replace(b'"observed":3', b'"observed":NaN')), ('array', b'[]'),
+                          ('oversize', text + b' ' * trial.INSTALLER_LIMIT), ('trailing', text + b'\n'),
+                          ('invalid json', text[:-1])):
+            with self.subTest(name), self.assertRaises(trial.Failure):
+                trial.installer_body(raw)
+        zero = json.loads(self.record(b''))
+        self.assertEqual((zero['output_status'], zero['head'], zero['tail'], zero['observed']), ('ok', '', '', 0))
+        self.assertEqual(trial.installer_body(trial.encoded(zero))['observed'], 0)
+
+    def test_binding_and_time_window_use_contract_boot_and_absolute_stage_bounds(self):
+        item = trial.installer_body(self.record())
+        self.assertIs(trial.installer_bound(item, self.v, self.v['boot_uuid']), item)
+        for key, other in (('source_sha', 'd' * 40), ('nonce', '9' * 32),
+                           ('lease', '33333333-3333-4333-8333-333333333333'),
+                           ('boot_uuid', '33333333-3333-4333-8333-333333333333')):
+            with self.subTest(key), self.assertRaises(trial.Failure):
+                trial.installer_bound(item, dict(self.v, **{key: other}), self.v['boot_uuid'])
+        with self.assertRaises(trial.Failure):
+            trial.installer_bound(item, self.v, '33333333-3333-4333-8333-333333333333')
+        admitted = trial.stamp(self.v['admitted_at'])
+        for now in (admitted - 5, admitted + 35 * 60, admitted + 36 * 60):
+            with self.subTest(now=now - admitted), self.assertRaises(trial.Failure):
+                self.record(now=now)
+        self.record(now=admitted)
+        self.record(now=admitted + 35 * 60 - 1)
+        with self.assertRaises(trial.Failure):
+            trial.installer_bound(item, self.v, self.v['boot_uuid'], 'child-signal', -9)
+
+    def test_hook_receives_only_a_returned_nonzero_tuple_never_launch_or_cleanup_exceptions(self):
+        seen = []
+        hook = lambda code, out: seen.append((code, out))
+        for fault, (code, out) in (('exit', (17, b'native')), ('installer preflight refusal', (2, b'refused: no network')),
+                                   ('signal', (-9, b'')), ('exit 255', (255, bytes(range(256))))):
+            with self.subTest(fault), patch.object(trial, 'call_bounded', return_value=(code, out)):
+                with self.assertRaises(trial.Failure) as raised:
+                    trial.run(['/bin/x'], self.clock, 'stage', 235, on_failure=hook)
+                self.assertEqual((raised.exception.code, raised.exception.child_status),
+                                 (code if code > 0 else 128 - code, code))
+        self.assertEqual(seen, [(17, b'native'), (2, b'refused: no network'), (-9, b''), (255, bytes(range(256)))])
+        seen.clear()
+        with patch.object(trial, 'call_bounded', return_value=(0, b'ok')):
+            self.assertEqual(trial.run(['/bin/x'], self.clock, 'stage', 235, on_failure=hook), b'ok')
+        for fault in (hhfab_release.Refusal('command timeout'), hhfab_release.Refusal('command output overflow'),
+                      hhfab_release.Refusal(SENTINEL), OSError(SENTINEL), KeyboardInterrupt(), SystemExit(143)):
+            with self.subTest(type(fault).__name__), patch.object(hhfab_release, 'bounded', side_effect=fault), \
+                 self.assertRaises(BaseException):
+                trial.run(['/bin/x'], self.clock, 'stage', 235, on_failure=hook)
+        expired = Mock()
+        expired.remaining.side_effect = trial.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+        with patch.object(trial, 'call_bounded', side_effect=AssertionError('never launched')), \
+             self.assertRaises(trial.Failure):
+            trial.run(['/bin/x'], expired, 'stage', 235, on_failure=hook)
+        self.assertEqual(seen, [])  # launch refusal, timeout, overflow, spawn: no tuple, no record
+
+    def test_every_diagnostic_base_exception_preserves_the_same_original_failure(self):
+        real = trial.child_failure
+        built = []
+        def make(code, message):
+            built.append(real(code, message))
+            return built[-1]
+        for fault in (KeyboardInterrupt(SENTINEL), SystemExit(143), trial.Failure('signal', 143, 'interrupted'),
+                      trial.Failure('signal', 130, 'interrupted'), OSError(SENTINEL), RuntimeError(SENTINEL),
+                      MemoryError()):
+            with self.subTest(type(fault).__name__):
+                built.clear()
+                before_hook = []
+                def hook(code, out, fault=fault):
+                    before_hook.append(len(built))  # (a failed assert here would be swallowed, so record it)
+                    raise fault
+                with patch.object(trial, 'call_bounded', return_value=(17, b'native')), \
+                     patch.object(trial, 'child_failure', side_effect=make):
+                    with self.assertRaises(trial.Failure) as raised:
+                        trial.run(['/bin/x'], self.clock, 'stage', 235, on_failure=hook)
+                self.assertEqual(before_hook, [1])  # the original is constructed BEFORE diagnostic work
+                self.assertIs(raised.exception, built[0])
+                self.assertEqual((str(raised.exception), raised.exception.code, raised.exception.category,
+                                  raised.exception.child_status), ('fixed child failed', 17, 'child-exit', 17))
+
+    def test_real_stdlib_child_stderr_to_bounded_to_writer(self):
+        hook = lambda code, out: trial.capture_installer_failure(self.v, self.clock, code, out)
+        binary = bytes(range(256))
+        cases = (
+            ('exit 1', "import sys; sys.stderr.write('boom'); sys.exit(1)", 1, 'child-exit', b'boom'),
+            ('exit 255 binary', "import sys; sys.stderr.buffer.write(bytes(range(256))); sys.stderr.flush(); sys.exit(255)",
+             255, 'child-exit', binary),
+            ('signal', "import os, signal, sys; sys.stderr.write('before'); sys.stderr.flush(); "
+                       "os.kill(os.getpid(), signal.SIGKILL)", -9, 'child-signal', b'before'),
+            ('mixed streams', "import sys; sys.stdout.write('out'); sys.stdout.flush(); sys.stderr.write('err'); sys.exit(3)",
+             3, 'child-exit', None),
+            ('large', "import sys; sys.stdout.write('A' * 20000 + 'Z'); sys.exit(4)", 4, 'child-exit', b'A' * 20000 + b'Z'),
+        )
+        for name, program, status, outcome, expected in cases:
+            with self.subTest(name):
+                self.final.unlink(missing_ok=True)
+                with self.assertRaises(trial.Failure) as raised:
+                    trial.run([sys.executable, '-c', program], self.clock, 'stage', 30, on_failure=hook)
+                self.assertEqual((raised.exception.category, raised.exception.child_status), (outcome, status))
+                info = self.final.lstat()
+                self.assertEqual((stat.S_IMODE(info.st_mode), info.st_nlink, info.st_uid), (0o600, 1, os.getuid()))
+                self.assertFalse(self.temp.exists())
+                item = trial.installer_body(self.final.read_bytes())
+                self.assertEqual((item['outcome'], item['status'], item['source_sha'], item['nonce'], item['lease'],
+                                  item['boot']), (outcome, status, self.v['source_sha'], NONCE, self.v['lease'],
+                                                  self.v['boot_uuid']))
+                head, tail = base64.b64decode(item['head']), base64.b64decode(item['tail'])
+                if expected is None:
+                    self.assertIn(b'out', head)
+                    self.assertIn(b'err', head)
+                elif len(expected) <= trial.INSTALLER_WHOLE:
+                    self.assertEqual((head, tail, item['omitted']), (expected, b'', 0))
+                else:
+                    self.assertEqual((item['output_status'], item['observed'], head, tail, item['omitted']),
+                                     ('truncated', len(expected), expected[:1024], expected[-12288:],
+                                      len(expected) - 13312))
+
+    def test_writer_first_record_wins_with_owner_mode_single_link_and_no_leftovers(self):
+        first, second = self.record(b'one'), self.record(b'two')
+        trial.write_installer_failure(first, self.clock)
+        trial.write_installer_failure(second, self.clock)  # a later failure never replaces the first writer
+        info = self.final.lstat()
+        self.assertEqual((self.final.read_bytes(), stat.S_IMODE(info.st_mode), info.st_nlink, info.st_uid),
+                         (first, 0o600, 1, os.getuid()))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['contract.json', trial.INSTALLER_FAILURE])
+        self.assertEqual(trial.regular(self.final, trial.INSTALLER_LIMIT, 0, 0o600), first)
+
+    def test_writer_io_failures_leave_no_partial_final_and_no_temp(self):
+        real_write, real_close = os.write, os.close
+        writes = []
+        def partial(fd, view):
+            writes.append(fd)
+            if len(writes) == 1:
+                return real_write(fd, bytes(view[:5]))
+            raise OSError(SENTINEL)
+        def closing(fd):
+            real_close(fd)
+            raise OSError(SENTINEL)
+        faults = {
+            'partial write': patch.object(os, 'write', side_effect=partial),
+            'write error': patch.object(os, 'write', side_effect=OSError(SENTINEL)),
+            'zero write': patch.object(os, 'write', return_value=0),
+            'fsync': patch.object(os, 'fsync', side_effect=OSError(SENTINEL)),
+            'fchmod': patch.object(os, 'fchmod', side_effect=OSError(SENTINEL)),
+            'link': patch.object(os, 'link', side_effect=OSError(SENTINEL)),
+            'close': patch.object(os, 'close', side_effect=closing),
+        }
+        raw = self.record(b'native')
+        for name, fault in faults.items():
+            with self.subTest(name):
+                writes.clear()
+                with fault, self.assertRaises(BaseException):
+                    trial.write_installer_failure(raw, self.clock)
+                self.assertFalse(self.final.exists() or self.final.is_symlink())
+                self.assertFalse(self.temp.exists())
+        with self.subTest('expired stage before publication'):
+            expired = Mock()
+            expired.remaining.side_effect = trial.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+            with self.assertRaises(trial.Failure):
+                trial.write_installer_failure(raw, expired)
+            self.assertFalse(self.final.exists() or self.temp.exists())
+            with self.assertRaises(trial.Failure):
+                trial.capture_installer_failure(self.v, expired, 17, b'x')
+            self.assertFalse(self.final.exists() or self.temp.exists())
+        with self.subTest('then a clean write still works'):
+            trial.write_installer_failure(raw, self.clock)
+            self.assertEqual(self.final.read_bytes(), raw)
+
+    def test_writer_refuses_collisions_links_and_unsafe_root_without_adopting_them(self):
+        raw = self.record(b'native')
+        elsewhere = self.base / 'elsewhere'
+        elsewhere.write_bytes(b'UNTOUCHED')
+        self.temp.write_bytes(b'PARTIAL')
+        with self.assertRaises(FileExistsError):  # a leftover temp is never adopted or published
+            trial.write_installer_failure(raw, self.clock)
+        self.assertEqual((self.temp.read_bytes(), self.final.exists()), (b'PARTIAL', False))
+        self.temp.unlink()
+        self.temp.symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            trial.write_installer_failure(raw, self.clock)
+        self.assertEqual(elsewhere.read_bytes(), b'UNTOUCHED')
+        self.temp.unlink()
+        self.final.symlink_to(elsewhere)  # an existing name (even a link) is an earlier writer; nothing follows it
+        trial.write_installer_failure(raw, self.clock)
+        self.assertEqual((elsewhere.read_bytes(), self.final.is_symlink(), self.temp.exists()),
+                         (b'UNTOUCHED', True, False))
+        self.final.unlink()
+        self.root.chmod(0o755)
+        with self.assertRaises(trial.Failure):
+            trial.write_installer_failure(raw, self.clock)
+        self.root.chmod(0o700)
+        link = self.base / 'rootlink'
+        link.symlink_to(self.root)
+        with patch.object(trial, 'ROOT', link), self.assertRaises(trial.Failure):
+            trial.write_installer_failure(raw, self.clock)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['contract.json'])
+
+    def test_exporter_builds_envelope_from_contract_boot_and_validated_terminal_only(self):
+        detail = self.terminal()
+        self.assertEqual(trial.export_failure(NONCE), b'absent')
+        trial.capture_installer_failure(self.v, self.clock, 17, b'native \xff output')
+        with patch.object(trial, 'load_sibling', side_effect=AssertionError('no core load')), \
+             patch.object(trial.subprocess, 'Popen', side_effect=AssertionError('no query child')):
+            raw = trial.export_failure(NONCE)
+        first, separator, rest = raw.partition(b'\n')
+        self.assertEqual(separator, b'\n')
+        self.assertEqual(json.loads(first), {
+            'schema': 2, 'kind': 'installer', 'source_sha': self.v['source_sha'], 'nonce': NONCE,
+            'lease': self.v['lease'], 'boot': self.v['boot_uuid'], 'phase': 'stage', 'operation': 'install-docker',
+            'outcome': detail['category'], 'status': detail['child_status']})
+        self.assertEqual(rest, self.final.read_bytes())
+        self.assertEqual(trial.installer_body(rest)['status'], 17)
+        self.terminal('child-signal', -9)
+        self.final.unlink()
+        trial.capture_installer_failure(self.v, self.clock, -9, b'')
+        self.assertEqual(json.loads(trial.export_failure(NONCE).partition(b'\n')[0])['outcome'], 'child-signal')
+
+    def test_exporter_refuses_every_mismatched_unsafe_or_stale_record(self):
+        self.terminal()
+        other = '33333333-3333-4333-8333-333333333333'
+        admitted = trial.stamp(self.v['admitted_at'])
+        def edited(**changes):
+            return trial.encoded(dict(json.loads(self.record(b'native')), **changes))
+        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        good = self.record(b'native')
+        cases = {
+            'foreign nonce': edited(nonce='9' * 32), 'foreign source': edited(source_sha='d' * 40),
+            'foreign lease': edited(lease=other), 'foreign boot': edited(boot=other),
+            'status vs terminal': edited(status=18), 'outcome vs terminal': edited(outcome='child-signal', status=-9),
+            'captured before admission': edited(captured_at=stamp(admitted - 5)),
+            'captured at stage cutoff': edited(captured_at=stamp(admitted + 35 * 60)),
+            'extra field': edited(extra=1), 'bool schema': edited(schema=True),
+            'cross kind': edited(kind='first-failure'), 'truncated file': good[:-1], 'empty file': b'',
+            'oversize file': good + b' ' * trial.INSTALLER_LIMIT, 'legacy bundle name content': b'{}',
+        }
+        for name, raw in cases.items():
+            with self.subTest(name):
+                self.final.unlink(missing_ok=True)
+                self.final.write_bytes(raw)
+                self.final.chmod(0o600)
+                with self.assertRaises(trial.Failure):
+                    trial.export_failure(NONCE)
+        for name in ('wide mode', 'hard link', 'symlink', 'directory'):
+            with self.subTest(name):
+                self.final.unlink(missing_ok=True)
+                if self.final.is_dir():
+                    self.final.rmdir()
+                extra = self.base / 'extra'
+                extra.unlink(missing_ok=True)
+                if name == 'symlink':
+                    extra.write_bytes(good)
+                    extra.chmod(0o600)
+                    self.final.symlink_to(extra)
+                elif name == 'directory':
+                    self.final.mkdir(mode=0o700)
+                else:
+                    self.final.write_bytes(good)
+                    self.final.chmod(0o640 if name == 'wide mode' else 0o600)
+                    if name == 'hard link':
+                        os.link(self.final, extra)
+                with self.assertRaises((trial.Failure, OSError)):
+                    trial.export_failure(NONCE)
+        self.final.unlink(missing_ok=True)
+        extra = self.base / 'extra'
+        self.final.write_bytes(good)
+        self.final.chmod(0o600)
+        with self.assertRaises(trial.Failure):
+            trial.export_failure('9' * 32)
+        for wrong in (dict(self.v, boot_uuid=other),):
+            (self.root / 'contract.json').write_bytes(trial.encoded(wrong))
+            with self.assertRaises(trial.Failure):
+                trial.export_failure(NONCE)
+        (self.root / 'contract.json').write_bytes(trial.encoded(self.v))
+        late = SimpleNamespace(time=lambda: trial.stamp(self.v['deadline']) + 1, monotonic=time.monotonic, sleep=time.sleep)
+        with patch.object(trial, 'time', late), self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+        self.terminal('child-signal', -9)  # terminal outcome differs from the exit record
+        with self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+
+    def test_only_a_validated_installer_terminal_selects_the_file_only_mode(self):
+        trial.capture_installer_failure(self.v, self.clock, 17, b'native')
+        class Core(Exception):
+            pass
+        def foreign_nonce():
+            detail = self.terminal()
+            (self.root / 'result.json').write_bytes(trial.encoded(
+                {'schema': 2, 'code': 17, 'contained': True, 'nonce': '9' * 32, 'diagnostic': detail}))
+        def wide_mode():
+            self.terminal()
+            (self.root / 'result.json').chmod(0o644)
+        for name, prepare in (('no terminal', lambda: None),
+                              ('other stage operation', lambda: self.terminal(operation='install-hhfab')),
+                              ('foreign nonce', foreign_nonce), ('unsafe file mode', wide_mode)):
+            with self.subTest(name):
+                (self.root / 'result.json').unlink(missing_ok=True)
+                prepare()
+                with patch.object(trial, 'load_sibling', side_effect=Core), self.assertRaises(Core):
+                    trial.export_failure(NONCE)  # fell through to the unchanged core path, never the record
+        self.assertFalse(trial.installer_terminal(None))
+        for detail in ({'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker', 'category': 'child-exit',
+                        'child_status': None},
+                       {'origin': 'guardian', 'phase': 'stage', 'operation': 'worker-supervision',
+                        'category': 'child-exit', 'child_status': 17},
+                       {'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker', 'category': 'child-timeout',
+                        'child_status': None},
+                       {'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker', 'category': 'child-exit',
+                        'child_status': True}):
+            with self.subTest(detail=detail):
+                self.assertFalse(trial.installer_terminal(detail))
+        self.assertTrue(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': 'install-docker',
+                                                  'category': 'child-signal', 'child_status': -9}))
