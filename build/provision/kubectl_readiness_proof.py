@@ -15,7 +15,8 @@ production loop sleeps 5s); the fixture speaks HTTP/1.1 (no ALPN h2); there is n
 kube-apiserver. Same-code client time bounds may race (request timeout 10s vs execute cap 10s):
 timings and outcomes are RECORDED and a case only asserts what is deterministic. Nothing here
 changes a timeout, classifier, retry or budget, and a 124 is never treated as Pending.
-Report: sanitized JSON only (fixed strings, counts, booleans, timings), never child output.
+Report: sanitized JSON only; exact allowlisted PUBLIC SYNTHETIC formatter bytes/hash for #461,
+never unmatched child output or its hash.
 """
 import argparse
 import base64
@@ -59,9 +60,9 @@ SEAMS = (
     'runtime container root with only SETUID, SETGID, KILL and DAC_OVERRIDE capabilities',
     'synthetic OpenSSL certificates generated in the separate preparation container',
     'request timeout 10s and execute cap 10s may race; outcomes recorded, no winner guaranteed',
-    'quick-case operation deadlines are 2s, delayed startup 6s, explicit exhaustion 3s; stalls 10s',
+    'quick-case deadlines 2s; delayed startup 6s; exhaustion and fixed 503 sequence 3s; stalls 10s',
     'production diagnostic storage is unprepared; exception byte counts are not emitted-byte counts',
-    'Pending context is inspected only for discarded cleanup uncertainty, never to restore child output',
+    'Pending context supplies cleanup uncertainty; only #461 fixed public fixtures allow exact formatter evidence',
 )
 REMAINING = (
     'SIGTERM/SIGINT delivery during a live kubectl child (existing production executor tests only)',
@@ -69,7 +70,7 @@ REMAINING = (
     '503 malformed/date Retry-After were never implemented',
     'unknown error; repeated refusal through expiry',
     'body trickle slower than the output limit; HTTP/2; ten-retry (eleven-attempt) exhaustion',
-    'plain-text (non-Status) 503/500 bodies; Retry-After values between 1s and the cap',
+    'non-Status 503 bodies; other plaintext 500 bodies; Retry-After values between 1s and the cap',
     'full api_ready/ready_body, native forwarding, systemd/cgroup, 18 nodes, switches, trial-16 cause',
 )
 
@@ -107,6 +108,21 @@ def OK():
 def STATUS(code, phrase, reason, retry_after=None, name=None):
     headers = () if retry_after is None else (('Retry-After', retry_after),)
     return respond(name or '%d' % code, code, phrase, status_body(code, reason), headers=headers)
+
+
+# Fixed PUBLIC SYNTHETIC examples, not native diagnostics. Pinned source chain is in README.
+HEALTH_500 = respond('plaintext-readyz-500', 500, 'Internal Server Error',
+                     b'[+]ping ok\n[-]informer-sync failed: reason withheld\nreadyz check failed\n',
+                     'text/plain; charset=utf-8', (('X-Content-Type-Options', 'nosniff'),))
+K3S_503 = respond('k3s-prehandler-503', 503, 'Service Unavailable',
+                  status_body(503, 'ServiceUnavailable', 'apiserver not ready'))
+PUBLIC_FORMATTERS = {
+    'plaintext-readyz-500': (
+        b'Error from server (InternalError): an error on the server '
+        b'("[+]ping ok\\n[-]informer-sync failed: reason withheld\\nreadyz check failed") '
+        b'has prevented the request from succeeding\n'),
+    'k3s-prehandler-503-then-ready': b'Error from server (ServiceUnavailable): apiserver not ready\n',
+}
 
 
 STALL_HEADER = {'do': 'stall', 'name': 'stall-before-response-header'}
@@ -242,6 +258,9 @@ class Fixture:
                            'method': clean(line[0], 8), 'path': clean(path),
                            'query': clean(query), 'client_cn': client_cn, 'step': step['name'],
                            'headers_sent': False, 'body_bytes_sent': 0}
+                if step['do'] == 'respond':
+                    request.update(response_code=step['code'], response_type=step['type'],
+                                   response_body_sha256=hashlib.sha256(step['body']).hexdigest())
                 self.requests.append(request)
             if step['do'] == 'stall':
                 self._wait_stop()
@@ -325,8 +344,23 @@ def private_flags(raw):
     return {name: bool(re.search(pattern, raw)) for name, pattern in FLAG_PATTERNS.items()}
 
 
-def attempt(core, kubectl, deadline, clock=time.monotonic):
-    """One production call -> fixed-schema record. Never includes child output, only derived flags."""
+def public_formatter(core, error, name):
+    """Release constants only after exact whole-output and executed-child provenance checks."""
+    candidate = PUBLIC_FORMATTERS[name]
+    matches = (isinstance(error, core.Failure) and error.code == 1
+               and str(error) == 'child command failed'
+               and getattr(error, '_executed_child', False) is True
+               and error.route == 'api-initial-readyz'
+               and not getattr(error, 'cleanup_uncertain', False)
+               and error.private_output == candidate)
+    if not matches:
+        return {'matches': False}
+    return {'matches': True, 'bytes': len(candidate), 'sha256': hashlib.sha256(candidate).hexdigest(),
+            'text': candidate.decode('ascii'), 'child_route': error.route}
+
+
+def attempt(core, kubectl, deadline, clock=time.monotonic, public_case=None):
+    """One production call -> derived flags and optional exact PUBLIC SYNTHETIC constants only."""
     begun = clock()
     record = {'at_remaining': round(deadline - begun, 3)}
     try:
@@ -339,11 +373,15 @@ def attempt(core, kubectl, deadline, clock=time.monotonic):
                       flags=private_flags(error.private_output),
                       cleanup_uncertain=bool(getattr(error, 'cleanup_uncertain', False)
                                             or getattr(error.__context__, 'cleanup_uncertain', False)))
+        if public_case in PUBLIC_FORMATTERS:
+            record['public_synthetic_formatter'] = public_formatter(core, error.__context__, public_case)
     except core.Failure as error:
         record.update(kind='failure', code=error.code, message=str(error), route=error.route,
                       cleanup_uncertain=bool(getattr(error, 'cleanup_uncertain', False)),
                       private_output_bytes=len(error.private_output),
                       flags=private_flags(error.private_output))
+        if public_case in PUBLIC_FORMATTERS:
+            record['public_synthetic_formatter'] = public_formatter(core, error, public_case)
     except Exception as error:  # noqa: BLE001 - a harness/environment fault, reported by class
         record.update(kind='harness-error', code=None, message=type(error).__name__)
     record['elapsed'] = round(clock() - begun, 3)
@@ -380,6 +418,16 @@ HANG = {('failure', 124), ('failure', 1)}   # request timeout and execute cap ma
 CAPPED = (5.0, 15.0)
 
 
+def public_cases():
+    return (
+        case('plaintext-readyz-500', [HEALTH_500], allowed={('failure', 1)}, requests=(1, 1),
+             flag='internal_error', message='child command failed'),
+        case('k3s-prehandler-503-then-ready', [K3S_503, OK()], loop=True, deadline=3.0, budget=8.0,
+             allowed={('ok', None)}, pre_final={('pending', 1)}, min_pending=1, requests=(2, 2),
+             elapsed=(1.0, 8.0)),
+    )
+
+
 def build_cases():
     return (
         case('ok-ready', [OK()], allowed={('ok', None)}, requests=(1, 1)),
@@ -410,12 +458,20 @@ def build_cases():
              budget=15.0, deadline=10.0, requests=(1, 1)),
         case('body-stall-after-partial-body', [STALL_BODY], allowed=HANG, elapsed=CAPPED,
              budget=15.0, deadline=10.0, requests=(1, 1)),
+        *public_cases(),
     )
+
+
+def fixed_public_case(spec):
+    return (spec['name'] in PUBLIC_FORMATTERS
+            and spec == next(c for c in public_cases() if c['name'] == spec['name']))
 
 
 def verdict(spec, attempts, fixture, evidence):
     """Return (verdict, reasons). Deterministic claims only; others are 'recorded'."""
     reasons = []
+    public = fixed_public_case(spec)
+    served_pending = public and spec['name'] == 'k3s-prehandler-503-then-ready'
     final = attempts[-1] if attempts else {'kind': 'not-run', 'code': None, 'message': ''}
     if not attempts or any(a['kind'] == 'harness-error' for a in attempts):
         reasons.append('harness error')
@@ -445,8 +501,21 @@ def verdict(spec, attempts, fixture, evidence):
             reasons.append('too few pending attempts before readiness')
         if any((a['kind'], a['code']) not in spec['pre_final'] for a in early):
             reasons.append('a pre-final attempt was not exact pending')
-        if any(a.get('server_started', True) for a in early):
+        if not served_pending and any(a.get('server_started', True) for a in early):
             reasons.append('pending was not observed before listener startup')
+    if public:
+        expected = PUBLIC_FORMATTERS[spec['name']]
+        receipt = {'matches': True, 'bytes': len(expected), 'sha256': hashlib.sha256(expected).hexdigest(),
+                   'text': expected.decode('ascii'), 'child_route': 'api-initial-readyz'}
+        if not attempts or attempts[0].get('public_synthetic_formatter') != receipt:
+            reasons.append('missing exact public synthetic formatter evidence')
+        ranges = [(0, 1), (1, 2)] if served_pending else [(0, 1)]
+        if (len(attempts) != len(ranges)
+                or any(not a.get('server_started') or (a.get('request_start'), a.get('request_end')) != pair
+                       for a, pair in zip(attempts, ranges))):
+            reasons.append('public fixture attempt/delivery association differs')
+        if len(fixture['requests']) != evidence['request_count']:
+            reasons.append('public fixture request inventory differs')
     low, high = spec['elapsed']
     if not low <= evidence['elapsed'] <= high:
         reasons.append('elapsed outside the case window')
@@ -460,8 +529,8 @@ def verdict(spec, attempts, fixture, evidence):
                        or r.get('query') != 'timeout=10s' or r.get('client_cn') != CLIENT_CN
                        for r in fixture['requests'])):
             reasons.append('request lacks matching connection and verified mTLS evidence')
-        for request in fixture['requests']:
-            step = spec['steps'][0]
+        for index, request in enumerate(fixture['requests']):
+            step = spec['steps'][min(index, len(spec['steps']) - 1)] if served_pending else spec['steps'][0]
             expected_body = len(step['body']) if step['do'] == 'respond' else 2 if step['do'] == 'stall-body' else 0
             body_matches = (request.get('body_bytes_sent', 0) > 1024 * 1024
                             if spec['name'] == 'output-overflow'
@@ -470,6 +539,11 @@ def verdict(spec, attempts, fixture, evidence):
                     or request.get('headers_sent') != (step['do'] != 'stall')
                     or not body_matches):
                 reasons.append('fixture response evidence differs')
+            if public and (request.get('n') != index + 1
+                    or request.get('response_code') != step['code']
+                    or request.get('response_type') != step['type']
+                    or request.get('response_body_sha256') != hashlib.sha256(step['body']).hexdigest()):
+                reasons.append('public fixture status/type/body evidence differs')
     if spec['tls'] != 'good' and (cleanup.get('connections_accepted') != 1
             or cleanup.get('handshakes_started') != 1 or cleanup.get('handshakes_completed') != 0
             or not cleanup.get('server_errors')):
@@ -503,8 +577,12 @@ def run_case(spec, core, contexts, kubectl, uid, clock=time.monotonic, sleep=tim
             if not started and (spec['start_after'] is None or clock() - begun >= spec['start_after']):
                 fixture.start(spec['steps'], spec['mode'])
                 started = True
-            record = attempt(core, kubectl, deadline, clock)
+            request_start = len(fixture.requests)
+            public_case = spec['name'] if fixed_public_case(spec) else None
+            record = attempt(core, kubectl, deadline, clock, public_case)
             record['server_started'] = started
+            if public_case is not None:
+                record.update(request_start=request_start, request_end=len(fixture.requests))
             if len(attempts) < MAX_REPORTED_ATTEMPTS:
                 attempts.append(record)
             else:

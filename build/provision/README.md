@@ -531,7 +531,7 @@ on error/cancel) covers both containers, the image and the temp directory; it ma
 Hard termination or deadline interruption can leave no complete JSON/cleanup receipt; outer owned
 container disposal remains required. These bounds assume normal OS scheduling, not hard real time.
 
-**Cases (reduced slice, 14 gating, zero observation-only).** The original source had 33 test
+**Cases (16 gating, zero observation-only).** The original source had 33 test
 methods (not 40) and 22 cases: 14 gating plus eight observations. All eight Retry-After
 observations are now deferred, not passed or silently skipped.
 The retained cases are `ok-ready` (one verified mTLS `/readyz?timeout=10s` request);
@@ -553,13 +553,27 @@ mTLS GET, matching 401 fixture response delivery, original failure route and cle
 peers remain required. The canonical bytes are derived from pinned source, not retained native
 client output; only a separately authorized real-client run can confirm actual behavior.
 
+Two fixed #461 cases extend, without changing, those original 14 cases:
+`plaintext-readyz-500` sends the public synthetic body
+`[+]ping ok\n[-]informer-sync failed: reason withheld\nreadyz check failed\n`
+as `text/plain; charset=utf-8`, with HTTP500 and `nosniff`. It expects one delivered response,
+the exact pinned formatter candidate, and the original **fatal** exit1/`api-initial-readyz` route.
+`k3s-prehandler-503-then-ready` sends a JSON Status/ServiceUnavailable with the fixed message
+`apiserver not ready`, then 200/`ok`, with no Retry-After. The k3s prehandler uses negotiated
+Status serialization, **not plaintext503**. This case requires exactly two production calls:
+empty/unlabeled Pending while the listener is already running, then ok, with one matching
+verified mTLS request/response per call. Only this exact case specification may bypass the
+before-listener Pending assertion; a name alone, generic ServiceUnavailable, or any missing
+delivery/route/formatter evidence cannot qualify.
+
 Quick cases have a **2s caller operation deadline**, delayed startup 6s, explicit exhaustion 3s,
-and stalls 10s; the production request-timeout10/cap10 arguments are unchanged. Reservations
+the new 503 sequence 3s, and stalls 10s; production request-timeout10/cap10 arguments are unchanged. Reservations
 cover work plus the existing 2s executor reap, 1s fixture close and 2s process settle:
-eight quick cases ×7s + delayed11s + exhaustion8s + four stalls ×15s = **135s**.
-A further 5s report reserve remains inside 170s, leaving 30s for identity/setup/scheduling.
+the unchanged original **135s**, plus plaintext500 **7s** and prehandler503→200 **8s**, total **150s**.
+A further 5s report reserve remains inside 170s, leaving 15s for identity/setup/scheduling.
 Admission clips against that same original deadline; each case also clips work/cleanup/settling
-to its reservation, counts settling in elapsed, and refuses a late result. Failure to fit is failure.
+to its reservation, charges actual fixture startup and settling, and refuses a late result.
+The 503 loop retains one original deadline across both calls and its 1s sleep. Failure to fit is failure.
 These shorter successful-case deadlines are an explicit test seam, not a production policy change.
 
 Pending is a **new exception with empty private bytes and no route**, not a retained refusal
@@ -567,8 +581,8 @@ message. The delayed-start regression injects an ordinary refusal at the child b
 passes through the unchanged classifier. Every observed `cleanup_uncertain` is fatal, even
 on earlier attempts or observations. The production classifier preserves cleanup-uncertain
 failures instead of converting them to Pending. The harness also rejects uncertainty found in
-a suppressed exception's context (a synthetic matching-transient negative control), without
-restoring discarded output.
+a suppressed exception's context (a synthetic matching-transient negative control). Only the two
+fixed #461 cases also inspect that context for an exact public formatter match, not arbitrary output.
 
 Every case checks listener/socket/thread closure and no remaining live `ubuntu`-uid process
 in this container. The fixture closes and settles the acceptor before its final handler/socket
@@ -584,7 +598,15 @@ refuses), the disclosed `seams`, per case the actual `(kind, code)`, message, ro
 request records (count, path, `timeout=` query, verified client-certificate CN, header/body send counts),
 accepted-connection/handshake and route counts, cleanup and
 `cleanup_uncertain`, plus `remaining_coverage`. Child output is reduced to fixed boolean flags and a
-byte count, never copied. Zero exception bytes do **not** prove zero partial bytes emitted:
+byte count. The sole exception is an exact whole-output allowlist for the two fixed PUBLIC SYNTHETIC
+#461 formatter candidates: after executed-child/exit1/message/original-route/cleanup checks, the report
+includes the constant candidate text, byte count and SHA256. A mismatch emits only `matches: false`,
+never the unmatched bytes or their hash. Other cases cannot opt in; no private/VM output is restored.
+The 503 Pending remains empty and unlabeled; its separate receipt binds the suppressed original
+Failure's route and formatter. Verdicts additionally require matching status/content-type/body hash,
+complete delivery, ordered request-to-attempt association, mTLS and clean peers. These are source-derived
+candidates, not recovered native diagnostics or verified real-client results until separately executed.
+Zero exception bytes do **not** prove zero partial bytes emitted:
 timeout/overflow exceptions do not carry the executor's accumulated output. Production diagnostic
 storage is deliberately **unprepared**, so this proof does not verify retained partial-output files.
 The summary status is `passed` only if nothing failed or was skipped and the deadline remains valid.
@@ -593,7 +615,7 @@ The summary status is `passed` only if nothing failed or was skipped and the dea
 systemd, cgroups, cloud-init, native forwarding, a real kube-apiserver, HTTP/2 (the fixture has no
 ALPN), 18 nodes, switches, persistence or the trial-16 cause. The retry loop sleeps 1s (production
 5s). Unknown-error real-client behavior, repeated refusal through expiry, body trickle, all eleven
-HTTP attempts/ten retries, intermediate integer Retry-After, plain-text 5xx, HTTP/2 and live-client
+HTTP attempts/ten retries, intermediate integer Retry-After, other plaintext5xx, HTTP/2 and live-client
 signals remain unproved. The deferred eight observations were 429 absent/malformed/date/1s/30s and
 503 absent/1s/30s; **503 malformed/date were never implemented**, despite the original prose.
 The matching-transient cleanup control and unknown-error/124 classifier controls are synthetic only;
@@ -610,6 +632,28 @@ and exits 1. Other timing sources (per #448 comment 6573335502): kubectl
 [`rest/request.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go) and
 [`rest/with_retry.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/with_retry.go)
 (retry policy coverage remains the #448 reviewer's; the 401 chain above was read directly).
+
+The #461 fixture/formatter chain (primary pinned sources, accessed **2026-11-02**) is
+[Fabricator v0.43.1 `versions.go`](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/versions.go)
+→ k3s `v1.34.1-k3s1` ([dependency replacements](https://github.com/k3s-io/k3s/blob/v1.34.1%2Bk3s1/go.mod))
+→ its Kubernetes fork's
+[`healthz.go`](https://github.com/k3s-io/kubernetes/blob/v1.34.1-k3s1/staging/src/k8s.io/apiserver/pkg/server/healthz/healthz.go).
+`handleRootHealth` always emits individual check lines on failure, with withheld reasons,
+then `readyz check failed` via `http.Error` (one terminal newline). The fixture models two check
+outcomes, not the complete server's check inventory or an observed startup failure.
+k3s [`handlers.go`](https://github.com/k3s-io/k3s/blob/v1.34.1%2Bk3s1/pkg/server/handlers/handlers.go)
+uses [`util/apierrors.go`](https://github.com/k3s-io/k3s/blob/v1.34.1%2Bk3s1/pkg/util/apierrors.go)
+to negotiate `NewServiceUnavailable("apiserver not ready")` before the API handler exists.
+The fixture preserves that Status's fields/message/code, not serializer whitespace.
+For kubectl/client-go/apimachinery **v0.35.0**, `RawGet` → `Stream` → `transformResponse` →
+`newUnstructuredResponseError` trims the plaintext body's terminal whitespace;
+`NewGenericServerResponse` quotes it using Go `%q` (embedded newlines become literal `\n`).
+`StandardErrorMessage` supplies `Error from server (InternalError): ` and `fatal` one final newline.
+For negotiated503, the Status message survives, yielding exactly
+`Error from server (ServiceUnavailable): apiserver not ready\n`.
+The fixed candidates are bounded whole byte strings, not a generic InternalError whitelist.
+Missing Retry-After avoids the pinned client's header-driven retry path; all eight deferred
+observations remain deferred. No production health/timeout policy or canonical16 cause is established.
 
 ## Offline-delivered guest prerequisite probe
 
