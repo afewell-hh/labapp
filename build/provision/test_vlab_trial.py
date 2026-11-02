@@ -3069,34 +3069,68 @@ class FirstFailureExport(unittest.TestCase):
         self.assertEqual((bundle['stage'], bundle['operation'], bundle['invocation']),
                          ('unit', self.operation, self.invocation))
         self.assertLessEqual(len(rest), trial.FAILURE_LIMIT)
-        # Bundle schema 2; the envelope/state/public schemas above are unchanged (1).
+        # Bundle schema 3 (#430 route); the envelope/state/public schemas above are unchanged (1).
         self.assertEqual((bundle['schema'], bundle['unit_ready']),
-                         (2, {'status': 'unavailable', 'message': None, 'code': None}))
+                         (3, {'status': 'unavailable', 'message': None, 'code': None, 'route': None}))
 
     def test_real_unit_ready_record_roundtrips_through_capture_export_and_validator(self):
         core = self.core
         value = self.value
 
-        def publish(message, code):
-            record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
+        def publish(message, code, route=None):
+            record = {'schema': 2, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
                       'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
                       'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
-                      'message': message, 'code': code}
+                      'message': message, 'code': code, 'route': route}
             core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
 
-        publish('synthetic readiness refusal', 17)
+        publish('synthetic readiness refusal', 17, 'api-final-switches')
         self.assertNotIn('invocation', self.reserved)
         self.capture(error=core.Failure('child command failed', 1, b'x'))
         bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
-        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal', 'code': 17})
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic readiness refusal',
+                                                'code': 17, 'route': 'api-final-switches'})
         self.assertLessEqual(len((self.state_root / self.core.FIRST_FAILURE).read_bytes()), trial.FAILURE_LIMIT)
+
+    def test_every_closed_route_and_null_roundtrip_writer_to_export_and_unknown_routes_are_not_exported(self):
+        core = self.core
+        value = self.value
+        def publish(route, schema=2):
+            record = {'schema': schema, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': NONCE,
+                      'mode': 'fresh', 'operation': self.operation, 'invocation': self.invocation,
+                      'boot': value['boot'], 'started': value['started'], 'deadline': value['deadline'],
+                      'message': 'synthetic readiness refusal', 'code': 124, 'route': route}
+            core.write_first_failure(trial.encoded(record), core.UNIT_READY_FAILURE)
+        self.assertEqual(tuple(trial.FAILURE_ROUTES), tuple(core.UNIT_READY_ROUTES))
+        for route in (*core.UNIT_READY_ROUTES, None):
+            with self.subTest(route=route):
+                for name in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+                    (self.state_root / name).unlink(missing_ok=True)
+                publish(route)
+                self.capture(error=core.Failure('child deadline exceeded', 124))
+                bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+                self.assertEqual(bundle['unit_ready']['route'], route)
+                self.assertEqual(bundle['unit_ready']['status'], 'ok')
+        # Writer-side refusals reach the bundle as a null, status-coherent invalid/unavailable section.
+        for name, route, schema in (('unknown', 'api-final-pods', 2), ('wrong type', 7, 2),
+                                    ('legacy schema', 'svc-entry', 1)):
+            with self.subTest(name):
+                for fixed in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
+                    (self.state_root / fixed).unlink(missing_ok=True)
+                publish(route, schema)
+                self.capture(error=core.Failure('child deadline exceeded', 124))
+                bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
+                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None,
+                                                        'route': None})
+                self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                                 ('child deadline exceeded', 124))
 
     def test_missing_current_clock_authority_invalidates_only_readiness_section(self):
         current = {key: item for key, item in self.value.items() if key != 'started'}
         self.core.atomic(self.state_root / 'state.json', current)
         self.capture()
         bundle = trial.first_failure_bundle(self.export().partition(b'\n')[2])
-        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+        self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None, 'route': None})
         self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
         self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
         self.assertEqual(len(self.queries), 2)
@@ -3198,6 +3232,8 @@ class FirstFailureExport(unittest.TestCase):
         self.capture()
         good = json.loads((self.state_root / self.core.FIRST_FAILURE).read_bytes())
         import base64
+        def ready(status, message=None, code=None, route=None):
+            return {'status': status, 'message': message, 'code': code, 'route': route}
         cases = {
             'extra key': dict(good, extra=1), 'missing key': {k: v for k, v in good.items() if k != 'journal'},
             'bool schema': dict(good, schema=True), 'wrong source': dict(good, source='other'),
@@ -3218,28 +3254,48 @@ class FirstFailureExport(unittest.TestCase):
             'context cap': dict(good, command_context=dict(good['command_context'], status='ok',
                                output=base64.b64encode(b'x' * 2049).decode())),
             'extra state field': dict(good, state=dict(good['state'], text=SENTINEL)),
-            'legacy schema 1': dict(good, schema=1), 'future schema 3': dict(good, schema=3),
+            'legacy schema 1': dict(good, schema=1), 'legacy schema 2': dict(good, schema=2),
+            'future schema 4': dict(good, schema=4),
             'missing unit_ready': {k: v for k, v in good.items() if k != 'unit_ready'},
             'null unit_ready': dict(good, unit_ready=None),
             'unit_ready extra key': dict(good, unit_ready=dict(good['unit_ready'], extra=1)),
-            'unit_ready missing key': dict(good, unit_ready={'status': 'unavailable', 'message': None}),
-            'unit_ready bad status': dict(good, unit_ready={'status': 'captured', 'message': None, 'code': None}),
-            'ok null message': dict(good, unit_ready={'status': 'ok', 'message': None, 'code': 1}),
-            'ok null code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': None}),
-            'ok bool code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': True}),
-            'ok float code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': 1.0}),
-            'ok negative code': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': -1}),
-            'ok long message': dict(good, unit_ready={'status': 'ok', 'message': 'x' * 129, 'code': 1}),
-            'ok empty message': dict(good, unit_ready={'status': 'ok', 'message': '', 'code': 1}),
-            'ok non-ascii message': dict(good, unit_ready={'status': 'ok', 'message': 'café', 'code': 1}),
-            'unavailable with message': dict(good, unit_ready={'status': 'unavailable', 'message': 'x', 'code': None}),
-            'invalid with code': dict(good, unit_ready={'status': 'invalid', 'message': None, 'code': 0}),
+            'unit_ready missing key': dict(good, unit_ready={'status': 'unavailable', 'message': None,
+                                                             'route': None}),
+            'unit_ready legacy three keys': dict(good, unit_ready={'status': 'unavailable', 'message': None,
+                                                                    'code': None}),
+            'unit_ready missing route': dict(good, unit_ready={'status': 'ok', 'message': 'x', 'code': 1}),
+            'unit_ready bad status': dict(good, unit_ready=ready('captured')),
+            'ok null message': dict(good, unit_ready=ready('ok', None, 1)),
+            'ok null code': dict(good, unit_ready=ready('ok', 'x', None)),
+            'ok bool code': dict(good, unit_ready=ready('ok', 'x', True)),
+            'ok float code': dict(good, unit_ready=ready('ok', 'x', 1.0)),
+            'ok negative code': dict(good, unit_ready=ready('ok', 'x', -1)),
+            'ok long message': dict(good, unit_ready=ready('ok', 'x' * 129, 1)),
+            'ok empty message': dict(good, unit_ready=ready('ok', '', 1)),
+            'ok non-ascii message': dict(good, unit_ready=ready('ok', 'café', 1)),
+            'unavailable with message': dict(good, unit_ready=ready('unavailable', 'x', None)),
+            'invalid with code': dict(good, unit_ready=ready('invalid', None, 0)),
+            'unknown route': dict(good, unit_ready=ready('ok', 'x', 1, 'api-final-pods')),
+            'generic route': dict(good, unit_ready=ready('ok', 'x', 1, 'kubectl-list')),
+            'route wrong case': dict(good, unit_ready=ready('ok', 'x', 1, 'SVC-ENTRY')),
+            'route empty': dict(good, unit_ready=ready('ok', 'x', 1, '')),
+            'route int': dict(good, unit_ready=ready('ok', 'x', 1, 1)),
+            'route bool': dict(good, unit_ready=ready('ok', 'x', 1, True)),
+            'route list': dict(good, unit_ready=ready('ok', 'x', 1, ['svc-entry'])),
+            'route dict': dict(good, unit_ready=ready('ok', 'x', 1, {'svc-entry': 1})),
+            'route free text': dict(good, unit_ready=ready('ok', 'x', 1, '/usr/local/bin/kubectl get nodes')),
+            'unavailable with route': dict(good, unit_ready=ready('unavailable', None, None, 'svc-entry')),
+            'invalid with route': dict(good, unit_ready=ready('invalid', None, None, 'api-final-nodes')),
             'ok on reservation': dict(good, operation=None, invocation=None, stage='reserve',
                                       manager={'status': 'unavailable', 'output': ''},
                                       journal={'status': 'unavailable', 'output': ''},
                                       command_context=dict(good['command_context'], status='unavailable', output=''),
-                                      unit_ready={'status': 'ok', 'message': 'x', 'code': 1}),
+                                      unit_ready=ready('ok', 'x', 1)),
         }
+        # Positive controls: the same shapes with exact closed values are accepted.
+        for route in (None, *trial.FAILURE_ROUTES):
+            accepted = trial.first_failure_bundle(trial.encoded(dict(good, unit_ready=ready('ok', 'x', 1, route))))
+            self.assertEqual(accepted['unit_ready']['route'], route)
         for name, bad in cases.items():
             with self.subTest(name), self.assertRaises(trial.Failure):
                 trial.first_failure_bundle(trial.encoded(bad))

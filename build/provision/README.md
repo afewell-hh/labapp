@@ -2005,26 +2005,60 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   dashes> _SYSTEMD_INVOCATION_ID=<frozen> _SYSTEMD_UNIT=<fixed unit>` (at most 8 KiB,
   8 s). It remains allowed when the manager forgot the unit, and there is no unit-only
   fallback or history search. Success is never assumed from missing `ExecMain*`.
-* **Bundle schema 2 and `unit_ready` (issue #390).** The bundle schema is now `2` (state,
-  host envelope and public result schemas are unchanged). The shared guest/host validator
-  accepts only schema 2; there is no legacy schema-1 fallback because host and source are
-  pinned together. A new exactly typed private section `unit_ready` is
-  `{status, message, code}`: only `status=ok` carries a validated message (printable ASCII,
-  1..128) and strict integer code (0..255); `unavailable` and `invalid` require null
-  message and null code. It is a diagnostic observation inside the existing 32 KiB serialized
+* **Bundle schema 3 and `unit_ready` (issues #390, #430).** The bundle schema is now `3`
+  (state, host envelope and public result schemas are unchanged; schema 2 added
+  `unit_ready`, schema 3 adds its `route`). The shared guest/host validator accepts only
+  schema 3; there is no legacy schema-1/2 fallback because host and source are
+  pinned together. The exactly typed private section `unit_ready` is
+  `{status, message, code, route}`: only `status=ok` carries a validated message (printable
+  ASCII, 1..128), a strict integer code (0..255) and a `route` that is either null or one of
+  the closed 37 values below; `unavailable` and `invalid` require null message, null code and
+  null route. It is a diagnostic observation inside the existing 32 KiB serialized
   cap, with unchanged primary/command-context/manager/journal bounds, one manager and one
   journal query, the shared 10 s capture/reap budget and the 35 s cleanup.
   * **Record.** `unit-ready` writes one fixed root-private
     `/var/lib/labapp-vlab-core/unit-ready-failure.json` (at most 1024 bytes, root 0600, single
     link, root 0700 directory) using the same exclusive temp + `link()` first-writer pattern:
-    it never overwrites, adopts, retries or deletes a stale record or stale temp file. Exactly 12 keys:
-    `schema` (1, this record's own), `source` (`vlab_core`), `action` (`unit-ready`), `nonce`,
-    `mode`, `operation`, `invocation`, `boot`, `started`, `deadline`, `message`, `code`. There is
+    it never overwrites, adopts, retries or deletes a stale record or stale temp file. Exactly 13 keys:
+    `schema` (2, this record's own; a schema-1 record is `invalid`), `source` (`vlab_core`),
+    `action` (`unit-ready`), `nonce`, `mode`, `operation`, `invocation`, `boot`, `started`,
+    `deadline`, `message`, `code`, `route` (null or a closed value, see below). There is
     no argv, command output, raw exception or `repr`, credential, step/kind, wall-clock timestamp
     or public notice. A `Failure` originating in this source keeps its text only if it is
     printable ASCII 1..128 with a strict integer code 0..255 (the outer status is unchanged);
     any other exception, or an unsafe text/code, records only the fixed `operational failure`
     with code `1`.
+  * **Route (issue #430).** `route` names which fixed executed readiness child's ORIGINAL
+    `Failure` escaped `unit_ready`; it identifies the next failing child and says nothing
+    about why it failed. `routed()` wraps the existing `execute` call with identical
+    arguments and sets one optional label on the same exception object (message, code,
+    private output and `cleanup_uncertain` are untouched). Only a `Failure` escaping that
+    child call is labeled: the exact handled `terminated` 130/143 signal, a non-`Failure`
+    exception, an already-labeled failure, the `Pending` that `kubectl` raises for a known
+    transient (a new exception), and every local `require`/JSON/identity/critical-snapshot
+    failure carry no label. There is no global last-child state. Non-readiness callers pass
+    no route. Repeated polling attempts reuse the same fixed value; there is no counter and no
+    new query. The 37 values (`core.UNIT_READY_ROUTES`, copied into the guest validator as
+    `FAILURE_ROUTES` and compared by a test):
+    * service `systemctl show` (6): `svc-entry`, `svc-bridge-wait` (both poll-step checks),
+      `svc-api-loop`, `svc-post-inspect`, `svc-post-critical`, `svc-final-lock`;
+    * bridge (5): `bridge-wait-probe`, `bridge-initial-helper`, `bridge-initial-verify`,
+      `bridge-final-helper`, `bridge-final-verify`;
+    * hhfab (2): `hhfab-wait-switches`, `hhfab-inspect-strict`;
+    * API (24): `api-initial-` and `api-final-` each followed by `readyz`, `nodes`,
+      `kube-system-ns`, `fabricators`, `controlnodes`, `fabnodes`, `switches`, `servers`,
+      `connections`, `switchgroups`, `vlannamespaces`, `ipv4namespaces`.
+
+    A route supplied outside the closed set or with the wrong type makes the record writer's
+    own validation refuse the record; it is never rewritten to null and the original
+    exception, exit status and cleanup are unchanged (the bundle then reports
+    `unit_ready` `unavailable`). A route is also not a timing claim: for example, a
+    child timeout may be the child's own cap rather than the whole operation deadline, and
+    equal inner/outer caps (kubectl `--request-timeout=10s` against the 10 s cap, the bridge
+    helper's 60 s against the 60 s cap) are possible races that this field does not resolve.
+    Offline tests run the real executor with small stdlib children and the real readiness
+    path with injected child failures; they do not show native hhfab, kubectl or systemd
+    behavior and no resume cause is established.
   * **When.** Only at the actual `unit_ready` failure boundary, after the ORIGINAL
     `startup_snapshot` succeeded and after the readiness locks unwound. Before publishing it
     revalidates the original nonce, mode, operation, invocation, boot, started and deadline

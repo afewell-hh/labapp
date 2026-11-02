@@ -1025,7 +1025,23 @@ FAILURE_LIMIT = 32 * 1024
 FAILURE_SECTIONS = {'primary': 2048, 'command_context': 2048, 'manager': 2048, 'journal': 8192}
 FAILURE_CONTEXT = 'last failed command output observed before manager-wrapper overwrite/core cleanup'
 FAILURE_STATUS = ('ok', 'truncated', 'unavailable', 'invalid')
-FAILURE_SCHEMA = 2  # first-failure BUNDLE schema only (#390); no legacy schema-1 fallback
+FAILURE_SCHEMA = 3  # first-failure BUNDLE schema only (#430 route); no legacy schema-1/2 fallback
+# Closed #430 readiness-child route enum; must stay identical to vlab_core.UNIT_READY_ROUTES
+# (a test compares them). Host and guest validators share this reader.
+FAILURE_ROUTES = (
+    'svc-entry', 'svc-bridge-wait', 'svc-api-loop', 'svc-post-inspect', 'svc-post-critical',
+    'svc-final-lock',
+    'bridge-wait-probe', 'bridge-initial-helper', 'bridge-initial-verify',
+    'bridge-final-helper', 'bridge-final-verify',
+    'hhfab-wait-switches', 'hhfab-inspect-strict',
+    'api-initial-readyz', 'api-initial-nodes', 'api-initial-kube-system-ns',
+    'api-initial-fabricators', 'api-initial-controlnodes', 'api-initial-fabnodes',
+    'api-initial-switches', 'api-initial-servers', 'api-initial-connections',
+    'api-initial-switchgroups', 'api-initial-vlannamespaces', 'api-initial-ipv4namespaces',
+    'api-final-readyz', 'api-final-nodes', 'api-final-kube-system-ns',
+    'api-final-fabricators', 'api-final-controlnodes', 'api-final-fabnodes',
+    'api-final-switches', 'api-final-servers', 'api-final-connections',
+    'api-final-switchgroups', 'api-final-vlannamespaces', 'api-final-ipv4namespaces')
 FAILURE_STAGES = ('reserve', 'manager', 'unit', 'final')
 HEX32 = '[0-9a-f]{32}'
 UUID = '[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}'
@@ -1074,14 +1090,16 @@ def first_failure_bundle(raw):
             require(section['label'] == FAILURE_CONTEXT)
     # #390 observed unit-ready refusal: diagnostic observation, never an initiating cause.
     ready = value['unit_ready']
-    require(type(ready) is dict and set(ready) == {'status', 'message', 'code'}
+    require(type(ready) is dict and set(ready) == {'status', 'message', 'code', 'route'}
             and ready['status'] in ('ok', 'unavailable', 'invalid'))
     if ready['status'] == 'ok':
         require(type(ready['message']) is str and re.fullmatch('[ -~]{1,128}', ready['message'])
                 and type(ready['code']) is int and 0 <= ready['code'] < 256
                 and value['invocation'] is not None and value['stage'] != 'reserve')
+        # #430: null only for a genuinely unlabeled failure; a supplied value is exact enum or refused.
+        require(ready['route'] is None or type(ready['route']) is str and ready['route'] in FAILURE_ROUTES)
     else:
-        require(ready['message'] is None and ready['code'] is None)
+        require(ready['message'] is None and ready['code'] is None and ready['route'] is None)
     # Output can exist only for an exact bound identity.
     require(value['manager']['status'] == 'unavailable' or value['invocation'] is not None)
     require(value['command_context']['status'] == 'unavailable' or value['operation'] is not None)

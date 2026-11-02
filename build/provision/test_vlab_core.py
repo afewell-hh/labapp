@@ -361,6 +361,23 @@ class GuestEnvironment:
         raise AssertionError('UNINSPECTED CHILD PATH ' + repr(argv))
 
 
+API_ROUTE_NAMES = ('readyz', 'nodes', 'kube-system-ns', 'fabricators', 'controlnodes', 'fabnodes',
+                   'switches', 'servers', 'connections', 'switchgroups', 'vlannamespaces', 'ipv4namespaces')
+# Every executed child of one successful readiness pass, in order: (route, child kind, cap, user).
+# 38 children, 37 distinct routes: ``svc-bridge-wait`` is reused by both polling-step checks.
+READY_CHILDREN = (
+    [('svc-entry', 'show', 5, False), ('svc-bridge-wait', 'show', 5, False),
+     ('bridge-wait-probe', 'ip', 3, False), ('svc-bridge-wait', 'show', 5, False),
+     ('bridge-initial-helper', 'helper', 60, False), ('bridge-initial-verify', 'ip', 3, False),
+     ('svc-api-loop', 'show', 5, False)]
+    + [('api-initial-' + name, 'kubectl', 10, True) for name in API_ROUTE_NAMES]
+    + [('hhfab-wait-switches', 'hhfab', 600, True), ('hhfab-inspect-strict', 'hhfab', 600, True)]
+    + [('api-final-' + name, 'kubectl', 10, True) for name in API_ROUTE_NAMES]
+    + [('bridge-final-helper', 'helper', 60, False), ('bridge-final-verify', 'ip', 3, False),
+       ('svc-post-inspect', 'show', 5, False), ('svc-post-critical', 'show', 5, False),
+       ('svc-final-lock', 'show', 5, False)])
+
+
 class GuestFixture(GuestEnvironment, unittest.TestCase):
     def test_installer_selected_fabric_versions_are_required_by_actual_api_ready(self):
         self.prepared()
@@ -1028,7 +1045,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                                              'status': 'unavailable', 'output': ''})
         # unit_ready is patched out here, so no record exists: unknown, not a cause.
         self.assertEqual((bundle['schema'], bundle['unit_ready']),
-                         (2, {'status': 'unavailable', 'message': None, 'code': None}))
+                         (3, {'status': 'unavailable', 'message': None, 'code': None, 'route': None}))
         self.assertEqual([d[0] for d in self.diagnostics], [
             [core.SYSTEMCTL, 'show', core.UNIT['fresh'], '--no-pager', '--timestamp=us+utc',
              '--property=ActiveState,SubState,Result,InvocationID,ExecMainCode,ExecMainStatus,'
@@ -1287,21 +1304,214 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
             self.assertEqual(self.call('start-fresh'), 17)
         self.assertEqual(spy.call_count, 1)  # one read, no wait or reread
         state, record, bundle = core.state(), self.ready_record(), self.bundle()
-        self.assertEqual(len(record), 12)
+        self.assertEqual(len(record), 13)
         self.assertEqual(record, {
-            'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+            'schema': 2, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
             'operation': state['operation'], 'invocation': 'a' * 32, 'boot': core.boot(),
             'started': state['started'], 'deadline': state['deadline'],
-            'message': 'synthetic command failure', 'code': 17})
+            'message': 'synthetic command failure', 'code': 17, 'route': 'hhfab-inspect-strict'})
         info = self.ready_path().stat()
         self.assertEqual((stat.S_IMODE(info.st_mode), info.st_nlink), (0o600, 1))
         self.assertLessEqual(info.st_size, core.UNIT_READY_LIMIT)
         self.assertFalse((core.ROOT / (core.UNIT_READY_FAILURE + '.new')).exists())
-        self.assertEqual(bundle['schema'], 2)
-        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic command failure', 'code': 17})
+        self.assertEqual(bundle['schema'], 3)
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'synthetic command failure', 'code': 17,
+                                                'route': 'hhfab-inspect-strict'})
         self.assertEqual(len(self.diagnostics), 2)  # exactly one manager and one journal query
         self.assertEqual([d[2] for d in self.diagnostics], [2048, 8192])
         self.assertEqual(self.diagnostics[1][0], self.journal_argv('a' * 32))
+        self.assertEqual(core.state()['containment'], 'verified')
+
+    # -- #430 readiness-child route. The REAL start/unit_ready/ready_body/api_ready/bridge code runs;
+    #    only the child boundary (``execute``), clocks and files are the existing fixtures.
+    def run_ready(self, injector=None, action='start-fresh'):
+        """-> (status, children, meta). ``children``/``meta`` list each child ONLY inside ready_body."""
+        seen, meta, armed = [], [], [False]
+        real_body, actual = core.ready_body, self.command
+        def body(mode, original, deadline):
+            armed[0] = True
+            try:
+                return real_body(mode, original, deadline)
+            finally:
+                armed[0] = False
+        def wrapped(argv, deadline, cap=30, user=False, *, retain=True):
+            if armed[0]:
+                seen.append(list(argv))
+                meta.append((deadline, cap, user))
+                replaced = injector(len(seen) - 1, list(argv)) if injector is not None else None
+                if replaced is not None:
+                    return replaced
+            return actual(argv, deadline, cap, user, retain=retain)
+        with patch.object(core, 'ready_body', side_effect=body), \
+             patch.object(core, 'execute', side_effect=wrapped), \
+             patch.object(core.time, 'sleep'):
+            status = self.call(action)
+        return status, seen, meta
+
+    @staticmethod
+    def child_kind(argv):
+        if argv[0] == core.SYSTEMCTL:
+            return 'show'
+        if argv[0] == core.PYTHON:
+            return 'helper'
+        if argv[:2] == ['/usr/sbin/ip', '-j']:
+            return 'ip'
+        return 'kubectl' if argv[0] == core.KUBECTL else 'hhfab'
+
+    @staticmethod
+    def api_name(argv):
+        if '--raw=/readyz' in argv:
+            return 'readyz'
+        resource = argv[argv.index('get') + 1]
+        return 'kube-system-ns' if resource == 'namespace' else resource.split('.')[0]
+
+    def test_fixed_children_table_matches_the_actual_successful_readiness_sequence(self):
+        self.prepared()
+        status, seen, meta = self.run_ready()
+        self.assertEqual(status, 0, self.stderr.getvalue())
+        self.assertEqual(len(seen), 38)
+        self.assertEqual([self.child_kind(a) for a in seen], [kind for _, kind, _, _ in READY_CHILDREN])
+        self.assertEqual([m[1:] for m in meta], [(cap, user) for _, _, cap, user in READY_CHILDREN])
+        self.assertEqual(len({m[0] for m in meta}), 1)  # one original deadline, never renewed
+        names = [self.api_name(a) for a in seen if self.child_kind(a) == 'kubectl']
+        self.assertEqual(names, list(API_ROUTE_NAMES) * 2)
+        self.assertEqual([a[1:3] for a in seen if self.child_kind(a) == 'hhfab'],
+                         [['vlab', 'wait-switches'], ['vlab', 'inspect-switches']])
+        self.assertEqual(set(r for r, _, _, _ in READY_CHILDREN), set(core.UNIT_READY_ROUTES))
+        self.assertFalse(self.ready_path().exists())  # success records nothing
+
+    def test_every_readiness_child_124_records_exactly_its_route_through_record_and_bundle(self):
+        for index, (route, kind, _, _) in enumerate(READY_CHILDREN):
+            with self.subTest(index=index, route=route):
+                self.setUp()
+                self.prepared()
+                def inject(number, argv):
+                    if number == index:
+                        raise core.Failure('child deadline exceeded', 124)
+                status, seen, meta = self.run_ready(inject)
+                self.assertEqual(status, 124, self.stderr.getvalue())
+                self.assertEqual(len(seen), index + 1)  # no extra child, retry or renewed clock
+                self.assertEqual(self.child_kind(seen[-1]), kind)
+                record = self.ready_record()
+                self.assertEqual((record['schema'], record['message'], record['code'], record['route']),
+                                 (2, 'child deadline exceeded', 124, route))
+                self.assertEqual(self.bundle()['unit_ready'], {
+                    'status': 'ok', 'message': 'child deadline exceeded', 'code': 124, 'route': route})
+                self.assertEqual(self.bundle()['schema'], 3)
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    def test_nonzero_child_failure_route_and_private_output_are_independent(self):
+        index = 20  # hhfab inspect-switches
+        self.prepared()
+        def inject(number, argv):
+            if number == index:
+                raise core.Failure('child command failed', 9, b'PRIVATE ' + SENTINEL.encode())
+        status, seen, _ = self.run_ready(inject)
+        self.assertEqual(status, 9)
+        self.assertEqual(self.ready_record()['route'], 'hhfab-inspect-strict')
+        self.assertNotIn(SENTINEL.encode(), self.ready_path().read_bytes())  # route is a fixed token only
+
+    def test_resume_readiness_child_failure_records_its_route(self):
+        self.resumable()
+        index = 27  # final switches list
+        def inject(number, argv):
+            if number == index:
+                raise core.Failure('child deadline exceeded', 124)
+        status, seen, _ = self.run_ready(inject, 'start-resume')
+        self.assertEqual(status, 124, self.stderr.getvalue())
+        record = self.ready_record()
+        self.assertEqual((record['mode'], record['route']), ('resume', 'api-final-switches'))
+        self.assertEqual(self.bundle()['mode'], 'resume')
+        self.assertEqual(self.bundle()['unit_ready']['route'], 'api-final-switches')
+
+    def test_pending_attempts_leave_no_label_and_the_second_attempt_reuses_the_fixed_route(self):
+        refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
+                   b'did you specify the right host or port?\n')
+        for name, first in (('not ok', b'not-ok'),
+                            ('refused', core.Failure('child command failed', 1, refused))):
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                def inject(number, argv):
+                    if number == 7:  # first initial /readyz attempt: caught Pending
+                        if isinstance(first, Exception):
+                            raise first
+                        return first
+                    if number == 9:  # second attempt, same fixed route, no counter
+                        raise core.Failure('child deadline exceeded', 124)
+                status, seen, meta = self.run_ready(inject)
+                self.assertEqual(status, 124, self.stderr.getvalue())
+                self.assertEqual(len(seen), 10)
+                self.assertEqual([self.child_kind(a) for a in seen[7:]], ['kubectl', 'show', 'kubectl'])
+                self.assertEqual([m[0] for m in meta], [meta[0][0]] * 10)
+                self.assertEqual(self.ready_record()['route'], 'api-initial-readyz')
+
+    def test_local_failures_after_successful_children_never_inherit_a_label(self):
+        # (a) final switches list returns invalid JSON: the child succeeded, parsing is local.
+        self.prepared()
+        status, seen, _ = self.run_ready(lambda n, a: b'not-json' if n == 27 else None)
+        self.assertEqual(status, 1)
+        self.assertEqual(len(seen), 28)
+        record = self.ready_record()
+        self.assertEqual((record['message'], record['code'], record['route']), ('invalid JSON', 1, None))
+        # (b) every child succeeded; the critical snapshot (in-process) is refused.
+        self.setUp()
+        self.prepared()
+        with patch.object(core, 'critical_snapshot', side_effect=core.Failure('synthetic critical failure', 29)):
+            status, seen, _ = self.run_ready()
+        self.assertEqual(status, 29)
+        self.assertEqual(len(seen), 36)
+        record = self.ready_record()
+        self.assertEqual((record['message'], record['code'], record['route']),
+                         ('synthetic critical failure', 29, None))
+        self.assertEqual(self.bundle()['unit_ready']['route'], None)
+        # The local post-inspection identity refusal after successful children is asserted in
+        # test_ready_refusal_survives_later_cancellation_and_outer_wrapper_failure (route None).
+
+    def test_handled_signal_at_a_child_boundary_has_no_label_and_writes_no_record(self):
+        for code in (130, 143):
+            with self.subTest(code=code):
+                self.setUp()
+                self.prepared()
+                def inject(number, argv):
+                    if number == 19:
+                        raise core.Failure('terminated', code)
+                status, seen, _ = self.run_ready(inject)
+                self.assertEqual(status, code)
+                self.assertFalse(self.ready_path().exists())
+                self.assertEqual(self.bundle()['unit_ready']['route'], None)
+                self.assertEqual(self.bundle()['unit_ready']['status'], 'unavailable')
+                self.assertEqual(core.state()['containment'], 'verified')
+
+    def test_malformed_supplied_route_refuses_the_record_but_keeps_status_and_cleanup(self):
+        for name, route in (('unknown', 'api-final-pods'), ('generic', 'kubectl-list'), ('int', 7),
+                            ('empty', ''), ('list', ['svc-entry']), ('bool', True)):
+            with self.subTest(name):
+                self.setUp()
+                self.prepared()
+                error = core.Failure('synthetic refusal', 29)
+                error.route = route
+                with patch.object(core, 'api_ready', side_effect=error):
+                    self.assertEqual(self.call('start-fresh'), 29)
+                self.assertFalse(self.ready_path().exists())  # never silently rewritten to null
+                bundle = self.bundle()
+                self.assertEqual(bundle['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None,
+                                                        'route': None})
+                self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
+                                 ('synthetic refusal', 29))
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    def test_longest_route_with_longest_text_stays_inside_the_1024_byte_record(self):
+        self.prepared()
+        error = core.Failure('m' * 128, 255)
+        error.route = max(core.UNIT_READY_ROUTES, key=len)
+        error.cleanup_uncertain = True
+        with patch.object(core, 'api_ready', side_effect=error):
+            self.assertEqual(self.call('start-fresh'), 255)
+        self.assertLessEqual(self.ready_path().stat().st_size, core.UNIT_READY_LIMIT)
+        self.assertEqual(self.ready_record()['route'], max(core.UNIT_READY_ROUTES, key=len))
+        self.assertEqual(self.bundle()['unit_ready']['route'], max(core.UNIT_READY_ROUTES, key=len))
+        self.assertLessEqual(len((core.ROOT / core.FIRST_FAILURE).read_bytes()), core.FIRST_FAILURE_LIMIT)
         self.assertEqual(core.state()['containment'], 'verified')
 
     def test_ready_refusal_survives_later_cancellation_and_outer_wrapper_failure(self):
@@ -1325,7 +1535,9 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         with patch.object(core, 'execute', side_effect=wrapped):
             self.assertEqual(self.call('start-fresh'), 1)  # outer primary, unchanged
         bundle = self.bundle()
-        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'post-inspection identity differs', 'code': 1})
+        # A local require() after successful children never inherits a child route (#430).
+        self.assertEqual(bundle['unit_ready'], {'status': 'ok', 'message': 'post-inspection identity differs', 'code': 1,
+                                                'route': None})
         self.assertEqual((bundle['primary']['message'], bundle['primary']['code']), ('child command failed', 1))
         self.assertIn(SENTINEL.encode(), self.raw_section('primary'))
         self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
@@ -1368,8 +1580,10 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                     self.assertEqual(self.call('start-fresh'), 17)
                 self.assertEqual(len(observations), 1)
                 bundle = observations[0]
-                expected = ({'status': 'ok', 'message': 'synthetic command failure', 'code': 17}
-                            if mutation == 'unchanged' else {'status': 'invalid', 'message': None, 'code': None})
+                expected = ({'status': 'ok', 'message': 'synthetic command failure', 'code': 17,
+                             'route': 'hhfab-inspect-strict'}
+                            if mutation == 'unchanged' else
+                            {'status': 'invalid', 'message': None, 'code': None, 'route': None})
                 self.assertEqual(bundle['unit_ready'], expected)
                 self.assertEqual(reader.call_count, 1 if mutation == 'unchanged' else 0)
                 self.assertEqual(bundle['invocation'], 'a' * 32)
@@ -1408,7 +1622,8 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                 self.assertEqual(len(opened), 1)
                 self.assertEqual(closed, opened)
                 bundle = self.bundle()
-                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None})
+                self.assertEqual(bundle['unit_ready'], {'status': 'invalid', 'message': None, 'code': None,
+                                                        'route': None})
                 self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
                                  ('synthetic command failure', 17))
                 self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
@@ -1446,7 +1661,8 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(attempts, [self.ready_path()])
         self.assertEqual(self.ready_record()['message'], 'synthetic command failure')
         bundle = self.bundle()
-        self.assertEqual(bundle['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None})
+        self.assertEqual(bundle['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None,
+                                                'route': None})
         self.assertEqual((bundle['primary']['message'], bundle['primary']['code']),
                          ('synthetic command failure', 17))
         self.assertEqual((bundle['manager']['status'], bundle['journal']['status']), ('ok', 'ok'))
@@ -1470,7 +1686,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                 self.assertEqual((record['message'], record['code']), ('operational failure', 1))
                 self.assertNotIn(SENTINEL.encode(), self.ready_path().read_bytes())
                 self.assertEqual(self.bundle()['unit_ready'],
-                                 {'status': 'ok', 'message': 'operational failure', 'code': 1})
+                                 {'status': 'ok', 'message': 'operational failure', 'code': 1, 'route': None})
         self.setUp()
         self.prepared()
         with patch.object(core, 'api_ready', side_effect=core.Failure('x' * 128, 0)):
@@ -1511,7 +1727,8 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         with patch.object(core, 'startup_snapshot', side_effect=snapshot):
             self.assertEqual(self.call('start-fresh'), 17)
         self.assertFalse(self.ready_path().exists())
-        self.assertEqual(self.bundle()['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None})
+        self.assertEqual(self.bundle()['unit_ready'], {'status': 'unavailable', 'message': None, 'code': None,
+                                                       'route': None})
 
     def test_expired_owned_stop_and_every_binding_change_prevent_authoritative_write(self):
         def mutate(field, change):
@@ -1573,9 +1790,10 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
 
     def test_preplaced_stale_or_unsafe_record_is_never_overwritten_adopted_or_deleted(self):
         foreign = self.base / 'foreign'
-        stale = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+        stale = {'schema': 2, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
                  'operation': 'd' * 32, 'invocation': 'a' * 32, 'boot': core.boot(), 'started': 1.5,
-                 'deadline': 1.5 + core.START_SECONDS['fresh'], 'message': 'stale refusal', 'code': 3}
+                 'deadline': 1.5 + core.START_SECONDS['fresh'], 'message': 'stale refusal', 'code': 3,
+                 'route': None}
         def regular():
             self.ready_path().write_bytes(b'FOREIGN')
             self.ready_path().chmod(0o600)
@@ -1601,7 +1819,8 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                           if p.name.startswith(core.UNIT_READY_FAILURE) and not p.is_symlink()}
                 self.fail_inspection()
                 self.assertEqual(self.call('start-fresh'), 17)
-                self.assertEqual(self.bundle()['unit_ready'], {'status': status, 'message': None, 'code': None})
+                self.assertEqual(self.bundle()['unit_ready'], {'status': status, 'message': None, 'code': None,
+                                                               'route': None})
                 after = {p.name: p.read_bytes() for p in core.ROOT.iterdir()
                          if p.name.startswith(core.UNIT_READY_FAILURE) and not p.is_symlink()}
                 self.assertEqual(after, before)
@@ -1613,10 +1832,10 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.prepared()
         value = {'nonce': 'b' * 32, 'mode': 'fresh', 'operation': 'e' * 32, 'boot': core.boot(),
                  'started': 100.5, 'deadline': 100.5 + core.START_SECONDS['fresh']}
-        record = {'schema': 1, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
+        record = {'schema': 2, 'source': 'vlab_core', 'action': 'unit-ready', 'nonce': 'b' * 32, 'mode': 'fresh',
                   'operation': 'e' * 32, 'invocation': 'a' * 32, 'boot': value['boot'],
                   'started': value['started'], 'deadline': value['deadline'],
-                  'message': 'synthetic readiness refusal', 'code': 17}
+                  'message': 'synthetic readiness refusal', 'code': 17, 'route': 'api-final-switches'}
         return value, record
 
     def place_ready(self, content, mode=0o600):
@@ -1629,12 +1848,23 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
 
     def test_outer_reader_accepts_only_exact_record_and_rejects_every_original_binding_change(self):
         value, record = self.ready_inputs()
-        self.assertEqual(self.read_ready(value), ('unavailable', None, None))  # missing
+        self.assertEqual(self.read_ready(value), ('unavailable', None, None, None))  # missing
         self.place_ready(record)
-        self.assertEqual(self.read_ready(value), ('ok', 'synthetic readiness refusal', 17))
-        invalid = ('invalid', None, None)
+        self.assertEqual(self.read_ready(value), ('ok', 'synthetic readiness refusal', 17, 'api-final-switches'))
+        self.place_ready(dict(record, route=None))
+        self.assertEqual(self.read_ready(value), ('ok', 'synthetic readiness refusal', 17, None))
+        invalid = ('invalid', None, None, None)
         cases = {
-            'schema 2': dict(record, schema=2), 'bool schema': dict(record, schema=True),
+            'legacy schema 1': dict({k: v for k, v in record.items() if k != 'route'}, schema=1),
+            'legacy schema 1 with route': dict(record, schema=1),
+            'schema 3': dict(record, schema=3), 'bool schema': dict(record, schema=True),
+            'route missing': {k: v for k, v in record.items() if k != 'route'},
+            'route unknown': dict(record, route='api-final-pods'),
+            'route generic': dict(record, route='kubectl-list'),
+            'route wrong case': dict(record, route='API-FINAL-SWITCHES'),
+            'route empty': dict(record, route=''), 'route int': dict(record, route=1),
+            'route bool': dict(record, route=True), 'route list': dict(record, route=['svc-entry']),
+            'route dict': dict(record, route={'svc-entry': 1}),
             'source': dict(record, source='vlab_trial'), 'action': dict(record, action='unit_ready'),
             'nonce': dict(record, nonce='9' * 32), 'mode': dict(record, mode='resume'),
             'operation': dict(record, operation='9' * 32), 'invocation': dict(record, invocation='9' * 32),
@@ -1672,7 +1902,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
 
     def test_outer_reader_refuses_unsafe_paths_and_changed_descriptors(self):
         value, record = self.ready_inputs()
-        invalid = ('invalid', None, None)
+        invalid = ('invalid', None, None, None)
         self.place_ready(record, 0o640)
         self.assertEqual(self.read_ready(value), invalid)
         self.place_ready(record)
@@ -1708,9 +1938,10 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         value, record = self.ready_inputs()
         self.place_ready(record)
         with patch.object(core.os, 'open', side_effect=AssertionError('no authoritative read')):
-            self.assertEqual(core.read_unit_ready('fresh', None, 'a' * 32, value['boot']), ('unavailable', None, None))
-            self.assertEqual(core.read_unit_ready('fresh', value, None, value['boot']), ('unavailable', None, None))
-            self.assertEqual(core.read_unit_ready('fresh', value, 'a' * 32, None), ('unavailable', None, None))
+            unavailable = ('unavailable', None, None, None)
+            self.assertEqual(core.read_unit_ready('fresh', None, 'a' * 32, value['boot']), unavailable)
+            self.assertEqual(core.read_unit_ready('fresh', value, None, value['boot']), unavailable)
+            self.assertEqual(core.read_unit_ready('fresh', value, 'a' * 32, None), unavailable)
 
     def test_first_record_wins_and_later_failures_cannot_overwrite_it(self):
         self.prepared()
@@ -1747,7 +1978,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(self.ready_path().read_bytes(), first)
         value = core.state()
         self.assertEqual(core.read_unit_ready('fresh', dict(value, operation='9' * 32), 'a' * 32, value['boot']),
-                         ('invalid', None, None))
+                         ('invalid', None, None, None))
 
     def test_serialized_cap_still_bounds_bundle_with_maximum_unit_ready_text(self):
         self.prepared()
@@ -1766,7 +1997,8 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         raw = (core.ROOT / core.FIRST_FAILURE).read_bytes()
         self.assertLessEqual(len(raw), core.FIRST_FAILURE_LIMIT)
         self.assertLessEqual(self.ready_path().stat().st_size, core.UNIT_READY_LIMIT)
-        self.assertEqual(json.loads(raw)['unit_ready'], {'status': 'ok', 'message': 'm' * 128, 'code': 17})
+        self.assertEqual(json.loads(raw)['unit_ready'], {'status': 'ok', 'message': 'm' * 128, 'code': 17,
+                                                         'route': None})
 
     @contextmanager
     def diagnostic_fixture(self, *, late=None, code=0, ownership='owned', persistent=False,
@@ -2423,7 +2655,7 @@ class BridgePrerequisiteMixin(GuestEnvironment):
         self.assertGreater(sum(self.sleeps), 61)
         self.assertLess(self.now[0], self.deadline)
         self.assertEqual(len(self.helper_calls()), 1)
-        self.ready.assert_called_once_with(self.deadline, 42)
+        self.ready.assert_called_once_with(self.deadline, 42, core.BRIDGE_INITIAL)
         self.assertEqual(self.diagnostic_bytes(), OLD_DIAGNOSTIC)
         self.assertNotEqual(core.state()['phase'], 'ready')
 
@@ -2438,7 +2670,7 @@ class BridgePrerequisiteMixin(GuestEnvironment):
         self.assertEqual(self.probes, 41)
         self.assertEqual(len(self.helper_calls()), 2)
         self.assertEqual(self.api.call_count, 2)
-        self.assertEqual(self.ready.call_args_list[0].args, (self.deadline, 42))
+        self.assertEqual(self.ready.call_args_list[0].args, (self.deadline, 42, core.BRIDGE_INITIAL))
         self.assertEqual(self.ready.call_args_list[1].args, (self.deadline,))
         value = core.state()
         self.assertEqual(self.commits, [value])
@@ -2799,6 +3031,117 @@ class FormatAndSourceTests(unittest.TestCase):
                                 'import json,os; print(json.dumps(dict(os.environ)))'],
                                core.time.monotonic() + 3)
         self.assertEqual(json.loads(raw), core.SAFE_ENV)
+
+    # -- #430: the label is attached by the production wrapper to the ORIGINAL executed-child
+    #    Failure. These use the REAL executor with small inspected stdlib children (no network,
+    #    no external binary); a mocked execute alone would not prove the annotation.
+    def routed_failure(self, code, cap=2, route='svc-entry', total=3):
+        with self.assertRaises(core.Failure) as raised:
+            core.routed(route, [sys.executable, '-I', '-B', '-c', code], core.time.monotonic() + total,
+                        cap, retain=False)
+        return raised.exception
+
+    def test_actual_executor_failures_carry_route_without_changing_the_original_failure(self):
+        cases = (('timeout', 'import time; time.sleep(10)', .4, 'child deadline exceeded', 124, b''),
+                 ('nonzero', 'import sys; sys.stdout.write("PUBLIC_OUT"); sys.exit(19)', 2,
+                  'child command failed', 19, b'PUBLIC_OUT'),
+                 ('overflow', 'import os; os.write(1,b"x"*1100000)', 2, 'private child output overflow', 1, b''))
+        for name, program, cap, message, code, output in cases:
+            with self.subTest(name):
+                error = self.routed_failure(program, cap)
+                self.assertEqual((str(error), error.code, error.private_output, error.route),
+                                 (message, code, output, 'svc-entry'))
+                self.assertFalse(hasattr(error, 'cleanup_uncertain'))
+                # Identical failure from the unlabeled path: only the route differs.
+                with self.assertRaises(core.Failure) as plain:
+                    core.execute([sys.executable, '-I', '-B', '-c', program], core.time.monotonic() + 3, cap,
+                                 retain=False)
+                self.assertEqual((str(plain.exception), plain.exception.code, plain.exception.private_output),
+                                 (message, code, output))
+                self.assertIsNone(plain.exception.route)
+
+    def test_actual_executor_group_remaining_containment_failure_carries_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / 'descendant'
+            descendant = 'import time; time.sleep(10)'
+            program = ('import subprocess,sys; from pathlib import Path; '
+                       'p=subprocess.Popen([sys.executable,"-I","-B","-c",' + repr(descendant) + '], '
+                       'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '
+                       'Path(' + repr(str(pidfile)) + ').write_text(str(p.pid))')
+            error = self.routed_failure(program, 5, 'bridge-final-helper', 5)
+            self.assertEqual((str(error), error.code, error.route),
+                             ('unexpected child group remains', 1, 'bridge-final-helper'))
+
+    def test_actual_executor_cleanup_uncertainty_is_preserved_on_the_labeled_failure(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(core.os, 'killpg', side_effect=OSError('SYNTHETIC_PRIVATE_DETAIL')))
+            errors = stack.enter_context(patch('sys.stderr', new_callable=io.StringIO))
+            error = self.routed_failure('raise SystemExit(19)', 2, 'hhfab-inspect-strict')
+        self.assertEqual((str(error), error.code, error.route, error.cleanup_uncertain),
+                         ('child command failed', 19, 'hhfab-inspect-strict', True))
+        self.assertIn('child group containment unverified', errors.getvalue())
+        self.assertNotIn('SYNTHETIC_PRIVATE_DETAIL', errors.getvalue())
+
+    def test_route_is_never_applied_to_handled_signals_other_exceptions_or_a_second_label(self):
+        for code in (130, 143):
+            with self.subTest(handled=code), patch.object(core, 'execute',
+                                                          side_effect=core.Failure('terminated', code)):
+                with self.assertRaises(core.Failure) as raised:
+                    core.routed('svc-entry', ['/synthetic'], 1)
+                self.assertIsNone(raised.exception.route)
+            # A genuine child exit with the same code is a child failure and is labeled.
+            with self.subTest(child=code), patch.object(core, 'execute',
+                                                        side_effect=core.Failure('child command failed', code)):
+                with self.assertRaises(core.Failure) as raised:
+                    core.routed('svc-entry', ['/synthetic'], 1)
+                self.assertEqual(raised.exception.route, 'svc-entry')
+        for error in (OSError('synthetic'), KeyboardInterrupt(), RuntimeError('synthetic')):
+            with self.subTest(type(error).__name__), patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(type(error)) as raised:
+                    core.routed('svc-entry', ['/synthetic'], 1)
+                self.assertIs(raised.exception, error)
+                self.assertFalse(hasattr(error, 'route'))
+        first = core.Failure('child command failed', 7)
+        first.route = 'bridge-wait-probe'
+        with patch.object(core, 'execute', side_effect=first):
+            with self.assertRaises(core.Failure) as raised:
+                core.routed('svc-entry', ['/synthetic'], 1)
+        self.assertIs(raised.exception, first)
+        self.assertEqual(first.route, 'bridge-wait-probe')
+        with patch.object(core, 'execute', side_effect=core.Failure('child command failed', 7)):
+            with self.assertRaises(core.Failure) as raised:
+                core.routed(None, ['/synthetic'], 1)
+        self.assertIsNone(raised.exception.route)
+
+    def test_pending_rewrite_carries_no_route_but_other_kubectl_failures_do(self):
+        known = b'The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?\n'
+        with patch.object(core, 'execute', side_effect=core.Failure('child command failed', 1, known)):
+            with self.assertRaises(core.Pending) as raised:
+                core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-initial-readyz')
+        self.assertIsNone(raised.exception.route)
+        self.assertIsNone(raised.exception.__cause__)
+        for failure in (core.Failure('child deadline exceeded', 124), core.Failure('child command failed', 1, b'other')):
+            with self.subTest(str(failure)), patch.object(core, 'execute', side_effect=failure):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-final-readyz')
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(failure.route, 'api-final-readyz')
+
+    def test_route_enum_is_the_closed_37_values_shared_with_the_guest_validator(self):
+        import vlab_trial as guest
+        routes = core.UNIT_READY_ROUTES
+        self.assertEqual(len(routes), 37)
+        self.assertEqual(len(set(routes)), 37)
+        self.assertEqual(tuple(guest.FAILURE_ROUTES), tuple(routes))
+        self.assertEqual(sum(r.startswith('svc-') for r in routes), 6)
+        self.assertEqual(sum(r.startswith('bridge-') for r in routes), 5)
+        self.assertEqual(sum(r.startswith('hhfab-') for r in routes), 2)
+        self.assertEqual(sum(r.startswith('api-initial-') for r in routes), 12)
+        self.assertEqual(sum(r.startswith('api-final-') for r in routes), 12)
+        self.assertEqual(core.BRIDGE_INITIAL + core.BRIDGE_FINAL,
+                         ('bridge-initial-helper', 'bridge-initial-verify',
+                          'bridge-final-helper', 'bridge-final-verify'))
+        self.assertEqual(core.FIRST_FAILURE_SCHEMA, guest.FAILURE_SCHEMA)
 
     def test_actual_kubectl_classifier_preserves_deadline_and_only_known_transients(self):
         known = b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n'
