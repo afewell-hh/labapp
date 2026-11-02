@@ -317,19 +317,19 @@ def regular(path, limit, uid=None, mode=None):
                 (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             return raw
         # Same fixed refusal for every caller; only the exact replaced-inode signature
-        # (see ReplacedState) is distinguished, and only the guardian facade reads it.
+        # (see _ReplacedState) is distinguished, and only the guardian facade reads it.
         replaced = (len(raw) == info.st_size
                     and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_uid, info.st_gid,
                          info.st_mode) ==
                         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_uid, after.st_gid,
                          after.st_mode)
                     and info.st_nlink == 1 and after.st_nlink == 0 and info.st_ctime_ns != after.st_ctime_ns)
-        raise (ReplacedState if replaced else Failure)('file changed', 1, 'policy')
+        raise (_ReplacedState if replaced else Failure)('file changed', 1, 'policy')
     finally:
         os.close(fd)
 
 
-class ReplacedState(Failure):
+class _ReplacedState(Failure):
     """regular()'s 'file changed' refusal with the closed eligible signature: the opened
     inode was unlinked (link count exactly 1 -> 0, ctime changed) while every other observed
     attribute and the byte count stayed unchanged. Internal flag only; message, code and
@@ -341,7 +341,7 @@ class ReplacedState(Failure):
 def guardian_state(path, recover):
     """Guardian-only read of the two atomically replaced mutable files (issue #422).
 
-    Runs the unchanged complete regular(). Only a first ReplacedState failure is recovered:
+    Runs the unchanged complete regular(). Only a first _ReplacedState failure is recovered:
     its bytes are discarded (never consumed), ``recover`` (original Clock checks) runs, then
     ONE more complete regular() runs OUTSIDE the recovery catch, followed by ``recover``
     again. No third attempt, sleep, recursion or deadline renewal; a second failure,
@@ -350,7 +350,7 @@ def guardian_state(path, recover):
     require(path in (ROOT / 'phase.json', ROOT / 'heartbeat.json'))
     try:
         return regular(path, 4096, 0)
-    except ReplacedState as error:
+    except _ReplacedState as error:
         if error.eligible is not True:
             raise
     recover()
@@ -1311,6 +1311,7 @@ def guardian():
             require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
             beat = data(guardian_state(ROOT / 'heartbeat.json', lambda phase=phase: clock.remaining(phase)))
             require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
+            clock.remaining(phase)
             require(oom_count() == original_oom, 'OOM event', 'oom-event')
             sample = resources()
             minimum = sample if minimum is None else {k: min(v, minimum[k]) for k, v in sample.items()}
