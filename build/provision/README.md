@@ -802,14 +802,71 @@ student access, Linux boot, full VLAB, networking, reboot or image readiness.
 ```bash
 python3 -m unittest discover -s build/provision -p test_qemu.py -v
 python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
+python3 -m unittest discover -s build/provision -p test_qemu_auth_control.py -v
 # Separately scoped lead execution only: runs the loopback apt-helper transport
 # fixture (retry/404/digest/deadline; HTTP only, not TLS or signature proof)
-# before any public snapshot request, then strict signature/missing-pin checks.
+# before any public snapshot request, then the local native-APT authentication
+# controls (below) and the missing-pin check.
 timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 # Separate lead scope required; not activated by ordinary CI:
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh --selection baseline-20260114
 ```
+
+#### Local signed-metadata authentication controls (#447 Tier 1, test-only)
+
+`qemu_auth_control.py run` replaces only the former *online* empty-key control, so
+that one external dependency (the public snapshot) is removed from it. It does
+**not** fix CI outages: the genuine online install/rerun, the offline controls,
+TCG/KVM refusal, the transport controls and the missing-pin check (still original
+HTTPS) are unchanged. `test-qemu.sh` runs it once (lane 1) in a separate
+`--network=none` root container created from the committed prepared image, after
+the network preparation and before the runtime container. A suite pass requires
+that stage to have run and exited 0 (`auth_runs == 1`); package acquisition stays in
+the preparation container. No new overall timeout or retry allowance; the stage has
+a 150 s/170 s bound, 25 s per case and at most 64 requests per case.
+
+Inside it, a closed-route stdlib loopback HTTP server serves three **unchanged
+public** snapshot `InRelease` files (noble 255850 B, noble-updates 126125 B,
+noble-security 126127 B; total 508102 B; SHA-256 pinned in the module) from
+`fixtures/ubuntu-snapshot-20261024T000000Z/`. The real production
+`qemu_offline.setup()` workspace and `apt-get ... -o APT::Update::Error-Mode=any update`
+are used; the test asserts the exact production three-line `sources.list`, then
+changes only each URI (and `signed-by` for the empty-key cases). Production
+options, pins, freshness, `Error-Mode=any`, retries and `signature_proof` are
+untouched. Every request is in a method/path/status/bytes/SHA ledger; unexplained
+paths, non-GET methods, conditional/range headers, redirects and external fallback
+are failures. Each case uses a fresh workspace; packages and `/etc/apt` must be
+unchanged and no `apt-get install` is ever invoked.
+
+Cases, in order (each later case is not relied on unless the first qualifies):
+
+1. **Native positive probe** (valid keyring, intact releases, fresh lists/cache). It
+   adds two *diagnostic-only* `Debug::` options, so it is a separate probe. Update
+   must exit **nonzero** because index files are deliberately absent (explicit
+   index-absence 404 paths); that is never a successful update. It passes only
+   if each suite shows exactly one delivered 200 `InRelease`, no rejection or
+   freshness/policy vocabulary, per-suite `GOODSIG`/`VALIDSIG` diagnostics, and an
+   index request *after* that suite's release (authenticated index scheduling).
+   If it cannot, the runner fails closed as **unqualified**.
+2. **Empty key**: genuine `NO_PUBKEY` via the unchanged `signature_proof`, all three
+   releases delivered 200 with exact bytes, no other request, no mixed transport.
+3. **Tampered, valid key**: one signed-cleartext byte flipped in all three releases
+   (armor/signature untouched); requires an explicit bad-signature refusal that is
+   *not* `NO_PUBKEY` and that `signature_proof` rejects.
+4. **Persistent 502** and 5. **503**: real APT retries; both must remain
+   transport-only failures rejected by the unchanged `signature_proof`, with
+   exactly `1 + Acquire::Retries` requests per release.
+
+Limits and open facts: the real fixture bytes are staged separately by the lead; until
+then `load_fixtures` refuses (`fixtures not staged`) and the stage cannot pass. The
+`Debug::` option output, the exact error text and whether APT 2.8.3 issues other
+requests (for example `Release`/`Release.gpg` fallback after a 502/503, which is
+allowed only in those two cases) are **not verified**; raw APT 2.8.3 source was
+unavailable and adjacent 2.8.2 reading does not prove runtime behavior. HTTP proves
+neither TLS nor repository trust. The container's capability set
+(`CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID`) is untested. This work has not been
+executed; no native proof exists yet.
 
 The existing offline harness passes the digest printed at the trusted acquisition
 boundary into the disconnected target independently of the copied bundle. The

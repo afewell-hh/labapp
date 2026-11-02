@@ -245,32 +245,12 @@ def install():
     module = runpy.run_path('/suite/install-qemu.py')
     apt_before ={str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()}
     packages_before = module['installed']()
-    # Exercise actual APT authentication failure against the official signed
-    # snapshot with an owned empty trust keyring, before installing anything.
+    # The empty-key signature refusal is no longer exercised here against the
+    # public snapshot: qemu_auth_control.py proves it (after a native positive
+    # boundary) in a separate disconnected container with local signed fixtures.
+    # test-qemu.sh fails the suite unless that stage ran and passed.
     globals_ = module['install'].__globals__
     original_call = globals_['call']
-    with tempfile.TemporaryDirectory(prefix='labapp-qemu-rejection-') as temporary:
-        Path(temporary).chmod(0o755)
-        key = Path(temporary) / 'empty.gpg'
-        key.write_bytes(b'')
-        def rejected_trust(args, seconds=10):
-            if args[0] == '/usr/bin/apt-get' and args[-1] == 'update':
-                source = Path(next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist=')))
-                source.write_text(source.read_text().replace('/usr/share/keyrings/ubuntu-archive-keyring.gpg', str(key)))
-                code, output = bounded(args, seconds, env=module['ENV'])
-                signature_proof(code, output)
-                raise Refusal('actual signature refusal')
-            return original_call(args, seconds)
-        globals_['call'] = rejected_trust
-        try:
-            module['install']()
-        except Refusal as exc:
-            assert str(exc) == 'stage=update: actual signature refusal'
-        else:
-            raise AssertionError('untrusted signature accepted')
-        finally:
-            globals_['call'] = original_call
-    assert module['installed']() == packages_before
     # Unavailable explicit pin must fail at resolution, without package changes.
     original_pin = module['PINS']['qemu-system-x86']
     module['PINS']['qemu-system-x86'] = '999:0.invalid'
@@ -286,7 +266,7 @@ def install():
         globals_['call'] = original_call
         module['PINS']['qemu-system-x86'] = original_pin
     assert module['installed']() == packages_before
-    print(json.dumps({'actual_signature_refusal': True, 'actual_unavailable_pin_refusal': True,
+    print(json.dumps({'actual_unavailable_pin_refusal': True,
                       'preinstall_failure_packages_unchanged': True}))
     for _ in range(2):
         code, output = bounded(['/usr/bin/python3', '/suite/install-qemu.py'], 240,

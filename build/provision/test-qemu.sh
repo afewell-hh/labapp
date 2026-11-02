@@ -8,8 +8,11 @@ run_label="labapp.qemu-test.run=${suffix}"
 image_tag="labapp-qemu-test:${suffix}"
 prep="labapp-qemu-prep-${suffix}"
 runtime="labapp-qemu-runtime-${suffix}"
+auth="labapp-qemu-auth-${suffix}"
 prep_id=
 runtime_id=
+auth_id=
+auth_runs=0
 image_id=
 workdir="$(mktemp -d)"
 owned_container() {
@@ -25,7 +28,7 @@ cleanup() {
   # Recover by exact nonce-bearing name/tag AND ownership label even if create
   # or commit succeeded at the daemon but its response was lost. Never infer
   # absence from a failed query; never remove by a name prefix or label alone.
-  for container in "$runtime" "$prep"; do
+  for container in "$runtime" "$auth" "$prep"; do
     if ! object="$(owned_container "$container")"; then
       failed=1
       continue
@@ -81,6 +84,25 @@ for lane in 1 2; do
   [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
   timeout --kill-after=1s 5s docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
   timeout --kill-after=1s 5s docker image inspect "$image_id" --format 'Prepared {{.Id}}'
+  if ((lane == 1)); then
+    # Native-APT metadata-authentication controls (#447 Tier 1): a separate
+    # disconnected root container from the committed image, with local signed
+    # fixtures only. Its success is the only way auth_runs becomes 1; the final
+    # guard below refuses a suite pass without it. Unproven runtime hardening:
+    # root keeps only the capabilities APT's _apt sandbox needs.
+    auth_id="$(timeout --kill-after=3s 15s docker create --name "$auth" --label "$run_label" \
+      --network=none --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER \
+      --cap-add=SETUID --cap-add=SETGID --security-opt=no-new-privileges --user=0:0 \
+      --memory=768m --cpus=1 --pids-limit=128 --env PYTHONDONTWRITEBYTECODE=1 \
+      "$image_id" timeout --kill-after=3s 150s python3 /suite/qemu_auth_control.py run)"
+    [[ "$auth_id" =~ ^[a-f0-9]{64}$ ]]
+    if ! timeout --kill-after=5s 170s docker start -a "$auth_id"; then lane_failed=1; fi
+    if [[ "$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$auth_id")" == 0 ]]; then
+      ((auth_runs += 1))
+    else
+      lane_failed=1
+    fi
+  fi
   runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --label "$run_label" \
     --network=none --cap-drop=ALL --security-opt=no-new-privileges --read-only --user=1000:1000 \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,uid=1000,gid=1000,mode=700 \
@@ -90,6 +112,7 @@ for lane in 1 2; do
   if ! timeout --kill-after=5s 60s docker start -a "$runtime_id"; then lane_failed=1; fi
   [[ "$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$runtime_id")" == 0 ]] || lane_failed=1
   cleanup
-  prep_id='' runtime_id='' image_id=''
+  prep_id='' runtime_id='' auth_id='' image_id=''
 done
-[[ "$lane_failed" == 0 ]]
+# A full-suite pass requires the native authentication controls to have run and passed.
+[[ "$auth_runs" == 1 && "$lane_failed" == 0 ]]
