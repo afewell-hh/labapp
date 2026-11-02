@@ -191,8 +191,20 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(status.exception.code, 0)
 
     def test_actual_owner_registration_checks_cloud_shape_before_narrow_cas(self):
+        self.owner_registration_checks(1)
+
+    def test_schema2_owner_registration_preserves_schema_and_checks_history_before_cloud(self):
+        self.owner_registration_checks(2)
+
+    def owner_registration_checks(self, schema):
         from build.gcp.lifecycle.test_vlab_trial_profile import world
         w = world()
+        if schema == 2:
+            from build.gcp.lifecycle.inline_history import plan_migration
+            free = dict(schema=1, slot=w.cfg.key, state='FREE', epoch=0, quarantine=[])
+            generation = w.store.write(w.cfg.key, free, if_generation_match=0)
+            plan = plan_migration(free, generation)
+            w.store.write(w.cfg.key, plan['replacement'], if_generation_match=generation)
         rec = w.started(run=123)
         value = {k: rec[k] for k in host.SNAPSHOT_FIELDS}
         value.update(source_sha='a'*40, self_user='users/12345')
@@ -212,6 +224,14 @@ class OwnerTrial(unittest.TestCase):
             registration = host.OwnerRegistration(w.store, w.cloud, records, value)
             registration._OwnerRegistration__controller.cfg.now = w.clock.now
             self.assertEqual(registration.current()['ids'], rec['ids'])
+            if schema == 2:
+                corrupt, generation = w.store.read(w.cfg.key)
+                corrupt['legacy_history'] = dict(count=0, sha256='f'*64)
+                generation = w.store.write(w.cfg.key, corrupt, if_generation_match=generation)
+                calls = len(w.raw.calls)
+                with self.assertRaises(host.Refused): registration.current()
+                self.assertEqual(len(w.raw.calls), calls)
+                w.store.write(w.cfg.key, rec, if_generation_match=generation)
             boot['sizeGb'] = '800'
             with self.assertRaises(guest.Failure): registration.register('public fixture')
             self.assertNotIn('access', w.record())
@@ -221,6 +241,9 @@ class OwnerTrial(unittest.TestCase):
             self.assertEqual(context.binding['run_id'], 123)
             self.assertEqual(context.binding['vm_id'], rec['ids']['instance'])
             self.assertEqual(w.record()['access']['phase'], 'registered')
+            self.assertEqual(w.record()['schema'], schema)
+            if schema == 2:
+                self.assertEqual(w.record()['legacy_history'], rec['legacy_history'])
 
     def test_lost_master_cleanup_withholds_removed_receipt_and_preserves_primary(self):
         value = snapshot()
