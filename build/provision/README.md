@@ -498,7 +498,7 @@ env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/timeout --kill-after=30s 10m \
   /usr/bin/bash /absolute/path/build/provision/test-kubectl-readiness.sh /absolute/path/to/kubectl
 # Offline harness tests (loopback plain-socket fixture, fake production callables; no kubectl,
 # Docker, TLS or external network). Needs distribution python3-yaml/libyaml.
-# 45 test methods by source inspection, NOT executed. ROOT adds the separate CI hook.
+# 46 test methods by source inspection, NOT executed. ROOT adds the separate CI hook.
 python3 -B -m unittest discover -s /absolute/path/build/provision -p test_kubectl_readiness_proof.py -v
 ```
 

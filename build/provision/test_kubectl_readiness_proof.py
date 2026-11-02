@@ -161,6 +161,20 @@ class FixtureTests(unittest.TestCase):
         fixture.acceptor.is_alive.return_value = True
         self.assertGreater(fixture.close()['threads_alive'], 0)
 
+    def test_handler_cannot_replace_tracked_socket_after_stop(self):
+        context = Mock()
+        fixture = proof.Fixture(port=0, context=context)
+        self.addCleanup(fixture.close)
+        conn, peer = socket.socketpair()
+        self.addCleanup(conn.close)
+        self.addCleanup(peer.close)
+        fixture.sockets.add(conn)
+        fixture.stop.set()
+        fixture._serve(conn)
+        context.wrap_socket.assert_not_called()
+        self.assertEqual(conn.fileno(), -1)
+        self.assertFalse(fixture.sockets)
+
 
 class AttemptTests(unittest.TestCase):
     def call(self, outcome):

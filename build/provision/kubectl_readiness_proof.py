@@ -143,10 +143,10 @@ class Fixture:
     def start(self, steps, mode='serve'):
         self.steps, self.mode, self.t0 = list(steps), mode, self.clock()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.host, self.port))
         sock.listen(8)
-        self.sock = sock
         if self.port == 0:
             self.port = sock.getsockname()[1]
         if mode != 'backlog':
@@ -209,6 +209,8 @@ class Fixture:
             if self.context is not None:
                 # Track the SSLSocket BEFORE its blocking handshake, not the detached raw socket.
                 with self.lock:
+                    if self.stop.is_set():
+                        return
                     self.handshakes_started += 1
                     wrapped = self.context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
                     self.sockets.discard(conn)
