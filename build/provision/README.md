@@ -565,10 +565,10 @@ These shorter successful-case deadlines are an explicit test seam, not a product
 Pending is a **new exception with empty private bytes and no route**, not a retained refusal
 message. The delayed-start regression injects an ordinary refusal at the child boundary and
 passes through the unchanged classifier. Every observed `cleanup_uncertain` is fatal, even
-on earlier attempts or observations. On this source, the existing classifier can discard that
-attribute for a matching transient; the harness checks the suppressed exception's context only
-for this boolean (synthetic matching-transient control), without changing production or restoring
-its output. ROOT's separate #449 integration is still needed.
+on earlier attempts or observations. The production classifier preserves cleanup-uncertain
+failures instead of converting them to Pending. The harness also rejects uncertainty found in
+a suppressed exception's context (a synthetic matching-transient negative control), without
+restoring discarded output.
 
 Every case checks listener/socket/thread closure and no remaining live `ubuntu`-uid process
 in this container. The fixture closes and settles the acceptor before its final handler/socket
