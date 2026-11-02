@@ -625,6 +625,17 @@ unknown bounded-refusal text is withheld. The unchanged combined-output cap is
 These diagnostics locate a new observed failure; they cannot reconstruct the
 stage or cause of earlier failures or prove installation/runtime success.
 
+The container harness's unavailable-pin fixture also preserves the first failed
+APT stage and actual exit code when update/check fails early, or when simulation
+fails for an unrelated reason. Its diagnostic tail considers only the last 40
+lines, drops lines containing unsafe controls or credential-looking text, and
+replaces non-ASCII text with `?`. The retained text is at most 4096 ASCII bytes;
+its quoted, escaped `output_tail` representation is at most 8194 ASCII bytes.
+Empty/non-bytes output uses a fixed marker. This is a narrow filter for controlled
+fixture APT output, not a general secret scrubber. Missing-pin proof still requires
+successful authenticated update and check, followed by a nonzero simulation with
+the exact invalid-pin error; transport or exit 100 alone does not qualify.
+
 #### QEMU installation output-overflow observations
 
 Only `install-qemu.py` opts in (`bounded(..., observe=True)`); every other

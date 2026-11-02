@@ -692,6 +692,71 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
             with self.subTest(name), self.assertRaises(AssertionError):
                 container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
 
+    def test_missing_pin_failures_keep_stage_exit_and_bounded_tail(self):
+        pin = b"E: Version '999:0.invalid' for 'qemu-system-x86' was not found\n"
+        ok = [('update', 0, b''), ('check', 0, b'')]
+        cases = {
+            'update': ([('update', 100, b'Err:1 http://x InRelease\n  502  Bad Gateway\n')],
+                       'failed_stage=update exit=100', '502  Bad Gateway'),
+            'check': ([ok[0], ('check', 100, b'E: Unmet dependencies\n')],
+                      'failed_stage=check exit=100', 'Unmet dependencies'),
+            'unrelated simulate': (ok + [('simulate', 17, b'E: Unable to locate package')],
+                                   'failed_stage=simulate exit=17', 'Unable to locate'),
+        }
+        for name, (log, stage, text) in cases.items():
+            failed_stage, code, output = log[-1]
+            log[-1] = (failed_stage, code, b'x' * 10000 + b'\n' + output +
+                       b'\nAuthor\x1bization: Basic SENTINEL\n')
+            with self.subTest(name), self.assertRaises(AssertionError) as caught:
+                container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
+            message = str(caught.exception)
+            self.assertIn(stage, message)
+            self.assertIn(text, message)
+            self.assertNotIn('SENTINEL', message)
+            self.assertLessEqual(len(message.split('output_tail=', 1)[1].encode('ascii')), 8194)
+        with self.assertRaises(AssertionError) as caught:
+            container.missing_pin_proof([('update', 100, b'first failure'),
+                                         ('check', 17, b'later failure')],
+                                        'qemu-system-x86', '999:0.invalid')
+        self.assertTrue(str(caught.exception).startswith(
+            "invalid pin did not fail at simulation after update/check: [('update', 100), ('check', 17)]"))
+        self.assertIn("failed_stage=update exit=100 output_tail='first failure'", str(caught.exception))
+        # Transport/code 100 alone never counts as proof, and a valid path still passes.
+        container.missing_pin_proof(ok + [('simulate', 100, pin)], 'qemu-system-x86', '999:0.invalid')
+
+    def test_diagnostic_tail_is_finite_sanitized_text(self):
+        tail = container.diagnostic_tail
+        self.assertEqual(tail(b''), '<empty>')
+        self.assertEqual(tail(None), '<non-bytes output>')
+        self.assertEqual(tail('SENTINEL'), '<non-bytes output>')
+        self.assertEqual(tail(b'Authorization: Basic SENTINEL'), '<empty>')
+        self.assertLessEqual(len(tail(b'x' * 100000)), 4096)
+        many = b'\n'.join(b'line%d' % i for i in range(1000))
+        self.assertNotIn('line0\n', tail(many))
+        self.assertIn('line999', tail(many))
+        self.assertEqual(tail(many).splitlines(), [f'line{i}' for i in range(960, 1000)])
+        out = tail(b'Err http://user:pw@host\nAuthorization: Basic abc\nok \xff text\nbad\x00 text\n')
+        for leaked in ('pw', 'Basic', 'Authorization'):
+            self.assertNotIn(leaked, out)
+        self.assertIn('ok', out)
+        self.assertNotIn('\x00', out)
+
+    def test_diagnostic_tail_drops_control_obfuscated_sensitive_lines(self):
+        for control in (b'\x00', b'\t', b'\r', b'\x0b', b'\x1b', b'\x7f', '\u200b'.encode()):
+            with self.subTest(control=control):
+                output = b'Author' + control + b'ization: Basic SENTINEL\nE: retained marker'
+                self.assertEqual(container.diagnostic_tail(output), 'E: retained marker')
+        self.assertEqual(container.diagnostic_tail(
+            b'Authori\x00zation: Basic NUL_SENTINEL\nE: retained marker'), 'E: retained marker')
+
+    def test_diagnostic_tail_bounds_ascii_and_rendered_multibyte_and_escaped_text(self):
+        for output in (('\U0001f994' * 10000).encode(), b"\\'\"" * 10000,
+                       bytearray(b'x' * 10000), b'\xff' * 10000):
+            with self.subTest(prefix=output[:12]):
+                tail = container.diagnostic_tail(output)
+                self.assertEqual(len(tail.encode('ascii')), 4096)
+                self.assertLessEqual(len(repr(tail).encode('ascii')), 8194)
+
     def test_recording_call_keeps_stage_code_and_output(self):
         log = []
         module = {'ENV': {'APT_CONFIG': '/x'}}
