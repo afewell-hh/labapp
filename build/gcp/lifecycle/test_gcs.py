@@ -150,7 +150,7 @@ class GcsTests(unittest.TestCase):
     def test_bad_json_duplicate_keys_and_unknown_schema_are_rejected(self):
         bad = [b"[]", b"not-json", b'{}', b'\xff',
                b'{"schema":1,"schema":1,"slot":"slots/slot-1.json","state":"FREE","epoch":0}',
-               body(dict(FREE, schema=2)), body(dict(FREE, epoch=True)),
+               body(dict(FREE, schema=3)), body(dict(FREE, epoch=True)),
                body(dict(FREE, state="OTHER")), body(dict(FREE, epoch=-1)),
                body(dict(FREE, state="ACTIVE")), body(dict(FREE, extra=float("nan")))]
         for raw in bad:

@@ -815,11 +815,115 @@ trial below reuses these access records; workers receive no credentials.
 Access objects are retained after release. Late old uploads remain confined to
 the old UUID namespace and cannot authorize or occupy the next lease's paths.
 Separate `access_history` accounting survives reuse, prevents key/UUID reuse,
-and stops new access registration after sixteen completed access leases; nothing
+and in schema1 stops admission/submission and new access registration after sixteen completed access leases; nothing
 is silently pruned. Eventual exact-generation deletion, late-upload accounting,
 soft-deleted/noncurrent versions and migration at the bound need a separately
 reviewed policy before unattended enablement. No complete deletion/physical
 erasure or old-producer-quiescence claim is made.
+
+#### Finite inline schema2
+
+`lifecycle/inline_history.py` provides a separate inline ledger version, with
+**24 completed access entries as a ceiling, not a capacity promise**. Schema1
+retains its sixteen-entry limit. There is no automatic conversion, additional
+storage namespace, segment upload, pruning or history reset. Existing schema1
+inspector, component, base-build and capture cleanup remain supported. New
+schema2 execution is restricted to the canonical VLAB profile, without capture
+or retained image quarantine; #179 remains deferred.
+
+The complete schema1 history is an immutable ordered prefix. `legacy_history`
+binds its count and canonical SHA256, without retroactive new-entry size caps.
+All old receipt/proof paths, generations, digests, unknown legacy entry fields
+and FAILED/UNKNOWN meanings remain in place. New suffix entries have closed
+typed fields; lease UUIDs and key digests are scanned across the entire history.
+This digest is an integrity binding, **not historical authentication or approval**.
+The existing trusted-writer/CAS boundary still matters; admission does not
+reauthenticate every historical remote receipt or invent trusted lead provenance.
+
+Capacity is checked before reservation, submission and access registration, and
+at ordinary schema2 transitions. The actual canonical retained history and
+inventory are charged, including JSON escaping. Prospective disjoint budgets
+bound a new entry (2048 bytes), live fixed fields including current access
+(8192), evidence array (4096) and proof content outside its embedded slot
+(8192). These are enforced serialized aggregate limits, not measurements of
+maximum provider payloads. Normal and failed FREE continuations are reserved,
+as is the larger occupied-slot-plus-failed-proof continuation. Conservative
+framing allowance overcounts rather than omitting keys/separators. The exact
+formulas and field partition are documented in the codec. A near-limit legacy
+prefix or retained inventory can refuse the very next admission, even below
+24. Evidence is not shortened to make a schema2 transition fit.
+
+Schema2 producers additionally reserve the actual old evidence plus every
+still-possible distinct cleanup fact before reservation, submission and access
+registration. The canonical profile has exactly two children (`instance`, `boot`),
+fixed names bounded by `spec.names` (15 run digits and 3 attempt digits), and one
+immutable unsigned64 ID per child (at most 20 decimal digits). Each child can
+produce only an absent-404 fact and a deleted-ID/confirmed-404 fact: at most four
+distinct physical facts over arbitrarily many retries. Unknown IDs are charged
+at their full width without deduplicating a hypothetical placeholder. The largest
+standalone four-fact canonical array is 311 bytes (names 34/39 bytes, IDs 20);
+the producer charges the actual old array plus all missing facts and framing.
+New facts are appended once; every existing entry, including historical duplicates
+and escaped bytes, stays in order unchanged. This prospective check is a producer
+gate in addition to, not a relaxation of, the readers' actual 4096-byte cap.
+Access producers recheck the current slot's prospective reserve before intent
+preparation, access-record uploads (intent/import/seal), and OS Login import,
+including after reading the durable intent. `Context.from_slot` and `current`
+remain reading/identity gates: own-key removal and its terminal `removed`
+receipt do not require new-producer reserve. Already-invalid prospective
+accounting therefore blocks new access, not independently verified key deletion.
+`test_access_producer_capacity.py` exercises these actual adapters with changed
+4096-byte opaque evidence and checks cleanup remains available without unsafe
+FREE. The normal-release boundary reserves missing facts separately from actual
+evidence; the failed-proof boundary still exercises actual 65491-byte proof media.
+
+The physical CAS checks that same evidence/live reserve, immutable IDs and
+append-only fixed fact vocabulary independently of history semantics. Pending
+operations, later failed reads and missing access receipts retain preceding
+physical progress. Fixed failure codes occupy the reason field; API/transport
+diagnostic text remains in the returned outcome, not in an unbounded persisted
+reason. No evidence/live/proof/media cap is raised. For already-invalid records
+with no writable progress headroom, verified IDs can remain local while owned
+deletion continues; old bytes remain untouched and the separate accounting gate
+still refuses FREE. This is not a repair or acceptance of that corrupt record.
+`test_cleanup_history_bounds.py` adds actual-controller alternating-failure and
+eventual normal/failed disposal cases, including maximum common/evidence reserves
+and preservation of old history and immutable proof objects; source authoring is
+not execution evidence.
+
+The GCS media limit remains 65536 bytes and nesting limit remains 32.
+Schema2 occupied records reserve two depth levels for the embedded proof and
+its validation wrapper. Storage/resource IDs retain unsigned64 domains;
+binding/intent fields retain their existing positive signed63 domains and
+booleans are not integers. Resource-name constructors and fixed identities
+are unchanged. Pre-schema2 `GcsSlotStore` and `Context.from_slot` reject the
+new version; upgraded constructors preserve it instead of writing schema1.
+
+History/provenance/capacity refusal is distinct from physical ownership.
+After independently verifying persisted intent, original insert, immutable
+resource IDs and complete disk inventory, reconciliation can still delete
+owned VM/disks. It preserves opaque accounting and keeps the slot occupied
+when semantic history or disposal-capacity checks prevent safe FREE. This is
+not permission to delete resources with corrupt ownership or to erase history.
+
+`plan_migration(record, generation)` is **pure offline planning only**. It
+requires exact compatible schema1 FREE, explicit empty quarantine and absent
+access/capture; unknown top-level content is refused rather than dropped.
+It preserves history, epoch, last release and capture UUID tombstones, and
+returns the complete expected record/generation/digest and replacement.
+It does not authenticate history, approve UNKNOWN disposal, create clients,
+write data or authorize a CAS. Actual full-history authentication, trusted
+approval provenance, fresh whole-record/generation comparison and a separately
+reviewed single CAS remain ROOT execution work. No migration or VM17 is
+authorized by this source.
+
+The existing lifecycle discovery command below includes `test_inline_history.py`,
+which uses real controllers, access/recovery validators and generation-CAS GCS
+adapters with offline transports. Fixed creator/cleanup source-fetch lists must
+both include `inline_history.py`; their exact-loader tests require it and check
+that removing it breaks the isolated import. ROOT must stage those workflow
+fetch-list additions before qualification, without changing permissions,
+identities, events or dispatch behavior.
 
 Proposed A permissions remain **ungranted**: exact slot `get`, and `get/create`
 under the entire `access/slot-1/` object namespace in the configured existing
@@ -889,7 +993,7 @@ Oversize evidence refuses without truncation. Generation-pinned canonical
 readback reconciles a lost proof reply; a lost slot-write reply succeeds only
 on exact equality with that same expected FREE record. No blind CAS replay,
 intermediate recovery phase, import/removal forgery or pruning is provided.
-Retained failed history and proof references consume the existing sixteen-entry
+Retained failed history and proof references consume the version's finite entry
 budget and permanently retire the original key/lease. Late old uploads cannot
 revise UNKNOWN or authorize a successor.
 
@@ -1007,7 +1111,7 @@ source mount and private collection gates above remain required if a future
 separately reviewed source-inspection task is authorized; this workflow does
 not dispatch that profile.
 
-The runner fetches only the eleven required Python module files through GitHub's
+The runner fetches only its fixed required Python module allowlist through GitHub's
 Contents API at the trusted workflow's `github.sha`, before WIF authentication.
 It does not check out archived gitlinks, execute triggering-run code, download
 artifacts or overwrite auth credentials. The CLI is invoked from that temporary

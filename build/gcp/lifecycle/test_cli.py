@@ -605,6 +605,17 @@ class PilotBudgetTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def assert_missing_dependency(self, result, path):
+        self.assertNotEqual(result.returncode, 0)
+        if path.name == 'inline_history.py':
+            self.assertIn(
+                "ImportError: cannot import name 'inline_history' from 'lifecycle' ("
+                + str(path.with_name('__init__.py').resolve()) + ')', result.stderr)
+        else:
+            self.assertIn(
+                "ModuleNotFoundError: No module named 'lifecycle." + path.stem + "'",
+                result.stderr)
+
     @staticmethod
     def import_fetched_cli(root):
         # -I excludes the source checkout, user site and Python environment.
@@ -715,7 +726,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual({p.name for p in files}, {
                     '__init__.py', 'auth_http.py', 'cloud.py', 'compute.py',
                     'controller.py', 'gcs.py', 'spec.py', 'store.py', 'cli.py',
-                    'access_records.py', 'oslogin.py'})
+                    'access_records.py', 'oslogin.py', 'inline_history.py'})
                 self.assertTrue(all(url.endswith('?ref=' + 'a' * 40) for url in requested))
                 self.assertEqual(credentials.read_text(), 'unchanged')
                 self.assertEqual((Path(tmp) / 'labapp-trusted-lifecycle/lifecycle/cli.py').read_bytes(),
@@ -727,15 +738,23 @@ class WorkflowTests(unittest.TestCase):
                                  'isolated fetched CLI import and trust validation passed')
                 # Demonstrate this check detects the original omission rather
                 # than importing already-loaded modules from this test process.
-                for missing in ('access_records.py', 'oslogin.py'):
+                for missing in ('access_records.py', 'oslogin.py', 'inline_history.py'):
                     path = fetched / 'lifecycle' / missing
                     content = path.read_bytes()
                     path.unlink()
                     try:
                         result = self.import_fetched_cli(fetched)
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertIn('ModuleNotFoundError', result.stderr)
-                        self.assertIn('lifecycle.' + path.stem, result.stderr)
+                        self.assert_missing_dependency(result, path)
                     finally:
                         path.write_bytes(content)
+                    if missing == 'inline_history.py':
+                        try:
+                            path.write_text("raise ImportError('wrong dependency failure')\n")
+                            wrong = self.import_fetched_cli(fetched)
+                            self.assertNotEqual(wrong.returncode, 0)
+                            self.assertIn('ImportError: wrong dependency failure', wrong.stderr)
+                            with self.assertRaises(AssertionError):
+                                self.assert_missing_dependency(wrong, path)
+                        finally:
+                            path.write_bytes(content)
                 self.assertEqual(credentials.read_text(), 'unchanged')

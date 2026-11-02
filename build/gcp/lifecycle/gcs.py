@@ -77,7 +77,7 @@ def _record(record, key: str) -> None:
     # Unknown versions/states and occupied records missing core fields block
     # access instead of being treated as FREE. Nested JSON is bounded below.
     if (not isinstance(record, dict) or type(record.get("schema")) is not int or
-            record["schema"] != 1 or record.get("slot") != key or
+            record["schema"] not in (1, 2) or record.get("slot") != key or
             not isinstance(record.get("state"), str) or record["state"] not in _STATES or
             type(record.get("epoch")) is not int or record["epoch"] < 0):
         raise StoreError("invalid ledger record envelope")

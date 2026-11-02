@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from . import spec
+from . import inline_history
 from .access_records import AccessError, Context, KINDS, digest, public_key
 from .oslogin import check_receipt
 from .cloud import ApiError, NotFound, PolicyCloud, Uncertain
@@ -108,6 +109,15 @@ class Controller:
 
     # ---------------------------------------------------------------- helpers
     def _cas(self, prev: dict, rec: dict, gen: int) -> int:
+        if prev.get("schema") == 2:
+            if (rec.get("schema") != 2 or
+                    rec.get("legacy_history") != prev.get("legacy_history") or
+                    len(rec.get("access_history", [])) > len(prev.get("access_history", [])) + 1 or
+                    rec.get("access_history", [])[:len(prev.get("access_history", []))] !=
+                    prev.get("access_history", [])):
+                raise Refused("schema2 history cannot be rewritten or downgraded")
+            self._accounting(rec, reserve=rec.get("state") != FREE,
+                             adding=rec.get("state") != FREE)
         if prev.get("state") != FREE and rec.get("state") != FREE:
             for name in IMMUTABLE:
                 if prev.get(name) != rec.get(name):
@@ -141,6 +151,49 @@ class Controller:
         except PreconditionFailed as exc:
             raise _Conflict(str(exc)) from exc
 
+    def _accounting(self, rec, *, reserve=False, adding=False):
+        try:
+            inline_history.validate(rec, reserve=reserve, adding=adding)
+            if rec.get("schema") == 2 and rec.get("state") != FREE:
+                inline_history.cleanup_budget(rec)
+        except inline_history.HistoryError as exc:
+            raise Refused("access retention/accounting limit or invalid history: " + str(exc)) from exc
+
+    def _physical_cas(self, prev, rec, gen):
+        """Persist only owned-disposal progress, without trusting history.
+
+        This is not a release or an access capability. Opaque accounting and
+        access data must survive unchanged even if their semantics are corrupt.
+        """
+        if prev.get("schema") != 2:
+            return self._cas(prev, rec, gen)
+        allowed = {"state", "reason", "evidence", "ids"}
+        if ({k: v for k, v in prev.items() if k not in allowed} !=
+                {k: v for k, v in rec.items() if k not in allowed} or
+                rec.get("state") not in (RESERVED, ACTIVE, CLEANUP_FAILED)):
+            raise Refused("physical cleanup cannot change retained accounting")
+        if any(value is not None and rec["ids"].get(kind) != value
+               for kind, value in prev["ids"].items()):
+            raise Refused("physical cleanup cannot replace immutable IDs")
+        if (rec["evidence"][:len(prev["evidence"])] != prev["evidence"] or
+                rec["evidence"] != inline_history.cleanup_evidence(
+                    prev["evidence"], rec["evidence"][len(prev["evidence"]):])):
+            raise Refused("physical cleanup cannot rewrite or duplicate evidence")
+        facts = [inline_history.cleanup_fact(kind, name)
+                 for kind, name in rec["names"].items()]
+        facts += [inline_history.cleanup_fact(kind, rec["names"][kind], value)
+                  for kind, value in rec["ids"].items() if value is not None]
+        if any(fact not in facts for fact in rec["evidence"][len(prev["evidence"]):]):
+            raise Refused("physical cleanup can append only fixed child observations")
+        try:
+            inline_history.cleanup_budget(rec)
+        except inline_history.HistoryError as exc:
+            raise Refused(str(exc)) from exc
+        try:
+            return self.store.write(self.cfg.key, rec, if_generation_match=gen)
+        except PreconditionFailed as exc:
+            raise _Conflict(str(exc)) from exc
+
     def _lease_kinds(self, rec: dict) -> tuple:
         """Validate persisted intent before reading or deleting its children.
 
@@ -148,6 +201,9 @@ class Controller:
         never normalize it in place (old CAS immutable fields stay unchanged).
         """
         try:
+            if (type(rec.get("schema")) is not int or rec["schema"] not in (1, 2) or
+                    (rec["schema"] == 2 and rec.get("profile") != spec.UBUNTU_VLAB_CORE)):
+                raise ValueError("unsupported schema/profile")
             profile = rec.get("profile", spec.INSPECTOR)
             kinds = spec.kinds(profile)
             expected_names = spec.names(rec["run_id"], rec["attempt"], profile)
@@ -326,14 +382,22 @@ class Controller:
                     return f"{kind}:attached-but-missing", found
         return None, found
 
-    def _adopt(self, rec: dict, gen: int, found: dict):
+    def _adopt(self, rec: dict, gen: int, found: dict, *, physical=False):
         """Record immutable ids of already-verified resources (one CAS)."""
         new = {k: res["id"] for k, res in found.items()
                if rec["ids"].get(k) is None}
         if new:
             prev = dict(rec)
             rec["ids"] = dict(rec["ids"], **new)
-            gen = self._cas(prev, rec, gen)
+            if physical and rec.get("schema") == 2:
+                try:
+                    inline_history.cleanup_budget(rec)
+                except inline_history.HistoryError:
+                    # The verified preflight IDs still fence each immediate delete.
+                    # Bad accounting cannot require an unwritable progress CAS.
+                    # The separate accounting gate must still refuse unsafe FREE.
+                    return rec, gen
+            gen = (self._physical_cas if physical else self._cas)(prev, rec, gen)
         return rec, gen
 
     # -------------------------------------------------------------- admission
@@ -423,6 +487,11 @@ class Controller:
             rec, gen = self.store.read(cfg.key)
         if rec["state"] != FREE:
             raise Refused(f"slot is {rec['state']}")
+        self._accounting(rec, reserve=True, adding=True)
+        if rec["schema"] == 2 and cfg.profile != spec.UBUNTU_VLAB_CORE:
+            raise Refused("schema2 supports only canonical VLAB without capture")
+        if any(item["binding"]["lease"] == request_id for item in rec.get("access_history", [])):
+            raise Refused("access lease/key must never be reused")
         self._quarantines(rec)
         self._census()
         if cfg.profile in spec.UBUNTU_PROFILES:
@@ -450,6 +519,10 @@ class Controller:
         }
         if cfg.profile in spec.UBUNTU_PROFILES:
             lease["boot_image_id"] = spec.COMPONENT_IMAGE_ID
+        if rec["schema"] == 2:
+            lease.update(schema=2, legacy_history=dict(rec["legacy_history"]))
+            lease = inline_history.carry(rec, lease)
+        self._accounting(lease, reserve=True, adding=True)
         try:
             self._cas(rec, lease, gen)
         except _Conflict as exc:
@@ -465,6 +538,7 @@ class Controller:
                 rec["request_id"] != request_id:
             raise Refused("no RESERVED lease with this request id to submit")
         self._lease_kinds(rec)
+        self._accounting(rec, reserve=True, adding=True)
         if rec.get("profile") in spec.UBUNTU_PROFILES:
             self._check_component_image()
         deadline = _parse(rec["deadline"])
@@ -584,12 +658,34 @@ class Controller:
         return inst is not None and inst.get("status") in NOT_RUNNING
 
     def _fail(self, rec: dict, gen: int, reason: str, ev: list) -> Outcome:
+        if rec.get("schema") == 2:
+            prev = dict(rec)
+            rec.update(state=CLEANUP_FAILED, reason=reason,
+                       evidence=inline_history.cleanup_evidence(rec["evidence"], ev))
+            if rec != prev:
+                self._physical_cas(prev, rec, gen)
+            return Outcome("cleanup-failed", reason)
         if not (rec["state"] == CLEANUP_FAILED and rec["reason"] == reason):
             prev = dict(rec)
             rec.update(state=CLEANUP_FAILED, reason=reason,
                        evidence=(rec["evidence"] + ev)[-50:])
-            self._cas(prev, rec, gen)
+            self._physical_cas(prev, rec, gen)
         return Outcome("cleanup-failed", reason)
+
+    def _remember_cleanup(self, rec, gen, ev):
+        """Retain progress even if a later read, operation or access gate blocks."""
+        if rec.get("schema") == 2:
+            prev = dict(rec)
+            rec["evidence"] = inline_history.cleanup_evidence(rec["evidence"], ev)
+            if rec != prev:
+                try:
+                    gen = self._physical_cas(prev, rec, gen)
+                except Refused:
+                    # Already-invalid accounting may leave no writable headroom.
+                    # Preserve old bytes and continue independently owned deletion;
+                    # _accounting still refuses FREE after physical disposal.
+                    return prev, gen
+        return rec, gen
 
     def _delete_owned(self, rec, gen, kind, resource, found, proof, ev):
         """Delete one resource by exact name after identity verification.
@@ -602,7 +698,7 @@ class Controller:
         name = rec["names"][kind]
         res = self._get(resource, name)
         if res is None:
-            ev.append(f"{kind} {name}: absent (404)")
+            ev.append(inline_history.cleanup_fact(kind, name))
             return rec, gen, None
         reason = None if kind in found else "appeared-during-cleanup"
         reason = reason or self._verify(kind, res, rec, proof)
@@ -614,6 +710,11 @@ class Controller:
         try:
             op = self.cloud.call(resource, "delete", name=name)
         except (ApiError, Uncertain) as exc:
+            if rec.get("schema") == 2:
+                code = "uncertain" if isinstance(exc, Uncertain) else "api-error"
+                outcome = self._fail(rec, gen, f"delete-{kind}:{code}", ev)
+                outcome.detail = f"delete-{kind}:{exc}"
+                return rec, gen, outcome
             return rec, gen, self._fail(rec, gen, f"delete-{kind}:{exc}", ev)
         done = self._wait(op["name"])
         if done is None:
@@ -622,7 +723,7 @@ class Controller:
             return rec, gen, self._fail(rec, gen, f"delete-{kind}-op-error", ev)
         if self._get(resource, name) is not None:
             return rec, gen, self._fail(rec, gen, f"{kind}-still-exists", ev)
-        ev.append(f"{kind} {name} id {res['id']}: deleted, 404 confirmed")
+        ev.append(inline_history.cleanup_fact(kind, name, res["id"]))
         return rec, gen, None
 
     def _reconcile_once(self, rec: dict, gen: int, force: bool) -> Outcome:
@@ -666,7 +767,7 @@ class Controller:
         reason, found = self._inspect(rec, proof)
         if reason:
             return self._fail(rec, gen, f"identity-mismatch:{reason}", ev)
-        rec, gen = self._adopt(rec, gen, found)
+        rec, gen = self._adopt(rec, gen, found, physical=True)
         quarantine = list(rec.get("quarantine", []))
         if rec.get("capture"):
             c, image = self._capture_status(self._capture_intent(rec))
@@ -682,10 +783,12 @@ class Controller:
             else:
                 rec, gen, c = self._dispose_image(rec, gen, c, image)
         for kind, resource in self._lease_kinds(rec):
+            rec, gen = self._remember_cleanup(rec, gen, ev)
             rec, gen, blocked = self._delete_owned(
                 rec, gen, kind, resource, found, proof, ev)
             if blocked:
                 return blocked
+        rec, gen = self._remember_cleanup(rec, gen, ev)
         create_resolved = (
             rec["submit_attempts"] == 0 or rec["ids"]["instance"] is not None
             or bool(own_inserts))
@@ -700,6 +803,7 @@ class Controller:
             return Outcome("settling", "create outcome unproven")
         if foreign_pending:
             return Outcome("blocked", "unexpected pending operation in zone")
+        self._accounting(rec, reserve=True, adding="access" in rec)
         if "access" in rec:
             rec, gen = self._archive_access(rec, gen)
         history = list(rec.get("access_history", []))
@@ -713,7 +817,15 @@ class Controller:
                     "run_id": rec["run_id"], "attempt": rec["attempt"],
                     "request_id": rec["request_id"], "ids": rec["ids"],
                     "released_at": spec.rfc3339(cfg.now()),
-                    "evidence": (rec["evidence"] + ev)[-50:]}}
+                    "evidence": inline_history.cleanup_evidence(rec["evidence"], ev) if rec.get("schema") == 2
+                    else (rec["evidence"] + ev)[-50:]}}
+        if rec["schema"] == 2:
+            free.update(schema=2, legacy_history=dict(rec["legacy_history"]))
+            free = inline_history.carry(rec, free)
+            try:
+                inline_history.free_budget(free)
+            except inline_history.HistoryError as exc:
+                raise Refused(str(exc)) from exc
         self._cas(rec, free, gen)
         return Outcome("released", "; ".join(ev))
 
@@ -733,6 +845,7 @@ class Controller:
                 rec.get("capture") or self.access_records is None):
             raise Refused("access requires confirmed current build and record adapter")
         self._lease_kinds(rec)
+        self._accounting(rec, reserve=True, adding=True)
         if rec['profile'] == spec.UBUNTU_VLAB_CORE and (producer_run_id, producer_attempt) != (rec['run_id'], rec['attempt']):
             raise Refused("owner registration requires exact creator correlation")
         if rec['profile'] == spec.UBUNTU_VLAB_CORE:
@@ -753,7 +866,8 @@ class Controller:
             raise Refused("access requires current exact VM/boot ownership")
         _, sha = public_key(public_key_text)
         history = rec.get("access_history", [])
-        if not isinstance(history, list) or len(history) >= 16:
+        limit = inline_history.HISTORY_LIMIT if rec["schema"] == 2 else inline_history.LEGACY_LIMIT
+        if not isinstance(history, list) or len(history) >= limit:
             raise Refused("access retention/accounting limit reached")
         for item in history:
             try:
@@ -774,6 +888,7 @@ class Controller:
         validate_binding(binding)
         prev = dict(rec)
         rec["access"] = dict(binding=binding, phase="registered", archive={})
+        self._accounting(rec, reserve=True, adding=True)
         context = Context.from_slot(rec)
         # The UUID namespace is immutable. Existing objects are collisions, even
         # if someone claims their contents are equal; never recover import here.
