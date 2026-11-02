@@ -589,7 +589,42 @@ def export_command(nonce):
             'export-failure', '--nonce', nonce]
 
 
-def accept_failure(raw, source_sha, nonce, boot, mode='fresh'):
+def accept_installer(raw, source_sha, nonce, boot, installer):
+    """-> ('absent'|'invalid'|'captured', bytes) for the private installer record (#439).
+
+    ``installer`` = {'lease', 'admitted_at', 'detail'} is HOST-held: the lease and snapshot
+    reserved_at, and the host-validated terminal diagnostic. Nothing selecting this mode, the
+    outcome/status or the time bounds is taken from the guest bytes. The schema-2 envelope and
+    the body are validated independently and must agree with each other and the host values.
+    """
+    if raw == b'absent':
+        return 'absent', None
+    try:
+        detail = installer['detail']
+        guest.require(guest.installer_terminal(detail))
+        guest.require(type(boot) is str and re.fullmatch(guest.UUID, boot) and boot != ZERO_BOOT)
+        guest.require(type(raw) is bytes and 0 < len(raw) <= EXPORT_READ_LIMIT and raw != b'invalid')
+        first, separator, rest = raw.partition(b'\n')
+        guest.require(separator == b'\n' and len(rest) <= guest.INSTALLER_LIMIT)
+        envelope = guest.data(first)
+        guest.require(type(envelope) is dict and set(envelope) == guest.INSTALLER_ENVELOPE_FIELDS
+                      and type(envelope['schema']) is int and envelope['schema'] == guest.INSTALLER_ENVELOPE_SCHEMA)
+        expected = {'schema': guest.INSTALLER_ENVELOPE_SCHEMA, 'kind': 'installer', 'source_sha': source_sha,
+                    'nonce': nonce, 'lease': installer['lease'], 'boot': boot, 'phase': 'stage',
+                    'operation': guest.INSTALLER_OPERATION, 'outcome': detail['category'].removeprefix('child-'),
+                    'status': detail['child_status']}
+        guest.require(first == guest.encoded(expected) and envelope == expected)
+        body = guest.installer_body(rest)
+        guest.require({k: body[k] for k in expected if k != 'schema'}
+                      == {k: v for k, v in expected.items() if k != 'schema'})
+        admitted = guest.stamp(installer['admitted_at'])
+        guest.require(admitted <= body['captured_at'] < admitted + guest.PHASES['stage'] * 60)
+        return 'captured', raw
+    except Exception:
+        return 'invalid', None
+
+
+def accept_failure(raw, source_sha, nonce, boot, mode='fresh', installer=None):
     """-> ('absent'|'invalid'|'captured', bundle). Expected values are HOST-held.
 
     The envelope (live guest state + contract + live boot) and the bundle header are two
@@ -598,6 +633,8 @@ def accept_failure(raw, source_sha, nonce, boot, mode='fresh'):
     worker/resume/core-start-resume); the default and any other value stay fresh-only.
     A self-consistent but foreign, stale or replaced bundle fails here. Mandatory, never optional.
     """
+    if mode == 'installer':
+        return accept_installer(raw, source_sha, nonce, boot, installer)
     if raw == b'absent':
         return 'absent', None
     try:
@@ -624,13 +661,18 @@ def accept_failure(raw, source_sha, nonce, boot, mode='fresh'):
         return 'invalid', None
 
 
-def retain_private(directory, lease, raw):
-    """Exclusive 0600 file in the owner-private directory outside ``output``; no overwrite."""
+def retain_private(directory, lease, raw, kind='first-failure'):
+    """Exclusive 0600 file in the owner-private directory outside ``output``; no overwrite.
+
+    ``kind`` is a closed choice of two source literals, never caller or guest supplied text.
+    """
     guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', lease))
-    guest.exclusive(directory / ('first-failure-' + lease + '.bin'), raw)
+    guest.require(kind in ('first-failure', 'installer-failure'))
+    guest.exclusive(directory / (kind + '-' + lease + '.bin'), raw)
 
 
-def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, process_uncertain, mode='fresh'):
+def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, process_uncertain, mode='fresh',
+                    installer=None):
     """Diagnostic-only; returns a closed status. Owner-local cleanup uncertainty is NEVER swallowed."""
     try:
         try:
@@ -642,9 +684,13 @@ def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, proc
         until = owned_process.monotonic() + min(EXPORT_CAP_SECONDS, left)
         raw = master.remote(export_command(nonce), 'persistence', cap=EXPORT_CAP_SECONDS, cleanup=True,
                             until=until, limit=EXPORT_READ_LIMIT)
-        state, kept = accept_failure(raw, snapshot['source_sha'], nonce, boot, mode)
+        state, kept = accept_failure(raw, snapshot['source_sha'], nonce, boot, mode, installer)
         if state != 'captured':
             return state
+        if mode == 'installer':
+            # File-only guest export: there is no core bundle and no guest query to be uncertain.
+            retain_private(directory, lease, kept, 'installer-failure')
+            return 'captured'
         retain_private(directory, lease, kept)
         # A guest query child whose cleanup was not confirmed is contained by the guardian and
         # VM disposal (a different process namespace); the capture must not look clean.
@@ -702,6 +748,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     guest_status, guest_detail, guest_service = 'unavailable', None, None
     private_diagnostic = 'skipped'
     export_mode = 'fresh'  # frozen from the primary validated terminal result only
+    export_installer_terminal = None
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -870,7 +917,10 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             guest.require(state == 'valid', 'guest result invalid')
             result, contained = record['code'], record['contained']
             guest_detail = record['diagnostic']
-            export_mode = guest.terminal_export_mode(guest_detail)
+            # Frozen from the validated primary terminal result only, never from payload headers.
+            export_mode = 'installer' if guest.installer_terminal(guest_detail) \
+                else guest.terminal_export_mode(guest_detail)
+            export_installer_terminal = dict(guest_detail)
             phase = 'guest-result'
             failure_category = 'guest' if result else 'none'
             break
@@ -919,7 +969,10 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 # closes: no reconnect, reauthentication or retry. Diagnostic only; it
                 # cannot change `result`, `contained` or the stop above.
                 private_diagnostic = extract_failure(master, clock, nonce, snapshot, initial['boot_uuid'],
-                                                     private, rec['request_id'], process_uncertain, export_mode)
+                                                     private, rec['request_id'], process_uncertain, export_mode,
+                                                     {'lease': rec['request_id'], 'detail': export_installer_terminal,
+                                                      'admitted_at': initial['admitted_at']}
+                                                     if export_mode == 'installer' else None)
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

@@ -2147,6 +2147,34 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   from moved/deleted state. Dangling or live links, wrong type/owner/mode and
   malformed or foreign bindings remain refusals. A host-origin failure still
   permits the existing one-shot export because a guest failure may be concurrent.
+* **Installer failure evidence (issue #439).** `install-docker.py` and the other
+  installers are unchanged. In `provision` only the Docker installer call passes an
+  `on_failure` hook to `run()`; it receives just the nonzero `(code, output)` tuple that
+  `call_bounded` returned, AFTER the exact original `child_failure` object was built.
+  Whatever the hook raises (any `BaseException`) is discarded and that same object is
+  raised, so code/category/child_status/message and the worker status cannot change.
+  Timeout, overflow, spawn and cleanup exceptions return no tuple and create no record;
+  installer-internal preflight refusals do run inside the launched CLI and are
+  captured. The record is `installer-failure.json` in the root-0700 trial root: an
+  exclusive fsynced `installer-failure.json.new`, then `link()` (first writer wins, no
+  overwrite) and unlink of the temp; `regular()` later requires owner root, mode 0600,
+  one link and a stable descriptor. Exact fields: `schema` 1, `kind` `installer`,
+  `source_sha`, `nonce`, `lease`, `boot`, `phase` `stage`, `operation` `install-docker`,
+  `captured_at` (integer Unix seconds, never bool), `outcome` (`exit` status 1..255 /
+  `signal` -64..-1), `status`,
+  `observed`, `kept_head`, `kept_tail`, `omitted`, `output_status`, `head`, `tail`
+  (canonical base64). Output N: 0 → empty/zero/`empty`; 1..13312 → whole in `head`,
+  `ok`; 13313..1048576 → first 1024 + last 12288 bytes, `omitted` = N-13312,
+  `truncated`; `observed` = kept_head + kept_tail + omitted; body at most 20480 bytes.
+  Raw bytes are never decoded, repr'd or truncated again. The capture needs
+  `clock.remaining('stage')` positive and renews nothing. The record is private, possibly
+  credential-bearing, and survives guardian stop until the VM is disposed.
+  `export-failure` (same command) switches to this file-only kind only when the
+  independently validated terminal result is a failed worker `stage`/`install-docker`
+  child exit/signal, and emits `{schema 2, kind, source_sha, nonce, lease, boot, phase,
+  operation, outcome, status}\n<record bytes>` built from the contract, live boot and
+  that terminal result. It additionally requires `captured_at` within the contract's
+  admission/stage window and the current time before the original deadline.
 * **Mode binding (issue #412).** The remote command is unchanged and takes no mode.
   The expected mode is `fresh` unless the nonce-bound terminal `result.json` (read once
   through the existing `result_record` validator and 4096-byte bound) is a failed
