@@ -18,7 +18,8 @@ Codex does not document an import mechanism, so this file uses plain links;
 - **Current priority:** efficient, reproducible, automated VM builds for
   multiple platforms, with GCP as the current production delivery. The lead
   selects tools based on source-backed research and measured fit, using a
-  lead / Claude worker / Codex reviewer workflow. Same-code provisioning
+  lead / Claude worker / independent-reviewer workflow (see
+  [review routing](docs/contributing/agent-workflow.md#independent-review-routing)). Same-code provisioning
   modules and container checks live in `build/provision/`; a complete image
   pipeline remains to be implemented. Additional platform priorities and CPU
   scope are open; compatibility requires validation. GCP Marketplace publication
@@ -79,6 +80,9 @@ Codex does not document an import mechanism, so this file uses plain links;
   selects the fixed disposable canonical Ubuntu trial); see the [GCP access runbook](docs/runbooks/gcp-build-access.md).
   Never give general worker jobs cloud credentials. Access setup and lifecycle
   pilots do not authorize routine Packer builds or guest recovery.
+- Independent reviews are lead-routed to Copilot (explicit model, or the distinct
+  built-in review); native Codex review only on explicit owner request. See
+  [review routing](docs/contributing/agent-workflow.md#independent-review-routing).
 - Never commit secrets. Do not merge or close issues; the lead accepts work.
 - A failed, denied or unrun check is not passing evidence; report it exactly.
 - Update this file and the workflow doc when the workflow changes.

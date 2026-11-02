@@ -11,7 +11,7 @@ issue (#145) and its children; this document describes only stable rules.
 |---|---|---|
 | **Lead** (human owner plus any orchestrating session) | Scope, task dispatch, dependencies, issue status, cost/cloud authorization, evidence review, acceptance, merge | Delegate acceptance or merge to a worker or reviewer |
 | **Worker** (ephemeral Claude run) | Scoped execution of one task, its docs, its evidence, an explicit handoff | Expand scope, run unauthorized cloud/production actions, merge, close issues, mark its own work accepted |
-| **Reviewer** (independent, e.g. Codex PR review) | Judging the change against the task's acceptance criteria *and* significant defects | Rubber-stamp: a default bug-focused review alone does not show every criterion was assessed |
+| **Reviewer** (independent, e.g. a lead-routed Copilot review; see [Independent review routing](#independent-review-routing)) | Judging the change against the task's acceptance criteria *and* significant defects | Rubber-stamp: a default bug-focused review alone does not show every criterion was assessed |
 
 Workers start with no memory. Everything they need must be in the issue, this
 document, or files it links.
@@ -289,10 +289,12 @@ changes or broad IAM are implied by build/test authorization.
 Current status, permission and CI baselines, and evidence live in GitHub, not
 here: see #145 (parent), #139 and #140.
 
-- **Dispatch.** The lead dispatches work with an explicit `@claude` or
-  `@codex review` comment on the issue or PR. Issue and PR templates must not
-  contain live mentions, because the workflow triggers on `@claude` in newly
-  opened issues.
+- **Dispatch.** The lead dispatches work with an explicit `@claude` comment on
+  the issue or PR. Independent reviews are routed as in
+  [Independent review routing](#independent-review-routing); native `@codex review`
+  and Codex security calls are no longer the default and need an explicit owner
+  request. Issue and PR templates must not contain live mentions, because the
+  workflow triggers on `@claude` in newly opened issues.
 - **Check capabilities first.** Before work that depends on a tool (shell
   checks, `docker`, web fetch, `gh` subcommands, PR creation), the worker
   checks what it is actually allowed to run. The authority is the current
@@ -363,6 +365,69 @@ continues to require the fixed-main workflow/event identities in the
 After a workflow permission change, the lead must verify a harmless, scoped
 worker run and its actual results. A parsed allowlist is not execution evidence;
 until verified, retain the CI/lead fallback and report denials exactly.
+
+## Independent review routing
+
+Owner preference: local Codex stays lead, Claude workers implement, and
+independent reviews use company-provided GitHub Copilot credits instead of
+personal Codex credits. Workers proactively request an independent review from
+the lead; the lead dispatches it. Workers never accept their own work. Actual
+integration, model and billing evidence belongs in GitHub issues and PRs.
+
+1. **Model-selected Copilot review (default intent).** The lead starts a
+   read-only review through Copilot cloud agent with an explicit model: the
+   [model picker](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/changing-the-ai-model)
+   (for example `@copilot` in a PR comment) or the
+   [agent tasks API](https://docs.github.com/en/enterprise-cloud@latest/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api)
+   (`model`, `create_pull_request: false`; user-to-server token only, so
+   lead-run, never a worker or workflow credential). Prefer GPT-6.1 Sol among
+   the owner's listed models, and reassess when a stronger suitable entitled
+   OpenAI model is available. An omitted model or a picker-less entrypoint uses
+   Auto. Compare the requested model against the task GET response's
+   `sessions[].model`, retaining the exact returned identifier (for example,
+   `sweagent-capi:gpt-6.1-sol`). Missing or mismatched identity is not a pass;
+   never silently accept a fallback to Auto.
+
+   Retrieve the actual report with
+   `gh agent-task view <SESSION> --repo afewell-hh/labapp --log`. The lead relays
+   attributable findings to the issue or PR, including source SHA, task/session,
+   returned model, coverage and limitations. Do not assume the agent can post
+   issue comments or a formal PR review; no bot write permission or firewall
+   expansion is needed for this relay. Record Copilot AI-credit usage and the
+   session owner when exposed; neither alone proves the company's billing payer.
+
+   Review-only is a prompt instruction to a coding agent, not a security
+   sandbox. No project execution, imports, compilation, private data, credentials,
+   cloud access or permission expansion is authorized by a review task. A
+   platform-generated working branch or `head_ref` alone is normal. Verify no
+   unauthorized file changes, commits or PRs; report any and do not adopt them
+   as worker output.
+2. **Built-in Copilot PR review (distinct option).** Assigning Copilot as PR
+   reviewer uses a
+   [mix of models with effort levels (Lite/Balanced/Max) and no model switching](https://docs.github.com/en/copilot/concepts/agent-capabilities/agent-powered-workflows-and-operations/code-review).
+   Record it as built-in review with its effort level, never as a named model or
+   native Codex review. It does not satisfy a task that requires a specific model.
+3. **Native Codex** (`@codex review`, security review): only on explicit owner
+   request. Keep GitHub apps needed for local lead/GitHub access installed.
+   Turning off the owner's automatic Codex review is a user-account setting the
+   repo cannot change; do not claim it changed without proof.
+
+   Owner setup: open [Codex code review settings](https://chatgpt.com/settings/code-review)
+   and choose `afewell-hh/labapp`. Under **Review code**, turn off **Automatic
+   review**; separately, under **Review security vulnerabilities**, turn off
+   **Auto security review**. Confirm both repository settings and report their
+   states to the lead. The lead records that handoff in the issue and checks the
+   next PR for unexpected native automatic reviews without requesting one.
+   Absence of a review alone does not prove the account settings changed.
+
+Every review keeps the independence and coverage rules: judge the task's
+acceptance criteria, cited sources and security, not only bugs; record the exact
+reviewed head SHA, actual model or effort level, billing owner when shown, what
+was read and a per-criterion result. A denied, failed or unrun review is not a
+pass. A new head invalidates the review; after a Claude fix the lead may route
+one bounded re-review of that exact head (within the two-round limit). Bot-loop
+re-triggering is not assumed. Copilot findings are input: only the lead accepts
+and merges, and no review grants automatic merge or broader permissions.
 
 ## Lead follow-up
 
