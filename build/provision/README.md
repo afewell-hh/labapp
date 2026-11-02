@@ -478,6 +478,75 @@ The manual workflow fixes a 700s outer bound with 30s kill grace and a 13-minute
 these enclose the 600s work plus 60s cleanup envelope without renewing it. Cancellation
 grace consumes that same fixed envelope; cleanup receives at most 60s of its remainder.
 
+### Real kubectl readiness timing proof (issue #452, source only)
+
+`test-kubectl-readiness.sh` and `kubectl_readiness_proof.py` measure how the **real pinned kubectl
+1.35.0** behaves under the **unchanged** `vlab_core.kubectl()` (so the real `routed`/`execute`, uid/group
+drop to `ubuntu`, accepted kubeconfig reader, `--request-timeout=10s`, execute cap 10s, 1 MiB output
+limit and the exact-refusal/ServiceUnavailable classifier) against a deterministic loopback TLS fixture
+on `127.0.0.1:6443`. It supports #448 (trial-16 initial-readiness `child deadline exceeded`/124). It is
+**evidence tooling, not a fix**: no timeout, classifier, retry, auth or budget changes; a 124 is never
+treated as Pending; the harness asserts only deterministic facts and **records** outcomes and windows
+where the same-code 10s request timeout and 10s cap may race (neither is guaranteed to win).
+
+```bash
+# Separately scoped lead execution only (Docker, network for preparation). The only input is the
+# attested pinned kubectl file (58597560 bytes, SHA256 a2e984a1...d060989); it is copied, re-hashed
+# and mounted read-only, never executed on the host.
+timeout --kill-after=30s 10m bash build/provision/test-kubectl-readiness.sh /absolute/path/to/kubectl
+# Offline harness tests (loopback plain-socket fixture, fake production callables; no kubectl,
+# Docker, TLS or network). Needs distribution python3-yaml. Not yet in CI (see below).
+python3 -m unittest discover -s build/provision -p test_kubectl_readiness_proof.py -v
+```
+
+**Separation.** Preparation container (network, 150s apt cap, 170s attach cap): Ubuntu 24.04 amd64
+base `ubuntu@sha256:68ee2200...aff33ac`, pinned `python3`, `python3.12`, `python3-yaml`, `libyaml-0-2`
+(as in the hhfab offline proof) plus **unpinned** `openssl` whose resolved version is recorded. It generates
+only synthetic test data: fixture CA, `127.0.0.1` IP-SAN server certificate, a client certificate (embedded in
+the accepted `ubuntu`-owned 0600 kubeconfig), a foreign-CA server certificate and a wrong-SAN (`127.0.0.2`)
+certificate; CA private keys are deleted. The prepared image is committed under an owned nonce tag.
+Runtime container: network none (loopback only), read-only root, 8 MiB `/tmp`, 1 GiB, 2 CPUs, 256 PIDs,
+no Docker socket/host credentials/KVM/privileged/host-network, `--cap-drop=ALL` with only
+`SETUID`, `SETGID` (account drop), `KILL` (process-group kill) and `DAC_OVERRIDE` (root reads the
+ubuntu-owned 0600 kubeconfig), `no-new-privileges`, and kubectl bind-mounted read-only. The driver
+runs 170s of work inside a 200s `timeout` and 215s attach cap; the whole launcher is expected to finish
+within 10 minutes. Exact owned cleanup (name + label + nonce, by immutable ID, absence verified, also
+on error/cancel) covers both containers, the image and the temp directory; it makes no global claim.
+
+**Cases (initial slice, 22).** Deterministic assertions: `ok-ready` (one verified mTLS `/readyz` request);
+`refused-then-delayed-start` (exact loopback refusal Pending, then ok, under one unrenewed absolute
+deadline); `success-but-not-ok-body`; `401`/`403`; `x509` unknown authority and wrong IP SAN;
+`500` without Retry-After (failure, not Pending); `output-overflow`; `absolute-deadline-before-cap`
+(operation deadline 3s beats the cap and request timeout: failure 124); and four hang cases
+(`tcp-accepted-never-served`, `tls-clienthello-never-answered`, `header-stall-after-request`,
+`body-stall-after-partial-body`) that must end in failure (124 or exit 1, since the two 10s bounds
+may race), never ok or Pending, within the 10s cap plus grace. Observation-only (outcome and timing
+recorded, `asserted: false`): 429/503 with no, malformed, HTTP-date, 1s and 30s (over-cap) integer
+`Retry-After`. Every case also checks fixture listener/thread closure and that no `ubuntu`-uid
+process remains in the container (container-scoped, not a global absence claim).
+
+**Report.** One sanitized JSON line: source/pin identity (SHA256 of the driver, `vlab_core.py`,
+`owned_process.py`, kubectl size/hash, package versions, os-release), a source-binding drift check
+(the reviewed `--request-timeout=10s` and cap-10 `user=True` call must still be present, else the run
+refuses), the disclosed `seams`, per case the actual `(kind, code)`, message, route, elapsed, server-side
+request records (count, path, `timeout=` query, verified client-certificate CN), cleanup and
+`cleanup_uncertain`, plus `remaining_coverage`. Child output is reduced to fixed boolean flags and a
+byte count, never copied. The summary status is `passed` only if nothing failed or was skipped.
+
+**Limits (not proved).** Only `get --raw=/readyz` through `kubectl()`: not `api_ready`, `ready_body`,
+systemd, cgroups, cloud-init, native forwarding, a real kube-apiserver, HTTP/2 (the fixture has no
+ALPN), 18 nodes, switches, persistence or the trial-16 cause. The retry loop sleeps 1s (production
+5s). Signals during a live child, the matching exit-1 transient rewrite with `cleanup_uncertain`
+(#448 finding 5), body trickle, ten-retry exhaustion and plain-text 5xx bodies remain later work;
+existing production-executor tests cover process-group cleanup only as source evidence. The kubectl
+compiler identity is not inspected. Container results do not substitute for later VM validation.
+Official sources (accessed 2026-11-02, per #448 comment 6573335502): kubectl
+[`get.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/get/get.go),
+[`rawhttp/raw.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/rawhttp/raw.go), client-go
+[`rest/request.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go) and
+[`rest/with_retry.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/with_retry.go) (read by
+the #448 reviewer, not re-read by this worker).
+
 ## Offline-delivered guest prerequisite probe
 
 `component_prerequisites.py` is a small **guest** check for an explicitly
