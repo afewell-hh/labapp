@@ -2358,6 +2358,30 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(attempts[0], core.state()['deadline'])
         self.assertEqual(core.state()['deadline'] - core.state()['started'], 900)
 
+    def test_ready_body_initial_poll_does_not_retry_cleanup_uncertain_transient(self):
+        self.resumable()
+        actual = self.command
+        outputs = (b'The connection to the server 127.0.0.1:6443 was refused - '
+                   b'did you specify the right host or port?\n',
+                   b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n')
+        initial = core.state()
+        for output in outputs:
+            core.save(copy.deepcopy(initial))
+            attempts = []
+            def uncertain(argv, deadline, *args, **kwargs):
+                if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                    attempts.append(deadline)
+                    error = core.Failure('child command failed', 1, output)
+                    error.cleanup_uncertain = True
+                    raise error
+                return actual(argv, deadline, *args, **kwargs)
+            with self.subTest(output=output), patch.object(core, 'execute', side_effect=uncertain), \
+                 patch.object(core.time, 'sleep') as pause:
+                self.assertEqual(self.call('start-resume'), 1)
+                pause.assert_not_called()
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(core.state()['phase'], 'failed')
+
     def test_api_permanent_auth_tls_and_unknown_error_are_terminal(self):
         self.resumable()
         initial = core.state()
@@ -3198,6 +3222,27 @@ class FormatAndSourceTests(unittest.TestCase):
                     core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5)
                 self.assertNotIsInstance(raised.exception, core.Pending)
                 self.assertEqual(raised.exception.code, code)
+
+    def test_kubectl_cleanup_uncertain_transient_reraises_same_failure_not_pending(self):
+        refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
+                   b'did you specify the right host or port?\n')
+        unavailable = b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n'
+        for name, output in (('refused', refused), ('unavailable', unavailable)):
+            uncertain = executed_failure('child command failed', 1, output)
+            uncertain.cleanup_uncertain = True
+            with self.subTest(name), patch.object(core, 'execute', side_effect=uncertain):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-initial-readyz')
+            self.assertNotIsInstance(raised.exception, core.Pending)
+            self.assertIs(raised.exception, uncertain)
+            self.assertEqual((str(uncertain), uncertain.code, uncertain.private_output, uncertain.route,
+                              uncertain.cleanup_uncertain),
+                             ('child command failed', 1, output, 'api-initial-readyz', True))
+            # Positive clean control: the identical output without uncertainty stays Pending.
+            clean = executed_failure('child command failed', 1, output)
+            with self.subTest(name + '-clean'), patch.object(core, 'execute', side_effect=clean):
+                with self.assertRaises(core.Pending):
+                    core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5, 'api-initial-readyz')
 
     def test_parent_signal_preserves_primary_and_reaps_known_child(self):
         with tempfile.TemporaryDirectory() as directory:
