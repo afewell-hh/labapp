@@ -878,6 +878,25 @@ paths, non-GET methods, conditional/range headers, redirects and external fallba
 are failures. Each case uses a fresh workspace; packages and `/etc/apt` must be
 unchanged and no `apt-get install` is ever invoked.
 
+The finite `Accept` values are exactly `text/*` and the existing `*/*`
+compatibility value, not a media-range parser. Source provenance (accessed
+2026-11-02): official Ubuntu Noble
+[APT 2.8.3 descriptor](https://archive.ubuntu.com/ubuntu/pool/main/a/apt/apt_2.8.3.dsc)
+and [exact source archive](https://archive.ubuntu.com/ubuntu/pool/main/a/apt/apt_2.8.3.tar.xz),
+2354680 B, SHA-256
+`088522b3613b28fdbcfa61f1f7e476bf6dc6b0120a8f74409e9527580c9f9d3b`
+(matches the descriptor; descriptor signature not independently verified).
+In that archive, `methods/http.cc:948–954` (`HttpMethod::SendReq`) defaults
+`SendAccept` to true and emits `Accept: text/*` when the last URI component has
+no extension; `apt-pkg/contrib/fileutl.cc:697–704` (`flExtension`) returns the
+unchanged name when no dot exists. This covers `InRelease` and `Release`, not
+`Release.gpg`. The source does not establish `*/*` as native APT behavior.
+Other values, parameters, lists, malformed/wider near matches and duplicate
+headers remain refused/redacted, as do unknown, conditional and range headers.
+Synthetic delivery/write ledgers do not establish client receipt, signature
+acceptance or native authentication qualification; the positive probe below
+still always refuses.
+
 Cases, in order (each later case is not relied on unless the first qualifies):
 
 1. **Native positive probe** (valid keyring, intact releases, fresh lists/cache). It
@@ -908,8 +927,9 @@ Limits and open facts: the real fixture bytes are staged and the required offlin
 unit test refuses missing/mismatched bytes rather than skipping. The
 `Debug::` option output, the exact error text and whether APT 2.8.3 issues other
 requests (for example `Release`/`Release.gpg` fallback after a 502/503, which is
-allowed only in those two cases) are **not verified**; raw APT 2.8.3 source was
-unavailable and adjacent 2.8.2 reading does not prove runtime behavior. HTTP proves
+allowed only in those two cases) are **not verified**; the exact 2.8.3 source
+reading above establishes only HTTP `Accept` construction, not native diagnostic
+correlation or runtime authentication behavior. HTTP proves
 neither TLS nor repository trust. The auth container retains only
 `CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID` for APT's sandbox/filesystem setup
 plus **KILL** for the existing supervisor's group kill across `_apt` UID changes;

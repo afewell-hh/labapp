@@ -206,7 +206,7 @@ class ServerAndLedgerTests(unittest.TestCase):
             for method in ('GET', 'POST'):
                 for name, value in forbidden.items():
                     with self.subTest(method=method, header=name):
-                        self.assertEqual(get(base, path, method, {name: value}), (404, b''))
+                        self.assertEqual(get(base, path, method, {'Accept': 'text/*', name: value}), (404, b''))
         rows = ledger.snapshot()
         self.assertEqual(len(rows), 2 * len(forbidden))
         self.assertEqual([row['method'] for row in rows],
@@ -221,6 +221,74 @@ class ServerAndLedgerTests(unittest.TestCase):
             self.assertEqual(row['sha256'], hashlib.sha256(b'').hexdigest())
             self.assertEqual(row['completed_sha256'], row['sha256'])
             self.assertLess(row['attempt_order'], row['complete_order'])
+        with self.assertRaisesRegex(AssertionError, 'unexplained request'):
+            auth._no_unexpected(rows)
+
+    def test_apt_283_metadata_headers_deliver_exact_bytes_and_public_ledger(self):
+        data = bodies()
+        with auth.serve(auth.Case('production', data)) as (base, ledger):
+            for suite in auth.SUITES:
+                self.assertEqual(get(base, f'{auth.BASE_PATH}{suite}/InRelease', headers={
+                    'Accept': 'text/*', 'Cache-Control': 'max-age=0',
+                    'User-Agent': 'Debian APT-HTTP/1.3 (2.8.3)',
+                }), (200, data[suite]))
+            self.assertEqual(get(base, f'{auth.BASE_PATH}noble/InRelease',
+                                 headers={'Accept': '*/*'}), (200, data['noble']))
+        rows = ledger.snapshot()
+        auth._no_unexpected(rows)
+        auth._release_rows(rows[:3], data)
+        for row, suite in zip(rows, (*auth.SUITES, 'noble')):
+            self.assertEqual((row['kind'], row['status']), ('release', 200))
+            self.assertIn(['accept', '*/*' if row['n'] == 3 else 'text/*'], row['headers'])
+            self.assertNotIn('<redacted>', json.dumps(row['headers']))
+            self.assertEqual(row['completed_bytes'], len(data[suite]))
+            self.assertEqual(row['completed_sha256'], hashlib.sha256(data[suite]).hexdigest())
+            self.assertLess(row['attempt_order'], row['complete_order'])
+        with self.assertRaisesRegex(AssertionError, 'UNQUALIFIED'):
+            auth.classify_positive(100, b'', rows[:3], data)
+
+    def test_accept_near_misses_are_refused_redacted_and_accounted(self):
+        values = ('', 'text/', 'text', 'text/**', 'text/*x', 'Text/*', 'text/plain',
+                  'application/*', '*', '*/*;q=1', 'text/*;q=1', 'text/*, */*',
+                  'text/* ', 'text/*\t', 'text/*\x01', 'text/* synthetic-SENTINEL',
+                  'text/*' + 'x' * 129)
+        with auth.serve(auth.Case('production', bodies())) as (base, ledger):
+            for value in values:
+                with self.subTest(value=value):
+                    self.assertEqual(get(base, f'{auth.BASE_PATH}noble/InRelease',
+                                         headers={'Accept': value}), (404, b''))
+        rows = ledger.snapshot()
+        self.assertEqual(len(rows), len(values))
+        for row in rows:
+            self.assertEqual((row['kind'], row['status']), ('unexpected', 404))
+            self.assertIn(['accept', '<redacted>'], row['headers'])
+            self.assertTrue(row['completed'])
+            self.assertIsNone(row['failure'])
+            self.assertEqual((row['bytes'], row['completed_bytes']), (0, 0))
+            self.assertEqual(row['completed_sha256'], hashlib.sha256(b'').hexdigest())
+        self.assertNotIn('SENTINEL', json.dumps(auth.summary(rows)))
+        with self.assertRaisesRegex(AssertionError, 'unexplained request'):
+            auth._no_unexpected(rows)
+
+    def test_duplicate_accept_and_unknown_headers_still_refuse(self):
+        headers = ({'Accept': 'text/*', 'aCcEpT': 'text/*'},
+                   {'Accept': '*/*', 'aCcEpT': 'text/*'},
+                   {'Accept': 'text/*', 'aCcEpT': '*/*'},
+                   {'Accept': 'text/*', 'X-Test': 'synthetic-SENTINEL'})
+        with auth.serve(auth.Case('production', bodies())) as (base, ledger):
+            for fields in headers:
+                with self.subTest(headers=fields):
+                    self.assertEqual(get(base, f'{auth.BASE_PATH}noble/InRelease',
+                                         headers=fields), (404, b''))
+        rows = ledger.snapshot()
+        self.assertEqual(len(rows), len(headers))
+        for row in rows:
+            self.assertEqual((row['kind'], row['status']), ('unexpected', 404))
+            self.assertEqual(row['headers'][-1][1], '<redacted>')
+            self.assertTrue(row['completed'])
+            self.assertEqual((row['bytes'], row['completed_bytes']), (0, 0))
+            self.assertEqual(row['completed_sha256'], hashlib.sha256(b'').hexdigest())
+        self.assertNotIn('SENTINEL', json.dumps(auth.summary(rows)))
         with self.assertRaisesRegex(AssertionError, 'unexplained request'):
             auth._no_unexpected(rows)
 

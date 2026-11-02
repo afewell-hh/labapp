@@ -257,7 +257,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lower == 'host' and value == f'127.0.0.1:{server.server_port}'
                 or lower == 'user-agent' and re.fullmatch(r'Debian APT-HTTP/[0-9.]+ \(2\.8\.3\)', value)
                 or lower == 'connection' and value.lower() in ('close', 'keep-alive')
-                or lower == 'accept' and value == '*/*'
+                # APT 2.8.3 methods/http.cc SendReq emits text/* for extensionless metadata.
+                or lower == 'accept' and value in ('*/*', 'text/*')
                 or lower == 'accept-encoding' and value == 'identity'
                 or lower == 'cache-control' and value == 'max-age=0')
             seen.add(lower)
