@@ -313,11 +313,50 @@ def regular(path, limit, uid=None, mode=None):
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             raw = stream.read(limit + 1)
         after = os.fstat(fd)
-        require(len(raw) == info.st_size and (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
-                (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'file changed')
-        return raw
+        if len(raw) == info.st_size and (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) == \
+                (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            return raw
+        # Same fixed refusal for every caller; only the exact replaced-inode signature
+        # (see ReplacedState) is distinguished, and only the guardian facade reads it.
+        replaced = (len(raw) == info.st_size
+                    and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_uid, info.st_gid,
+                         info.st_mode) ==
+                        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_uid, after.st_gid,
+                         after.st_mode)
+                    and info.st_nlink == 1 and after.st_nlink == 0 and info.st_ctime_ns != after.st_ctime_ns)
+        raise (ReplacedState if replaced else Failure)('file changed', 1, 'policy')
     finally:
         os.close(fd)
+
+
+class ReplacedState(Failure):
+    """regular()'s 'file changed' refusal with the closed eligible signature: the opened
+    inode was unlinked (link count exactly 1 -> 0, ctime changed) while every other observed
+    attribute and the byte count stayed unchanged. Internal flag only; message, code and
+    category are the ordinary refusal, so strict callers behave identically. It does NOT prove
+    who replaced the file or that the replacement is legitimate."""
+    eligible = True
+
+
+def guardian_state(path, recover):
+    """Guardian-only read of the two atomically replaced mutable files (issue #422).
+
+    Runs the unchanged complete regular(). Only a first ReplacedState failure is recovered:
+    its bytes are discarded (never consumed), ``recover`` (original Clock checks) runs, then
+    ONE more complete regular() runs OUTSIDE the recovery catch, followed by ``recover``
+    again. No third attempt, sleep, recursion or deadline renewal; a second failure,
+    clock expiry, signal or other exception propagates as the primary.
+    """
+    require(path in (ROOT / 'phase.json', ROOT / 'heartbeat.json'))
+    try:
+        return regular(path, 4096, 0)
+    except ReplacedState as error:
+        if error.eligible is not True:
+            raise
+    recover()
+    raw = regular(path, 4096, 0)
+    recover()
+    return raw
 
 
 def exclusive(path, raw, mode=0o600):
@@ -1246,7 +1285,7 @@ def guardian():
         original_oom = oom_count()
         # Initial heartbeat grace is bounded by the same thirty-second loss
         # window; no provisioning starts before the guardian checks it.
-        beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
+        beat = data(guardian_state(ROOT / 'heartbeat.json', lambda: clock.remaining('stage')))
         require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
         # Armed credential gate: no worker/provisioning until bootstrap published the
         # verified credential, within a bounded wait. Expiry fails closed into cleanup.
@@ -1254,7 +1293,7 @@ def guardian():
         if auth_armed():
             require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
             clock.remaining('stage')
-            beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
+            beat = data(guardian_state(ROOT / 'heartbeat.json', lambda: clock.remaining('stage')))
             require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
         operation = 'worker-spawn'
         child = subprocess.Popen([PYTHON, str(ROOT / 'vlab_trial.py'), 'worker'],
@@ -1263,12 +1302,14 @@ def guardian():
         operation = 'worker-supervision'
         minimum = None
         while True:
-            phase = data(regular(ROOT / 'phase.json', 4096, 0))['phase']
+            # Recovery of a replaced phase.json is bounded by the persistence cutoff (never the
+            # previous phase's); the consumed phase's own cutoff is checked just below as before.
+            phase = data(guardian_state(ROOT / 'phase.json', lambda: clock.remaining('persistence')))['phase']
             if phase in PHASE_NAMES:
                 phase_seen = phase
             clock.remaining(phase)
             require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
-            beat = data(regular(ROOT / 'heartbeat.json', 4096, 0))
+            beat = data(guardian_state(ROOT / 'heartbeat.json', lambda phase=phase: clock.remaining(phase)))
             require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
             require(oom_count() == original_oom, 'OOM event', 'oom-event')
             sample = resources()
