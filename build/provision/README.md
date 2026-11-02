@@ -478,6 +478,139 @@ The manual workflow fixes a 700s outer bound with 30s kill grace and a 13-minute
 these enclose the 600s work plus 60s cleanup envelope without renewing it. Cancellation
 grace consumes that same fixed envelope; cleanup receives at most 60s of its remainder.
 
+### Real kubectl readiness timing proof (issue #452)
+
+`test-kubectl-readiness.sh` and `kubectl_readiness_proof.py` measure how the **real pinned kubectl
+1.35.0** behaves under the **unchanged** `vlab_core.kubectl()` (so the real `routed`/`execute`, uid/group
+drop to `ubuntu`, accepted kubeconfig reader, `--request-timeout=10s`, execute cap 10s, 1 MiB output
+limit and the exact-refusal/ServiceUnavailable classifier) against a deterministic loopback TLS fixture
+on `127.0.0.1:6443`. It supports #448 (trial-16 initial-readiness `child deadline exceeded`/124). It is
+**evidence tooling, not a fix**: no timeout, classifier, retry, auth or budget changes; a 124 is never
+treated as Pending; the harness asserts only deterministic facts and **records** outcomes and windows
+where the same-code 10s request timeout and 10s cap may race (neither is guaranteed to win).
+
+```bash
+# Separately scoped lead execution only, from an assessed credential-free host environment
+# (Docker, network for preparation). The only input is the
+# attested pinned kubectl file (58597560 bytes, SHA256 a2e984a1...d060989); it is copied, re-hashed
+# and mounted read-only, never executed on the host.
+env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/timeout --kill-after=30s 10m \
+  /usr/bin/bash /absolute/path/build/provision/test-kubectl-readiness.sh /absolute/path/to/kubectl
+# Offline harness tests (loopback plain-socket fixture, fake production callables; no kubectl,
+# Docker, TLS or external network). Needs distribution python3-yaml/libyaml.
+# CI separately requires nonzero discovery and no skips; this is not real-client evidence.
+python3 -B -m unittest discover -s /absolute/path/build/provision -p test_kubectl_readiness_proof.py -v
+```
+
+**Host prerequisite, not an OS sandbox.** Trust the launcher/source directory, interpreter,
+`/usr/bin:/bin` tools and local Docker daemon at `unix:///var/run/docker.sock`, and exclude
+concurrent mutation. Remote/rootless/custom contexts are not supported. Every Docker call uses
+`env -i`, a newly created private HOME and empty private Docker `config.json`, explicit
+`--config` and the fixed local `--host`. No user Docker config, context, credential helper,
+proxy URL or ambient Docker/auth/TLS variable is read or forwarded by that dispatcher.
+This actively excludes Docker CLI config-based container proxy injection; it does not assess
+or sanitize a hostile daemon, base image or host. The lead must assess that environment before
+execution; no user credential/config dumping is needed or permitted.
+
+**Separation.** Preparation container (network, 150s apt cap, 170s attach cap): Ubuntu 24.04 amd64
+base `ubuntu@sha256:68ee2200...aff33ac`, pinned `python3`, `python3.12`, `python3-yaml`, `libyaml-0-2`
+(as in the hhfab offline proof) plus **unpinned** `openssl` whose resolved version is recorded. It generates
+only synthetic test data: fixture CA, `127.0.0.1` IP-SAN server certificate, a client certificate (embedded in
+the accepted `ubuntu`-owned 0600 kubeconfig), a foreign-CA server certificate and a wrong-SAN (`127.0.0.2`)
+certificate; CA private keys are deleted. The prepared image is committed under an owned nonce tag.
+Runtime container: network none (loopback only), read-only root, 8 MiB `/tmp`, 1 GiB, 2 CPUs, 256 PIDs,
+no Docker socket/host credentials/KVM/privileged/host-network, `--cap-drop=ALL` with only
+`SETUID`, `SETGID` (account drop), `KILL` (process-group kill) and `DAC_OVERRIDE` (root reads the
+ubuntu-owned 0600 kubeconfig), `no-new-privileges`, and kubectl bind-mounted read-only. The driver
+runs under ONE original 170s deadline, including identity checks, all cases, executor reaping,
+server cleanup, process settling and report serialization/output. The CLI arms a one-shot alarm
+before importing the core, keeps it armed through output, and refuses late success.
+It retains the original 200s container `timeout`, 215s attach cap and whole-launcher 10-minute
+command bound. Exact owned cleanup (name + label + nonce, by immutable ID, absence verified, also
+on error/cancel) covers both containers, the image and the temp directory; it makes no global claim.
+Hard termination or deadline interruption can leave no complete JSON/cleanup receipt; outer owned
+container disposal remains required. These bounds assume normal OS scheduling, not hard real time.
+
+**Cases (reduced slice, 14 gating, zero observation-only).** The original source had 33 test
+methods (not 40) and 22 cases: 14 gating plus eight observations. All eight Retry-After
+observations are now deferred, not passed or silently skipped.
+The retained cases are `ok-ready` (one verified mTLS `/readyz?timeout=10s` request);
+`refused-then-delayed-start` (production Pending before listener start, then ok under one original
+deadline); `success-but-not-ok-body`; `401`/`403`; `x509` unknown authority and wrong IP SAN;
+`500` without Retry-After (exactly one delivered response, InternalError flag, original failure
+route, no retry); `output-overflow`; `absolute-deadline-before-cap` (3s operation deadline,
+failure 124); and four hang cases
+(`tcp-accepted-never-served`, `tls-clienthello-never-answered`, `header-stall-after-request`,
+`body-stall-after-partial-body`). Stalls require observed accepted connection/ClientHello or verified
+request and the appropriate absent-header/partial-body send evidence, plus original route and
+either deadline124 or a specific client-timeout exit1. Timer winner/timing remain observations,
+not guaranteed conclusions. Auth/TLS cases require the corresponding fixed child signature and
+request or rejected-handshake counts; generic exit1 is insufficient.
+For the fixed 401 Status message, the harness recognizes the exact kubectl 1.35.0 formatter line
+`error: You must be logged in to the server (synthetic fixture response)` followed by one newline,
+as well as the existing `Unauthorized` form. This signature alone cannot pass: the single verified
+mTLS GET, matching 401 fixture response delivery, original failure route and clean child/server
+peers remain required. The canonical bytes are derived from pinned source, not retained native
+client output; only a separately authorized real-client run can confirm actual behavior.
+
+Quick cases have a **2s caller operation deadline**, delayed startup 6s, explicit exhaustion 3s,
+and stalls 10s; the production request-timeout10/cap10 arguments are unchanged. Reservations
+cover work plus the existing 2s executor reap, 1s fixture close and 2s process settle:
+eight quick cases ×7s + delayed11s + exhaustion8s + four stalls ×15s = **135s**.
+A further 5s report reserve remains inside 170s, leaving 30s for identity/setup/scheduling.
+Admission clips against that same original deadline; each case also clips work/cleanup/settling
+to its reservation, counts settling in elapsed, and refuses a late result. Failure to fit is failure.
+These shorter successful-case deadlines are an explicit test seam, not a production policy change.
+
+Pending is a **new exception with empty private bytes and no route**, not a retained refusal
+message. The delayed-start regression injects an ordinary refusal at the child boundary and
+passes through the unchanged classifier. Every observed `cleanup_uncertain` is fatal, even
+on earlier attempts or observations. The production classifier preserves cleanup-uncertain
+failures instead of converting them to Pending. The harness also rejects uncertainty found in
+a suppressed exception's context (a synthetic matching-transient negative control), without
+restoring discarded output.
+
+Every case checks listener/socket/thread closure and no remaining live `ubuntu`-uid process
+in this container. The fixture closes and settles the acceptor before its final handler/socket
+inventory, actively closes tracked accepted sockets (including handshaking TLS sockets), and
+fails if any thread remains. The deterministic late-registration test and complete `run()` success
+control use **fake callables**, not native kubectl/TLS evidence. Test cleanups are registered before
+assertions.
+
+**Report.** One sanitized JSON line: source/pin identity (SHA256 of the driver, `vlab_core.py`,
+`owned_process.py`, kubectl size/hash, package versions, os-release), a source-binding drift check
+(the reviewed `--request-timeout=10s` and cap-10 `user=True` call must still be present, else the run
+refuses), the disclosed `seams`, per case the actual `(kind, code)`, message, route, elapsed, server-side
+request records (count, path, `timeout=` query, verified client-certificate CN, header/body send counts),
+accepted-connection/handshake and route counts, cleanup and
+`cleanup_uncertain`, plus `remaining_coverage`. Child output is reduced to fixed boolean flags and a
+byte count, never copied. Zero exception bytes do **not** prove zero partial bytes emitted:
+timeout/overflow exceptions do not carry the executor's accumulated output. Production diagnostic
+storage is deliberately **unprepared**, so this proof does not verify retained partial-output files.
+The summary status is `passed` only if nothing failed or was skipped and the deadline remains valid.
+
+**Limits (not proved).** Only `get --raw=/readyz` through `kubectl()`: not `api_ready`, `ready_body`,
+systemd, cgroups, cloud-init, native forwarding, a real kube-apiserver, HTTP/2 (the fixture has no
+ALPN), 18 nodes, switches, persistence or the trial-16 cause. The retry loop sleeps 1s (production
+5s). Unknown-error real-client behavior, repeated refusal through expiry, body trickle, all eleven
+HTTP attempts/ten retries, intermediate integer Retry-After, plain-text 5xx, HTTP/2 and live-client
+signals remain unproved. The deferred eight observations were 429 absent/malformed/date/1s/30s and
+503 absent/1s/30s; **503 malformed/date were never implemented**, despite the original prose.
+The matching-transient cleanup control and unknown-error/124 classifier controls are synthetic only;
+existing production-executor tests cover process-group cleanup only as source evidence. The kubectl
+compiler identity is not inspected. Container results do not substitute for later VM validation.
+The 401 call chain (official v0.35.0 sources, accessed 2026-11-02) is `get.Run` →
+`rawhttp.RawGet` → client-go `Request.Stream` → `transformResponse`/`Result.Error` →
+apimachinery [`errors.FromObject`](https://github.com/kubernetes/apimachinery/blob/v0.35.0/pkg/api/errors/errors.go)
+→ kubectl [`CheckErr`/`StandardErrorMessage`/`fatal`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/util/helpers.go).
+The Unauthorized reason selects the login formatter with the Status message; `fatal` adds the newline
+and exits 1. Other timing sources (per #448 comment 6573335502): kubectl
+[`get.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/get/get.go),
+[`rawhttp/raw.go`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/rawhttp/raw.go), client-go
+[`rest/request.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go) and
+[`rest/with_retry.go`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/with_retry.go)
+(retry policy coverage remains the #448 reviewer's; the 401 chain above was read directly).
+
 ## Offline-delivered guest prerequisite probe
 
 `component_prerequisites.py` is a small **guest** check for an explicitly
