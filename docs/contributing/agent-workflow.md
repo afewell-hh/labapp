@@ -412,6 +412,14 @@ integration, model and billing evidence belongs in GitHub issues and PRs.
    Turning off the owner's automatic Codex review is a user-account setting the
    repo cannot change; do not claim it changed without proof.
 
+   Owner setup: open [Codex code review settings](https://chatgpt.com/settings/code-review)
+   and choose `afewell-hh/labapp`. Under **Review code**, turn off **Automatic
+   review**; separately, under **Review security vulnerabilities**, turn off
+   **Auto security review**. Confirm both repository settings and report their
+   states to the lead. The lead records that handoff in the issue and checks the
+   next PR for unexpected native automatic reviews without requesting one.
+   Absence of a review alone does not prove the account settings changed.
+
 Every review keeps the independence and coverage rules: judge the task's
 acceptance criteria, cited sources and security, not only bugs; record the exact
 reviewed head SHA, actual model or effort level, billing owner when shown, what
