@@ -4,6 +4,7 @@ They exercise the harness logic only (loopback plain-socket fixture on an epheme
 production callables, fake clocks). They prove nothing about the real pinned kubectl; the actual
 timing evidence comes only from separately authorized execution of test-kubectl-readiness.sh.
 """
+import copy
 import http.client
 import json
 from pathlib import Path
@@ -56,6 +57,34 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(json.loads(first[2])['reason'], 'TooManyRequests')
         self.assertEqual((second[0], third[0]), (200, 200))
         self.assertEqual([r['n'] for r in fixture.requests], [1, 2, 3])
+
+    def test_plaintext_readyz_failure_has_exact_public_multiline_body(self):
+        fixture = self.fixture([proof.HEALTH_500])
+        code, headers, body = get(fixture)
+        cleanup = fixture.close()
+        self.assertEqual(code, 500)
+        self.assertEqual(headers['Content-Type'], 'text/plain; charset=utf-8')
+        self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+        self.assertNotIn('Retry-After', headers)
+        self.assertEqual(body, b'[+]ping ok\n[-]informer-sync failed: reason withheld\nreadyz check failed\n')
+        request = fixture.requests[0]
+        self.assertEqual((request['response_code'], request['body_bytes_sent']), (500, len(body)))
+        self.assertEqual(request['response_body_sha256'], proof.hashlib.sha256(body).hexdigest())
+        self.assertEqual(cleanup['threads_alive'], 0)
+
+    def test_k3s_prehandler_is_negotiated_status_not_plaintext_then_ready(self):
+        fixture = self.fixture([proof.K3S_503, proof.OK()])
+        code, headers, body = get(fixture)
+        ready = get(fixture)
+        cleanup = fixture.close()
+        self.assertEqual((code, headers['Content-Type']), (503, 'application/json'))
+        self.assertNotIn('Retry-After', headers)
+        self.assertEqual(json.loads(body), {'kind': 'Status', 'apiVersion': 'v1', 'metadata': {},
+                                          'status': 'Failure', 'message': 'apiserver not ready',
+                                          'reason': 'ServiceUnavailable', 'code': 503})
+        self.assertEqual((ready[0], ready[2]), (200, b'ok'))
+        self.assertEqual([r['response_code'] for r in fixture.requests], [503, 200])
+        self.assertEqual(cleanup['threads_alive'], 0)
 
     def test_request_text_is_sanitized_and_bounded(self):
         fixture = self.fixture([proof.OK()])
@@ -489,6 +518,177 @@ class UnauthorizedFormatterTests(unittest.TestCase):
                 self.assertEqual(self.verdict(record)[0], 'failed')
 
 
+class PublicHealthFormatterTests(unittest.TestCase):
+    NAMES = ('plaintext-readyz-500', 'k3s-prehandler-503-then-ready')
+
+    def classify(self, name, raw=None, code=1, message='child command failed', route=None,
+                 executed=True, uncertain=False):
+        error = core.Failure(message, code, proof.PUBLIC_FORMATTERS[name] if raw is None else raw)
+        error.route = route
+        error._executed_child = executed
+        error.cleanup_uncertain = uncertain
+        with patch.object(core, 'execute', side_effect=error):
+            return proof.attempt(core, core.kubectl, 1000.0, clock=lambda: 990.0, public_case=name)
+
+    def data(self, name):
+        item = next(c for c in proof.build_cases() if c['name'] == name)
+        rows = [self.classify(name)]
+        if item['loop']:
+            rows += attempts_of(('ok', None, ''))
+        requests = []
+        for index, (row, step) in enumerate(zip(rows, item['steps'])):
+            row.update(server_started=True, request_start=index, request_end=index + 1)
+            requests.append({'n': index + 1, 'method': 'GET', 'path': '/readyz', 'query': 'timeout=10s',
+                             'client_cn': proof.CLIENT_CN, 'step': step['name'], 'headers_sent': True,
+                             'body_bytes_sent': len(step['body']), 'response_code': step['code'],
+                             'response_type': step['type'],
+                             'response_body_sha256': proof.hashlib.sha256(step['body']).hexdigest()})
+        evidence = {'elapsed': 1.5, 'request_count': len(requests), 'owned_uid_processes_after': 0,
+                    'cleanup': {'listener_closed': True, 'sockets_closed': True, 'threads_alive': 0,
+                                'connections_accepted': len(requests), 'handshakes_completed': len(requests)}}
+        return item, rows, {'requests': requests}, evidence
+
+    def test_exact_candidates_preserve_fatal_500_and_empty_unlabeled_pending_503(self):
+        pins = ((178, '0e3c3fc0399c911b89b8b73e970cb32bd64be9e0131de8b1d0e8119f0e001dac'),
+                (60, '3f7e946c59f2ab5dcac5f1442315b4cc6c2ddb69b6bd6829f24aa5bb63ac0b95'))
+        for name, kind, pin in zip(self.NAMES, ('failure', 'pending'), pins):
+            with self.subTest(case=name):
+                record = self.classify(name)
+                expected = proof.PUBLIC_FORMATTERS[name]
+                self.assertEqual((record['kind'], record['code']), (kind, 1))
+                receipt = record['public_synthetic_formatter']
+                self.assertTrue(receipt['matches'])
+                self.assertEqual(receipt['text'].encode('ascii'), expected)
+                self.assertEqual((receipt['bytes'], receipt['sha256']),
+                                 (len(expected), proof.hashlib.sha256(expected).hexdigest()))
+                self.assertEqual((receipt['bytes'], receipt['sha256']), pin)
+                self.assertEqual(receipt['child_route'], 'api-initial-readyz')
+                if kind == 'pending':
+                    self.assertEqual((record['route'], record['private_output_bytes']), (None, 0))
+                    self.assertFalse(any(record['flags'].values()))
+                else:
+                    self.assertEqual(record['route'], 'api-initial-readyz')
+                self.assertEqual(proof.verdict(*self.data(name)), ('passed', []))
+
+    def test_whole_formatter_near_misses_never_release_text_or_hash(self):
+        for name in self.NAMES:
+            raw = proof.PUBLIC_FORMATTERS[name]
+            for other in (raw.rstrip(b'\n'), raw + b'\n', raw + SECRET, SECRET + raw, raw.lower(),
+                          raw.replace(b'not ready', b'not ready yet').replace(b'withheld', b'unknown'),
+                          b'Error from server (InternalError): unrelated\n'):
+                with self.subTest(case=name, raw=other):
+                    receipt = self.classify(name, other)['public_synthetic_formatter']
+                    self.assertEqual(receipt, {'matches': False})
+                    self.assertNotIn('PRIVATE-CHILD', json.dumps(receipt))
+                    item, rows, fixture, evidence = self.data(name)
+                    rows[0] = {**rows[0], **self.classify(name, other)}
+                    self.assertEqual(proof.verdict(item, rows, fixture, evidence)[0], 'failed')
+
+    def test_exact_bytes_cannot_override_child_status_provenance_or_cleanup(self):
+        for name in self.NAMES:
+            for change in ({'code': 124, 'message': 'child deadline exceeded'},
+                           {'message': 'child containment unverified'}, {'route': 'api-final-readyz'},
+                           {'executed': False}, {'uncertain': True}):
+                with self.subTest(case=name, change=change):
+                    row = self.classify(name, **change)
+                    self.assertEqual(row['public_synthetic_formatter'], {'matches': False})
+                    item, rows, fixture, evidence = self.data(name)
+                    rows[0] = {**rows[0], **row}
+                    self.assertEqual(proof.verdict(item, rows, fixture, evidence)[0], 'failed')
+
+    def test_other_cases_do_not_export_even_exact_public_candidate_bytes(self):
+        for raw in (*proof.PUBLIC_FORMATTERS.values(), SECRET):
+            error = core.Failure('child command failed', 1, raw)
+            error._executed_child = True
+            with patch.object(core, 'execute', side_effect=error):
+                row = proof.attempt(core, core.kubectl, 1000.0, clock=lambda: 990.0)
+            self.assertNotIn('public_synthetic_formatter', row)
+            self.assertNotIn('PRIVATE-CHILD', json.dumps(row))
+            self.assertNotIn(proof.hashlib.sha256(raw).hexdigest(), json.dumps(row))
+
+    def test_status_delivery_mtls_and_order_are_required_for_both_new_cases(self):
+        for name in self.NAMES:
+            item, rows, fixture, evidence = self.data(name)
+            for index in range(len(fixture['requests'])):
+                for change in ({'method': 'POST'}, {'path': '/other'}, {'query': ''}, {'client_cn': None},
+                               {'n': 9}, {'step': 'other'}, {'headers_sent': False}, {'body_bytes_sent': 0},
+                               {'response_code': 401}, {'response_code': 500 if index else 200},
+                               {'response_type': 'application/octet-stream'}, {'response_body_sha256': '0' * 64}):
+                    with self.subTest(case=name, index=index, change=change):
+                        changed = copy.deepcopy(fixture)
+                        changed['requests'][index].update(change)
+                        self.assertEqual(proof.verdict(item, rows, changed, evidence)[0], 'failed')
+            for requests in ([], fixture['requests'] * 2, list(reversed(fixture['requests']))):
+                if requests == fixture['requests']:
+                    continue
+                self.assertEqual(proof.verdict(item, rows, {'requests': requests}, evidence)[0], 'failed')
+
+    def test_cleanup_route_and_formatter_evidence_are_required(self):
+        for name in self.NAMES:
+            item, rows, fixture, evidence = self.data(name)
+            for change in ({'listener_closed': False}, {'sockets_closed': False}, {'threads_alive': 1},
+                           {'connections_accepted': 0}, {'handshakes_completed': 0}):
+                altered = {**evidence, 'cleanup': {**evidence['cleanup'], **change}}
+                self.assertEqual(proof.verdict(item, rows, fixture, altered)[0], 'failed')
+            for change in ({'owned_uid_processes_after': 1}, {'request_count': 0}, {'elapsed': 99}):
+                self.assertEqual(proof.verdict(item, rows, fixture, {**evidence, **change})[0], 'failed')
+            for change in ({'public_synthetic_formatter': {'matches': False}}, {'cleanup_uncertain': True},
+                           {'route': 'api-final-readyz'}, {'request_start': 9}, {'request_end': 9},
+                           {'server_started': False}):
+                changed = [{**rows[0], **change}, *rows[1:]]
+                self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
+            for key, value in (('text', 'other'), ('sha256', '0' * 64), ('bytes', 0), ('child_route', None)):
+                changed = copy.deepcopy(rows)
+                changed[0]['public_synthetic_formatter'][key] = value
+                self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
+
+    def test_listener_started_pending_exception_is_only_the_exact_503_case(self):
+        item, rows, fixture, evidence = self.data(self.NAMES[1])
+        for change in ({'name': 'other'}, {'steps': [proof.STATUS(503, 'Service Unavailable',
+                                                               'ServiceUnavailable'), proof.OK()]},
+                       {'deadline': 4.0}):
+            outcome, reasons = proof.verdict({**item, **change}, rows, fixture, evidence)
+            self.assertEqual(outcome, 'failed')
+            self.assertIn('pending was not observed before listener startup', reasons)
+        original = next(c for c in proof.build_cases() if c['name'] == 'refused-then-delayed-start')
+        self.assertEqual(proof.verdict(original, rows, fixture, evidence)[0], 'failed')
+        for changed in ([rows[-1]], [rows[0], rows[0], rows[-1]], list(reversed(rows))):
+            self.assertEqual(proof.verdict(item, changed, fixture, evidence)[0], 'failed')
+
+    def test_503_run_uses_one_deadline_and_one_delivered_response_per_attempt(self):
+        item, _, scripted, _ = self.data(self.NAMES[1])
+        factory = fake_fixture_factory(cleanup={'listener_closed': True, 'threads_alive': 0,
+                                               'sockets_closed': True, 'connections_accepted': 2,
+                                               'handshakes_completed': 2})
+        instance = factory()
+        clock, deadlines = Clock(), []
+        original_start = instance.start
+
+        def start(steps, mode):
+            clock.now += 0.4                 # real fixture startup consumes the same caller deadline
+            original_start(steps, mode)
+        instance.start = start
+
+        def execute(*args, **kwargs):
+            index = len(deadlines)
+            deadlines.append(args[1])
+            instance.requests.append(scripted['requests'][index])
+            clock.now += 0.1
+            if index == 0:
+                error = core.Failure('child command failed', 1, proof.PUBLIC_FORMATTERS[item['name']])
+                error._executed_child = True
+                raise error
+            return b'ok'
+        with patch.object(core, 'execute', side_effect=execute):
+            record = proof.run_case(item, core, {}, core.kubectl, 1000, clock, clock.sleep,
+                                    lambda **kwargs: instance, lambda uid: 0)
+        self.assertEqual(deadlines, [103.0, 103.0])
+        self.assertEqual([a['kind'] for a in record['attempts']], ['pending', 'ok'])
+        self.assertTrue(all(a['server_started'] for a in record['attempts']))
+        self.assertEqual(record['verdict'], 'passed')
+        self.assertAlmostEqual(record['elapsed'], 1.6)
+
+
 class RunTests(unittest.TestCase):
     def ident(self, **kubectl):
         pinned = {'size': proof.KUBECTL_PIN['size'], 'sha256': proof.KUBECTL_PIN['sha256'], **kubectl}
@@ -586,6 +786,19 @@ class RunTests(unittest.TestCase):
 
 
 class StaticContractTests(unittest.TestCase):
+    def test_original_fourteen_case_deadlines_reservations_and_order_are_unchanged(self):
+        self.assertEqual([(c['name'], c['deadline'], c['budget']) for c in proof.build_cases()[:14]], [
+            ('ok-ready', 2.0, 7.0), ('refused-then-delayed-start', 6.0, 11.0),
+            ('success-but-not-ok-body', 2.0, 7.0), ('401-unauthorized', 2.0, 7.0),
+            ('403-forbidden', 2.0, 7.0), ('x509-unknown-authority', 2.0, 7.0),
+            ('x509-wrong-ip-san', 2.0, 7.0), ('500-no-retry-after', 2.0, 7.0),
+            ('output-overflow', 2.0, 7.0), ('absolute-deadline-before-cap', 3.0, 8.0),
+            ('tcp-accepted-never-served', 10.0, 15.0), ('tls-clienthello-never-answered', 10.0, 15.0),
+            ('header-stall-after-request', 10.0, 15.0), ('body-stall-after-partial-body', 10.0, 15.0),
+        ])
+        self.assertEqual((proof.WORK_BUDGET, proof.REPORT_RESERVE, proof.REAP, proof.CLEANUP, proof.SETTLE),
+                         (170, 5.0, 2.0, 1.0, 2.0))
+
     def test_case_matrix_is_coherent(self):
         cases = proof.build_cases()
         names = [c['name'] for c in cases]
@@ -612,7 +825,8 @@ class StaticContractTests(unittest.TestCase):
 
     def test_reservations_cover_full_case_windows_inside_unchanged_budget(self):
         cases = proof.build_cases()
-        self.assertEqual((len(cases), sum(c['budget'] for c in cases)), (14, 135.0))
+        self.assertEqual((len(cases), sum(c['budget'] for c in cases)), (16, 150.0))
+        self.assertEqual((len(cases[:14]), sum(c['budget'] for c in cases[:14])), (14, 135.0))
         self.assertLess(sum(c['budget'] for c in cases) + proof.REPORT_RESERVE, proof.WORK_BUDGET)
         for item in cases:
             self.assertGreaterEqual(item['budget'], item['elapsed'][1])
