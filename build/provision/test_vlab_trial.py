@@ -3108,13 +3108,20 @@ class FirstFailureExport(unittest.TestCase):
         self.stack.enter_context(patch.object(core, 'diagnostic_run', side_effect=self.query))
         self.v = v
         self.operation, self.invocation = 'e' * 32, 'f' * 32
-        started = time.monotonic()
-        self.value = {'schema': 1, 'nonce': NONCE, 'mode': 'fresh', 'operation': self.operation,
-                      'phase': 'starting', 'invocation': self.invocation, 'boot': v['boot_uuid'],
-                      'started': started, 'deadline': started + core.START_SECONDS['fresh']}
+        # Raw started + duration loses the exact resume duration at this binary64 clock.
+        self.stack.enter_context(patch.object(core.time, 'monotonic', return_value=128.0 + 2**-43))
+        self.value = self.startup_value('fresh')
         # reserve() returns before unit_gate publishes the invocation in current state.
         self.reserved = {key: item for key, item in self.value.items() if key != 'invocation'}
         core.atomic(self.state_root / 'state.json', self.value)
+
+    def startup_value(self, mode):
+        duration = self.core.START_SECONDS[mode]
+        deadline = time.monotonic() + duration
+        # Match reserve(): derive started from EACH mode's already rounded deadline.
+        return {'schema': 1, 'nonce': NONCE, 'mode': mode, 'operation': self.operation,
+                'phase': 'starting', 'invocation': self.invocation, 'boot': self.v['boot_uuid'],
+                'started': deadline - duration, 'deadline': deadline}
 
     def query(self, argv, end, keep):
         self.queries.append(list(argv))
@@ -3171,8 +3178,7 @@ class FirstFailureExport(unittest.TestCase):
         core = self.core
         for name in (core.FIRST_FAILURE, core.UNIT_READY_FAILURE):
             (self.state_root / name).unlink(missing_ok=True)
-        original = dict(self.value, mode=mode,
-                        deadline=self.value['started'] + core.START_SECONDS[mode])
+        original = self.startup_value(mode)
         reserved = {key: item for key, item in original.items() if key != 'invocation'}
         core.atomic(self.state_root / 'state.json', original)
         primary = core.Failure('child command failed', 1, b'PRIMARY_UNCHANGED')
@@ -3214,7 +3220,6 @@ class FirstFailureExport(unittest.TestCase):
                         child.stdout.close.assert_called_once()
                     raise
         with patch.dict(os.environ, {'INVOCATION_ID': self.invocation}), \
-             patch.object(core, 'startup_snapshot', return_value=(original, original['deadline'])), \
              patch.object(core, 'ready_body', side_effect=body):
             with self.assertRaises(core.Failure) as raised:
                 core.unit_ready(mode)
@@ -3264,6 +3269,45 @@ class FirstFailureExport(unittest.TestCase):
             self.assertEqual(host.accept_failure(trial.encoded(foreign) + b'\n' + rest, *args), ('invalid', None))
         self.assertEqual((self.state_root / core.UNIT_READY_FAILURE).read_bytes(), record_raw)
         self.assertEqual((self.state_root / core.FIRST_FAILURE).read_bytes(), written)
+
+    def test_rounding_sensitive_clock_refuses_raw_started_but_records_deadline_first(self):
+        core, mode = self.core, 'resume'
+        original = self.startup_value(mode)
+        old = dict(original, started=time.monotonic())
+        duration = core.START_SECONDS[mode]
+        self.assertNotEqual(old['deadline'] - old['started'], duration)
+        self.assertEqual(original['deadline'] - original['started'], duration)
+        error = core.Failure('child command failed', 19, b'CHILD_PRIVATE')
+        error.route = 'api-final-readyz'
+        path = self.state_root / core.UNIT_READY_FAILURE
+        with patch.dict(os.environ, {'INVOCATION_ID': self.invocation}):
+            core.atomic(self.state_root / 'state.json', old)
+            with self.assertRaisesRegex(core.Failure, '^operation clock refused$'):
+                core.operation_deadline(old)
+            with self.assertRaisesRegex(core.Failure, '^operation clock refused$'):
+                core.record_unit_ready_failure(mode, old, error)
+            self.assertFalse(path.exists())
+            # The mocked startup snapshot formerly let this invalid pair reach the child.
+            with patch.object(core, 'startup_snapshot', return_value=(old, old['deadline'])), \
+                 patch.object(core, 'ready_body', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.unit_ready(mode)
+            self.assertIs(raised.exception, error)
+            self.assertFalse(path.exists())
+            core.atomic(self.state_root / 'state.json', original)
+            with patch.object(core, 'ready_body', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.unit_ready(mode)
+            self.assertIs(raised.exception, error)
+        record = core.json_data(path.read_bytes())
+        core.valid_unit_ready(record, mode, original, self.invocation, original['boot'])
+        with self.assertRaisesRegex(core.Failure, '^unit-ready clock refused$'):
+            core.valid_unit_ready(dict(record, started=old['started']), mode, old,
+                                  self.invocation, old['boot'])
+        self.assertEqual(core.read_unit_ready(mode, original, self.invocation, original['boot']),
+                         ('ok', 'child command failed', 19, 'api-final-readyz'))
+        self.assertEqual((str(error), error.code, error.private_output, error.route),
+                         ('child command failed', 19, b'CHILD_PRIVATE', 'api-final-readyz'))
 
     def test_real_executed_readiness_failure_whole_chain_fresh_and_resume(self):
         for mode in ('fresh', 'resume'):
