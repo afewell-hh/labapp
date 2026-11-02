@@ -649,6 +649,22 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
           PYTEST
+      - name: Required local signed-metadata authentication harness regressions
+        run: |
+          test -f build/provision/test_qemu_auth_control.py
+          python3 -I -B - <<'PYTEST'
+          import os
+          import sys
+          import unittest
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_qemu_auth_control.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required local QEMU authentication suite discovered no tests')
+          print(f'Required local QEMU authentication tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PYTEST
       - name: Offline data, target drift and downloader ownership regressions
         run: python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
       - name: Two fresh unchanged installations and nonroot offline fixture
