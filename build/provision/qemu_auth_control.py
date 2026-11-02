@@ -12,9 +12,9 @@ runs first and fails closed if it cannot show per-suite signature acceptance
 followed by authenticated index scheduling. Only then are the empty-key,
 tamper-with-valid-key and persistent 502/503 controls run.
 
-STATUS: written without execution (no Python/Docker/APT in the authoring job).
-The real signed bytes are staged separately by the lead; until then this runner
-refuses (``fixtures not staged``) and must never be reported as passing.
+STATUS: exact APT 2.8.3 diagnostic semantics remain unverified. The positive
+probe captures evidence but ALWAYS refuses UNQUALIFIED until a separately
+reviewed per-suite native correlation is implemented. No native pass is claimed.
 """
 import contextlib
 import hashlib
@@ -58,6 +58,8 @@ PRODUCTION_UPDATE = ['-o', 'APT::Update::Error-Mode=any', 'update']  # as instal
 DIAGNOSTIC = ['-o', 'Debug::Acquire::gpgv=true', '-o', 'Debug::pkgAcquire::Auth=true']
 CASE_SECONDS = 25
 MAX_REQUESTS = 64
+SOCKET_SECONDS = 2
+SHUTDOWN_SECONDS = 3
 OUTPUT_LIMIT = 4 * 1024 * 1024
 BASE_PATH = f'/ubuntu/{SNAPSHOT}/dists/'
 PATH_RE = re.compile(re.escape(BASE_PATH) + r'(noble|noble-updates|noble-security)/([A-Za-z0-9_.+~/-]{1,240})')
@@ -67,6 +69,10 @@ REJECTION = re.compile(rb'NO_PUBKEY|BADSIG|EXPKEYSIG|REVKEYSIG|ERRSIG|NODATA|sig
                        rb'is not signed|could not be verified|couldn.t be verified|has expired|'
                        rb'not valid yet|changed its')
 BADSIG = re.compile(rb'BADSIG|signatures were invalid')
+MIXED_TRANSPORT = re.compile(rb'(?i)\b(?:40[0-9]|41[0-9]|429)\b[ \t]+(?:not found|forbidden|'
+                             rb'unauthorized|too many requests)|could not handshake|'
+                             rb'connection refused|network is unreachable|unexpected eof|'
+                             rb'undetermined error|hash sum mismatch|file has unexpected size')
 
 
 # ---------------------------------------------------------------- fixtures
@@ -136,20 +142,36 @@ def rewrite_sources(original, base, key=None):
 # -------------------------------------------------------- loopback fixture
 
 class Ledger:
-    """Closed request/response ledger; every request is recorded, even rejected ones."""
+    """Atomic socket admission and ordered write observations, not client receipts."""
     def __init__(self):
         self.lock = threading.Lock()
         self.rows = []
+        self.order = 0
 
-    def add(self, **row):
+    def admit(self):
         with self.lock:
-            row['n'] = len(self.rows)
+            if len(self.rows) > MAX_REQUESTS:
+                raise Refusal('fixture admission already closed')
+            over = len(self.rows) == MAX_REQUESTS
+            row = dict(n=len(self.rows), method='<unparsed>', path='<unparsed>',
+                       headers=[], status=None, bytes=0, sha256=None,
+                       kind='over-budget' if over else 'incomplete',
+                       attempted=False, completed=False, failure=None,
+                       completed_bytes=None, completed_sha256=None,
+                       admitted_order=self.order)
+            self.order += 1
             self.rows.append(row)
-            return row['n']
+            return row['n'], over
+
+    def update(self, n, event, **values):
+        with self.lock:
+            self.rows[n].update(values)
+            self.rows[n][event + '_order'] = self.order
+            self.order += 1
 
     def snapshot(self):
         with self.lock:
-            return [dict(row) for row in self.rows]
+            return [dict(row, headers=[list(pair) for pair in row['headers']]) for row in self.rows]
 
 
 class Case:
@@ -187,40 +209,168 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def handle(self):
+        self.row = self.server.sockets[self.request]
+        try:
+            super().handle()
+        finally:
+            row = self.server.ledger.snapshot()[self.row]
+            if not row['completed'] and row['failure'] is None:
+                self.server.ledger.update(self.row, 'failure', failure='incomplete-request')
+
+    def send_error(self, code, message=None, explain=None):
+        # Base parser errors and unknown verbs must not escape the same ledger.
+        self._request_fields()
+        self.server.ledger.update(self.row, 'parsed', kind='unexpected', status=code)
+        self._write(code, b'')
+
+    def _write(self, status, body):
+        ledger = self.server.ledger
+        ledger.update(self.row, 'attempt', attempted=True, status=status,
+                      bytes=len(body), sha256=hashlib.sha256(body).hexdigest())
+        try:
+            self.send_response_only(status)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            sent = self.wfile.write(body)
+            if sent != len(body):
+                raise OSError('short write')
+            self.wfile.flush()
+        except OSError:
+            ledger.update(self.row, 'failure', failure='write-failed')
+        else:
+            ledger.update(self.row, 'complete', completed=True, completed_bytes=len(body),
+                          completed_sha256=hashlib.sha256(body).hexdigest())
+        self.close_connection = True
+
+    def _request_fields(self):
+        server = self.server
+        # Never publish arbitrary request text or header values. Recognized
+        # public loopback/APT fields only, with bounded redaction for everything else.
+        headers = []
+        seen = set()
+        safe = True
+        for name, value in getattr(self, 'headers', {}).items():
+            lower = name.lower()
+            allowed = lower not in seen and len(value) <= 128 and (
+                lower == 'host' and value == f'127.0.0.1:{server.server_port}'
+                or lower == 'user-agent' and re.fullmatch(r'Debian APT-HTTP/[0-9.]+ \(2\.8\.3\)', value)
+                or lower == 'connection' and value.lower() in ('close', 'keep-alive')
+                or lower == 'accept' and value == '*/*'
+                or lower == 'accept-encoding' and value == 'identity'
+                or lower == 'cache-control' and value == 'max-age=0')
+            seen.add(lower)
+            headers.append([lower if lower in ('host', 'user-agent', 'connection', 'accept',
+                                               'accept-encoding', 'cache-control') else '<other>',
+                            value if allowed else '<redacted>'])
+            safe = safe and bool(allowed)
+        if len(headers) > 16:
+            headers, safe = [['<overflow>', '<redacted>']], False
+        path = getattr(self, 'path', '')
+        path = path if PATH_RE.fullmatch(path) else '<unexpected>'
+        method = getattr(self, 'command', '')
+        method = method if method in ('GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS',
+                                      'PATCH', 'CONNECT', 'TRACE') else '<other>'
+        server.ledger.update(self.row, 'request', method=method, path=path, headers=headers)
+        return safe
+
     def _serve(self):
         server = self.server
         status, body, kind = decide(server.case, self.command, self.path, self.headers)
-        if len(server.ledger.rows) >= MAX_REQUESTS:
-            status, body, kind = 404, b'', 'over-budget'
-        server.ledger.add(method=self.command, path=self.path, status=status, bytes=len(body),
-                          sha256=hashlib.sha256(body).hexdigest(), kind=kind)
-        self.send_response(status)
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Connection', 'close')
-        self.end_headers()
-        if self.command != 'HEAD':
-            self.wfile.write(body)
+        if not self._request_fields():
+            status, body, kind = 404, b'', 'unexpected'
+        server.ledger.update(self.row, 'parsed', kind=kind)
+        self._write(status, body)
 
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = do_OPTIONS = _serve
 
 
+class Server(http.server.HTTPServer):
+    """Track sockets before spawning; stop admission before draining all handlers."""
+    def __init__(self, case):
+        self.case, self.ledger = case, Ledger()
+        self.stopping = threading.Event()
+        self.guard = threading.Lock()
+        self.sockets, self.handlers = {}, []
+        super().__init__(('127.0.0.1', 0), Handler)
+        self.timeout = 0.1
+
+    def get_request(self):
+        request, address = super().get_request()
+        try:
+            request.settimeout(SOCKET_SECONDS)
+            n, over = self.ledger.admit()
+        except BaseException:
+            request.close()
+            raise
+        if over:
+            self.ledger.update(n, 'failure', failure='request-budget')
+            self.stopping.set()
+            request.close()
+            raise OSError('request budget')
+        with self.guard:
+            self.sockets[request] = n
+        return request, address
+
+    def process_request(self, request, address):
+        thread = threading.Thread(target=self.worker, args=(request, address))
+        with self.guard:
+            self.handlers.append(thread)
+        try:
+            thread.start()
+        except BaseException:
+            self.ledger.update(self.sockets[request], 'failure', failure='handler-start')
+            self.shutdown_request(request)
+            with self.guard:
+                del self.sockets[request]
+                self.handlers.remove(thread)
+            raise
+
+    def worker(self, request, address):
+        try:
+            self.finish_request(request, address)
+        except Exception:
+            self.ledger.update(self.sockets[request], 'failure', failure='handler-failed')
+        finally:
+            self.shutdown_request(request)
+            with self.guard:
+                del self.sockets[request]
+
+    def loop(self):
+        while not self.stopping.is_set():
+            self.handle_request()
+
+    def close_owned(self, thread):
+        self.stopping.set()
+        thread.join(SHUTDOWN_SECONDS)
+        self.server_close()
+        # Admission/spawn has settled before taking the handler snapshot.
+        with self.guard:
+            sockets, handlers = list(self.sockets), list(self.handlers)
+        for request in sockets:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        deadline = time.monotonic() + SHUTDOWN_SECONDS
+        for handler in handlers:
+            handler.join(max(0, deadline - time.monotonic()))
+        if thread.is_alive() or any(handler.is_alive() for handler in handlers) or self.sockets:
+            raise Refusal('fixture owned socket/handler remains')
+
+
 @contextlib.contextmanager
 def serve(case):
-    """Loopback-only bounded stdlib server owned by this case; proven closed on exit."""
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-    server.daemon_threads = True
-    server.case, server.ledger = case, Ledger()
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+    """Loopback-only server; bounded reads/writes, admission and exact owned shutdown."""
+    server = Server(case)
+    port = server.server_port
+    thread = threading.Thread(target=server.loop)
     thread.start()
     try:
         yield f'http://127.0.0.1:{port}', server.ledger
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(5)
-        if thread.is_alive():
-            raise Refusal('fixture server thread remains')
+        server.close_owned(thread)
         probe = socket.socket()
         probe.settimeout(1)
         try:
@@ -249,14 +399,17 @@ def _release_rows(rows, bodies, expect_status=200):
     if expect_status == 200:
         for row in found:
             suite = PATH_RE.fullmatch(row['path']).group(1)
-            if (row['status'], row['bytes'], row['sha256']) != (
-                    200, len(bodies[suite]), hashlib.sha256(bodies[suite]).hexdigest()):
+            if not row['completed'] or row['failure'] is not None or (
+                    row['status'], row['completed_bytes'], row['completed_sha256']) != (
+                    200, len(bodies[suite]), hashlib.sha256(bodies[suite]).hexdigest()) or (
+                    row['bytes'], row['sha256']) != (row['completed_bytes'], row['completed_sha256']):
                 raise AssertionError('delivered InRelease bytes differ from the expected body: ' + suite)
     return found
 
 
 def _no_unexpected(rows):
-    bad = [row for row in rows if row['kind'] in ('unexpected', 'over-budget')]
+    bad = [row for row in rows if row['kind'] in ('unexpected', 'over-budget', 'incomplete')
+           or not row['completed'] or row['failure'] is not None]
     if bad:
         raise AssertionError(f'unexplained request(s): {[(r["method"], r["path"], r["status"]) for r in bad]!r}')
 
@@ -273,20 +426,13 @@ def classify_positive(code, output, rows, intact):
     rejection = REJECTION.search(output)
     if rejection:
         raise AssertionError(f'positive probe shows an authentication/policy rejection: {rejection.group(0)!r}')
-    scheduled = {}
-    for suite in SUITES:
-        release = next(row for row in rows if row['path'] == f'{BASE_PATH}{suite}/InRelease')
-        later = [row for row in _rows(rows, 'index-absence')
-                 if row['path'].startswith(f'{BASE_PATH}{suite}/') and row['n'] > release['n']]
-        if not later:
-            raise AssertionError('no authenticated index scheduling after InRelease for ' + suite)
-        scheduled[suite] = len(later)
-    for token in (b'GOODSIG', b'VALIDSIG'):
-        if output.count(token) < len(SUITES):
-            raise AssertionError(f'diagnostic output lacks per-suite {token.decode()} evidence '
-                                 f'(count={output.count(token)}); boundary unqualified')
-    return {'index_requests_after_release': scheduled, 'goodsig': output.count(b'GOODSIG'),
-            'validsig': output.count(b'VALIDSIG')}
+    # Neither globally counted gpgv tokens nor release-request order associates
+    # verification with a suite, metadata-policy acceptance and subsequent index
+    # scheduling. Exact 2.8.3 diagnostics have not been verified. Do not invent a
+    # grammar from synthetic tests; retain the bounded native capture for ROOT.
+    raise AssertionError('UNQUALIFIED: exact APT 2.8.3 per-suite verification -> '
+                         'metadata-policy acceptance -> authenticated index scheduling '
+                         'diagnostic correlation is not verified')
 
 
 def _only_releases(code, output, rows, bodies):
@@ -299,6 +445,10 @@ def _only_releases(code, output, rows, bodies):
 def classify_empty_key(code, output, rows, intact):
     """Genuine NO_PUBKEY with intact releases delivered 200, using the unchanged predicate."""
     qemu_container.signature_proof(code, output)
+    if type(code) is not int:
+        raise AssertionError('empty-key control has no native integer exit')
+    if qemu_container.TRANSPORT.search(output) or MIXED_TRANSPORT.search(output):
+        raise AssertionError('empty-key control mixed with transport failure')
     if BADSIG.search(output):
         raise AssertionError('empty-key control mixed with a bad-signature failure')
     _only_releases(code, output, rows, intact)
@@ -311,6 +461,9 @@ def classify_tamper(code, output, rows, tampered):
         raise AssertionError(f'tampered releases were accepted: code={code!r}')
     if b'NO_PUBKEY' in output or not BADSIG.search(output):
         raise AssertionError('tamper refusal is not an explicit signature-integrity failure')
+    if (qemu_container.TRANSPORT.search(output) or MIXED_TRANSPORT.search(output)
+            or re.search(rb'GOODSIG|VALIDSIG', output)):
+        raise AssertionError('tamper control has mixed or ambiguous authentication/transport evidence')
     try:
         qemu_container.signature_proof(code, output)
     except AssertionError:
@@ -330,6 +483,8 @@ def classify_transport(status, code, output, rows, attempts):
             raise AssertionError(f'{status} was not classified as transport-only: {exc}') from None
     else:
         raise AssertionError(f'{status} control was accepted as signature proof')
+    if type(code) is not int or code == 0:
+        raise AssertionError(f'{status} control has no native nonzero integer exit')
     _no_unexpected(rows)
     if b'NO_PUBKEY' in output or BADSIG.search(output):
         raise AssertionError(f'{status} control produced an authentication result')
@@ -346,10 +501,18 @@ def classify_transport(status, code, output, rows, attempts):
 
 def identity(module):
     """Actual prepared APT/keyring identity; APT must be exactly the known 2.8.3."""
-    version = bounded(['/usr/bin/dpkg-query', '-W', '-f=${Version}', 'apt'], 10, env=module['ENV'])[1].decode()
-    if not version.startswith(EXPECTED_APT):
+    def query(package):
+        code, output = bounded(['/usr/bin/dpkg-query', '-W', '-f=${Version}', package], 10, env=module['ENV'])
+        if code != 0:
+            raise Refusal('prepared package identity query failed')
+        return output.decode()
+    release = Path('/etc/os-release').read_text().splitlines()
+    if 'ID=ubuntu' not in release or 'VERSION_ID="24.04"' not in release:
+        raise Refusal('prepared Ubuntu 24.04 required')
+    version = query('apt')
+    if version != EXPECTED_APT:
         raise Refusal(f'prepared APT is not the attested {EXPECTED_APT}: {version!r}')
-    keyring = bounded(['/usr/bin/dpkg-query', '-W', '-f=${Version}', 'ubuntu-keyring'], 10, env=module['ENV'])[1].decode()
+    keyring = query('ubuntu-keyring')
     return {'apt': version, 'ubuntu_keyring': keyring, 'keyring_sha256': digest(Path(KEY))}
 
 
@@ -362,25 +525,40 @@ def run_case(name, case, module, run=bounded, ownership=qemu_container.OwnedGrou
         empty = root / 'empty.gpg'
         if case.key == 'empty':
             empty.write_bytes(b'')
-        with serve(case) as (base, ledger):
-            (root / 'sources.list').write_text(
-                rewrite_sources(original, base, empty if case.key == 'empty' else None))
-            env = dict(module['ENV'], APT_CONFIG=config)
-            args = [*apt, *(DIAGNOSTIC if case.debug else []), *PRODUCTION_UPDATE]
-            owned = ownership()
-            started = time.monotonic()
-            try:
-                code, output = run(args, CASE_SECONDS, limit=OUTPUT_LIMIT, env=env, on_start=owned.started)
-            finally:
-                owned.verify()
-            elapsed = round(time.monotonic() - started, 3)
-        rows = ledger.snapshot()
+        ledger = None
+        code, output = None, b''
+        try:
+            with serve(case) as (base, ledger):
+                (root / 'sources.list').write_text(
+                    rewrite_sources(original, base, empty if case.key == 'empty' else None))
+                env = dict(module['ENV'], APT_CONFIG=config)
+                args = [*apt, *(DIAGNOSTIC if case.debug else []), *PRODUCTION_UPDATE]
+                owned = ownership()
+                started = time.monotonic()
+                try:
+                    code, output = run(args, CASE_SECONDS, limit=OUTPUT_LIMIT, env=env, on_start=owned.started)
+                finally:
+                    owned.verify()
+                elapsed = round(time.monotonic() - started, 3)
+        finally:
+            rows = ledger.snapshot() if ledger is not None else []
+            print(json.dumps({'auth_case': name, 'exit': code, 'ledger': summary(rows),
+                              'diagnostics': public_diagnostics(output),
+                              'server_write_is_not_client_receipt': True}), flush=True)
     return code, output, rows, elapsed
 
 
 def summary(rows):
-    return [{k: row[k] for k in ('n', 'method', 'path', 'status', 'bytes', 'kind')} | {'sha256': row['sha256'][:16]}
-            for row in rows]
+    return [dict(row) for row in rows]
+
+
+def public_diagnostics(output):
+    """Complete bounded controlled-public-fixture output, with unsafe lines withheld."""
+    if not isinstance(output, bytes) or len(output) > OUTPUT_LIMIT:
+        return '<unavailable>'
+    return '\n'.join(line.decode('ascii') for line in output.split(b'\n')
+                     if all(32 <= ch < 127 or ch == 9 for ch in line)
+                     and not qemu_container.SENSITIVE.search(line))
 
 
 def main(installer=None, fixtures=None, run=bounded):
@@ -392,16 +570,20 @@ def main(installer=None, fixtures=None, run=bounded):
     module = runpy.run_path(str(installer or Path(__file__).with_name('install-qemu.py')))
     retries = int(qemu_container.production_retries())
     packages = module['installed']()
-    apt_before = {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()}
+    apt_before = qemu_offline.policy_files()
     report = {'native_auth_control': True, 'snapshot': SNAPSHOT, 'fixture_bytes': FIXTURE_TOTAL,
-              'identity': identity(module), 'retries': retries, 'http_only_not_tls_proof': True}
-    report.update(controls(module, intact, 1 + retries, run))
-    if module['installed']() != packages:
-        raise Refusal('installed packages changed')
-    if {str(p): digest(p) for p in Path('/etc/apt').rglob('*') if p.is_file()} != apt_before:
-        raise Refusal('/etc/apt changed')
-    report.update(packages_unchanged=True, apt_configuration_unchanged=True, no_install_invoked=True)
+              'identity': identity(module), 'retries': retries, 'http_only_not_tls_proof': True,
+              'qualification': 'UNQUALIFIED', 'not_full_qemu_suite': True}
     print(json.dumps(report, sort_keys=True), flush=True)
+    try:
+        report.update(controls(module, intact, 1 + retries, run))
+    finally:
+        if module['installed']() != packages:
+            raise Refusal('installed packages changed')
+        if qemu_offline.policy_files() != apt_before:
+            raise Refusal('/etc/apt changed')
+        print(json.dumps({'packages_unchanged': True, 'apt_configuration_unchanged': True,
+                          'no_install_invoked': True, 'not_full_qemu_suite': True}), flush=True)
 
 
 def controls(module, intact, attempts, run=bounded, ownership=qemu_container.OwnedGroup):

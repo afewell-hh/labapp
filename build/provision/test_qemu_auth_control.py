@@ -7,15 +7,19 @@ is, or claims to be, native APT proof: the actual native proof is the disconnect
 container run of ``qemu_auth_control.py run`` and remains unrun.
 """
 import hashlib
+import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from hhfab_release import Refusal
 import qemu_auth_control as auth
@@ -39,12 +43,16 @@ def bodies(data=SIGNED):
 
 def release(n, suite, body, status=200, kind='release'):
     return {'n': n, 'method': 'GET', 'path': f'{auth.BASE_PATH}{suite}/InRelease', 'status': status,
-            'bytes': len(body), 'sha256': hashlib.sha256(body).hexdigest(), 'kind': kind}
+            'bytes': len(body), 'sha256': hashlib.sha256(body).hexdigest(), 'kind': kind,
+            'headers': [], 'attempted': True, 'completed': True, 'failure': None,
+            'completed_bytes': len(body), 'completed_sha256': hashlib.sha256(body).hexdigest()}
 
 
 def index(n, suite, name='main/binary-amd64/Packages.xz'):
     return {'n': n, 'method': 'GET', 'path': f'{auth.BASE_PATH}{suite}/{name}', 'status': 404,
-            'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest(), 'kind': 'index-absence'}
+            'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest(), 'kind': 'index-absence',
+            'headers': [], 'attempted': True, 'completed': True, 'failure': None,
+            'completed_bytes': 0, 'completed_sha256': hashlib.sha256(b'').hexdigest()}
 
 
 def get(base, path, method='GET', headers=None):
@@ -110,12 +118,22 @@ class IdentityAndFixtureTests(unittest.TestCase):
                     auth.load_fixtures(directory)
 
     def test_staged_fixtures_match_public_identity(self):
-        # Meaningful only after the lead stages the real public bytes; absence is
-        # reported as such and is never a passing fixture proof.
-        if not auth.FIXTURE_DIR.is_dir():
-            self.skipTest('real public InRelease fixtures not staged yet')
         loaded = auth.load_fixtures()
         self.assertEqual(sum(len(v) for v in loaded.values()), 508102)
+
+    def test_prepared_identity_requires_exact_apt_and_successful_queries(self):
+        module = {'ENV': {'PATH': '/usr/bin', 'LANG': 'C'}}
+        with patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"\n'), \
+             patch.object(auth, 'digest', return_value='0' * 64):
+            with patch.object(auth, 'bounded', side_effect=[(0, b'2.8.3'), (0, b'public-keyring-version')]):
+                self.assertEqual(auth.identity(module)['apt'], '2.8.3')
+            for result in ((0, b'2.8.30'), (0, b'2.8.3ubuntu1'), (1, b'2.8.3')):
+                with patch.object(auth, 'bounded', return_value=result), self.assertRaises(Refusal):
+                    auth.identity(module)
+        with patch.object(Path, 'read_text', return_value='ID=debian\n'), \
+             patch.object(auth, 'bounded', side_effect=AssertionError('query on wrong OS')):
+            with self.assertRaisesRegex(Refusal, 'Ubuntu'):
+                auth.identity(module)
 
 
 class RewriteAndTamperTests(unittest.TestCase):
@@ -163,17 +181,21 @@ class ServerAndLedgerTests(unittest.TestCase):
             self.assertEqual(get(base, path, 'POST')[0], 405)
             self.assertEqual(get(base, path, headers={'If-Modified-Since': 'x'})[0], 404)
             self.assertEqual(get(base, f'{auth.BASE_PATH}noble/../x')[0], 404)
-            rows = ledger.snapshot()
+        rows = ledger.snapshot()
         kinds = [row['kind'] for row in rows]
         self.assertEqual(kinds[:3], ['release', 'index-absence', 'unexpected'])
         self.assertEqual(kinds[3:], ['unexpected'] * 3)
         self.assertEqual(rows[0]['sha256'], hashlib.sha256(data['noble']).hexdigest())
         self.assertEqual(rows[0]['bytes'], len(data['noble']))
+        self.assertEqual(rows[0]['completed_sha256'], rows[0]['sha256'])
+        self.assertEqual(rows[0]['completed_bytes'], rows[0]['bytes'])
+        self.assertLess(rows[0]['admitted_order'], rows[0]['attempt_order'])
+        self.assertLess(rows[0]['attempt_order'], rows[0]['complete_order'])
 
     def test_index_absence_only_when_allowed(self):
         with auth.serve(auth.Case('production', bodies())) as (base, ledger):
             get(base, f'{auth.BASE_PATH}noble/main/binary-amd64/Packages.xz')
-            self.assertEqual(ledger.snapshot()[0]['kind'], 'unexpected')
+        self.assertEqual(ledger.snapshot()[0]['kind'], 'unexpected')
 
     def test_transport_status_and_fallback_routes(self):
         for status in (502, 503):
@@ -181,18 +203,136 @@ class ServerAndLedgerTests(unittest.TestCase):
                 self.assertEqual(get(base, f'{auth.BASE_PATH}noble/InRelease')[0], status)
                 self.assertEqual(get(base, f'{auth.BASE_PATH}noble/Release.gpg')[0], status)
                 self.assertEqual(get(base, f'{auth.BASE_PATH}noble/main/x')[0], 404)
-                self.assertEqual([r['kind'] for r in ledger.snapshot()],
-                                 ['release-transport', 'fallback-transport', 'unexpected'])
+            self.assertEqual([r['kind'] for r in ledger.snapshot()],
+                             ['release-transport', 'fallback-transport', 'unexpected'])
 
     def test_request_budget_and_owned_shutdown(self):
         with patch.object(auth, 'MAX_REQUESTS', 2):
             with auth.serve(auth.Case('production', bodies())) as (base, ledger):
-                for _ in range(3):
+                for _ in range(2):
+                    get(base, f'{auth.BASE_PATH}noble/InRelease')
+                with self.assertRaises((OSError, http.client.HTTPException)):
                     get(base, f'{auth.BASE_PATH}noble/InRelease')
                 kinds = [r['kind'] for r in ledger.snapshot()]
         self.assertEqual(kinds, ['release', 'release', 'over-budget'])
         with self.assertRaises(OSError):
             get(base, '/')  # closed on exit; no persistent service
+
+    def test_atomic_concurrent_admission_stops_at_terminal_overflow(self):
+        ledger = auth.Ledger()
+        barrier = threading.Barrier(3)
+        admitted = []
+        def admit():
+            barrier.wait(timeout=2)
+            admitted.append(ledger.admit())
+        with patch.object(auth, 'MAX_REQUESTS', 2):
+            threads = [threading.Thread(target=admit) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(sorted(admitted), [(0, False), (1, False), (2, True)])
+            with self.assertRaisesRegex(Refusal, 'closed'):
+                ledger.admit()
+        self.assertEqual(len(ledger.snapshot()), 3)
+
+    def test_write_attempt_is_not_completion_or_client_receipt(self):
+        for outcome in (OSError('synthetic partial write'), 1):
+            server = Mock(ledger=auth.Ledger())
+            n, _ = server.ledger.admit()
+            handler = object.__new__(auth.Handler)
+            handler.server, handler.row = server, n
+            handler.send_response_only = Mock()
+            handler.send_header = Mock()
+            handler.end_headers = Mock()
+            handler.wfile = Mock()
+            if isinstance(outcome, Exception):
+                handler.wfile.write.side_effect = outcome
+            else:
+                handler.wfile.write.return_value = outcome
+            handler._write(200, b'body')
+            row = server.ledger.snapshot()[0]
+            self.assertTrue(row['attempted'])
+            self.assertFalse(row['completed'])
+            self.assertIsNone(row['completed_bytes'])
+            self.assertIsNone(row['completed_sha256'])
+            self.assertEqual(row['failure'], 'write-failed')
+            self.assertEqual(row['sha256'], hashlib.sha256(b'body').hexdigest())
+            self.assertEqual(auth.summary([row]), [row])
+            self.assertLess(row['attempt_order'], row['failure_order'])
+
+    def test_malformed_and_unsupported_methods_are_accounted_without_request_secrets(self):
+        with auth.serve(auth.Case('production', bodies())) as (base, ledger):
+            port = int(base.rsplit(':', 1)[1])
+            for request in (b'NOTHTTP\r\n\r\n', b'PATCH /private-SENTINEL HTTP/1.0\r\n\r\n'):
+                with socket.create_connection(('127.0.0.1', port), timeout=2) as client:
+                    client.sendall(request)
+                    while client.recv(4096):
+                        pass
+        rows = ledger.snapshot()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['kind'] == 'unexpected' for row in rows))
+        self.assertNotIn('SENTINEL', json.dumps(auth.summary(rows)))
+        with self.assertRaises(AssertionError):
+            auth._no_unexpected(rows)
+
+    def test_shutdown_waits_for_accepted_handler_and_closes_partial_request(self):
+        entered, release_handler, closed = threading.Event(), threading.Event(), threading.Event()
+        original = auth.Handler.handle
+        def gated(handler):
+            entered.set()
+            if not release_handler.wait(3):
+                raise AssertionError('test handler gate')
+            original(handler)
+        server = auth.Server(auth.Case('production', bodies()))
+        serving = threading.Thread(target=server.loop)
+        failures = []
+        def close():
+            try:
+                server.close_owned(serving)
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                closed.set()
+        with patch.object(auth.Handler, 'handle', gated):
+            serving.start()
+            closer = None
+            try:
+                with socket.create_connection(server.server_address, timeout=2) as client:
+                    client.sendall(b'GET /')
+                    self.assertTrue(entered.wait(2))
+                    closer = threading.Thread(target=close)
+                    closer.start()
+                    self.assertEqual(client.recv(1), b'')
+                    self.assertFalse(closed.is_set())  # handler is still gated
+            finally:
+                release_handler.set()
+                if closer is None:
+                    close()
+                else:
+                    closer.join(4)
+        self.assertTrue(closed.is_set())
+        self.assertEqual(failures, [])
+        self.assertFalse(serving.is_alive())
+        self.assertTrue(all(not t.is_alive() for t in server.handlers))
+        self.assertEqual(server.sockets, {})
+        row = server.ledger.snapshot()[0]
+        self.assertTrue(row['kind'] in ('unexpected', 'incomplete') or row['failure'] is not None)
+
+    def test_headers_are_bounded_and_unknown_values_withheld(self):
+        with auth.serve(auth.Case('production', bodies())) as (base, ledger):
+            get(base, f'{auth.BASE_PATH}noble/InRelease', headers={'X-Test': 'synthetic-SENTINEL'})
+            get(base, f'{auth.BASE_PATH}noble/InRelease',
+                headers={'User-Agent': 'Debian APT-HTTP/' + '1' * 200 + ' (2.8.3)'})
+        rows = ledger.snapshot()
+        row = rows[0]
+        self.assertEqual(row['kind'], 'unexpected')
+        self.assertIn(['<other>', '<redacted>'], row['headers'])
+        self.assertNotIn('SENTINEL', json.dumps(row))
+        self.assertTrue(row['completed'])
+        self.assertEqual(rows[1]['kind'], 'unexpected')
+        self.assertTrue(all(len(value) <= 128 for row in rows for _, value in row['headers']))
 
 
 class ClassifierTests(unittest.TestCase):
@@ -213,8 +353,9 @@ class ClassifierTests(unittest.TestCase):
 
     def test_positive_requires_all_evidence(self):
         rows = self.positive_rows()
-        result = auth.classify_positive(100, self.GOOD, rows, self.intact)
-        self.assertEqual(set(result['index_requests_after_release']), set(auth.SUITES))
+        # Global tokens and request order are specifically NOT native correlation.
+        with self.assertRaisesRegex(AssertionError, 'UNQUALIFIED'):
+            auth.classify_positive(100, self.GOOD, rows, self.intact)
         bad = {
             'update succeeded': (0, self.GOOD, rows),
             'no pubkey': (100, self.GOOD + NO_PUBKEY, rows),
@@ -236,12 +377,19 @@ class ClassifierTests(unittest.TestCase):
         auth.classify_empty_key(100, NO_PUBKEY, rows, self.intact)
         bad = {
             'success': (0, NO_PUBKEY, rows),
+            'non-native exit': ('failure', NO_PUBKEY, rows),
             'transport': (100, b'Err 502  Bad Gateway\n', rows),
             'mixed bad signature': (100, NO_PUBKEY + BAD, rows),
             'extra request': (100, NO_PUBKEY, rows + [index(9, 'noble')]),
             'two releases': (100, NO_PUBKEY, rows[:2]),
             'mixed transport': (100, NO_PUBKEY, [dict(rows[0], status=503, kind='release-transport')] + rows[1:]),
             'tampered bytes': (100, NO_PUBKEY, self.releases(self.tampered)),
+            'all 200 but transport bytes': (100, NO_PUBKEY + b'503 Service Unavailable', rows),
+            'all 200 but timeout bytes': (100, NO_PUBKEY + b'Connection timed out', rows),
+            'incomplete write': (100, NO_PUBKEY, [dict(rows[0], completed=False)] + rows[1:]),
+            'failed write': (100, NO_PUBKEY, [dict(rows[0], failure='write-failed')] + rows[1:]),
+            'wrong completed hash': (100, NO_PUBKEY, [dict(rows[0], completed_sha256='0' * 64)] + rows[1:]),
+            'short completed body': (100, NO_PUBKEY, [dict(rows[0], completed_bytes=1)] + rows[1:]),
         }
         for name, (code, output, data) in bad.items():
             with self.subTest(name), self.assertRaises(AssertionError):
@@ -257,6 +405,8 @@ class ClassifierTests(unittest.TestCase):
             'unrelated': (100, b'something\n', rows),
             'intact delivered': (100, BAD, self.releases(self.intact)),
             'extra request': (100, BAD, rows + [index(9, 'noble')]),
+            'transport mixed': (100, BAD + b'502 Bad Gateway', rows),
+            'ambiguous good signature': (100, BAD + b'GOODSIG\nVALIDSIG', rows),
         }
         for name, (code, output, data) in bad.items():
             with self.subTest(name), self.assertRaises(AssertionError):
@@ -274,6 +424,7 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(auth.classify_transport(status, 100, output, rows, 2)['attempts_per_suite'], 2)
             for name, (code, out, data) in {
                     'signature proof': (100, NO_PUBKEY, rows),
+                    'non-native exit': ('failure', output, rows),
                     'success': (0, output, rows),
                     'fewer attempts': (100, output, rows[:-1]),
                     'wrong status': (100, output, [dict(r, status=500) for r in rows]),
@@ -331,10 +482,28 @@ class RunCaseTests(unittest.TestCase):
         self.assertEqual([a for a in captured[1] if a.startswith('Debug::')], [])
 
     def test_runner_failure_still_cleans_owned_resources(self):
+        captured = io.StringIO()
         def fake(args, seconds, limit=0, env=None, on_start=None):
+            source = Path(next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist=')))
+            base = re.search(r'(http://127\.0\.0\.1:\d+)/ubuntu', source.read_text()).group(1)
+            get(base, f'{auth.BASE_PATH}noble/InRelease')
             raise Refusal('command timeout')
-        with self.assertRaisesRegex(Refusal, 'timeout'):
+        with contextlib.redirect_stdout(captured), self.assertRaisesRegex(Refusal, 'timeout'):
             auth.run_case('x', auth.Case('production', bodies()), self.module(), fake, self.Owner)
+        report = json.loads(captured.getvalue())
+        self.assertEqual(len(report['ledger']), 1)
+        row = report['ledger'][0]
+        self.assertTrue(row['completed'])
+        self.assertEqual(row['completed_sha256'], hashlib.sha256(bodies()['noble']).hexdigest())
+        self.assertEqual(len(row['sha256']), 64)
+        self.assertTrue(report['server_write_is_not_client_receipt'])
+
+    def test_public_diagnostics_retains_bounded_safe_capture_not_only_tail(self):
+        output = b'first\n' + b'native evidence\n' * 100 + b'last\n'
+        self.assertEqual(auth.public_diagnostics(output), output.decode())
+        self.assertEqual(auth.public_diagnostics(b'Authorization: synthetic-SENTINEL\nsafe\x00bad\nsafe\n'),
+                         'safe\n')
+        self.assertEqual(auth.public_diagnostics(b'x' * (auth.OUTPUT_LIMIT + 1)), '<unavailable>')
 
 
 class ControlsOrderingTests(unittest.TestCase):
@@ -367,7 +536,9 @@ class ControlsOrderingTests(unittest.TestCase):
             order.append(name)
             code, output, rows = rows_for(name)
             return code, output, rows, 0.1
-        with patch.object(auth, 'run_case', fake_run_case):
+        # This mock tests orchestration only, never a fabricated native parser pass.
+        with patch.object(auth, 'run_case', fake_run_case), \
+             patch.object(auth, 'classify_positive', return_value={'orchestration_only': True}):
             report = auth.controls({}, data, 2)
         self.assertEqual(order, ['positive', 'empty_key', 'tampered_valid_key', 'persistent_502', 'persistent_503'])
         self.assertEqual(list(report), order)
@@ -384,7 +555,7 @@ class ControlsOrderingTests(unittest.TestCase):
 class LauncherTests(unittest.TestCase):
     SCRIPT = HERE / 'test-qemu.sh'
 
-    def run_harness(self, mode, fail_auth=False):
+    def run_harness(self, mode, fail_auth=False, auth_only=False):
         fake_source = ownership.FAKE_DOCKER.replace("elif a[0] == 'start':", "elif a[0] == 'cp':\n    pass\nelif a[0] == 'start':")
         if fail_auth:
             fake_source = fake_source.replace(
@@ -398,9 +569,33 @@ class LauncherTests(unittest.TestCase):
             fake.chmod(0o755)
             state_path = root / 'state.json'
             state_path.write_text(json.dumps({'containers': {}, 'images': {}, 'calls': []}))
+            host_config = root / 'synthetic-host-config'
+            host_config.mkdir()
+            sentinel_config = '{"proxies":{"default":{"httpProxy":"http://synthetic-SENTINEL.invalid"}}}'
+            (host_config / 'config.json').write_text(sentinel_config)
+            # Test-copy only: fixed absolute fake binary and synthetic environment.
+            # The production launcher has no executable, config or daemon override.
+            script = root / 'test-qemu.sh'
+            source = self.SCRIPT.read_text().replace('[[ -x /usr/bin/docker ]]', 'true')
+            fake_source = fake.read_text().replace(
+                "s['calls'].append(a)",
+                "s['calls'].append(a)\n"
+                "assert os.environ.get('HTTP_PROXY') is None\n"
+                "assert os.environ.get('DOCKER_CONTEXT') is None\n"
+                "assert Path(os.environ['DOCKER_CONFIG'], 'config.json').read_text() == '{}\\n'\n"
+                "assert os.environ['DOCKER_CONFIG'] != os.environ.get('SYNTHETIC_HOST_CONFIG')\n")
+            fake.write_text(fake_source)
+            source = source.replace('/usr/bin/docker --host unix:///var/run/docker.sock',
+                                    f'FAKE_DOCKER_STATE={state_path} FAKE_DOCKER_MODE={mode} {fake}')
+            script.write_text(source)
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
-                       FAKE_DOCKER_STATE=str(state_path), FAKE_DOCKER_MODE=mode)
-            result = subprocess.run(['bash', str(self.SCRIPT)], env=env, capture_output=True, text=True, timeout=10)
+                       FAKE_DOCKER_STATE=str(state_path), FAKE_DOCKER_MODE=mode,
+                       DOCKER_CONFIG=str(root / 'synthetic-host-config'), DOCKER_CONTEXT='SENTINEL',
+                       HTTP_PROXY='http://synthetic-SENTINEL.invalid')
+            result = subprocess.run(['bash', str(script)] + (['--auth-only'] if auth_only else []),
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual((host_config / 'config.json').read_text(), sentinel_config)
+            self.assertNotIn('SENTINEL', result.stdout + result.stderr)
             return result, json.loads(state_path.read_text())
 
     def test_one_disconnected_root_auth_container_between_prep_and_runtime(self):
@@ -412,14 +607,34 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(kinds, ['prep', 'auth', 'runtime', 'prep', 'runtime'])
         args = creates[1]
         for flag in ('--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0',
-                     '--memory=768m', '--cpus=1', '--pids-limit=128'):
+                     '--memory=768m', '--cpus=1', '--pids-limit=128', '--init', '--cap-add=KILL'):
             self.assertIn(flag, args)
         for forbidden in ('--privileged', '--read-only'):
             self.assertNotIn(forbidden, args)
         self.assertFalse(any(a.startswith(('--volume', '--mount', '--device', '--network=host', '-v'))
-                             or a == '--init' for a in args))
+                             for a in args))
         self.assertEqual(args[args.index('timeout'):args.index('timeout') + 3], ['timeout', '--kill-after=3s', '150s'])
         self.assertEqual(args[-2:], ['/suite/qemu_auth_control.py', 'run'])
+
+    def test_auth_only_never_invokes_qemu_install_or_runtime(self):
+        result, state = self.run_harness('success', auth_only=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        creates = [a for a in state['calls'] if a[0] == 'create']
+        self.assertEqual(len(creates), 2)
+        self.assertNotIn('qemu_container.py', ' '.join(' '.join(a) for a in creates))
+        self.assertIn('ubuntu-keyring', creates[0][-1])
+        self.assertIn('NOT a full-suite result', result.stdout)
+        result, _ = self.run_harness('success', fail_auth=True, auth_only=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('controls qualified', result.stdout)
+
+    def test_fixed_docker_client_prerequisites_have_no_host_config_or_endpoint_override(self):
+        text = self.SCRIPT.read_text()
+        self.assertIn('/usr/bin/env -i', text)
+        self.assertIn('/usr/bin/docker --host unix:///var/run/docker.sock', text)
+        self.assertIn('PATH=/usr/sbin:/usr/bin:/sbin:/bin', text)
+        self.assertNotIn('${DOCKER_CONFIG', text)
+        self.assertNotIn('${DOCKER_HOST', text)
 
     def test_auth_failure_fails_suite_and_removes_owned_resources(self):
         result, state = self.run_harness('success', fail_auth=True)
