@@ -51,7 +51,7 @@ finish() {
     failed=1; diag create-commit-uncertain 0 outstanding
   fi
   for name in "$runtime" "$prep"; do
-    case $name in "$runtime") stage=runtime-container ;; *) stage=prep-container ;; esac
+    case $name in "$runtime") stage="runtime-container" ;; *) stage="prep-container" ;; esac
     rc=0; object=$(containers "$name") || rc=$?
     if ((rc)); then failed=1; diag "$stage-select" "$rc" "$(failure_outcome "$rc")"; continue; fi
     if [[ -n "$object" ]]; then
