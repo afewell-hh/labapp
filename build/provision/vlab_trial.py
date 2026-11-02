@@ -550,13 +550,9 @@ def installer_body(raw):
             and type(item['nonce']) is str and re.fullmatch(HEX32, item['nonce'])
             and type(item['lease']) is str and re.fullmatch(UUID, item['lease'])
             and type(item['boot']) is str and re.fullmatch(UUID, item['boot']), 'installer evidence refused')
-    require(type(item['captured_at']) is str, 'installer evidence refused')
-    try:
-        stamp(item['captured_at'])
-    except ValueError:
-        raise Failure('installer evidence refused') from None
-    require(type(item['outcome']) is str and item['outcome'] in ('child-exit', 'child-signal')
-            and exact_int(item['status']) and child_status_ok(item['outcome'], item['status']),
+    require(exact_int(item['captured_at']), 'installer evidence refused')
+    require(type(item['outcome']) is str and item['outcome'] in ('exit', 'signal')
+            and exact_int(item['status']) and child_status_ok('child-' + item['outcome'], item['status']),
             'installer evidence refused')
     counts = [item[k] for k in ('observed', 'kept_head', 'kept_tail', 'omitted')]
     require(all(exact_int(c) and c >= 0 for c in counts), 'installer evidence refused')
@@ -565,7 +561,7 @@ def installer_body(raw):
     require(len(head) == kept_head and len(tail) == kept_tail and observed == kept_head + kept_tail + omitted
             and observed <= INSTALLER_OBSERVED_LIMIT and type(item['output_status']) is str, 'installer evidence refused')
     if observed == 0:
-        shape = ('ok', 0, 0, 0)
+        shape = ('empty', 0, 0, 0)
     elif observed <= INSTALLER_WHOLE:
         shape = ('ok', observed, 0, 0)
     else:
@@ -583,7 +579,7 @@ def installer_bound(item, value, boot, outcome=None, status=None):
     require(item['source_sha'] == value['source_sha'] and item['nonce'] == value['nonce']
             and item['lease'] == value['lease'] and item['boot'] == boot == value['boot_uuid'],
             'installer evidence binding refused')
-    captured = stamp(item['captured_at'])
+    captured = item['captured_at']
     require(stamp(value['admitted_at']) <= captured < phase_end(value, 'stage'), 'installer evidence time refused')
     if outcome is not None:
         require(item['outcome'] == outcome and item['status'] == status and exact_int(status),
@@ -594,7 +590,8 @@ def installer_bound(item, value, boot, outcome=None, status=None):
 def installer_envelope(value, boot, detail):
     return {'schema': INSTALLER_ENVELOPE_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
             'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
-            'operation': INSTALLER_OPERATION, 'outcome': detail['category'], 'status': detail['child_status']}
+            'operation': INSTALLER_OPERATION, 'outcome': detail['category'].removeprefix('child-'),
+            'status': detail['child_status']}
 
 
 def installer_record(value, boot, code, out, now):
@@ -603,15 +600,15 @@ def installer_record(value, boot, code, out, now):
             'installer evidence refused')
     observed = len(out)
     if observed <= INSTALLER_WHOLE:
-        head, tail, omitted, status = out, b'', 0, 'ok'
+        head, tail, omitted, status = out, b'', 0, 'ok' if observed else 'empty'
     else:
         head, tail = out[:INSTALLER_HEAD], out[-INSTALLER_TAIL:]
         omitted, status = observed - INSTALLER_WHOLE, 'truncated'
     body = {'schema': INSTALLER_SCHEMA, 'kind': 'installer', 'source_sha': value['source_sha'],
             'nonce': value['nonce'], 'lease': value['lease'], 'boot': boot, 'phase': 'stage',
             'operation': INSTALLER_OPERATION,
-            'captured_at': datetime.fromtimestamp(now, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'outcome': 'child-exit' if code > 0 else 'child-signal', 'status': code,
+            'captured_at': int(now),
+            'outcome': 'exit' if code > 0 else 'signal', 'status': code,
             'observed': observed, 'kept_head': len(head), 'kept_tail': len(tail), 'omitted': omitted,
             'output_status': status, 'head': base64.b64encode(head).decode(),
             'tail': base64.b64encode(tail).decode()}
@@ -1328,7 +1325,7 @@ def export_installer(value, nonce, detail):
     except FileNotFoundError:
         return b'absent'
     envelope = installer_envelope(value, boot, detail)
-    item = installer_bound(installer_body(raw), value, boot, detail['category'], detail['child_status'])
+    item = installer_bound(installer_body(raw), value, boot, detail['category'].removeprefix('child-'), detail['child_status'])
     require(time.time() < stamp(value['deadline']), 'installer export after original deadline')
     require({k: item[k] for k in INSTALLER_ENVELOPE_FIELDS - {'schema'}} == {k: v for k, v in envelope.items()
                                                                               if k != 'schema'})

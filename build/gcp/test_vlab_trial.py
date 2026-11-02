@@ -2100,7 +2100,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual(envelope, {
                     'schema': 2, 'kind': 'installer', 'source_sha': 'a' * 40, 'nonce': self.nonce,
                     'lease': snap['request_id'], 'boot': self.boot_uuid, 'phase': 'stage',
-                    'operation': 'install-docker', 'outcome': 'child-exit', 'status': code})
+                    'operation': 'install-docker', 'outcome': 'exit', 'status': code})
                 args, installer = self.installer_args(snap, terminal)
                 self.assertEqual(host.accept_failure(raw, *args, installer), ('captured', raw))
                 private = self.directory / 'private'
@@ -2130,9 +2130,32 @@ class GuestDiagnostics(unittest.TestCase):
         raw, snap, terminal = self.installer_export(b'S' * (guest.INSTALLER_WHOLE + 1), -9)
         body = json.loads(raw.partition(b'\n')[2])
         self.assertEqual((body['outcome'], body['status'], body['output_status'], body['omitted'],
-                          body['kept_head'], body['kept_tail']), ('child-signal', -9, 'truncated', 1, 1024, 12288))
+                          body['kept_head'], body['kept_tail']), ('signal', -9, 'truncated', 1, 1024, 12288))
         args, installer = self.installer_args(snap, terminal)
         self.assertEqual(host.accept_failure(raw, *args, installer)[0], 'captured')
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        calls = []
+        class Master:
+            def remote(self, argv, phase, cap=30, cleanup=False, until=None, limit=65536):
+                calls.append((list(argv), phase, cap, cleanup, until, limit))
+                return raw
+        uncertain = threading.Event()
+        clock = guest.Clock({'admitted_at': snap['reserved_at'], 'deadline': snap['deadline']})
+        with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')), \
+             patch.object(host.owned_process, 'monotonic', return_value=100), \
+             patch.object(clock, 'cleanup_remaining', return_value=100):
+            status = host.extract_failure(Master(), clock, self.nonce, snap, self.boot_uuid, private,
+                                          snap['request_id'], uncertain, 'installer', installer)
+        self.assertEqual(status, 'captured')
+        self.assertFalse(uncertain.is_set())
+        self.assertEqual(calls, [(host.export_command(self.nonce), 'persistence', host.EXPORT_CAP_SECONDS,
+                                 True, 100 + host.EXPORT_CAP_SECONDS, host.EXPORT_READ_LIMIT)])
+        kept = list(private.iterdir())
+        self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
+        self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode), kept[0].stat().st_nlink,
+                          kept[0].stat().st_uid), (raw, 0o600, 1, os.geteuid()))
+        self.assertEqual(terminal, worker_detail('child-signal', -9, **self.INSTALLER))
 
     def test_installer_acceptance_rejects_every_host_binding_and_shape_mismatch(self):
         raw, snap, terminal = self.installer_export()
@@ -2149,14 +2172,18 @@ class GuestDiagnostics(unittest.TestCase):
             'foreign boot': self.remade(raw, **both(boot='33333333-3333-4333-8333-333333333333')),
             'other operation': self.remade(raw, **both(operation='install-hhfab')),
             'other phase': self.remade(raw, **both(phase='fresh')),
-            'outcome vs terminal': self.remade(raw, **both(outcome='child-signal', status=-9)),
+            'outcome vs terminal': self.remade(raw, **both(outcome='signal', status=-9)),
             'status vs terminal': self.remade(raw, **both(status=18)),
             'envelope only differs': self.remade(raw, envelope=put(lease='22222222-2222-4222-8222-222222222222')),
             'body only differs': self.remade(raw, body=put(nonce='9' * 32)),
             'body status only differs': self.remade(raw, body=put(status=18)),
-            'captured before admission': self.remade(raw, body=put(captured_at=stamp(admitted - 5))),
-            'captured at stage cutoff': self.remade(raw, body=put(captured_at=stamp(admitted + 35 * 60))),
-            'captured long after': self.remade(raw, body=put(captured_at=stamp(admitted + 3600))),
+            'captured before admission': self.remade(raw, body=put(captured_at=int(admitted - 5))),
+            'captured at stage cutoff': self.remade(raw, body=put(captured_at=int(admitted + 35 * 60))),
+            'captured long after': self.remade(raw, body=put(captured_at=int(admitted + 3600))),
+            'captured bool': self.remade(raw, body=put(captured_at=True)),
+            'captured float': self.remade(raw, body=put(captured_at=admitted)),
+            'captured UTC': self.remade(raw, body=put(captured_at=snap['reserved_at'])),
+            'legacy public outcome': self.remade(raw, **both(outcome='child-exit')),
             'captured malformed': self.remade(raw, body=put(captured_at='2026-01-01 00:00:00')),
             'envelope schema 1': self.remade(raw, envelope=put(schema=1)),
             'envelope bool schema': self.remade(raw, envelope=put(schema=True)),

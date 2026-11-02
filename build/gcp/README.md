@@ -1627,8 +1627,11 @@ headers. In that mode the guest independently re-validates the terminal result a
 returns `<schema-2 envelope>\n<exact record bytes>` (or `absent`); no core bundle is read
 and no query subprocess runs, so there is no `query_cleanup` to fabricate. The host
 requires the envelope to equal its own source SHA, nonce, lease, initial boot UUID,
-`stage`/`install-docker` and the terminal outcome/status, the body to agree with it,
-and `captured_at` to lie in `[snapshot.reserved_at, reserved_at + PHASES['stage'])`.
+`stage`/`install-docker` and the terminal outcome/status (`exit`/`signal`, mapped from
+the unchanged public `child-exit`/`child-signal` categories), the body to agree with it,
+and integer Unix-seconds `captured_at` (never bool) to lie in
+`[snapshot.reserved_at, reserved_at + PHASES['stage'])`. Zero output requires
+`output_status='empty'` with empty head/tail and every byte count zero.
 Cross-kind, schema-1/3, extra, duplicate, wrongly typed, bool or oversize input is
 `invalid`. The budgets (15 s cap, 12 s teardown reserve, 6 s minimum, absolute `until`,
 `cleanup=True`), the master close, receipt schema and `private_diagnostic` values are

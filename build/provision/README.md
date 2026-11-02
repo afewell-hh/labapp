@@ -2160,9 +2160,10 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   overwrite) and unlink of the temp; `regular()` later requires owner root, mode 0600,
   one link and a stable descriptor. Exact fields: `schema` 1, `kind` `installer`,
   `source_sha`, `nonce`, `lease`, `boot`, `phase` `stage`, `operation` `install-docker`,
-  `captured_at`, `outcome` (`child-exit` status 1..255 / `child-signal` -64..-1), `status`,
+  `captured_at` (integer Unix seconds, never bool), `outcome` (`exit` status 1..255 /
+  `signal` -64..-1), `status`,
   `observed`, `kept_head`, `kept_tail`, `omitted`, `output_status`, `head`, `tail`
-  (canonical base64). Output N: 0 → empty/zero/`ok`; 1..13312 → whole in `head`,
+  (canonical base64). Output N: 0 → empty/zero/`empty`; 1..13312 → whole in `head`,
   `ok`; 13313..1048576 → first 1024 + last 12288 bytes, `omitted` = N-13312,
   `truncated`; `observed` = kept_head + kept_tail + omitted; body at most 20480 bytes.
   Raw bytes are never decoded, repr'd or truncated again. The capture needs

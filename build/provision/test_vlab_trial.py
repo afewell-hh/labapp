@@ -1,7 +1,8 @@
 """Fixed shared trial entrypoints, public temp files and fail-closed spies only.
 
-No real package/systemd/hhfab/QEMU/sudo/network/process invocation. Production
-paths are patched before mutating entrypoints. The only credential fixtures are the
+No real package/systemd/hhfab/QEMU/sudo/network invocation. Installer evidence
+controls launch only stdlib fixture children. Production paths are patched before
+mutating entrypoints. The only credential fixtures are the
 synthetic non-deployable canaries of the #378 transient-registry-auth tests.
 """
 import base64
@@ -1875,6 +1876,52 @@ class SharedTrial(unittest.TestCase):
                 again, status = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
                 self.assertEqual((again.code, again.category, again.child_status), primary)
                 self.assertEqual(status, baseline)  # public worker status identical to the no-capture baseline
+
+    def test_real_installer_writer_io_faults_through_docker_worker_hook_preserve_primary_and_status(self):
+        # Inject only while the real Docker capture runs: checkpoints/terminal status stay real.
+        original_capture, original_child = trial.capture_installer_failure, trial.child_failure
+        real_write, real_close = os.write, os.close
+        with patch.object(trial, 'capture_installer_failure', return_value=None):
+            _, baseline = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+        for fault in ('open', 'partial-write', 'fsync', 'link', 'close'):
+            with self.subTest(fault=fault):
+                built, attempted, writes = [], [], []
+                def make(code, message):
+                    built.append(original_child(code, message))
+                    return built[-1]
+                def fail(*args, **kwargs):
+                    attempted.append(fault)
+                    raise OSError(SENTINEL)
+                def partial(fd, view):
+                    writes.append(fd)
+                    if len(writes) == 1:
+                        return real_write(fd, bytes(view[:5]))
+                    return fail()
+                def closing(fd):
+                    real_close(fd)
+                    return fail()
+                def capture(v, clock, code, out):
+                    with ExitStack() as local:
+                        # run_worker models root; this private filesystem fixture belongs to its test uid.
+                        local.enter_context(patch.object(os, 'geteuid', return_value=os.getuid()))
+                        local.enter_context(patch.object(trial, 'kernel_boot', return_value=v['boot_uuid']))
+                        name = {'open': 'open', 'partial-write': 'write', 'fsync': 'fsync',
+                                'link': 'link', 'close': 'close'}[fault]
+                        local.enter_context(patch.object(os, name, side_effect=(
+                            partial if fault == 'partial-write' else closing if fault == 'close' else fail)))
+                        original_capture(v, clock, code, out)
+                with patch.object(trial, 'child_failure', side_effect=make), \
+                     patch.object(trial, 'capture_installer_failure', side_effect=capture):
+                    error, status = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+                self.assertEqual(attempted, [fault])  # reached the actual writer, not a preflight refusal
+                self.assertEqual(len(built), 1)
+                self.assertIs(error, built[0])
+                self.assertIsNone(error.__context__)
+                self.assertEqual((str(error), error.code, error.category, error.child_status),
+                                 ('fixed child failed', 17, 'child-exit', 17))
+                self.assertEqual(status, baseline)
+                self.assertFalse((self.root / trial.INSTALLER_FAILURE).exists())
+                self.assertFalse((self.root / (trial.INSTALLER_FAILURE + '.new')).exists())
 
     def test_worker_claim_collision_and_binding_failure_never_replace_incumbent_checkpoint(self):
         self.worker_inputs()
@@ -3752,7 +3799,7 @@ class InstallerFailureEvidence(unittest.TestCase):
 
     def test_byte_shapes_and_caps_at_every_boundary(self):
         pattern = b'\x00\xffAB\n'
-        for size, shape in ((0, ('ok', 0, 0, 0)), (1, ('ok', 1, 0, 0)), (13312, ('ok', 13312, 0, 0)),
+        for size, shape in ((0, ('empty', 0, 0, 0)), (1, ('ok', 1, 0, 0)), (13312, ('ok', 13312, 0, 0)),
                             (13313, ('truncated', 1024, 12288, 1)),
                             (1048576, ('truncated', 1024, 12288, 1048576 - 13312))):
             with self.subTest(size=size):
@@ -3761,6 +3808,8 @@ class InstallerFailureEvidence(unittest.TestCase):
                 item = trial.installer_body(raw)
                 self.assertEqual((item['output_status'], item['kept_head'], item['kept_tail'], item['omitted']), shape)
                 self.assertEqual(item['observed'], size)
+                self.assertIs(type(item['captured_at']), int)
+                self.assertEqual(item['outcome'], 'exit')
                 self.assertEqual(item['observed'], item['kept_head'] + item['kept_tail'] + item['omitted'])
                 self.assertLessEqual(len(raw), trial.INSTALLER_LIMIT)
                 self.assertEqual(base64.b64decode(item['head']), out[:item['kept_head']])
@@ -3783,8 +3832,10 @@ class InstallerFailureEvidence(unittest.TestCase):
             'phase': dict(good, phase='fresh'), 'operation': dict(good, operation='install-hhfab'),
             'short source': dict(good, source_sha='c' * 39), 'upper nonce': dict(good, nonce='A' * 32),
             'lease': dict(good, lease='x'), 'boot': dict(good, boot=None), 'captured fmt': dict(good, captured_at='x'),
-            'captured type': dict(good, captured_at=1), 'outcome': dict(good, outcome='child-timeout'),
-            'outcome vs status': dict(good, outcome='child-signal'), 'status zero': dict(good, status=0),
+            'captured UTC': dict(good, captured_at=self.v['admitted_at']),
+            'captured bool': dict(good, captured_at=True), 'captured float': dict(good, captured_at=1.0),
+            'outcome': dict(good, outcome='child-timeout'),
+            'outcome vs status': dict(good, outcome='signal'), 'status zero': dict(good, status=0),
             'status bool': dict(good, status=True), 'status 256': dict(good, status=256),
             'status float': dict(good, status=1.0), 'float count': dict(good, observed=3.0),
             'bool count': dict(good, kept_tail=False), 'negative omitted': dict(good, omitted=-1),
@@ -3807,8 +3858,14 @@ class InstallerFailureEvidence(unittest.TestCase):
             with self.subTest(name), self.assertRaises(trial.Failure):
                 trial.installer_body(raw)
         zero = json.loads(self.record(b''))
-        self.assertEqual((zero['output_status'], zero['head'], zero['tail'], zero['observed']), ('ok', '', '', 0))
+        self.assertEqual((zero['output_status'], zero['head'], zero['tail'], zero['observed']), ('empty', '', '', 0))
         self.assertEqual(trial.installer_body(trial.encoded(zero))['observed'], 0)
+        for wrong_status in ('ok', 'truncated'):
+            with self.subTest(empty_status=wrong_status), self.assertRaises(trial.Failure):
+                trial.installer_body(trial.encoded(dict(zero, output_status=wrong_status)))
+        for legacy in ('child-exit', 'child-signal'):
+            with self.subTest(legacy_outcome=legacy), self.assertRaises(trial.Failure):
+                trial.installer_body(trial.encoded(dict(good, outcome=legacy)))
 
     def test_binding_and_time_window_use_contract_boot_and_absolute_stage_bounds(self):
         item = trial.installer_body(self.record())
@@ -3827,7 +3884,7 @@ class InstallerFailureEvidence(unittest.TestCase):
         self.record(now=admitted)
         self.record(now=admitted + 35 * 60 - 1)
         with self.assertRaises(trial.Failure):
-            trial.installer_bound(item, self.v, self.v['boot_uuid'], 'child-signal', -9)
+            trial.installer_bound(item, self.v, self.v['boot_uuid'], 'signal', -9)
 
     def test_hook_receives_only_a_returned_nonzero_tuple_never_launch_or_cleanup_exceptions(self):
         seen = []
@@ -3903,7 +3960,7 @@ class InstallerFailureEvidence(unittest.TestCase):
                 self.assertFalse(self.temp.exists())
                 item = trial.installer_body(self.final.read_bytes())
                 self.assertEqual((item['outcome'], item['status'], item['source_sha'], item['nonce'], item['lease'],
-                                  item['boot']), (outcome, status, self.v['source_sha'], NONCE, self.v['lease'],
+                                  item['boot']), (outcome.removeprefix('child-'), status, self.v['source_sha'], NONCE, self.v['lease'],
                                                   self.v['boot_uuid']))
                 head, tail = base64.b64decode(item['head']), base64.b64decode(item['tail'])
                 if expected is None:
@@ -3915,6 +3972,76 @@ class InstallerFailureEvidence(unittest.TestCase):
                     self.assertEqual((item['output_status'], item['observed'], head, tail, item['omitted']),
                                      ('truncated', len(expected), expected[:1024], expected[-12288:],
                                       len(expected) - 13312))
+
+    def test_launched_installer_style_preflight_refusal_stderr_is_captured(self):
+        # Stdlib-only CLI mirrors install-docker's Refusal handler; no package code executes.
+        program = ("import sys\nclass Refusal(Exception): pass\n"
+                   "def preflight(): raise Refusal('fixture preflight refused')\n"
+                   "try: preflight()\nexcept Refusal as exc:\n"
+                   " sys.stderr.write('docker install: ' + str(exc) + '\\n'); sys.exit(1)\n")
+        hook = lambda code, out: trial.capture_installer_failure(self.v, self.clock, code, out)
+        with self.assertRaises(trial.Failure) as raised:
+            trial.run([sys.executable, '-c', program], self.clock, 'stage', 30, on_failure=hook)
+        self.assertEqual((raised.exception.category, raised.exception.child_status), ('child-exit', 1))
+        item = trial.installer_body(self.final.read_bytes())
+        self.assertEqual((item['outcome'], item['status']), ('exit', 1))
+        self.assertEqual(base64.b64decode(item['head']), b'docker install: fixture preflight refused\n')
+        self.assertEqual((item['tail'], item['omitted']), ('', 0))
+
+    def test_installer_writer_and_exporter_refuse_wrong_owner_root_and_record(self):
+        self.terminal()
+        raw = self.record(b'native', 17)
+        original_lstat = Path.lstat
+        def foreign_root(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if path == self.root:
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1)
+            return info
+        with patch.object(Path, 'lstat', foreign_root):
+            with self.assertRaises(trial.Failure):
+                trial.write_installer_failure(raw, self.clock)
+            with self.assertRaises(trial.Failure):
+                trial.export_failure(NONCE)
+        self.assertFalse(self.final.exists() or self.temp.exists())
+        trial.write_installer_failure(raw, self.clock)
+        original_fstat = os.fstat
+        inode = self.final.stat().st_ino
+        seen = []
+        def foreign_record(fd):
+            info = original_fstat(fd)
+            if info.st_ino == inode:
+                seen.append(fd)
+                return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink,
+                                       st_size=info.st_size, st_uid=os.geteuid() + 1)
+            return info
+        with patch.object(os, 'fstat', side_effect=foreign_record), \
+             patch.object(trial, 'regular', side_effect=lambda p, n, uid=None, mode=None:
+                          REAL_REGULAR(p, n, os.geteuid() if p == self.final else None, mode)), \
+             self.assertRaises(trial.Failure):
+            trial.export_failure(NONCE)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(self.final.read_bytes(), raw)
+        self.assertFalse(self.temp.exists())
+
+    def test_installer_exporter_refuses_replaced_and_changed_open_descriptors_without_retry(self):
+        self.terminal()
+        raw = self.record(b'native', 17)
+        for action in ('replace', 'append'):
+            with self.subTest(action=action):
+                self.final.unlink(missing_ok=True)
+                trial.write_installer_failure(raw, self.clock)
+                with ExitStack() as local:
+                    tap = DescriptorTap(self.root, trial.INSTALLER_FAILURE, json.loads(raw), action=action).install(local)
+                    with self.assertRaises(trial.Failure):
+                        trial.export_failure(NONCE)
+                self.assertEqual((tap.opened, tap.calls), (1, 2))  # strict immutable reader never recovers
+                self.assertTrue(tap.changed())
+                self.assertFalse(self.temp.exists())
+                if action == 'replace':
+                    self.assertIn((trial.INSTALLER_FAILURE + '.next', trial.INSTALLER_FAILURE), tap.replaced)
+                    self.assertEqual(self.final.read_bytes(), raw)
+                else:
+                    self.assertEqual(self.final.read_bytes(), raw + b' ')
 
     def test_writer_first_record_wins_with_owner_mode_single_link_and_no_leftovers(self):
         first, second = self.record(b'one'), self.record(b'two')
@@ -4008,13 +4135,13 @@ class InstallerFailureEvidence(unittest.TestCase):
         self.assertEqual(json.loads(first), {
             'schema': 2, 'kind': 'installer', 'source_sha': self.v['source_sha'], 'nonce': NONCE,
             'lease': self.v['lease'], 'boot': self.v['boot_uuid'], 'phase': 'stage', 'operation': 'install-docker',
-            'outcome': detail['category'], 'status': detail['child_status']})
+            'outcome': 'exit', 'status': detail['child_status']})
         self.assertEqual(rest, self.final.read_bytes())
         self.assertEqual(trial.installer_body(rest)['status'], 17)
         self.terminal('child-signal', -9)
         self.final.unlink()
         trial.capture_installer_failure(self.v, self.clock, -9, b'')
-        self.assertEqual(json.loads(trial.export_failure(NONCE).partition(b'\n')[0])['outcome'], 'child-signal')
+        self.assertEqual(json.loads(trial.export_failure(NONCE).partition(b'\n')[0])['outcome'], 'signal')
 
     def test_exporter_refuses_every_mismatched_unsafe_or_stale_record(self):
         self.terminal()
@@ -4022,14 +4149,13 @@ class InstallerFailureEvidence(unittest.TestCase):
         admitted = trial.stamp(self.v['admitted_at'])
         def edited(**changes):
             return trial.encoded(dict(json.loads(self.record(b'native')), **changes))
-        stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         good = self.record(b'native')
         cases = {
             'foreign nonce': edited(nonce='9' * 32), 'foreign source': edited(source_sha='d' * 40),
             'foreign lease': edited(lease=other), 'foreign boot': edited(boot=other),
-            'status vs terminal': edited(status=18), 'outcome vs terminal': edited(outcome='child-signal', status=-9),
-            'captured before admission': edited(captured_at=stamp(admitted - 5)),
-            'captured at stage cutoff': edited(captured_at=stamp(admitted + 35 * 60)),
+            'status vs terminal': edited(status=18), 'outcome vs terminal': edited(outcome='signal', status=-9),
+            'captured before admission': edited(captured_at=int(admitted - 5)),
+            'captured at stage cutoff': edited(captured_at=int(admitted + 35 * 60)),
             'extra field': edited(extra=1), 'bool schema': edited(schema=True),
             'cross kind': edited(kind='first-failure'), 'truncated file': good[:-1], 'empty file': b'',
             'oversize file': good + b' ' * trial.INSTALLER_LIMIT, 'legacy bundle name content': b'{}',
@@ -4043,9 +4169,10 @@ class InstallerFailureEvidence(unittest.TestCase):
                     trial.export_failure(NONCE)
         for name in ('wide mode', 'hard link', 'symlink', 'directory'):
             with self.subTest(name):
-                self.final.unlink(missing_ok=True)
-                if self.final.is_dir():
+                if self.final.is_dir() and not self.final.is_symlink():
                     self.final.rmdir()
+                else:
+                    self.final.unlink(missing_ok=True)
                 extra = self.base / 'extra'
                 extra.unlink(missing_ok=True)
                 if name == 'symlink':
@@ -4061,7 +4188,7 @@ class InstallerFailureEvidence(unittest.TestCase):
                         os.link(self.final, extra)
                 with self.assertRaises((trial.Failure, OSError)):
                     trial.export_failure(NONCE)
-        self.final.unlink(missing_ok=True)
+        self.final.rmdir()  # the last unsafe fixture is a directory
         extra = self.base / 'extra'
         self.final.write_bytes(good)
         self.final.chmod(0o600)
