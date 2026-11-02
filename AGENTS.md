@@ -30,6 +30,13 @@ Codex does not document an import mechanism, so this file uses plain links;
   current status, the CI baseline and known gaps. Do not add plan or status files.
 - **Hedgehog docs:** https://docs.hedgehog.cloud/latest/vlab/overview/
 
+## Lead takeover or crash recovery
+
+A replacement lead starts with this file and
+[Lead takeover and crash recovery](docs/contributing/agent-workflow.md#lead-takeover-and-crash-recovery),
+then finds the handover hub #476 and parent #145 on GitHub. Current facts live
+there, not in the repo.
+
 ## Read before editing
 
 1. Your task issue and cited sources, using the shared workflow’s scoped parent-reading rules; newer lead comments supersede.

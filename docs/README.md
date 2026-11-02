@@ -5,7 +5,7 @@
 | [`../README.md`](../README.md) | Everyone | Project overview |
 | [`../STUDENT_QUICK_START.md`](../STUDENT_QUICK_START.md) | Students | Using the lab VM |
 | [`VAIDC_COURSE_CREATOR_GUIDE.md`](VAIDC_COURSE_CREATOR_GUIDE.md) | Course creators | Building courses on the appliance |
-| [`contributing/agent-workflow.md`](contributing/agent-workflow.md) | Agents, contributors | Roles, onboarding, testing, evidence, handoff |
+| [`contributing/agent-workflow.md`](contributing/agent-workflow.md) | Agents, contributors | Roles, onboarding, testing, evidence, handoff, [lead takeover](contributing/agent-workflow.md#lead-takeover-and-crash-recovery) |
 | [`runbooks/gcp-build-access.md`](runbooks/gcp-build-access.md) | Maintainers, lead | Keyless runner access and required VM lifecycle gates |
 | [`runbooks/manual-image-build.md`](runbooks/manual-image-build.md) | Maintainers | Current manual image build and troubleshooting |
 | [`../build/gcp/README.md`](../build/gcp/README.md) | Developers, lead | Access bootstrap, fixed lifecycle runner and offline collector |
