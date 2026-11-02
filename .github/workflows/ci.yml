@@ -22,6 +22,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Required pinned API cleanup diagnostics offline controls
+        run: |
+          timeout --kill-after=1s 15s python3 -I -B - <<'PY'
+          from pathlib import Path
+          import unittest
+          root = Path.cwd()
+          path = root / 'build/provision/test_pinned_api_hosted_cleanup.py'
+          if not path.is_file():
+              raise SystemExit('Required pinned API cleanup controls are missing')
+          loader = unittest.TestLoader()
+          suite = loader.discover(str(path.parent), pattern=path.name)
+          import test_pinned_api_hosted_cleanup as controls
+          assert Path(controls.__file__).resolve() == path.resolve()
+          def ids(node):
+              if isinstance(node, unittest.TestSuite):
+                  return [item for child in node for item in ids(child)]
+              return [node.id()]
+          loaded = ids(suite)
+          required = ids(loader.loadTestsFromTestCase(controls.HostedCleanupDiagnosticsTests))
+          if (len(required) < 11 or len(loaded) != len(set(loaded))
+                  or set(loaded) != set(required)):
+              raise SystemExit('Required cleanup class or unique test coverage missing')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped
+                           and result.testsRun == len(loaded) else 1)
+          PY
       - name: Public preparation then isolated required offline fixture
         # Outer bound dominates phase maxima; reserve 75s for exact cleanup.
         run: timeout --kill-after=75s 23m bash build/provision/fixtures/pinned-api/run-hosted.sh
