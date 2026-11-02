@@ -59,7 +59,11 @@ def get(base, path, method='GET', headers=None):
     host, port = base.removeprefix('http://').split(':')
     conn = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
-        conn.request(method, path, headers=headers or {})
+        # Send only explicit headers; request() injects Content-Length: 0 for POST.
+        conn.putrequest(method, path)
+        for name, value in (headers or {}).items():
+            conn.putheader(name, value)
+        conn.endheaders()
         response = conn.getresponse()
         return response.status, response.read()
     finally:
@@ -178,19 +182,47 @@ class ServerAndLedgerTests(unittest.TestCase):
             self.assertEqual(get(base, path), (200, data['noble']))
             self.assertEqual(get(base, f'{auth.BASE_PATH}noble/main/binary-amd64/Packages.xz')[0], 404)
             self.assertEqual(get(base, '/elsewhere')[0], 404)
-            self.assertEqual(get(base, path, 'POST')[0], 405)
+            self.assertEqual(get(base, path, 'POST'), (405, b''))
             self.assertEqual(get(base, path, headers={'If-Modified-Since': 'x'})[0], 404)
             self.assertEqual(get(base, f'{auth.BASE_PATH}noble/../x')[0], 404)
         rows = ledger.snapshot()
         kinds = [row['kind'] for row in rows]
         self.assertEqual(kinds[:3], ['release', 'index-absence', 'unexpected'])
         self.assertEqual(kinds[3:], ['unexpected'] * 3)
+        self.assertEqual(rows[3]['status'], 405)
+        self.assertNotIn('<other>', [name for name, _ in rows[3]['headers']])
         self.assertEqual(rows[0]['sha256'], hashlib.sha256(data['noble']).hexdigest())
         self.assertEqual(rows[0]['bytes'], len(data['noble']))
         self.assertEqual(rows[0]['completed_sha256'], rows[0]['sha256'])
         self.assertEqual(rows[0]['completed_bytes'], rows[0]['bytes'])
         self.assertLess(rows[0]['admitted_order'], rows[0]['attempt_order'])
         self.assertLess(rows[0]['attempt_order'], rows[0]['complete_order'])
+
+    def test_forbidden_headers_override_method_refusal_and_remain_accounted(self):
+        forbidden = {'Content-Length': '0', 'If-Modified-Since': 'x',
+                     'If-None-Match': '"x"', 'Range': 'bytes=0-1', 'If-Range': 'x'}
+        with auth.serve(auth.Case('production', bodies())) as (base, ledger):
+            path = f'{auth.BASE_PATH}noble/InRelease'
+            for method in ('GET', 'POST'):
+                for name, value in forbidden.items():
+                    with self.subTest(method=method, header=name):
+                        self.assertEqual(get(base, path, method, {name: value}), (404, b''))
+        rows = ledger.snapshot()
+        self.assertEqual(len(rows), 2 * len(forbidden))
+        self.assertEqual([row['method'] for row in rows],
+                         ['GET'] * len(forbidden) + ['POST'] * len(forbidden))
+        for row in rows:
+            self.assertEqual((row['kind'], row['status']), ('unexpected', 404))
+            self.assertIn(['<other>', '<redacted>'], row['headers'])
+            self.assertTrue(row['attempted'])
+            self.assertTrue(row['completed'])
+            self.assertIsNone(row['failure'])
+            self.assertEqual((row['bytes'], row['completed_bytes']), (0, 0))
+            self.assertEqual(row['sha256'], hashlib.sha256(b'').hexdigest())
+            self.assertEqual(row['completed_sha256'], row['sha256'])
+            self.assertLess(row['attempt_order'], row['complete_order'])
+        with self.assertRaisesRegex(AssertionError, 'unexplained request'):
+            auth._no_unexpected(rows)
 
     def test_index_absence_only_when_allowed(self):
         with auth.serve(auth.Case('production', bodies())) as (base, ledger):
