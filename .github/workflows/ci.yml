@@ -41,7 +41,7 @@ jobs:
               return [node.id()]
           loaded = ids(suite)
           required = ids(loader.loadTestsFromTestCase(controls.HostedCleanupDiagnosticsTests))
-          if (len(required) < 11 or len(loaded) != len(set(loaded))
+          if (len(required) < 13 or len(loaded) != len(set(loaded))
                   or set(loaded) != set(required)):
               raise SystemExit('Required cleanup class or unique test coverage missing')
           result = unittest.TextTestRunner(verbosity=2).run(suite)

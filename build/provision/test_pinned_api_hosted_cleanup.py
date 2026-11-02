@@ -7,6 +7,8 @@ the ``docker`` timeout wrapper is replaced; selectors, ID checks, scratch identi
 and exit logic are the production text. A fake plan maps a call key to
 ``rc:N`` (exit status) or ``out:TEXT`` (stdout, ``\\n`` expands to a newline).
 Keys: c-prep-N / c-runtime-N (Nth container ls), rm, i-N (Nth image ls), imgrm.
+The production ``docker()`` dispatcher is tested separately with only ``env`` replaced
+by an argv recorder (no Docker, network or credentials).
 """
 import os
 from pathlib import Path
@@ -268,9 +270,65 @@ class HostedCleanupDiagnosticsTests(unittest.TestCase):
             self.assertRegex(line, allowed)
         self.assertNotIn(CID, result.stderr)
 
+    def test_nonzero_removal_never_succeeds_or_retries_even_when_object_is_absent_after(self):
+        for status in (1, 124, 137):
+            outcome = 'timeout-status' if status in (124, 137) else 'command-failed'
+            for after in ('absent', 'still-present'):
+                with self.subTest(kind='container', status=status, after=after):
+                    plan = 'c-runtime-1=out:%s\nrm=rc:%d' % (CID, status)
+                    if after == 'still-present':
+                        plan += '\nc-runtime-2=out:' + CID
+                    result = self.run_cleanup(plan)
+                    self.assert_unverified(result)
+                    self.assert_stage(result, 'runtime-container-remove', status, outcome)
+                    self.assert_stage(result, 'runtime-container-verify', 0, after)
+                    self.assertNotIn('stage=runtime-container-remove status=0', result.stderr)
+                    self.assertEqual(self.calls(), ['rm ' + CID])
+                    self.scratch.mkdir(mode=0o700, exist_ok=True)
+                with self.subTest(kind='image', status=status, after=after):
+                    plan = 'i-1=out:%s\nimgrm=rc:%d' % (IMG, status)
+                    if after == 'still-present':
+                        plan += '\ni-2=out:' + IMG
+                    result = self.run_cleanup(plan, primary=7)
+                    self.assert_unverified(result, 7)
+                    self.assert_stage(result, 'image-remove', status, outcome)
+                    self.assert_stage(result, 'image-verify', 0, after)
+                    self.assertNotIn('stage=image-remove status=0', result.stderr)
+                    self.assertEqual(self.calls(), ['image rm ' + IMG])
+                    self.scratch.mkdir(mode=0o700, exist_ok=True)
+
+    def dispatch(self, *args):
+        # Production docker() text with only `env` replaced by a recorder, so the real
+        # argv and limit selection run without Docker, timeout, network or credentials.
+        text = SCRIPT.read_text()
+        body = text[text.index('docker() {'):text.index('containers() {')]
+        script = ('set -euo pipefail\nscratch=/SCRATCH\n'
+                  'env() { printf "%s\\0" "$@" > "$REC"; }\n' + body + 'docker "$@"\n')
+        record = self.root / 'dispatch.rec'
+        record.unlink(missing_ok=True)
+        subprocess.run(['bash', '-c', script, 'bash', *args], env={'PATH': os.environ['PATH'], 'REC': str(record),
+                       'AWS_SECRET_ACCESS_KEY': SECRET}, check=True, timeout=10)
+        return record.read_bytes().decode().split('\0')[:-1]
+
+    def test_dispatcher_gives_only_exact_removal_forms_ten_seconds(self):
+        prefix = ['-i', 'HOME=/SCRATCH/home', 'DOCKER_CONFIG=/SCRATCH/home/docker', 'PATH=/usr/bin:/bin', 'timeout']
+        exact = (('rm', '-f', CID), ('image', 'rm', IMG))
+        other = (('container', 'ls', '-aq'), ('image', 'ls', '-q'), ('inspect', CID), ('rm', CID), ('rm', '-f', 'x' * 64),
+                 ('rm', '-f', CID[:63]), ('rm', '-f', CID, CID2), ('rm', '-f', CID.upper()), ('rm', '-f', CID + '\n'),
+                 ('container', 'rm', '-f', CID), ('image', 'rm', CID), ('image', 'rm', IMG[:-1]), ('image', 'rm', '-f', IMG),
+                 ('image', 'rm', IMG, IMG), ('image', 'rm', IMG + '\n'), ('rm', '-v', CID), ('rm', '-f'), ('image', 'rm'))
+        for args in exact:
+            with self.subTest(exact=args):
+                self.assertEqual(self.dispatch(*args), prefix + ['--kill-after=1s', '10s', 'docker', *args])
+        for args in other:
+            with self.subTest(other=args):
+                self.assertEqual(self.dispatch(*args), prefix + ['--kill-after=1s', '5s', 'docker', *args])
+
     def test_wrapper_keeps_selectors_and_helper_deadline(self):
         text = SCRIPT.read_text()
-        self.assertIn('timeout --kill-after=1s 5s docker "$@"', text)
+        self.assertIn('local limit=5s', text)
+        self.assertIn('timeout --kill-after=1s "$limit" docker "$@"', text)
+        self.assertEqual(text.count('limit=10s'), 2)
         self.assertIn('--filter "name=^/${1}$" --filter "label=$label"', text)
         self.assertIn('--filter "reference=$tag" --filter "label=$label"', text)
         self.assertIn('=~ ^[a-f0-9]{64}$', text)
