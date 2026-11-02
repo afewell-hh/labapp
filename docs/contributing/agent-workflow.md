@@ -493,16 +493,18 @@ Before any new admission, reconcile in-flight mutations, jobs, immutable
 resource IDs, original clocks and watchdogs, cleanup ownership, and the current
 authenticated ledger and project census, using the
 [GCP access runbook](../runbooks/gcp-build-access.md) and
-[runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner) as the only
-recovery policy. Do not replay uncertain operations, reset deadlines,
+[runner behavior](../../build/gcp/README.md#fixed-lifecycle-runner), together with
+the applicable named, reviewed lead operation/caller contracts. Do not replay
+uncertain operations, reset deadlines,
 reconstruct the ledger or bypass supported recovery. Issue assertions are as-of
 history; obtain fresh read-only evidence where an operation requires it, but do
 not rerun accepted history that no operation depends on.
 
 ### Access and private evidence
 
-Credentials, cloud access and private local artifacts do not transfer between
-accounts. Verify access without printing credentials. Missing private evidence
+Credentials, cloud access and private local artifacts must not be assumed to
+transfer or remain available between accounts. Verify actual access, existence
+and integrity before use, without printing credentials. Missing private evidence
 is never fabricated or replaced by a summary where a live prerequisite needs
 it; recover through supported read-only paths, record the exact blocker and
 continue independent work.
