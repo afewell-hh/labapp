@@ -692,6 +692,39 @@ class RetryPolicyAndEvidenceTests(unittest.TestCase):
             with self.subTest(name), self.assertRaises(AssertionError):
                 container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
 
+    def test_missing_pin_failures_keep_stage_exit_and_bounded_tail(self):
+        pin = b"E: Version '999:0.invalid' for 'qemu-system-x86' was not found\n"
+        ok = [('update', 0, b''), ('check', 0, b'')]
+        cases = {
+            'update': ([('update', 100, b'Err:1 http://x InRelease\n  502  Bad Gateway\n')],
+                       'failed_stage=update exit=100', '502  Bad Gateway'),
+            'check': ([ok[0], ('check', 100, b'E: Unmet dependencies\n')],
+                      'failed_stage=check exit=100', 'Unmet dependencies'),
+            'unrelated simulate': (ok + [('simulate', 100, b'E: Unable to locate package')],
+                                   'output_tail=', 'Unable to locate'),
+        }
+        for name, (log, stage, text) in cases.items():
+            with self.subTest(name), self.assertRaises(AssertionError) as caught:
+                container.missing_pin_proof(log, 'qemu-system-x86', '999:0.invalid')
+            self.assertIn(stage, str(caught.exception))
+            self.assertIn(text, str(caught.exception))
+        # Transport/code 100 alone never counts as proof, and a valid path still passes.
+        container.missing_pin_proof(ok + [('simulate', 100, pin)], 'qemu-system-x86', '999:0.invalid')
+
+    def test_diagnostic_tail_is_finite_sanitized_text(self):
+        tail = container.diagnostic_tail
+        self.assertEqual(tail(b''), '<empty>')
+        self.assertIn('non-bytes', tail(None))
+        self.assertLessEqual(len(tail(b'x' * 100000)), 4096)
+        many = b'\n'.join(b'line%d' % i for i in range(1000))
+        self.assertNotIn('line0\n', tail(many))
+        self.assertIn('line999', tail(many))
+        out = tail(b'Err http://user:pw@host\nAuthorization: Basic abc\nok \xff\x00 text\n')
+        for leaked in ('pw', 'Basic', 'Authorization'):
+            self.assertNotIn(leaked, out)
+        self.assertIn('ok', out)
+        self.assertNotIn('\x00', out)
+
     def test_recording_call_keeps_stage_code_and_output(self):
         log = []
         module = {'ENV': {'APT_CONFIG': '/x'}}

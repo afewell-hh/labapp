@@ -56,15 +56,33 @@ def signature_proof(code, output):
                          f'code={code!r} output_tail={output[-4096:]!r}')
 
 
+SENSITIVE = re.compile(rb'(?i)authorization|bearer|password|passwd|secret|token|credential|api[-_]?key|'
+                       rb'cookie|://[^/\s@]*@')
+
+
+def diagnostic_tail(output, limit=4096, lines=40):
+    """Finite text-only tail of APT output: last lines, credential-looking lines dropped."""
+    if not isinstance(output, (bytes, bytearray)):
+        return f'<non-bytes output: {type(output).__name__}>'
+    kept = [line for line in bytes(output).splitlines()[-lines:] if not SENSITIVE.search(line)]
+    text = b'\n'.join(kept).decode('utf-8', 'replace')
+    text = ''.join(ch if ch == '\n' or ch.isprintable() else '?' for ch in text)[-limit:]
+    return text if text.strip() else '<empty>'
+
+
 def missing_pin_proof(log, name, version):
     """Missing-version proof must reach simulation and fail with APT's exact pin error."""
     trail = [(stage, code) for stage, code, _ in log if stage]
     if ([stage for stage, _ in trail] != ['update', 'check', 'simulate']
             or trail[0][1] != 0 or trail[1][1] != 0 or trail[2][1] == 0):
-        raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}')
+        # Keep the failed stage/exit primary; the bounded tail only explains it.
+        failed = next(((s, c, o) for s, c, o in log if s and c != 0), None)
+        detail = ('' if failed is None else
+                  f' failed_stage={failed[0]} exit={failed[1]!r} output_tail={diagnostic_tail(failed[2])!r}')
+        raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}{detail}')
     output = log[-1][2]
     if f"Version '{version}' for '{name}' was not found".encode() not in output:
-        raise AssertionError(f'simulation failure was not the invalid-pin outcome: output_tail={output[-4096:]!r}')
+        raise AssertionError(f'simulation failure was not the invalid-pin outcome: output_tail={diagnostic_tail(output)!r}')
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
