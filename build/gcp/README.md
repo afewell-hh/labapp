@@ -853,6 +853,32 @@ formulas and field partition are documented in the codec. A near-limit legacy
 prefix or retained inventory can refuse the very next admission, even below
 24. Evidence is not shortened to make a schema2 transition fit.
 
+Schema2 producers additionally reserve the actual old evidence plus every
+still-possible distinct cleanup fact before reservation, submission and access
+registration. The canonical profile has exactly two children (`instance`, `boot`),
+fixed names bounded by `spec.names` (15 run digits and 3 attempt digits), and one
+immutable unsigned64 ID per child (at most 20 decimal digits). Each child can
+produce only an absent-404 fact and a deleted-ID/confirmed-404 fact: at most four
+distinct physical facts over arbitrarily many retries. Unknown IDs are charged
+at their full width without deduplicating a hypothetical placeholder. New facts
+are appended once; every existing entry, including historical duplicates and
+escaped bytes, stays in order unchanged. This prospective check is a producer
+gate in addition to, not a relaxation of, the readers' actual 4096-byte cap.
+
+The physical CAS checks that same evidence/live reserve, immutable IDs and
+append-only fixed fact vocabulary independently of history semantics. Pending
+operations, later failed reads and missing access receipts retain preceding
+physical progress. Fixed failure codes occupy the reason field; API/transport
+diagnostic text remains in the returned outcome, not in an unbounded persisted
+reason. No evidence/live/proof/media cap is raised. For already-invalid records
+with no writable progress headroom, verified IDs can remain local while owned
+deletion continues; old bytes remain untouched and the separate accounting gate
+still refuses FREE. This is not a repair or acceptance of that corrupt record.
+`test_cleanup_history_bounds.py` adds actual-controller alternating-failure and
+eventual normal/failed disposal cases, including maximum common/evidence reserves
+and preservation of old history and immutable proof objects; source authoring is
+not execution evidence.
+
 The GCS media limit remains 65536 bytes and nesting limit remains 32.
 Schema2 occupied records reserve two depth levels for the embedded proof and
 its validation wrapper. Storage/resource IDs retain unsigned64 domains;

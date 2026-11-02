@@ -359,6 +359,77 @@ def _common(record) -> dict:
     return {k: record[k] for k in keys if k in record}
 
 
+def cleanup_fact(kind, name, resource_id=None) -> str:
+    """The two physical observations emitted by controller._delete_owned."""
+    if resource_id is None:
+        return f'{kind} {name}: absent (404)'
+    return f'{kind} {name} id {resource_id}: deleted, 404 confirmed'
+
+
+def cleanup_evidence(evidence, facts) -> list:
+    """Append only unseen facts; preserve the entire old list, even duplicates."""
+    result = list(evidence)
+    for fact in facts:
+        if fact not in result:
+            result.append(fact)
+    return result
+
+
+def cleanup_evidence_bound(record) -> int:
+    """Actual old bytes plus every still-possible distinct physical observation.
+
+    Schema2 has exactly instance+boot (spec.kinds), with immutable spec.names
+    (15 run digits, 3 attempt digits) and at most one uint64 ID per child.
+    Each child emits only absent-404 and deleted-ID-404, so there are at most
+    FOUR lifetime facts, regardless of retries/reasons/operation names. For an
+    unadopted ID charge a full 20-digit fact without deduplicating a placeholder:
+    an old opaque string might equal the placeholder but not the eventual ID.
+    """
+    evidence = record['evidence']
+    if type(evidence) is not list or any(not isinstance(item, str) for item in evidence):
+        raise HistoryError('physical cleanup evidence must be strings')
+    expected = spec.names(record['run_id'], record['attempt'], spec.UBUNTU_VLAB_CORE)
+    if record['names'] != expected or set(record['ids']) != set(expected):
+        raise HistoryError('physical cleanup child inventory mismatch')
+    facts, unknown = [], []
+    for kind, name in expected.items():
+        facts.append(cleanup_fact(kind, name))
+        value = record['ids'][kind]
+        if value is None:
+            unknown.append(cleanup_fact(kind, name, str(UINT64)))
+        elif (isinstance(value, str) and _ID_RE.fullmatch(value) and int(value) <= UINT64):
+            facts.append(cleanup_fact(kind, name, value))
+        else:
+            raise HistoryError('physical cleanup id must be a uint64 string or null')
+    return (len(_canonical(cleanup_evidence(evidence, facts))) +
+            sum(len(_canonical(fact)) + 1 for fact in unknown))
+
+
+def cleanup_budget(record) -> None:
+    """Producer gate, independent of opaque history/access semantics.
+
+    Ordinary controller gates call this BEFORE admission/submission/registration.
+    Physical CAS also calls it, never shrinking old evidence to make room.
+    Readers still enforce their existing actual-byte limits; they confer no
+    permission to submit a record lacking this prospective producer reserve.
+    """
+    if cleanup_evidence_bound(record) > EVIDENCE_BYTES:
+        raise HistoryError('physical cleanup facts exceed evidence reserve')
+    live = {k: v for k, v in record.items() if k not in COMMON2 and k != 'evidence'}
+    live['state'] = 'CLEANUP_FAILED'
+    live['ids'] = {kind: value if value is not None else str(UINT64)
+                   for kind, value in record['ids'].items()}
+    # Longest fixed failure code in _reconcile_once/_delete_owned; API/transport
+    # text is returned to the caller, not persisted as an unbounded live reason.
+    reason = 'operation-mismatch:missing-or-mismatched-insert-target'
+    if len(_canonical(live.get('reason'))) < len(_canonical(reason)):
+        live['reason'] = reason
+    if len(_canonical(live)) > LIVE_BYTES:
+        raise HistoryError('physical cleanup live fields exceed reserve')
+    if len(_canonical(record)) > RECORD_BYTES:
+        raise HistoryError('physical cleanup record exceeds byte bound')
+
+
 def _reserve(record) -> None:
     """Refuse unless the largest permitted continuation from here still fits.
 
