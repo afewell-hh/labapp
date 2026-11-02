@@ -321,6 +321,22 @@ jobs:
         run: |
           test -f build/provision/test_hhfab_offline.py
           python3 -m unittest discover -s build/provision -p test_hhfab_offline.py -v
+      - name: Required kubectl readiness harness offline regressions
+        run: |
+          test -f build/provision/test_kubectl_readiness_proof.py
+          timeout --kill-after=5s 120s python3 -I -B - <<'PYTEST'
+          import os
+          import sys
+          import unittest
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_kubectl_readiness_proof.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('Required kubectl readiness suite discovered no tests')
+          print(f'Required kubectl readiness tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PYTEST
       - name: Required VLAB core offline entrypoint regressions
         shell: bash
         run: |
