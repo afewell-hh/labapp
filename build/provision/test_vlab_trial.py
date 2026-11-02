@@ -4148,8 +4148,13 @@ class InstallerFailureEvidence(unittest.TestCase):
         other = '33333333-3333-4333-8333-333333333333'
         admitted = trial.stamp(self.v['admitted_at'])
         def edited(**changes):
-            return trial.encoded(dict(json.loads(self.record(b'native')), **changes))
-        good = self.record(b'native')
+            return trial.encoded(dict(json.loads(self.record(b'native', code=17)), **changes))
+        good = self.record(b'native', code=17)
+        self.final.write_bytes(good)
+        self.final.chmod(0o600)
+        exported = trial.export_failure(NONCE)
+        self.assertEqual(exported.partition(b'\n')[2], good)
+        self.assertEqual(json.loads(exported.partition(b'\n')[0])['status'], 17)
         cases = {
             'foreign nonce': edited(nonce='9' * 32), 'foreign source': edited(source_sha='d' * 40),
             'foreign lease': edited(lease=other), 'foreign boot': edited(boot=other),
