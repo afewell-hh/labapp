@@ -27,6 +27,15 @@ VERIFY_PREREQUISITES = core.verify_prerequisites
 DIAGNOSTIC_RUN = core.diagnostic_run
 EXECUTE = core.execute
 SENTINEL = 'PRIVATE-SENTINEL-' + 'z' * 8
+HEALTH_FAILURE = (
+    b'Error from server (InternalError): an error on the server '
+    b'("[+]ping ok\\n[-]informer-sync failed: reason withheld\\nreadyz check failed") '
+    b'has prevented the request from succeeding\n')
+
+
+def health_formatter(body):
+    return (b'Error from server (InternalError): an error on the server ("'
+            + body.replace(b'\n', b'\\n') + b'") has prevented the request from succeeding\n')
 
 
 class ExecWitness(BaseException):
@@ -1331,7 +1340,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
 
     # -- #430 readiness-child route. The REAL start/unit_ready/ready_body/api_ready/bridge code runs;
     #    only the child boundary (``execute``), clocks and files are the existing fixtures.
-    def run_ready(self, injector=None, action='start-fresh'):
+    def run_ready(self, injector=None, action='start-fresh', sleep=None):
         """-> (status, children, meta). ``children``/``meta`` list each child ONLY inside ready_body."""
         seen, meta, armed = [], [], [False]
         real_body, actual = core.ready_body, self.command
@@ -1355,7 +1364,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
             return actual(argv, deadline, cap, user, retain=retain)
         with patch.object(core, 'ready_body', side_effect=body), \
              patch.object(core, 'execute', side_effect=wrapped), \
-             patch.object(core.time, 'sleep'):
+             patch.object(core.time, 'sleep', side_effect=sleep):
             status = self.call(action)
         return status, seen, meta
 
@@ -2358,12 +2367,114 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(attempts[0], core.state()['deadline'])
         self.assertEqual(core.state()['deadline'] - core.state()['started'], 900)
 
+    def test_initial_plaintext_health_pending_then_full_strict_readiness(self):
+        for mode, seconds in (('fresh', 2700), ('resume', 900)):
+            with self.subTest(mode=mode):
+                self.setUp()
+                before = self.prepared() if mode == 'fresh' else self.resumable()
+                polls = []
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                        polls.append(number)
+                        if len(polls) == 1:
+                            raise core.Failure('child command failed', 1, HEALTH_FAILURE)
+                status, seen, meta = self.run_ready(inject, 'start-' + mode)
+                self.assertEqual(status, 0, self.stderr.getvalue())
+                self.assertEqual(len(polls), 3)  # initial500, initial200, strict final200
+                self.assertEqual(len(seen), len(READY_CHILDREN) + 2)  # another live check + readyz
+                self.assertEqual(len({m[0] for m in meta}), 1)
+                value = core.state()
+                self.assertEqual((value['phase'], value['deadline'] - value['started']), ('ready', seconds))
+                self.assertEqual(meta[0][0], value['deadline'])
+                self.assertFalse(self.ready_path().exists())
+                self.assertEqual([self.api_name(a) for a in seen if a[0] == core.KUBECTL],
+                                 ['readyz'] + list(API_ROUTE_NAMES) * 2)
+                self.assertEqual([a[1:3] for a in seen if a[0] == core.HHFAB],
+                                 [['vlab', 'wait-switches'], ['vlab', 'inspect-switches']])
+                if mode == 'resume':
+                    self.assertEqual((value['cluster'], value['critical']), (before['cluster'], before['critical']))
+
+    def test_persistent_plaintext_health_expires_at_original_total_startup_deadline(self):
+        for mode, seconds in (('fresh', 2700), ('resume', 900)):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.prepared() if mode == 'fresh' else self.resumable()
+                clock, pauses, polls = [core.time.monotonic()], [], []
+                def sleep(duration):
+                    pauses.append(duration)
+                    clock[0] += duration
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                        polls.append(number)
+                        raise core.Failure('child command failed', 1, HEALTH_FAILURE)
+                begun = clock[0]
+                with patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]):
+                    status, seen, meta = self.run_ready(inject, 'start-' + mode, sleep=sleep)
+                self.assertEqual(status, 124, self.stderr.getvalue())
+                self.assertEqual((len(polls), sum(pauses), clock[0]), (seconds // 5, seconds, begun + seconds))
+                self.assertTrue(all(p == 5 for p in pauses))
+                self.assertEqual({m[0] for m in meta}, {begun + seconds})
+                self.assertFalse(any(a[0] == core.HHFAB for a in seen))
+                self.assertFalse(self.ready_path().exists())  # expired authority cannot publish a unit record
+                self.assertEqual((self.bundle()['primary']['message'], self.bundle()['primary']['code']),
+                                 ('deadline exceeded', 124))
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+                self.assertEqual(core.state()['deadline'], begun + seconds)
+
+    def test_final_plaintext_health_is_original_fatal_failure_without_retry(self):
+        for mode in ('fresh', 'resume'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.prepared() if mode == 'fresh' else self.resumable()
+                polls = []
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                        polls.append(number)
+                        if len(polls) == 2:
+                            raise core.Failure('child command failed', 1, HEALTH_FAILURE)
+                pauses = []
+                status, seen, _ = self.run_ready(inject, 'start-' + mode, sleep=pauses.append)
+                self.assertEqual(status, 1)
+                self.assertEqual((len(polls), pauses), (2, []))
+                self.assertEqual(seen[-1][-2:], ['get', '--raw=/readyz'])
+                self.assertEqual((self.ready_record()['message'], self.ready_record()['route']),
+                                 ('child command failed', 'api-final-readyz'))
+                self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    def test_initial_health_poll_keeps_124_overflow_generic_500_and_uncertain_cleanup_fatal(self):
+        cases = (
+            ('child deadline exceeded', 124, HEALTH_FAILURE, False),
+            ('private child output overflow', 1, HEALTH_FAILURE, False),
+            ('child command failed', 1, HEALTH_FAILURE, True),
+            ('child command failed', 1, b'Error from server (InternalError): synthetic fixture response\n', False),
+            ('child command failed', 1, HEALTH_FAILURE + b'unrelated output\n', False),
+        )
+        for message, code, raw, uncertain in cases:
+            with self.subTest(message=message, code=code, uncertain=uncertain):
+                self.setUp()
+                self.prepared()
+                error = core.Failure(message, code, raw)
+                error.cleanup_uncertain = uncertain
+                polls, pauses = [], []
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
+                        polls.append(number)
+                        raise error
+                status, seen, _ = self.run_ready(inject, sleep=pauses.append)
+                self.assertEqual((status, len(polls), pauses), (code, 1, []))
+                self.assertEqual(error.route, 'api-initial-readyz')
+                self.assertEqual(seen[-1][-2:], ['get', '--raw=/readyz'])
+                self.assertEqual((self.ready_record()['code'], self.ready_record()['route']),
+                                 (code, 'api-initial-readyz'))
+                self.assertEqual(core.state()['phase'], 'failed')
+
     def test_ready_body_initial_poll_does_not_retry_cleanup_uncertain_transient(self):
         self.resumable()
         actual = self.command
         outputs = (b'The connection to the server 127.0.0.1:6443 was refused - '
                    b'did you specify the right host or port?\n',
-                   b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n')
+                   b'Error from server (ServiceUnavailable): the server is currently unable to handle the request\n',
+                   HEALTH_FAILURE)
         initial = core.state()
         for output in outputs:
             core.save(copy.deepcopy(initial))
@@ -2371,7 +2482,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
             def uncertain(argv, deadline, *args, **kwargs):
                 if argv[0] == core.KUBECTL and '--raw=/readyz' in argv:
                     attempts.append(deadline)
-                    error = core.Failure('child command failed', 1, output)
+                    error = executed_failure('child command failed', 1, output)
                     error.cleanup_uncertain = True
                     raise error
                 return actual(argv, deadline, *args, **kwargs)
@@ -3222,6 +3333,111 @@ class FormatAndSourceTests(unittest.TestCase):
                     core.kubectl(['get', '--raw=/readyz'], core.time.monotonic() + 5)
                 self.assertNotIsInstance(raised.exception, core.Pending)
                 self.assertEqual(raised.exception.code, code)
+
+    def test_initial_health_grammar_accepts_varied_complete_failed_check_sets(self):
+        bodies = (
+            b'[-]etcd failed: reason withheld\nreadyz check failed',
+            b'[+]log ok\n[-]poststarthook/start-kube-apiserver-informers failed: reason withheld\n'
+            b'[+]shutdown ok\nreadyz check failed',
+            b'[-]informer-sync failed: reason withheld\n[-]etcd-readiness failed: reason withheld\n'
+            b'[+]poststarthook/rbac/bootstrap-roles ok\nreadyz check failed',
+        )
+        self.assertEqual(len(HEALTH_FAILURE), 178)
+        self.assertTrue(core.initial_readyz_failed(HEALTH_FAILURE))
+        for body in bodies:
+            with self.subTest(body=body):
+                raw = health_formatter(body)
+                self.assertTrue(core.initial_readyz_failed(raw))
+                error = executed_failure('child command failed', 1, raw)
+                with patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Pending) as raised:
+                        core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+                self.assertEqual((str(raised.exception), raised.exception.code,
+                                  raised.exception.private_output, raised.exception.route),
+                                 ('API discovery pending', 1, b'', None))
+                self.assertIs(raised.exception.__context__, error)
+
+    def test_initial_health_grammar_rejects_wrong_framing_body_footer_and_mixed_output(self):
+        bodies = (
+            b'', b'readyz check failed', b'[+]ping ok\nreadyz check failed',
+            b'[-]ping ok\nreadyz check failed', b'[+]ping failed: reason withheld\nreadyz check failed',
+            b'[-]etcd failed: actual reason\nreadyz check failed',
+            b'[-]etcd failed: reason withheld\nhealthz check failed',
+            b'[-]etcd failed: reason withheld\nreadyz check passed',
+            b'[-]etcd failed: reason withheld', b'[-] failed: reason withheld\nreadyz check failed',
+            b'[-]etcd failed: reason withheld\n\nreadyz check failed',
+            b'[-]etcd failed: reason withheld\nunrelated output\nreadyz check failed',
+            b'[+]ping excluded: ok\n[-]etcd failed: reason withheld\nreadyz check failed',
+            b'[-]bad name failed: reason withheld\nreadyz check failed',
+            b'[-]bad"name failed: reason withheld\nreadyz check failed',
+            b'[-]bad\\name failed: reason withheld\nreadyz check failed',
+            b'[-]etcd failed: reason withheld\r\nreadyz check failed',
+        )
+        outputs = [health_formatter(b) for b in bodies] + [
+            HEALTH_FAILURE.rstrip(b'\n'), HEALTH_FAILURE + b'\n', HEALTH_FAILURE + b'Unauthorized\n',
+            b'x509: error\n' + HEALTH_FAILURE, HEALTH_FAILURE.lower(),
+            HEALTH_FAILURE.replace(b'InternalError', b'Forbidden'),
+            HEALTH_FAILURE.replace(b'InternalError', b'Timeout'),
+            HEALTH_FAILURE.replace(b'\\n', b'\n'), HEALTH_FAILURE.replace(b'"', b"'"),
+            HEALTH_FAILURE.replace(b'has prevented', b'prevented'),
+            b'Error from server (InternalError): synthetic fixture response\n',
+            b'Error from server (InternalError): unrelated\n',
+        ]
+        for raw in outputs:
+            with self.subTest(raw=raw):
+                self.assertFalse(core.initial_readyz_failed(raw))
+                error = executed_failure('child command failed', 1, raw)
+                with patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Failure) as raised:
+                        core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+                self.assertIs(raised.exception, error)
+
+    def test_initial_health_grammar_enforces_pinned_pretrim_body_size_boundary(self):
+        fixed = b'[-] failed: reason withheld\nreadyz check failed'
+        body = b'[-]' + b'x' * (2047 - len(fixed)) + fixed[3:]
+        self.assertEqual(len(body + b'\n'), 2048)
+        self.assertTrue(core.initial_readyz_failed(health_formatter(body)))
+        self.assertFalse(core.initial_readyz_failed(health_formatter(body.replace(b'[-]', b'[-]x', 1))))
+        self.assertFalse(core.initial_readyz_failed(HEALTH_FAILURE + b'x' * core.LIMIT))
+        self.assertFalse(core.initial_readyz_failed(health_formatter(
+            b'[+]ping ok\n' * 2048 + b'[-]etcd failed: reason withheld\nreadyz check failed')))
+
+    def test_plaintext_health_pending_requires_exact_initial_route_and_command(self):
+        for route, args in (
+                (None, ['get', '--raw=/readyz']),
+                ('api-final-readyz', ['get', '--raw=/readyz']),
+                ('api-initial-nodes', ['get', '--raw=/readyz']),
+                ('api-initial-readyz', ['get', 'nodes', '-o', 'json']),
+                ('api-initial-readyz', ['get', '--raw=/healthz']),
+                ('api-initial-readyz', ['get', '--raw=/readyz?verbose']),
+                ('api-initial-readyz', ['get', '--raw=/readyz', '--v=8']),
+                ('api-initial-readyz', ['create', '--raw=/readyz'])):
+            error = executed_failure('child command failed', 1, HEALTH_FAILURE)
+            with self.subTest(route=route, args=args), patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(args, 1000, route)
+            self.assertIs(raised.exception, error)
+            self.assertNotIsInstance(raised.exception, core.Pending)
+
+    def test_plaintext_health_cannot_override_status_provenance_message_or_cleanup(self):
+        for message, code, executed, prior_route, uncertain in (
+                ('child command failed', 124, True, None, False),
+                ('child deadline exceeded', 124, True, None, False),
+                ('child command failed', 130, True, None, False),
+                ('child command failed', 143, True, None, False),
+                ('private child output overflow', 1, True, None, False),
+                ('child containment unverified', 1, True, None, False),
+                ('child command failed', 1, False, None, False),
+                ('child command failed', 1, True, 'api-final-readyz', False),
+                ('child command failed', 1, True, None, True)):
+            error = core.Failure(message, code, HEALTH_FAILURE)
+            error._executed_child, error.route, error.cleanup_uncertain = executed, prior_route, uncertain
+            with self.subTest(message=message, code=code, executed=executed, uncertain=uncertain), \
+                 patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+            self.assertIs(raised.exception, error)
+            self.assertNotIsInstance(raised.exception, core.Pending)
 
     def test_kubectl_cleanup_uncertain_transient_reraises_same_failure_not_pending(self):
         refused = (b'The connection to the server 127.0.0.1:6443 was refused - '

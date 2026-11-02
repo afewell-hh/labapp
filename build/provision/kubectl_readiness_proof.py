@@ -1,4 +1,4 @@
-"""Test-only driver: real pinned kubectl readiness timing through the unchanged vlab_core.kubectl (#452).
+"""Test-only driver: real pinned kubectl readiness timing through vlab_core.kubectl (#452/#463).
 
 Runs only inside the disposable container made by test-kubectl-readiness.sh (Ubuntu 24.04
 amd64, Python 3.12 stdlib + distribution PyYAML). Two commands, no other inputs:
@@ -14,7 +14,7 @@ only, NOT ``api_ready``/``ready_body``/systemd/cloud-init; the retry loop here s
 production loop sleeps 5s); the fixture speaks HTTP/1.1 (no ALPN h2); there is no real
 kube-apiserver. Same-code client time bounds may race (request timeout 10s vs execute cap 10s):
 timings and outcomes are RECORDED and a case only asserts what is deterministic. Nothing here
-changes a timeout, classifier, retry or budget, and a 124 is never treated as Pending.
+changes a timeout, retry or budget, and a 124 is never treated as Pending.
 Report: sanitized JSON only; exact allowlisted PUBLIC SYNTHETIC formatter bytes/hash for #461,
 never unmatched child output or its hash.
 """
@@ -60,7 +60,7 @@ SEAMS = (
     'runtime container root with only SETUID, SETGID, KILL and DAC_OVERRIDE capabilities',
     'synthetic OpenSSL certificates generated in the separate preparation container',
     'request timeout 10s and execute cap 10s may race; outcomes recorded, no winner guaranteed',
-    'quick-case deadlines 2s; delayed startup 6s; exhaustion and fixed 503 sequence 3s; stalls 10s',
+    'quick-case deadlines 2s; delayed startup 6s; exhaustion and fixed health sequences 3s; stalls 10s',
     'production diagnostic storage is unprepared; exception byte counts are not emitted-byte counts',
     'Pending context supplies cleanup uncertainty; only #461 fixed public fixtures allow exact formatter evidence',
 )
@@ -420,8 +420,9 @@ CAPPED = (5.0, 15.0)
 
 def public_cases():
     return (
-        case('plaintext-readyz-500', [HEALTH_500], allowed={('failure', 1)}, requests=(1, 1),
-             flag='internal_error', message='child command failed'),
+        case('plaintext-readyz-500', [HEALTH_500, OK()], loop=True, deadline=3.0, budget=8.0,
+             allowed={('ok', None)}, pre_final={('pending', 1)}, min_pending=1, requests=(2, 2),
+             elapsed=(1.0, 8.0)),
         case('k3s-prehandler-503-then-ready', [K3S_503, OK()], loop=True, deadline=3.0, budget=8.0,
              allowed={('ok', None)}, pre_final={('pending', 1)}, min_pending=1, requests=(2, 2),
              elapsed=(1.0, 8.0)),
@@ -471,7 +472,7 @@ def verdict(spec, attempts, fixture, evidence):
     """Return (verdict, reasons). Deterministic claims only; others are 'recorded'."""
     reasons = []
     public = fixed_public_case(spec)
-    served_pending = public and spec['name'] == 'k3s-prehandler-503-then-ready'
+    served_pending = public and spec['name'] in ('plaintext-readyz-500', 'k3s-prehandler-503-then-ready')
     final = attempts[-1] if attempts else {'kind': 'not-run', 'code': None, 'message': ''}
     if not attempts or any(a['kind'] == 'harness-error' for a in attempts):
         reasons.append('harness error')
