@@ -1329,17 +1329,21 @@ containers, committed preparation image and owned host scratch are absent.
 On exit the wrapper also writes one fixed-vocabulary line per cleanup stage to
 stderr, `Pinned API cleanup stage=<stage> status=<exit code> outcome=<word>`
 (#423), so an `owned cleanup unverified` result names the failing stage. Outcomes:
-`command-failed`, `timeout` (helper status 124 or 137), `malformed-id`,
+`command-failed`, `timeout-status` (observed status 124 or 137), `malformed-id`,
 `multiple-ids`, `still-present`, `identity-mismatch`, `stat-failed`,
 `not-owned-directory`, `outstanding` (create/commit response uncertainty), plus
 non-failure `absent`, `none-found`, `command-ok`, `match`. Docker output, names,
-IDs and environment are never printed. This changes no selector, label, ID, scratch
+IDs and environment are excluded from these new diagnostic lines. Status 124 or
+137 can come directly from Docker; 137 may also be another kill, so the label
+does not establish a timeout cause. This changes no selector, label, ID, scratch
 identity, helper deadline, overall budget or exit behavior: the original primary
 status is still preserved, cleanup failure alone still exits 1, and `command-ok`
 lines are not an absence receipt (only the unchanged final success line is). It
 cannot show what an earlier unlogged run did. The synthetic controls in
 `test_pinned_api_hosted_cleanup.py` run the extracted production cleanup functions
-against a fake `docker` shell function; CI does not yet invoke that file.
+against a fake `docker` shell function. CI requires all eleven controls without
+skips before public preparation in the same job. Run them separately with
+`python3 -m unittest discover -s build/provision -p test_pinned_api_hosted_cleanup.py -v`.
 
 Limits: these are typed decoding/defaulting inputs, not a complete validated
 admission topology. The pinned loader enables strict decoding and rejects unknown

@@ -132,12 +132,12 @@ class HostedCleanupDiagnosticsTests(unittest.TestCase):
         self.assert_stage(result, 'scratch-verify', 0, 'absent')
 
     def test_command_failure_and_timeout_are_distinct_per_stage(self):
-        for status, outcome in ((1, 'command-failed'), (124, 'timeout'), (137, 'timeout'), (125, 'command-failed')):
+        for status, outcome in ((1, 'command-failed'), (124, 'timeout-status'), (137, 'timeout-status'), (125, 'command-failed')):
             with self.subTest(select=status):
                 result = self.run_cleanup('c-runtime-1=rc:%d' % status)
                 self.assert_unverified(result)
                 self.assert_stage(result, 'runtime-container-select', status, outcome)
-        for status, outcome in ((1, 'command-failed'), (124, 'timeout')):
+        for status, outcome in ((1, 'command-failed'), (124, 'timeout-status')):
             with self.subTest(prep_verify=status):
                 (self.counts / 'c-prep').unlink(missing_ok=True)
                 result = self.run_cleanup('c-prep-1=out:%s\nc-prep-2=rc:%d' % (CID, status))
@@ -155,7 +155,7 @@ class HostedCleanupDiagnosticsTests(unittest.TestCase):
                 self.assert_stage(result, 'image-verify', status, outcome)
 
     def test_remove_command_failure_and_timeout_are_reported_without_absence_claim(self):
-        for status, outcome in ((1, 'command-failed'), (124, 'timeout')):
+        for status, outcome in ((1, 'command-failed'), (124, 'timeout-status')):
             with self.subTest(status=status):
                 result = self.run_cleanup('c-runtime-1=out:%s\nrm=rc:%d' % (CID, status))
                 self.assert_unverified(result)
@@ -253,7 +253,7 @@ class HostedCleanupDiagnosticsTests(unittest.TestCase):
                 result = self.run_cleanup('c-runtime-1=rc:124', primary=primary)
                 self.assert_unverified(result, primary)
                 self.assert_stage(result, 'primary', primary, 'recorded')
-                self.assert_stage(result, 'runtime-container-select', 124, 'timeout')
+                self.assert_stage(result, 'runtime-container-select', 124, 'timeout-status')
                 (self.counts / 'c-runtime').unlink(missing_ok=True)
         result = self.run_cleanup('c-runtime-1=rc:124', primary=0)
         self.assert_unverified(result, 1)

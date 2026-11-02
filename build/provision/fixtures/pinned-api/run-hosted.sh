@@ -31,8 +31,9 @@ images() {
 # Diagnostics only: fixed stage/outcome words and a numeric status. Arguments are
 # literals or exit codes; Docker output, names, IDs and environment are never printed.
 diag() { printf 'Pinned API cleanup stage=%s status=%s outcome=%s\n' "$1" "$2" "$3" >&2 || :; }
-# The helper's timeout wrapper yields 124 (TERM) or 137 (after --kill-after).
-failure_outcome() { case $1 in 124|137) echo timeout ;; *) echo command-failed ;; esac; }
+# Observed status only: Docker can itself return 124/137; 137 is also an
+# ambiguous kill. These statuses do not establish timeout provenance.
+failure_outcome() { case $1 in 124|137) echo timeout-status ;; *) echo command-failed ;; esac; }
 # $1 value, $2 anchored ID regex: value is non-empty; a second line means multiple IDs.
 id_outcome() {
   if [[ "$1" =~ $2 ]]; then echo valid
