@@ -56,15 +56,39 @@ def signature_proof(code, output):
                          f'code={code!r} output_tail={output[-4096:]!r}')
 
 
+SENSITIVE = re.compile(rb'(?i)authorization|bearer|password|passwd|secret|token|credential|api[-_]?key|'
+                       rb'cookie|://[^/\s@]*@')
+
+
+def diagnostic_tail(output):
+    """Controlled APT tail: <=4096 ASCII bytes; repr publication <=8194 bytes."""
+    if not isinstance(output, (bytes, bytearray)):
+        return '<non-bytes output>'
+    kept = []
+    for line in bytes(output).split(b'\n')[-40:]:
+        decoded = line.decode('utf-8', 'replace')
+        # Drop whole lines before replacement can hide a credential keyword.
+        if any(not ch.isprintable() for ch in decoded) or SENSITIVE.search(line):
+            continue
+        kept.append(decoded.encode('ascii', 'replace').decode('ascii'))
+    text = '\n'.join(kept)[-4096:]
+    return text if text.strip() else '<empty>'
+
+
 def missing_pin_proof(log, name, version):
     """Missing-version proof must reach simulation and fail with APT's exact pin error."""
     trail = [(stage, code) for stage, code, _ in log if stage]
     if ([stage for stage, _ in trail] != ['update', 'check', 'simulate']
             or trail[0][1] != 0 or trail[1][1] != 0 or trail[2][1] == 0):
-        raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}')
+        # Keep the failed stage/exit primary; the bounded tail only explains it.
+        failed = next(((s, c, o) for s, c, o in log if s and c != 0), None)
+        detail = ('' if failed is None else
+                  f' failed_stage={failed[0]} exit={failed[1]!r} output_tail={diagnostic_tail(failed[2])!r}')
+        raise AssertionError(f'invalid pin did not fail at simulation after update/check: {trail!r}{detail}')
     output = log[-1][2]
     if f"Version '{version}' for '{name}' was not found".encode() not in output:
-        raise AssertionError(f'simulation failure was not the invalid-pin outcome: output_tail={output[-4096:]!r}')
+        raise AssertionError('simulation failure was not the invalid-pin outcome: '
+                             f'failed_stage=simulate exit={trail[2][1]!r} output_tail={diagnostic_tail(output)!r}')
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
