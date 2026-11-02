@@ -19,8 +19,13 @@ prep_pending=0
 runtime_pending=0
 commit_pending=0
 docker() {
+  # Generic calls keep 5s. Only the two exact maintained removal forms (one full
+  # container ID, or one full image ID) get 10s; a client limit, not a success claim.
+  local limit=5s
+  if [[ $# == 3 && "$1 $2" == "rm -f" && "$3" =~ ^[a-f0-9]{64}$ ]]; then limit=10s
+  elif [[ $# == 3 && "$1 $2" == "image rm" && "$3" =~ ^sha256:[a-f0-9]{64}$ ]]; then limit=10s; fi
   env -i HOME="$scratch/home" DOCKER_CONFIG="$scratch/home/docker" PATH=/usr/bin:/bin \
-    timeout --kill-after=1s 5s docker "$@"
+    timeout --kill-after=1s "$limit" docker "$@"
 }
 containers() {
   docker container ls -aq --no-trunc --filter "name=^/${1}$" --filter "label=$label"

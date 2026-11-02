@@ -1341,9 +1341,24 @@ status is still preserved, cleanup failure alone still exits 1, and `command-ok`
 lines are not an absence receipt (only the unchanged final success line is). It
 cannot show what an earlier unlogged run did. The synthetic controls in
 `test_pinned_api_hosted_cleanup.py` run the extracted production cleanup functions
-against a fake `docker` shell function. CI requires all eleven controls without
-skips before public preparation in the same job, bounded to 15 seconds plus
-one second kill grace within the existing job budget. Run them separately with
+against a fake `docker` shell function; a separate control runs the production
+`docker()` dispatcher with only `env` replaced by an argv recorder.
+
+Removal limit (#426): generic Docker calls keep the 5s limit plus 1s kill grace. Only
+the exact maintained `rm -f <one 64-hex container id>` and
+`image rm <one sha256:64-hex image id>` calls get 10s plus 1s kill grace. This is
+removal-only tuning after one observed post-merge failure where both removals
+returned 124 after about 5s; it is not a proven fix, adds no retry or new deletion
+form, and does not change ownership guards. A nonzero removal status (including
+124/137, which stay ambiguous with other kills) still fails cleanup even if the
+object is later absent, and killing the CLI does not show the daemon rolled back or
+finished. Configured-call arithmetic for the worst `finish` path (nine Docker calls):
+6 selection/verification x 6s + 3 removals x 11s = 69s, leaving 6s of the existing
+75s cleanup reserve for bookkeeping, scratch removal and scheduling. That is
+arithmetic, not an absolute completion guarantee. The 23-minute outer bound, 75s
+reserve, 25-minute job and 15s+1s preflight are unchanged. CI requires all thirteen
+controls without skips before public preparation in the same job, bounded to 15
+seconds plus one second kill grace within the existing job budget. Run them separately with
 `python3 -m unittest discover -s build/provision -p test_pinned_api_hosted_cleanup.py -v`.
 
 Limits: these are typed decoding/defaulting inputs, not a complete validated
