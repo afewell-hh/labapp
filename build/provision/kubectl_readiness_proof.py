@@ -43,7 +43,9 @@ KUBECTL_PATH = '/usr/local/bin/kubectl'
 KUBECONFIG_PATH = Path('/home/ubuntu/hhfab/vlab/kubeconfig')
 WORK_BUDGET = 170          # whole runtime proof (seconds); the launcher adds an outer bound
 SETTLE = 2.0               # post-case wait for owned-uid processes to disappear
-SLACK = 2.0                # scheduling slack on top of the 10s cap plus 2s kill/reap grace
+CLEANUP = 1.0              # listener, sockets and threads, inside each case reservation
+REAP = 2.0                 # unchanged production executor's cleanup wait
+REPORT_RESERVE = 5.0       # held inside the original proof deadline
 MAX_CONNECTIONS = 64
 MAX_REPORTED_REQUESTS = 12
 MAX_REPORTED_ATTEMPTS = 20
@@ -57,10 +59,15 @@ SEAMS = (
     'runtime container root with only SETUID, SETGID, KILL and DAC_OVERRIDE capabilities',
     'synthetic OpenSSL certificates generated in the separate preparation container',
     'request timeout 10s and execute cap 10s may race; outcomes recorded, no winner guaranteed',
+    'quick-case operation deadlines are 2s, delayed startup 6s, explicit exhaustion 3s; stalls 10s',
+    'production diagnostic storage is unprepared; exception byte counts are not emitted-byte counts',
+    'Pending context is inspected only for discarded cleanup uncertainty, never to restore child output',
 )
 REMAINING = (
     'SIGTERM/SIGINT delivery during a live kubectl child (existing production executor tests only)',
-    'matching exit-1 transient rewrite with cleanup_uncertain (separate source/synthetic control)',
+    'all eight former Retry-After observations deferred: 429 absent/malformed/date/1s/30s; 503 absent/1s/30s',
+    '503 malformed/date Retry-After were never implemented',
+    'unknown error; repeated refusal through expiry',
     'body trickle slower than the output limit; HTTP/2; ten-retry (eleven-attempt) exhaustion',
     'plain-text (non-Status) 503/500 bodies; Retry-After values between 1s and the cap',
     'full api_ready/ready_body, native forwarding, systemd/cgroup, 18 nodes, switches, trial-16 cause',
@@ -69,6 +76,8 @@ REMAINING = (
 FLAG_PATTERNS = {
     'refused': rb'was refused',
     'x509': rb'x509:',
+    'unknown_authority': rb'x509: certificate signed by unknown authority',
+    'wrong_san': rb'x509: certificate is valid for 127\.0\.0\.2, not 127\.0\.0\.1',
     'client_timeout': rb'Client\.Timeout|context deadline exceeded|i/o timeout|timed out',
     'unauthorized': rb'Unauthorized',
     'forbidden': rb'Forbidden',
@@ -114,7 +123,7 @@ def clean(value, limit=128):
 
 
 class Fixture:
-    """One deterministic loopback server. mode: serve | backlog (listen, never accept) | tls-stall
+    """One deterministic loopback server. mode: serve | tcp-stall | tls-stall
     (accept, read the ClientHello, never answer). All sockets/threads are owned and closed by close()."""
 
     def __init__(self, port=PORT, host=HOST, context=None, clock=time.monotonic):
@@ -123,6 +132,9 @@ class Fixture:
         self.lock = threading.Lock()
         self.requests, self.errors, self.threads = [], {}, []
         self.accepted = 0
+        self.sockets = set()
+        self.acceptor = None
+        self.handshakes_started = self.handshakes_completed = self.clienthello_bytes = 0
         self.sock = None
         self.steps = []
         self.mode = 'serve'
@@ -140,7 +152,7 @@ class Fixture:
         if mode != 'backlog':
             sock.settimeout(0.2)
             thread = threading.Thread(target=self._accept_loop, daemon=True)
-            self.threads.append(thread)
+            self.acceptor = thread
             thread.start()
 
     def _accept_loop(self):
@@ -153,7 +165,9 @@ class Fixture:
                 break
             with self.lock:
                 self.accepted += 1
-                refuse = self.accepted > MAX_CONNECTIONS
+                refuse = self.stop.is_set() or self.accepted > MAX_CONNECTIONS
+                if not refuse:
+                    self.sockets.add(conn)
             if refuse:
                 conn.close()
                 continue
@@ -180,15 +194,29 @@ class Fixture:
 
     def _serve(self, conn):
         try:
+            if self.mode == 'tcp-stall':
+                self._wait_stop()
+                return
             conn.settimeout(5.0)
             if self.mode == 'tls-stall':
                 conn.settimeout(0.5)
-                self._recv(conn, self.clock() + 5.0)  # the ClientHello, never answered
+                hello = self._recv(conn, self.clock() + 5.0)
+                with self.lock:
+                    self.clienthello_bytes += len(hello)
                 self._wait_stop()
                 return
             client_cn = None
             if self.context is not None:
-                conn = self.context.wrap_socket(conn, server_side=True)
+                # Track the SSLSocket BEFORE its blocking handshake, not the detached raw socket.
+                with self.lock:
+                    self.handshakes_started += 1
+                    wrapped = self.context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+                    self.sockets.discard(conn)
+                    self.sockets.add(wrapped)
+                    conn = wrapped
+                conn.do_handshake()
+                with self.lock:
+                    self.handshakes_completed += 1
                 cert = conn.getpeercert() or {}
                 for rdn in cert.get('subject', ()):
                     for key, value in rdn:
@@ -207,23 +235,39 @@ class Fixture:
             with self.lock:
                 index = len(self.requests)
                 step = self.steps[min(index, len(self.steps) - 1)]
-                self.requests.append({'n': index + 1, 'at': round(self.clock() - self.t0, 3),
-                                      'method': clean(line[0], 8), 'path': clean(path),
-                                      'query': clean(query), 'client_cn': client_cn,
-                                      'step': step['name']})
+                request = {'n': index + 1, 'at': round(self.clock() - self.t0, 3),
+                           'method': clean(line[0], 8), 'path': clean(path),
+                           'query': clean(query), 'client_cn': client_cn, 'step': step['name'],
+                           'headers_sent': False, 'body_bytes_sent': 0}
+                self.requests.append(request)
             if step['do'] == 'stall':
                 self._wait_stop()
             elif step['do'] == 'stall-body':
                 head = ('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n'
-                        'Connection: close\r\n\r\nok')
+                        'Connection: close\r\n\r\n')
                 conn.sendall(head.encode())
+                with self.lock:
+                    request['headers_sent'] = True
+                conn.sendall(b'ok')
+                with self.lock:
+                    request['body_bytes_sent'] = 2
                 self._wait_stop()
             else:
                 extra = ''.join('%s: %s\r\n' % pair for pair in step['headers'])
                 head = ('HTTP/1.1 %d %s\r\nContent-Type: %s\r\n%sContent-Length: %d\r\n'
                         'Connection: close\r\n\r\n' % (step['code'], step['phrase'], step['type'],
                                                        extra, len(step['body'])))
-                conn.sendall(head.encode() + step['body'])
+                conn.sendall(head.encode())
+                with self.lock:
+                    request['headers_sent'] = True
+                view = memoryview(step['body'])
+                while view and not self.stop.is_set():
+                    sent = conn.send(view[:65536])
+                    if not sent:
+                        break
+                    with self.lock:
+                        request['body_bytes_sent'] += sent
+                    view = view[sent:]
         except (OSError, ssl.SSLError, ValueError) as error:
             self._error(error)
         finally:
@@ -231,8 +275,10 @@ class Fixture:
                 conn.close()
             except OSError:
                 pass
+            with self.lock:
+                self.sockets.discard(conn)
 
-    def close(self):
+    def close(self, deadline=None):
         """Stop, close the listener, join owned threads; returns closed-state evidence."""
         self.stop.set()
         listener_closed = True
@@ -241,14 +287,33 @@ class Fixture:
                 self.sock.close()
             except OSError:
                 listener_closed = False
-        end = self.clock() + 8.0
+        end = min(self.clock() + CLEANUP, deadline) if deadline is not None else self.clock() + CLEANUP
+        # No final handler inventory until the only producer has settled.
+        if self.acceptor is not None:
+            self.acceptor.join(max(0.0, end - self.clock()))
+        acceptor_alive = self.acceptor is not None and self.acceptor.is_alive()
         with self.lock:
             threads = list(self.threads)
+            sockets = list(self.sockets)
+        sockets_closed = True
+        for conn in sockets:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                sockets_closed = False
         for thread in threads:
             thread.join(max(0.0, end - self.clock()))
         return {'listener_closed': listener_closed,
-                'threads_alive': sum(1 for thread in threads if thread.is_alive()),
-                'connections_accepted': self.accepted, 'server_errors': dict(self.errors)}
+                'threads_alive': int(acceptor_alive) + sum(1 for thread in threads if thread.is_alive()),
+                'sockets_closed': sockets_closed and all(conn.fileno() == -1 for conn in sockets),
+                'connections_accepted': self.accepted, 'server_errors': dict(self.errors),
+                'handshakes_started': self.handshakes_started,
+                'handshakes_completed': self.handshakes_completed,
+                'clienthello_bytes': self.clienthello_bytes}
 
 
 # ---------------------------------------------------------------- classification
@@ -267,7 +332,10 @@ def attempt(core, kubectl, deadline, clock=time.monotonic):
         record['code'], record['message'], record['output_bytes'] = None, '', len(out)
     except core.Pending as error:
         record.update(kind='pending', code=error.code, message=str(error),
-                      route=error.route, flags=private_flags(error.private_output))
+                      route=error.route, private_output_bytes=len(error.private_output),
+                      flags=private_flags(error.private_output),
+                      cleanup_uncertain=bool(getattr(error, 'cleanup_uncertain', False)
+                                            or getattr(error.__context__, 'cleanup_uncertain', False)))
     except core.Failure as error:
         record.update(kind='failure', code=error.code, message=str(error), route=error.route,
                       cleanup_uncertain=bool(getattr(error, 'cleanup_uncertain', False)),
@@ -297,64 +365,48 @@ def owned_uid_processes(uid):
 
 
 def case(name, steps, *, mode='serve', tls='good', allowed=None, message=None, requests=None,
-         elapsed=(0.0, 8.0), deadline=30.0, budget=6.0, loop=False, start_after=None,
-         pre_final=None, min_pending=0):
+         elapsed=(0.0, 7.0), deadline=2.0, budget=7.0, loop=False, start_after=None,
+         pre_final=None, min_pending=0, flag=None):
     return {'name': name, 'steps': steps, 'mode': mode, 'tls': tls, 'allowed': allowed,
             'message': message, 'requests': requests, 'elapsed': elapsed, 'deadline': deadline,
             'budget': budget, 'loop': loop, 'start_after': start_after, 'pre_final': pre_final,
-            'min_pending': min_pending}
+            'min_pending': min_pending, 'flag': flag}
 
 
 HANG = {('failure', 124), ('failure', 1)}   # request timeout and execute cap may race
-CAPPED = (5.0, 10.0 + 2.0 + SLACK)
+CAPPED = (5.0, 15.0)
 
 
 def build_cases():
     return (
         case('ok-ready', [OK()], allowed={('ok', None)}, requests=(1, 1)),
-        case('refused-then-delayed-start', [OK()], loop=True, start_after=3.0, deadline=25.0,
-             allowed={('ok', None)}, pre_final={('pending', 1)}, min_pending=1, budget=28.0,
-             elapsed=(2.0, 25.0), requests=(1, 1)),
+        case('refused-then-delayed-start', [OK()], loop=True, start_after=3.0, deadline=6.0,
+             allowed={('ok', None)}, pre_final={('pending', 1)}, min_pending=1, budget=11.0,
+             elapsed=(2.0, 11.0), requests=(1, 1)),
         case('success-but-not-ok-body', [respond('not-ok', 200, 'OK', b'not-ok', 'text/plain')],
              allowed={('success-non-ok', None)}, requests=(1, 1)),
         case('401-unauthorized', [STATUS(401, 'Unauthorized', 'Unauthorized')],
-             allowed={('failure', 1)}),
-        case('403-forbidden', [STATUS(403, 'Forbidden', 'Forbidden')], allowed={('failure', 1)}),
-        case('x509-unknown-authority', [OK()], tls='foreign', allowed={('failure', 1)}),
-        case('x509-wrong-ip-san', [OK()], tls='wrong-san', allowed={('failure', 1)}),
+             allowed={('failure', 1)}, requests=(1, 1), flag='unauthorized', message='child command failed'),
+        case('403-forbidden', [STATUS(403, 'Forbidden', 'Forbidden')], allowed={('failure', 1)},
+             requests=(1, 1), flag='forbidden', message='child command failed'),
+        case('x509-unknown-authority', [OK()], tls='foreign', allowed={('failure', 1)},
+             requests=(0, 0), flag='unknown_authority', message='child command failed'),
+        case('x509-wrong-ip-san', [OK()], tls='wrong-san', allowed={('failure', 1)},
+             requests=(0, 0), flag='wrong_san', message='child command failed'),
         case('500-no-retry-after', [STATUS(500, 'Internal Server Error', 'InternalError')],
-             allowed={('failure', 1), ('failure', 124)}),
+             allowed={('failure', 1)}, requests=(1, 1), flag='internal_error', message='child command failed'),
         case('output-overflow', [HUGE(1024 * 1024 + 4096)], allowed={('failure', 1)},
-             message='private child output overflow'),
-        case('429-no-retry-after', [STATUS(429, 'Too Many Requests', 'TooManyRequests')],
-             elapsed=(0.0, 16.0)),
-        case('429-retry-after-malformed',
-             [STATUS(429, 'Too Many Requests', 'TooManyRequests', 'soon'), OK()],
-             elapsed=(0.0, 16.0)),
-        case('429-retry-after-http-date',
-             [STATUS(429, 'Too Many Requests', 'TooManyRequests', 'Wed, 21 Oct 2026 07:28:00 GMT'),
-              OK()], elapsed=(0.0, 16.0)),
-        case('503-no-retry-after', [STATUS(503, 'Service Unavailable', 'ServiceUnavailable')],
-             elapsed=(0.0, 16.0)),
-        case('429-retry-after-1s-then-ok',
-             [STATUS(429, 'Too Many Requests', 'TooManyRequests', '1'), OK()], elapsed=(0.0, 16.0)),
-        case('503-retry-after-1s-then-ok',
-             [STATUS(503, 'Service Unavailable', 'ServiceUnavailable', '1'), OK()],
-             elapsed=(0.0, 16.0)),
+             message='private child output overflow', requests=(1, 1)),
         case('absolute-deadline-before-cap', [STALL_HEADER], deadline=3.0, allowed={('failure', 124)},
-             message='child deadline exceeded', elapsed=(2.0, 3.0 + 2.0 + SLACK), budget=8.0),
-        case('tcp-accepted-never-served', [OK()], mode='backlog', allowed=HANG, elapsed=CAPPED,
-             requests=(0, 0), budget=14.0),
+             elapsed=(2.0, 8.0), budget=8.0, requests=(1, 1)),
+        case('tcp-accepted-never-served', [OK()], mode='tcp-stall', allowed=HANG, elapsed=CAPPED,
+             requests=(0, 0), budget=15.0, deadline=10.0),
         case('tls-clienthello-never-answered', [OK()], mode='tls-stall', allowed=HANG,
-             elapsed=CAPPED, requests=(0, 0), budget=14.0),
-        case('header-stall-after-request', [STALL_HEADER], allowed=HANG, elapsed=CAPPED, budget=14.0),
-        case('body-stall-after-partial-body', [STALL_BODY], allowed=HANG, elapsed=CAPPED, budget=14.0),
-        case('429-retry-after-30s-over-cap',
-             [STATUS(429, 'Too Many Requests', 'TooManyRequests', '30'), OK()],
-             elapsed=(0.0, 16.0), budget=14.0),
-        case('503-retry-after-30s-over-cap',
-             [STATUS(503, 'Service Unavailable', 'ServiceUnavailable', '30'), OK()],
-             elapsed=(0.0, 16.0), budget=14.0),
+             elapsed=CAPPED, requests=(0, 0), budget=15.0, deadline=10.0),
+        case('header-stall-after-request', [STALL_HEADER], allowed=HANG, elapsed=CAPPED,
+             budget=15.0, deadline=10.0, requests=(1, 1)),
+        case('body-stall-after-partial-body', [STALL_BODY], allowed=HANG, elapsed=CAPPED,
+             budget=15.0, deadline=10.0, requests=(1, 1)),
     )
 
 
@@ -362,8 +414,24 @@ def verdict(spec, attempts, fixture, evidence):
     """Return (verdict, reasons). Deterministic claims only; others are 'recorded'."""
     reasons = []
     final = attempts[-1] if attempts else {'kind': 'not-run', 'code': None, 'message': ''}
-    if final['kind'] == 'harness-error':
+    if not attempts or any(a['kind'] == 'harness-error' for a in attempts):
         reasons.append('harness error')
+    if any(a.get('cleanup_uncertain', False) for a in attempts):
+        reasons.append('child cleanup uncertain')
+    for row in attempts:
+        if row['kind'] == 'failure' and row.get('route') != 'api-initial-readyz':
+            reasons.append('failure lacks original child route')
+        if row['kind'] == 'pending' and (row['code'] != 1 or row.get('route') is not None
+                or row.get('private_output_bytes') != 0 or row['message'] != 'API discovery pending'):
+            reasons.append('pending differs from the production contract')
+    if spec['flag'] and not final.get('flags', {}).get(spec['flag'], False):
+        reasons.append('missing cause-specific child evidence')
+    if spec['allowed'] == HANG or spec['name'] == 'absolute-deadline-before-cap':
+        if final['code'] == 124:
+            if final['message'] not in ('child deadline exceeded', 'deadline exceeded'):
+                reasons.append('missing deadline evidence')
+        elif final['message'] != 'child command failed' or not final.get('flags', {}).get('client_timeout'):
+            reasons.append('missing client timeout evidence')
     if spec['allowed'] is not None and (final['kind'], final['code']) not in spec['allowed']:
         reasons.append('final outcome not in the allowed set')
     if spec['message'] is not None and final.get('message') != spec['message']:
@@ -374,18 +442,42 @@ def verdict(spec, attempts, fixture, evidence):
             reasons.append('too few pending attempts before readiness')
         if any((a['kind'], a['code']) not in spec['pre_final'] for a in early):
             reasons.append('a pre-final attempt was not exact pending')
-        if any(a['kind'] == 'pending' and not a['flags']['refused'] for a in early):
-            reasons.append('pending without the exact refusal text')
+        if any(a.get('server_started', True) for a in early):
+            reasons.append('pending was not observed before listener startup')
     low, high = spec['elapsed']
     if not low <= evidence['elapsed'] <= high:
         reasons.append('elapsed outside the case window')
     if spec['requests'] is not None and not spec['requests'][0] <= evidence['request_count'] <= spec['requests'][1]:
         reasons.append('server request count outside bounds')
-    if spec['name'] == 'ok-ready':
-        first = fixture['requests'][:1]
-        if not first or first[0]['path'] != '/readyz' or first[0]['client_cn'] != CLIENT_CN:
-            reasons.append('ok case did not show a verified mTLS /readyz request')
-    if not evidence['cleanup']['listener_closed'] or evidence['cleanup']['threads_alive']:
+    cleanup = evidence['cleanup']
+    if spec['requests'] and spec['requests'][0]:
+        if (cleanup.get('connections_accepted') != evidence['request_count']
+                or cleanup.get('handshakes_completed') != evidence['request_count']
+                or any(r.get('path') != '/readyz' or r.get('method') != 'GET'
+                       or r.get('query') != 'timeout=10s' or r.get('client_cn') != CLIENT_CN
+                       for r in fixture['requests'])):
+            reasons.append('request lacks matching connection and verified mTLS evidence')
+        for request in fixture['requests']:
+            step = spec['steps'][0]
+            expected_body = len(step['body']) if step['do'] == 'respond' else 2 if step['do'] == 'stall-body' else 0
+            body_matches = (request.get('body_bytes_sent', 0) > 1024 * 1024
+                            if spec['name'] == 'output-overflow'
+                            else request.get('body_bytes_sent') == expected_body)
+            if (request.get('step') != step['name']
+                    or request.get('headers_sent') != (step['do'] != 'stall')
+                    or not body_matches):
+                reasons.append('fixture response evidence differs')
+    if spec['tls'] != 'good' and (cleanup.get('connections_accepted') != 1
+            or cleanup.get('handshakes_started') != 1 or cleanup.get('handshakes_completed') != 0
+            or not cleanup.get('server_errors')):
+        reasons.append('missing rejected TLS handshake evidence')
+    if spec['mode'] in ('tcp-stall', 'tls-stall'):
+        if cleanup.get('connections_accepted') != 1 or cleanup.get('handshakes_completed') != 0:
+            reasons.append('missing accepted connection stall evidence')
+        if spec['mode'] == 'tls-stall' and not cleanup.get('clienthello_bytes', 0):
+            reasons.append('missing ClientHello evidence')
+    if (not cleanup['listener_closed'] or cleanup['threads_alive']
+            or not cleanup.get('sockets_closed', False)):
         reasons.append('fixture cleanup incomplete')
     if evidence['owned_uid_processes_after']:
         reasons.append('ubuntu-uid process remained in the container')
@@ -395,10 +487,13 @@ def verdict(spec, attempts, fixture, evidence):
 
 
 def run_case(spec, core, contexts, kubectl, uid, clock=time.monotonic, sleep=time.sleep,
-             factory=Fixture, count=owned_uid_processes):
+             factory=Fixture, count=owned_uid_processes, proof_deadline=None):
     fixture = factory(context=contexts.get(spec['tls']), clock=clock)
     begun = clock()
-    deadline = begun + spec['deadline']          # ONE original absolute operation deadline
+    end = begun + spec['budget']
+    if proof_deadline is not None:
+        end = min(end, proof_deadline - REPORT_RESERVE)
+    deadline = min(begun + spec['deadline'], end - REAP - CLEANUP - SETTLE)
     attempts, started = [], False
     try:
         while True:
@@ -406,30 +501,37 @@ def run_case(spec, core, contexts, kubectl, uid, clock=time.monotonic, sleep=tim
                 fixture.start(spec['steps'], spec['mode'])
                 started = True
             record = attempt(core, kubectl, deadline, clock)
+            record['server_started'] = started
             if len(attempts) < MAX_REPORTED_ATTEMPTS:
                 attempts.append(record)
             else:
                 attempts[-1] = record
-            if not spec['loop'] or record['kind'] != 'pending' or clock() >= deadline:
+            if (not spec['loop'] or record['kind'] != 'pending'
+                    or record.get('cleanup_uncertain') or clock() >= deadline):
                 break
             sleep(max(0.0, min(1.0, deadline - clock())))
     finally:
-        cleanup = fixture.close() if started else {'listener_closed': True, 'threads_alive': 0,
-                                                    'connections_accepted': 0, 'server_errors': {}}
-    elapsed = round(clock() - begun, 3)
-    settle = clock() + SETTLE
+        cleanup = fixture.close(min(end - SETTLE, clock() + CLEANUP))
+    settle = min(end, clock() + SETTLE)
     remaining = count(uid)
     while remaining and clock() < settle:
-        sleep(0.1)
+        sleep(min(0.1, max(0.0, settle - clock())))
         remaining = count(uid)
     served = fixture.requests
+    elapsed = round(clock() - begun, 3)
     evidence = {'elapsed': elapsed, 'request_count': len(served), 'cleanup': cleanup,
                 'owned_uid_processes_after': remaining}
     outcome, reasons = verdict(spec, attempts, {'requests': served}, evidence)
+    if clock() >= end:
+        outcome = 'failed'
+        reasons.append('case reservation exhausted including cleanup and settling')
     return {'name': spec['name'], 'verdict': outcome, 'reasons': reasons,
             'asserted': spec['allowed'] is not None, 'mode': spec['mode'], 'tls': spec['tls'],
             'operation_deadline_seconds': spec['deadline'], 'elapsed': elapsed,
             'server_requests': served[:MAX_REPORTED_REQUESTS], 'server_request_count': len(served),
+            'route_counts': {'api-initial-readyz': sum(a.get('route') == 'api-initial-readyz' for a in attempts),
+                             'unlabeled_pending': sum(a['kind'] == 'pending' and a.get('route') is None
+                                                      for a in attempts)},
             'attempts': attempts, 'cleanup': cleanup, 'owned_uid_processes_after': remaining}
 
 
@@ -495,8 +597,10 @@ def make_contexts():
 
 
 def run(core, kubectl=None, contexts=None, clock=time.monotonic, cases=None, ident=None,
-        fixtures=FIXTURES, config_path=KUBECONFIG_PATH):
+        fixtures=FIXTURES, config_path=KUBECONFIG_PATH, proof_deadline=None,
+        case_runner=run_case):
     begun = clock()
+    end = begun + WORK_BUDGET if proof_deadline is None else proof_deadline
     report = {'harness': HARNESS, 'status': 'failed', 'work_budget_seconds': WORK_BUDGET,
               'cap_seconds': 10, 'request_timeout_seconds': 10, 'seams': list(SEAMS),
               'remaining_coverage': list(REMAINING), 'cases': []}
@@ -520,21 +624,28 @@ def run(core, kubectl=None, contexts=None, clock=time.monotonic, cases=None, ide
         kubectl = kubectl or core.kubectl
         contexts = contexts if contexts is not None else make_contexts()
         for spec in (cases if cases is not None else build_cases()):
-            if clock() - begun + spec['budget'] > WORK_BUDGET:
+            if clock() + spec['budget'] + REPORT_RESERVE > end:
                 report['cases'].append({'name': spec['name'], 'verdict': 'not-run',
                                         'reasons': ['insufficient remaining proof budget']})
                 continue
-            report['cases'].append(run_case(spec, core, contexts, kubectl, account.pw_uid, clock))
+            report['cases'].append(case_runner(spec, core, contexts, kubectl, account.pw_uid, clock,
+                                                proof_deadline=end))
         verdicts = [c['verdict'] for c in report['cases']]
         report['summary'] = {name: verdicts.count(name) for name in ('passed', 'recorded', 'failed', 'not-run')}
         if verdicts and not report['summary']['failed'] and not report['summary']['not-run']:
             report['status'] = 'passed'
+    except ProofExpired:
+        report['error'] = 'original proof deadline exhausted'
     except KeyboardInterrupt:
         report['error'] = 'interrupted'
     except Exception as error:  # noqa: BLE001 - fixed class only, never message text
         report['error'] = 'operational failure (%s)' % type(error).__name__
     finally:
         report['elapsed_seconds'] = round(clock() - begun, 3)
+        json.dumps(report, sort_keys=True)  # charge report construction to the original clock
+        if clock() >= end:
+            report['status'] = 'failed'
+            report['error'] = 'original proof deadline exhausted'
     return report
 
 
@@ -611,6 +722,14 @@ def _terminate(_signum, _frame):
     raise KeyboardInterrupt
 
 
+class ProofExpired(BaseException):
+    """Whole-driver deadline, not a child error and never Pending."""
+
+
+def _expire(_signum, _frame):
+    raise ProofExpired
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('command', choices=('prepare', 'run'))
@@ -619,11 +738,21 @@ def main(argv=None):
         prepare()
         return 0
     signal.signal(signal.SIGTERM, _terminate)
-    sys.path.insert(0, str(SUITE))
-    import vlab_core as core
-    report = run(core)
-    print(json.dumps(report, sort_keys=True), flush=True)
-    return 0 if report['status'] == 'passed' else 1
+    signal.signal(signal.SIGALRM, _expire)
+    end = time.monotonic() + WORK_BUDGET
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, end - time.monotonic()))
+    try:
+        sys.path.insert(0, str(SUITE))
+        import vlab_core as core
+        report = run(core, proof_deadline=end)
+        if time.monotonic() >= end:
+            raise ProofExpired
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return 0 if report['status'] == 'passed' and time.monotonic() < end else 1
+    except ProofExpired:
+        return 1
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 if __name__ == '__main__':

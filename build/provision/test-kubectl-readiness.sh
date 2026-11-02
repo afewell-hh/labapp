@@ -4,8 +4,10 @@
 # The only input is the lead-attested pinned kubectl file (58597560 bytes, SHA256 below); it is
 # copied, re-hashed and mounted read-only, never executed on the host. Network only for the
 # separate preparation container; the runtime container has network none. No Docker socket, host
-# credentials, KVM, privileged or host-network mode, and no environment overrides.
+# credentials, KVM, privileged or host-network mode. Requires trusted host tools and local daemon.
 set -euo pipefail
+export PATH=/usr/bin:/bin
+umask 077
 [[ "$#" -eq 1 && "$1" == /* ]]
 source_kubectl=$1
 pin_size=58597560
@@ -21,12 +23,23 @@ prep_id=
 runtime_id=
 image_id=
 workdir="$(mktemp -d)"
+mkdir "$workdir/home" "$workdir/docker"
+printf '{}\n' > "$workdir/docker/config.json"
+# Never consult the user's Docker config, context, credential helpers or proxy settings.
+# Fixed local daemon; no inherited Docker/HTTP proxy/auth/TLS environment reaches the CLI.
+docker() {
+  local grace=$1 seconds=$2
+  shift 2
+  env -i PATH=/usr/bin:/bin HOME="$workdir/home" DOCKER_CONFIG="$workdir/docker" \
+    /usr/bin/timeout --kill-after="$grace" "$seconds" /usr/bin/docker \
+    --config "$workdir/docker" --host unix:///var/run/docker.sock "$@"
+}
 owned_container() {
-  timeout --kill-after=1s 5s docker container ls -aq --no-trunc \
+  docker 1s 5s container ls -aq --no-trunc \
     --filter "name=^/${1}$" --filter "label=$run_label"
 }
 owned_image() {
-  timeout --kill-after=1s 5s docker image ls --no-trunc --quiet \
+  docker 1s 5s image ls --no-trunc --quiet \
     --filter "reference=$image_tag" --filter "label=$run_label"
 }
 cleanup() {
@@ -40,7 +53,7 @@ cleanup() {
     fi
     [[ -n "$object" ]] || continue
     if [[ ! "$object" =~ ^[a-f0-9]{64}$ ]]; then failed=1; continue; fi
-    timeout --kill-after=1s 5s docker rm -f "$object" >/dev/null || failed=1
+    docker 1s 5s rm -f "$object" >/dev/null || failed=1
     remaining="$(owned_container "$container")" || failed=1
     [[ -z "$remaining" ]] || failed=1
   done
@@ -48,7 +61,7 @@ cleanup() {
     failed=1
   elif [[ -n "$object" ]]; then
     if [[ "$object" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-      timeout --kill-after=1s 5s docker image rm "$object" >/dev/null || failed=1
+      docker 1s 5s image rm "$object" >/dev/null || failed=1
       remaining="$(owned_image)" || failed=1
       [[ -z "$remaining" ]] || failed=1
     else
@@ -62,15 +75,16 @@ cleanup() {
 finish() {
   local result=$?
   trap - EXIT
-  cleanup || result=1
+  cleanup || { if ((result == 0)); then result=1; fi; }
   exit "$result"
 }
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for dependency in docker timeout python3 sha256sum stat install cut; do command -v "$dependency" >/dev/null; done
+for dependency in timeout python3 sha256sum stat install cut; do command -v "$dependency" >/dev/null; done
+[[ -x /usr/bin/docker ]]
 [[ -f "$source_kubectl" && ! -L "$source_kubectl" ]]
-timeout --kill-after=1s 5s docker version --format 'Docker server {{.Server.Version}}'
+docker 1s 5s version --format 'Docker server {{.Server.Version}}'
 
 # Stage a private copy first, then verify the COPY (not the original) so there is no check/use gap.
 stage="$workdir/stage"
@@ -84,7 +98,7 @@ done
 
 # Preparation (network allowed, bounded, separate from the proof): pinned distro packages plus an
 # unpinned-but-recorded openssl; generates SYNTHETIC test certificates and the accepted kubeconfig.
-prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$run_label" \
+prep_id="$(docker 3s 15s create --name "$prep" --label "$run_label" \
   --memory=512m --cpus=1 --pids-limit=128 --security-opt=no-new-privileges \
   "$base" timeout --kill-after=3s 150s bash -ceu '
     apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=15 update
@@ -96,18 +110,18 @@ prep_id="$(timeout --kill-after=3s 15s docker create --name "$prep" --label "$ru
     python3 -B /suite/kubectl_readiness_proof.py prepare
   ')"
 [[ "$prep_id" =~ ^[a-f0-9]{64}$ ]]
-timeout --kill-after=3s 30s docker cp "$stage/." "$prep_id:/"
-timeout --kill-after=5s 170s docker start -a "$prep_id"
-[[ "$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$prep_id")" == 0 ]]
-image_id="$(timeout --kill-after=3s 30s docker commit --change "LABEL $run_label" "$prep_id" "$image_tag")"
+docker 3s 30s cp "$stage/." "$prep_id:/"
+docker 5s 170s start -a "$prep_id"
+[[ "$(docker 1s 5s inspect --format '{{.State.ExitCode}}' "$prep_id")" == 0 ]]
+image_id="$(docker 3s 30s commit --change "LABEL $run_label" "$prep_id" "$image_tag")"
 [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
-timeout --kill-after=1s 5s docker image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
-timeout --kill-after=1s 5s docker image inspect "$image_id" --format 'Prepared {{.Id}}'
+docker 1s 5s image inspect "$base" --format 'Base {{.Id}} {{json .RepoDigests}}'
+docker 1s 5s image inspect "$image_id" --format 'Prepared {{.Id}}'
 
 # Runtime: network none (loopback only), read-only root, kubectl mounted read-only. Root with the
 # four capabilities production uid/group drop and process-group kill need (SETUID/SETGID for the
 # account switch, KILL for the group signal, DAC_OVERRIDE to read the ubuntu-owned 0600 kubeconfig).
-runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --label "$run_label" \
+runtime_id="$(docker 3s 15s create --name "$runtime" --label "$run_label" \
   --network=none --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=KILL \
   --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges --read-only --user=0:0 \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m \
@@ -116,8 +130,8 @@ runtime_id="$(timeout --kill-after=3s 15s docker create --name "$runtime" --labe
   timeout --kill-after=3s 200s python3 -B /suite/kubectl_readiness_proof.py run)"
 [[ "$runtime_id" =~ ^[a-f0-9]{64}$ ]]
 run_status=0
-timeout --kill-after=5s 215s docker start -a "$runtime_id" > "$workdir/report.json" || run_status=$?
-exit_code="$(timeout --kill-after=1s 5s docker inspect --format '{{.State.ExitCode}}' "$runtime_id")"
+docker 5s 215s start -a "$runtime_id" > "$workdir/report.json" || run_status=$?
+exit_code="$(docker 1s 5s inspect --format '{{.State.ExitCode}}' "$runtime_id")"
 [[ "$(stat -c %s -- "$workdir/report.json")" -le 262144 ]]
 # One JSON object line; print only the validated, re-serialized report.
 python3 -I -c '
