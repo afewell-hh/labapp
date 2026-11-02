@@ -28,34 +28,71 @@ containers() {
 images() {
   docker image ls --no-trunc -q --filter "reference=$tag" --filter "label=$label"
 }
+# Diagnostics only: fixed stage/outcome words and a numeric status. Arguments are
+# literals or exit codes; Docker output, names, IDs and environment are never printed.
+diag() { printf 'Pinned API cleanup stage=%s status=%s outcome=%s\n' "$1" "$2" "$3" >&2 || :; }
+# Observed status only: Docker can itself return 124/137; 137 is also an
+# ambiguous kill. These statuses do not establish timeout provenance.
+failure_outcome() { case $1 in 124|137) echo timeout-status ;; *) echo command-failed ;; esac; }
+# $1 value, $2 anchored ID regex: value is non-empty; a second line means multiple IDs.
+id_outcome() {
+  if [[ "$1" =~ $2 ]]; then echo valid
+  elif [[ "$1" == *$'\n'* ]]; then echo multiple-ids
+  else echo malformed-id; fi
+}
 finish() {
-  local primary=$? failed=0 name object remaining
+  local primary=$? failed=0 name object remaining rc stage now
   trap - EXIT
   trap '' INT TERM
+  diag primary "$primary" recorded
   # Lost create/commit responses may still complete at the daemon. Best-effort
   # exact cleanup below does not turn that uncertainty into an absence claim.
-  if ((prep_pending || runtime_pending || commit_pending)); then failed=1; fi
+  if ((prep_pending || runtime_pending || commit_pending)); then
+    failed=1; diag create-commit-uncertain 0 outstanding
+  fi
   for name in "$runtime" "$prep"; do
-    if ! object=$(containers "$name"); then failed=1; continue; fi
+    case $name in "$runtime") stage="runtime-container" ;; *) stage="prep-container" ;; esac
+    rc=0; object=$(containers "$name") || rc=$?
+    if ((rc)); then failed=1; diag "$stage-select" "$rc" "$(failure_outcome "$rc")"; continue; fi
     if [[ -n "$object" ]]; then
-      if [[ ! "$object" =~ ^[a-f0-9]{64}$ ]]; then failed=1; continue; fi
-      docker rm -f "$object" >/dev/null || failed=1
-    fi
-    if ! remaining=$(containers "$name"); then failed=1; continue; fi
-    [[ -z "$remaining" ]] || failed=1
+      if [[ ! "$object" =~ ^[a-f0-9]{64}$ ]]; then
+        failed=1; diag "$stage-select" 0 "$(id_outcome "$object" '^[a-f0-9]{64}$')"; continue
+      fi
+      rc=0; docker rm -f "$object" >/dev/null || rc=$?
+      if ((rc)); then failed=1; diag "$stage-remove" "$rc" "$(failure_outcome "$rc")"
+      else diag "$stage-remove" 0 command-ok; fi
+    else diag "$stage-select" 0 none-found; fi
+    rc=0; remaining=$(containers "$name") || rc=$?
+    if ((rc)); then failed=1; diag "$stage-verify" "$rc" "$(failure_outcome "$rc")"; continue; fi
+    if [[ -z "$remaining" ]]; then diag "$stage-verify" 0 absent
+    else failed=1; diag "$stage-verify" 0 still-present; fi
   done
-  if ! object=$(images); then failed=1
+  rc=0; object=$(images) || rc=$?
+  if ((rc)); then failed=1; diag image-select "$rc" "$(failure_outcome "$rc")"
   elif [[ -n "$object" ]]; then
     if [[ "$object" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-      docker image rm "$object" >/dev/null || failed=1
-    else failed=1; fi
-  fi
-  if ! remaining=$(images); then failed=1
-  elif [[ -n "$remaining" ]]; then failed=1; fi
-  if [[ -d "$scratch" && ! -L "$scratch" && $(stat -c %d:%i:%u:%a -- "$scratch") == "$identity" ]]; then
-    rm -rf --one-file-system -- "$scratch" || failed=1
-    [[ ! -e "$scratch" && ! -L "$scratch" ]] || failed=1
-  else failed=1; fi
+      rc=0; docker image rm "$object" >/dev/null || rc=$?
+      if ((rc)); then failed=1; diag image-remove "$rc" "$(failure_outcome "$rc")"
+      else diag image-remove 0 command-ok; fi
+    else failed=1; diag image-select 0 "$(id_outcome "$object" '^sha256:[a-f0-9]{64}$')"; fi
+  else diag image-select 0 none-found; fi
+  rc=0; remaining=$(images) || rc=$?
+  if ((rc)); then failed=1; diag image-verify "$rc" "$(failure_outcome "$rc")"
+  elif [[ -n "$remaining" ]]; then failed=1; diag image-verify 0 still-present
+  else diag image-verify 0 absent; fi
+  if [[ -d "$scratch" && ! -L "$scratch" ]]; then
+    rc=0; now=$(stat -c %d:%i:%u:%a -- "$scratch") || rc=$?
+    if ((rc)); then failed=1; diag scratch-identity "$rc" stat-failed
+    elif [[ "$now" != "$identity" ]]; then failed=1; diag scratch-identity 0 identity-mismatch
+    else
+      diag scratch-identity 0 match
+      rc=0; rm -rf --one-file-system -- "$scratch" || rc=$?
+      if ((rc)); then failed=1; diag scratch-remove "$rc" command-failed
+      else diag scratch-remove 0 command-ok; fi
+      if [[ ! -e "$scratch" && ! -L "$scratch" ]]; then diag scratch-verify 0 absent
+      else failed=1; diag scratch-verify 0 still-present; fi
+    fi
+  else failed=1; diag scratch-identity 0 not-owned-directory; fi
   if ((failed)); then
     echo 'Pinned API owned cleanup unverified' >&2
     if ((primary)); then exit "$primary"; fi

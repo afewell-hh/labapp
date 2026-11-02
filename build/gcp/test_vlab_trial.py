@@ -1484,6 +1484,28 @@ class GuestDiagnostics(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(host.guest_result(raw, self.nonce), ('invalid', None))
 
+    def test_host_consumes_guardian_policy_supervision_records_and_refuses_mislabels(self):
+        # Shape of the final record the actual guardian publishes for a policy refusal
+        # during supervision (#418); the guest-side tests produce it with the real guardian.
+        policy = {'origin': 'guardian', 'phase': 'fresh', 'operation': 'worker-supervision',
+                  'category': 'policy', 'child_status': None}
+        for contained in (True, False):
+            with self.subTest(contained=contained):
+                state, record = host.guest_result(self.encoded(result_value(self.nonce, 1, contained, policy)), self.nonce)
+                self.assertEqual((state, record['code'], record['contained'], record['diagnostic']),
+                                 ('valid', 1, contained, policy))
+        for name, detail in (('worker origin may not claim supervision', dict(policy, origin='worker')),
+                             ('policy never carries a child status', dict(policy, child_status=1)),
+                             ('unknown origin is status-invalid only', dict(policy, origin='unknown')),
+                             ('startup phase label stays closed', dict(policy, phase='bogus')),
+                             ('policy cannot be success', dict(policy, category='none'))):
+            with self.subTest(name):
+                self.assertEqual(host.guest_result(self.encoded(result_value(self.nonce, 1, True, detail)), self.nonce),
+                                 ('invalid', None))
+        with self.subTest('code 0 cannot carry a policy diagnostic'):
+            self.assertEqual(host.guest_result(self.encoded(result_value(self.nonce, 0, True, policy)), self.nonce),
+                             ('invalid', None))
+
     def test_guest_validator_is_the_same_gate_for_status_and_unknown_origin(self):
         unknown = {'origin': 'unknown', 'phase': 'stage', 'operation': 'install-docker',
                    'category': 'status-invalid', 'child_status': 137}

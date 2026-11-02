@@ -26,6 +26,7 @@ import hhfab_release
 import vlab_trial as trial
 
 REAL_REGULAR, REAL_ATOMIC = trial.regular, trial.atomic
+REAL_SLEEP = time.sleep
 NONCE = 'a' * 32
 SENTINEL = 'PRIVATE-SENTINEL-kubeconfig-token-password'
 
@@ -135,6 +136,76 @@ class FakeAdmissionApi:
             del self.store[key]
             return b'{}'
         raise AssertionError('unexpected kubectl ' + repr(args))
+
+
+def identity(info):
+    """The exact tuple the actual regular() compares between its two descriptor observations."""
+    return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+class DescriptorTap:
+    """Runs one REAL filesystem action between the two real fstat observations of regular().
+
+    It wraps os.open/os.fstat/os.replace and ALWAYS calls the original; it never fakes a
+    stat result, a read or a Failure. After the first real fstat of the chosen descriptor,
+    the second call first performs the action (the real trial.atomic, hence real
+    exclusive() + real os.replace, or a real in-place append) and then returns the real
+    fstat of the same descriptor. ``arm_on`` delays counting until that basename was opened.
+    """
+    def __init__(self, root, name, content=None, occurrence=1, action='replace', arm_on=None):
+        self.root, self.name, self.content = Path(root), name, content
+        self.occurrence, self.action, self.arm_on = occurrence, action, arm_on
+        self.armed, self.opened, self.fd, self.calls = arm_on is None, 0, None, 0
+        self.before = self.after = None
+        self.replaced = []
+        self.real_open, self.real_fstat, self.real_replace = os.open, os.fstat, os.replace
+
+    def install(self, stack):
+        stack.enter_context(patch.object(os, 'open', self.open))
+        stack.enter_context(patch.object(os, 'fstat', self.fstat))
+        stack.enter_context(patch.object(os, 'replace', self.replace))
+        return self
+
+    def open(self, path, *args, **kwargs):
+        fd = self.real_open(path, *args, **kwargs)
+        base = os.path.basename(os.fspath(path))
+        if self.arm_on is not None and base == self.arm_on:
+            self.armed = True
+        if base == self.name and self.armed and self.before is None and self.fd is None:
+            self.opened += 1
+            if self.opened == self.occurrence:
+                self.fd, self.calls = fd, 0
+        return fd
+
+    def replace(self, source, destination, *args, **kwargs):
+        self.replaced.append((os.path.basename(os.fspath(source)), os.path.basename(os.fspath(destination))))
+        return self.real_replace(source, destination, *args, **kwargs)
+
+    def fstat(self, fd):
+        if self.fd is None or fd != self.fd:
+            return self.real_fstat(fd)
+        self.calls += 1
+        if self.calls == 1:
+            self.before = self.real_fstat(fd)
+            return self.before
+        self.fd = None
+        # A real pause so a coarse kernel timestamp tick cannot hide an inode-change effect.
+        REAL_SLEEP(0.05)
+        path = self.root / self.name
+        if self.action == 'replace':
+            REAL_ATOMIC(path, self.content() if callable(self.content) else self.content)
+        else:
+            with open(path, 'ab') as stream:
+                stream.write(b' ')
+        self.after = self.real_fstat(fd)
+        return self.after
+
+    def changed(self):
+        return identity(self.before) != identity(self.after)
+
+    def observation(self):
+        return ('ino/size/mtime_ns/ctime_ns before=%r after=%r nlink_after=%d changed=%s replaced=%r' %
+                (identity(self.before), identity(self.after), self.after.st_nlink, self.changed(), self.replaced))
 
 
 class SharedTrial(unittest.TestCase):
@@ -707,11 +778,18 @@ class SharedTrial(unittest.TestCase):
         self.assertEqual(trial.worker_status(final, NONCE)['diagnostic'], trial.SUCCESS)
 
     # ---- issue #364: closed diagnostics, sole writers, truthful provenance -------
-    def guardian_fault(self, spawn=None, status=None, raw_status=None, overrides=None, clock_effects=None):
-        """Actual guardian with native actions patched; returns (exit, result|None, mocks)."""
+    def guardian_fault(self, spawn=None, status=None, raw_status=None, overrides=None, clock_effects=None,
+                       prepare=None, around=None):
+        """Actual guardian with native actions patched; returns (exit, result|None, mocks).
+
+        ``prepare(root)`` edits the real fixture files after creation; ``around`` is an
+        ExitStack callback installing extra real-function taps around the guardian run.
+        """
         if self.root.exists():
             shutil.rmtree(self.root)
         self.guardian_fixture()
+        if prepare is not None:
+            prepare(self.root)
         if status is not None:
             (self.root / 'worker-status.json').write_bytes(trial.encoded(status))
         if raw_status is not None:
@@ -726,6 +804,8 @@ class SharedTrial(unittest.TestCase):
             mocks['Popen'] = local.enter_context(patch.object(trial.subprocess, 'Popen', **(spawn or {})))
             if clock_effects is not None:
                 local.enter_context(patch.object(trial.Clock, 'remaining', side_effect=clock_effects))
+            if around is not None:
+                around(local)
             code = trial.main(['guardian'])
         path = self.root / 'result.json'
         return code, (json.loads(path.read_text()) if path.exists() else None), mocks
@@ -898,6 +978,262 @@ class SharedTrial(unittest.TestCase):
                 trial.main(['guardian'])
         contain.assert_not_called()
         self.assertFalse((self.root / 'result.json').exists())
+
+    # ---- issue #418: file-publication and policy failures, real functions, no VM ------
+    # Offline reproduction of a CANDIDATE mechanism only. It makes no claim about the
+    # unknown cause of the native13 failure and no attribution to any earlier change.
+    # Hypothesis: the guardian's regular() compares ino/size/mtime/ctime of one open
+    # descriptor before and after its read, so an os.replace() of the same path between
+    # the two observations may unlink the old inode (ctime change) and be refused as
+    # `file changed` (a policy Failure). Whether the assessed filesystem does that is
+    # RECORDED, not assumed: expectations below follow the real descriptor observations.
+    def test_real_regular_with_real_replace_between_descriptor_observations(self):
+        self.root.mkdir(mode=0o700)
+        cases = (('phase.json', {'phase': 'fresh'}, {'phase': 'strict'}),
+                 ('heartbeat.json', {'sequence': 1, 'received': 1.0}, {'sequence': 2, 'received': 2.0}))
+        for name, old, new in cases:
+            with self.subTest(name):
+                path = self.root / name
+                path.write_bytes(trial.encoded(old))
+                tap = DescriptorTap(self.root, name, content=new)
+                with ExitStack() as local:
+                    tap.install(local)
+                    try:
+                        outcome = REAL_REGULAR(path, 4096)
+                    except trial.Failure as error:
+                        outcome = error
+                self.assertEqual(tap.calls, 2)  # exactly two real observations of one descriptor
+                self.assertEqual(tap.replaced, [(name + '.next', name)])
+                self.assertEqual(path.read_bytes(), trial.encoded(new))  # the replacement really happened
+                self.assertFalse((self.root / (name + '.next')).exists())
+                sys.stderr.write('\nOBSERVED #418 %s %s\n' % (name, tap.observation()))
+                if tap.changed():
+                    self.assertIsInstance(outcome, trial.Failure)
+                    self.assertEqual((str(outcome), outcome.category, outcome.code, outcome.child_status),
+                                     ('file changed', 'policy', 1, None))
+                else:  # hypothesis negative on this filesystem: the old, consistent bytes are returned
+                    self.assertEqual(outcome, trial.encoded(old))
+        # In-place mutation between the same observations is the unambiguous control.
+        path = self.root / 'phase.json'
+        path.write_bytes(trial.encoded({'phase': 'fresh'}))
+        tap = DescriptorTap(self.root, 'phase.json', action='append')
+        with ExitStack() as local:
+            tap.install(local)
+            with self.assertRaisesRegex(trial.Failure, '^file changed$') as caught:
+                REAL_REGULAR(path, 4096)
+        self.assertEqual((caught.exception.category, caught.exception.child_status), ('policy', None))
+        self.assertTrue(tap.changed())
+        self.assertEqual(tap.replaced, [])
+        # No interference: the same real function accepts the unmodified file.
+        path.write_bytes(trial.encoded({'phase': 'fresh'}))
+        self.assertEqual(REAL_REGULAR(path, 4096), trial.encoded({'phase': 'fresh'}))
+
+    def test_real_regular_refuses_unsafe_files_and_accepts_the_matching_control(self):
+        self.root.mkdir(mode=0o700)
+        good = self.root / 'good.json'
+        good.write_bytes(b'{"phase":"fresh"}')
+        os.chmod(good, 0o600)
+        self.assertEqual(REAL_REGULAR(good, 4096, os.getuid(), 0o600), b'{"phase":"fresh"}')
+        self.assertEqual(REAL_REGULAR(good, len(b'{"phase":"fresh"}')), b'{"phase":"fresh"}')  # limit is inclusive
+        with self.subTest('oversized'):
+            with self.assertRaisesRegex(trial.Failure, 'file type/owner/size refused'):
+                REAL_REGULAR(good, len(b'{"phase":"fresh"}') - 1)
+        with self.subTest('owner'):
+            with self.assertRaisesRegex(trial.Failure, 'file type/owner/size refused'):
+                REAL_REGULAR(good, 4096, os.getuid() + 1)
+        with self.subTest('mode'):
+            with self.assertRaisesRegex(trial.Failure, 'file type/owner/size refused'):
+                REAL_REGULAR(good, 4096, None, 0o640)
+        with self.subTest('hardlink'):
+            os.link(good, self.root / 'alias.json')
+            for name in ('good.json', 'alias.json'):
+                with self.assertRaisesRegex(trial.Failure, 'file type/owner/size refused'):
+                    REAL_REGULAR(self.root / name, 4096)
+            (self.root / 'alias.json').unlink()
+            self.assertEqual(REAL_REGULAR(good, 4096), b'{"phase":"fresh"}')
+        with self.subTest('symlink'):
+            os.symlink(good, self.root / 'link.json')
+            with self.assertRaisesRegex(trial.Failure, 'path link refused'):
+                REAL_REGULAR(self.root / 'link.json', 4096)
+        with self.subTest('symlinked parent'):
+            (self.root / 'dir').mkdir()
+            (self.root / 'dir' / 'f.json').write_bytes(b'{}')
+            os.symlink(self.root / 'dir', self.root / 'dirlink')
+            with self.assertRaisesRegex(trial.Failure, 'path link refused'):
+                REAL_REGULAR(self.root / 'dirlink' / 'f.json', 4096)
+            self.assertEqual(REAL_REGULAR(self.root / 'dir' / 'f.json', 4096), b'{}')
+        with self.subTest('fifo and directory'):
+            os.mkfifo(self.root / 'fifo.json')
+            for name in ('fifo.json', 'dir'):
+                with self.assertRaisesRegex(trial.Failure, 'file type/owner/size refused'):
+                    REAL_REGULAR(self.root / name, 4096)
+        with self.subTest('missing is not a policy Failure'):
+            with self.assertRaises(FileNotFoundError):
+                REAL_REGULAR(self.root / 'absent.json', 4096)
+
+    def supervised_loop_fault(self, mutate=None, prepare=None, poll=(None, 17, 17), overrides=None, around=None):
+        """Actual guardian; first loop pass reads genuine `fresh` phase, then `mutate` runs once."""
+        child = Mock(pid=999999)
+        child.poll.side_effect = list(poll)
+        calls = []
+
+        def sleeper(_seconds):
+            calls.append(_seconds)
+            if len(calls) == 1 and mutate is not None:
+                mutate(self.root)
+
+        def fixture(root):
+            (root / 'phase.json').write_bytes(b'{"phase":"fresh"}')
+            if prepare is not None:
+                prepare(root)
+        with patch.object(trial.time, 'sleep', side_effect=sleeper):
+            return self.guardian_fault(spawn={'return_value': child}, prepare=fixture, overrides=overrides, around=around)
+
+    def assert_supervision_failure(self, outcome, phase, category, code=1):
+        exit_code, result, mocks = outcome
+        self.assertEqual(exit_code, code)
+        self.assertEqual((result['schema'], result['code'], result['contained'], result['nonce']), (2, code, True, NONCE))
+        self.assertEqual(result['diagnostic'], {'origin': 'guardian', 'phase': phase, 'operation': 'worker-supervision',
+                                                'category': category, 'child_status': None})
+        self.assertEqual(trial.result_record(result, NONCE), result)  # actual final record validates
+        mocks['containment'].assert_called_once_with()
+        mocks['Popen'].assert_called_once()  # failure was observed during supervision, after spawn
+
+    def test_guardian_supervision_maps_real_unsafe_inputs_to_policy_or_exception(self):
+        def write(name, raw):
+            return lambda root: (root / name).write_bytes(raw)
+
+        def replace_with(name, action):
+            def run(root):
+                (root / name).unlink()
+                action(root / name)
+            return run
+        heartbeat, phase = 'heartbeat.json', 'phase.json'
+        cases = (
+            ('heartbeat duplicate key', write(heartbeat, b'{"received":1,"received":2,"sequence":1}'), 'fresh', 'policy'),
+            ('heartbeat NaN', write(heartbeat, b'{"received":NaN,"sequence":1}'), 'fresh', 'policy'),
+            ('heartbeat Infinity', write(heartbeat, b'{"received":Infinity,"sequence":1}'), 'fresh', 'policy'),
+            ('heartbeat oversized', write(heartbeat, b' ' * 4097), 'fresh', 'policy'),
+            ('heartbeat hardlink', lambda root: os.link(root / heartbeat, root / 'heartbeat.alias'), 'fresh', 'policy'),
+            ('heartbeat symlink', replace_with(heartbeat, lambda p: os.symlink(p.parent / 'contract.json', p)), 'fresh', 'policy'),
+            ('heartbeat fifo', replace_with(heartbeat, os.mkfifo), 'fresh', 'policy'),
+            ('heartbeat malformed JSON is an ordinary exception', write(heartbeat, b'{'), 'fresh', 'exception'),
+            ('heartbeat missing field is an ordinary exception', write(heartbeat, b'{"sequence":1}'), 'fresh', 'exception'),
+            ('heartbeat missing is an ordinary exception', lambda root: (root / heartbeat).unlink(), 'fresh', 'exception'),
+            ('stale heartbeat is the explicit watchdog category',
+             lambda root: (root / heartbeat).write_bytes(trial.encoded({'sequence': 1, 'received': time.monotonic() - 31})),
+             'fresh', 'heartbeat-loss'),
+            ('phase duplicate key', write(phase, b'{"phase":"fresh","phase":"fresh"}'), 'fresh', 'policy'),
+            ('phase NaN', write(phase, b'{"phase":NaN}'), 'fresh', 'policy'),
+            ('phase unknown name', write(phase, b'{"phase":"bogus"}'), 'fresh', 'policy'),
+            ('phase startup has no cutoff', write(phase, b'{"phase":"startup"}'), 'startup', 'policy'),
+            ('phase hardlink', lambda root: os.link(root / phase, root / 'phase.alias'), 'fresh', 'policy'),
+            ('phase unhashable value is an ordinary exception', write(phase, b'{"phase":["fresh"]}'), 'fresh', 'exception'),
+            ('phase missing key is an ordinary exception', write(phase, b'{}'), 'fresh', 'exception'),
+            ('phase missing is an ordinary exception', lambda root: (root / phase).unlink(), 'fresh', 'exception'),
+        )
+        for label, mutate, expected_phase, category in cases:
+            with self.subTest(label):
+                self.assert_supervision_failure(self.supervised_loop_fault(mutate), expected_phase, category)
+
+    def test_guardian_measurements_path_refusals_and_symlink_replacement(self):
+        def link_next(root):
+            os.symlink(root / 'contract.json', root / 'measurements.json.next')
+
+        def regular_next(root):
+            (root / 'measurements.json.next').write_bytes(b'PUBLIC-STALE-TEMP')
+        self.assert_supervision_failure(self.supervised_loop_fault(prepare=link_next), 'fresh', 'policy')
+        outcome = self.supervised_loop_fault(prepare=regular_next)  # O_EXCL collision is not a Failure
+        self.assert_supervision_failure(outcome, 'fresh', 'exception')
+        self.assertEqual((self.root / 'measurements.json.next').read_bytes(), b'PUBLIC-STALE-TEMP')
+
+        # Reachable unsafe case: a symlink AT measurements.json is replaced by os.replace
+        # (never followed), so the guardian is not refused and the symlink target is untouched.
+        def link_target(root):
+            (root / 'victim').write_bytes(b'PUBLIC-VICTIM')
+            os.symlink(root / 'victim', root / 'measurements.json')
+        exit_code, result, _ = self.supervised_loop_fault(prepare=link_target)
+        self.assertEqual((self.root / 'victim').read_bytes(), b'PUBLIC-VICTIM')
+        self.assertFalse((self.root / 'measurements.json').is_symlink())
+        self.assertEqual((exit_code, result['diagnostic']['origin'], result['diagnostic']['category']),
+                         (17, 'unknown', 'status-invalid'))
+
+    def test_guardian_real_replace_between_observations_follows_actual_descriptor_evidence(self):
+        # The guardian reads phase 'fresh' genuinely first; the tap then performs a real
+        # os.replace between the real fstat observations of the NEXT read of the file.
+        def fresh_heartbeat():
+            return {'sequence': 2, 'received': time.monotonic()}
+        plans = (('phase.json', lambda: {'phase': 'fresh'}, 2, None),
+                 ('heartbeat.json', fresh_heartbeat, 1, 'phase.json'))
+        for name, content, occurrence, arm_on in plans:
+            with self.subTest(name):
+                taps = []
+
+                def around(stack):
+                    taps.append(DescriptorTap(self.root, name, content, occurrence, arm_on=arm_on).install(stack))
+                outcome = self.supervised_loop_fault(poll=(None, None, 17, 17), around=around)
+                tap = taps[0]
+                exit_code, result, mocks = outcome
+                self.assertEqual(tap.calls, 2)
+                self.assertIn((name + '.next', name), tap.replaced)
+                sys.stderr.write('\nOBSERVED #418 guardian %s %s\n' % (name, tap.observation()))
+                if tap.changed():
+                    self.assert_supervision_failure(outcome, 'fresh', 'policy')
+                else:  # hypothesis negative: no policy rejection; the later worker exit is the primary
+                    self.assertEqual((exit_code, result['code'], result['contained']), (17, 17, True))
+                    self.assertEqual(result['diagnostic'], {'origin': 'unknown', 'phase': 'fresh',
+                                     'operation': 'worker-supervision', 'category': 'status-invalid', 'child_status': 17})
+                    mocks['containment'].assert_called_once_with()
+                # Validate the guardian's published bytes through the host's independent gate.
+                from build.gcp.vlab_trial import guest_result
+                raw = (self.root / 'result.json').read_bytes()
+                self.assertEqual(json.loads(raw), result)
+                self.assertEqual(guest_result(raw, NONCE), ('valid', result))
+
+    def test_guardian_policy_primary_survives_cleanup_interruption_and_failed_final_write(self):
+        def bogus_phase(root):
+            (root / 'phase.json').write_bytes(b'{"phase":"bogus"}')
+
+        def run(**overrides):
+            child = Mock(pid=999999)
+            child.poll.return_value = None
+            return self.guardian_fault(spawn={'return_value': child}, prepare=bogus_phase, overrides=overrides)
+        # Baseline: invalid phase at the first supervision read -> policy, phase still `startup`.
+        self.assert_supervision_failure(run(), 'startup', 'policy')
+        for label, trouble in (('Failure', trial.Failure('uncertain')), ('interrupt', KeyboardInterrupt()),
+                               ('OSError', OSError(SENTINEL))):
+            with self.subTest('containment ' + label):
+                exit_code, result, mocks = run(containment={'side_effect': trouble})
+                self.assertEqual((exit_code, result['code'], result['contained']), (1, 1, False))
+                self.assertEqual(result['diagnostic'], {'origin': 'guardian', 'phase': 'startup',
+                                 'operation': 'worker-supervision', 'category': 'policy', 'child_status': None})
+                self.assertNotIn(SENTINEL, json.dumps(result))
+                mocks['containment'].assert_called_once_with()
+
+        def failing(path, value):
+            if Path(path).name == 'result.json':
+                raise OSError(SENTINEL)
+            return REAL_ATOMIC(path, value)
+        with self.subTest('failed final write'):
+            exit_code, result, mocks = run(atomic={'side_effect': failing})
+            self.assertEqual((exit_code, result), (1, None))  # primary preserved, no false receipt
+            mocks['containment'].assert_called_once_with()
+        with self.subTest('failed final write and containment trouble'):
+            exit_code, result, _ = run(atomic={'side_effect': failing}, containment={'side_effect': KeyboardInterrupt()})
+            self.assertEqual((exit_code, result), (1, None))
+
+    def test_guardian_policy_failure_never_replaces_an_incumbent_when_reservation_collides(self):
+        self.guardian_fixture()
+        (self.root / 'phase.json').write_bytes(b'{"phase":"bogus"}')
+        (self.root / 'started.json').write_bytes(b'{}')
+        incumbent = trial.encoded({'schema': 2, 'incumbent': True})
+        (self.root / 'result.json').write_bytes(incumbent)
+        with patch.object(trial.subprocess, 'Popen') as spawn, patch.object(trial, 'containment') as contain:
+            with self.assertRaises(FileExistsError):
+                trial.main(['guardian'])
+        spawn.assert_not_called()
+        contain.assert_not_called()
+        self.assertEqual((self.root / 'result.json').read_bytes(), incumbent)
 
     def test_final_record_degrades_to_closed_fallback_never_false_success(self):
         bad = {'origin': 'worker', 'phase': 'stage', 'operation': SENTINEL, 'category': 'none', 'child_status': None}
