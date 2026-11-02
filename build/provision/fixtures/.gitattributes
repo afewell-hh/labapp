@@ -1,0 +1,2 @@
+# Signed InRelease bytes must never be normalized (line endings/filters).
+ubuntu-snapshot-*/* -text -diff -merge

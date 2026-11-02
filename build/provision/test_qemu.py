@@ -1,5 +1,6 @@
 """Consequential offline failures; no host QEMU/APT invocation or cloud access."""
 import contextlib
+import http.client
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ from unittest.mock import patch, Mock
 import hhfab_release
 from hhfab_release import Refusal, bounded
 import qemu_container as container
+import qemu_auth_control as auth
 import qemu_offline as offline_protocol
 import qemu_witness as witness
 
@@ -260,28 +262,28 @@ class CommandDiagnosticTests(unittest.TestCase):
                     os.kill(int(pidfile.read_text()), 0)
 
     def test_actual_container_signature_callback_accepts_only_authentication_refusal(self):
-        # Run the maintained harness and installer transaction together. Stop at
-        # the inventory immediately after the signature assertion; never execute
-        # the later missing-pin, installation or held-package native fixtures.
-        class SignatureBoundaryReached(Exception):
-            pass
+        # The maintained signature boundary moved to the disconnected runner.
+        # Exercise its real setup/rewrite/HTTP/cleanup, not the removed callback.
         cases = (
-            ('signature', (100, RetryPolicyAndEvidenceTests.NO_PUBKEY), SignatureBoundaryReached, ''),
+            ('signature', (100, RetryPolicyAndEvidenceTests.NO_PUBKEY), None, ''),
             ('transport', (100, b'503 Service Unavailable'), AssertionError, 'transport-only'),
             ('unclassified', (100, b'unrelated error'), AssertionError, 'unclassified'),
             ('succeeded', (0, RetryPolicyAndEvidenceTests.NO_PUBKEY), AssertionError, 'succeeded'),
-            ('timeout', Refusal('command timeout'), AssertionError, ''),
+            ('mixed', (100, RetryPolicyAndEvidenceTests.NO_PUBKEY + b'503 Service Unavailable'),
+             AssertionError, 'mixed'),
+            ('timeout', Refusal('command timeout'), Refusal, 'timeout'),
         )
         for name, outcome, exception, reason in cases:
             with self.subTest(name=name):
                 owned = []
-                original_call = self.globals['call']
-                inventory = Mock(side_effect=[{}, SignatureBoundaryReached()])
-                def native_update(args, seconds, env=None):
+                environment = dict(self.module['ENV'])
+                data = {suite: b'public synthetic mechanics only' for suite in auth.SUITES}
+                def native_update(args, seconds, limit=0, env=None, on_start=None):
                     self.assertEqual(args[0], '/usr/bin/apt-get')
                     self.assertEqual(args[-1], 'update')
                     self.assertIn('APT::Update::Error-Mode=any', args)
-                    self.assertIs(env, self.module['ENV'])
+                    self.assertEqual(seconds, auth.CASE_SECONDS)
+                    self.assertEqual(limit, auth.OUTPUT_LIMIT)
                     source = Path(next(arg.split('=', 1)[1] for arg in args
                                        if arg.startswith('Dir::Etc::sourcelist=')))
                     text = source.read_text()
@@ -289,24 +291,65 @@ class CommandDiagnosticTests(unittest.TestCase):
                     key = Path(text.split('[signed-by=', 1)[1].split(']', 1)[0])
                     self.assertEqual(key.read_bytes(), b'')
                     owned.extend((source.parent, key.parent))
+                    base = re.search(r'http://127\.0\.0\.1:(\d+)/', text).group(1)
+                    for suite in auth.SUITES:
+                        connection = http.client.HTTPConnection('127.0.0.1', int(base), timeout=2)
+                        try:
+                            connection.request('GET', f'{auth.BASE_PATH}{suite}/InRelease')
+                            response = connection.getresponse()
+                            self.assertEqual((response.status, response.read()), (200, data[suite]))
+                        finally:
+                            connection.close()
                     if isinstance(outcome, Refusal):
                         raise outcome
                     return outcome
-                with patch.dict(self.globals, {'preflight': lambda: {}, 'installed': inventory}), \
-                     patch.dict(self.module, {'installed': inventory}), \
-                     patch.object(container, 'transport', return_value={}), \
-                     patch.object(container.runpy, 'run_path', return_value=self.module), \
-                     patch.object(container, 'bounded', side_effect=native_update) as native, \
-                     patch.object(Path, 'rglob', return_value=[]):
+                native = Mock(side_effect=native_update)
+                def boundary():
+                    code, output, rows, _ = auth.run_case(
+                        'empty_key', auth.Case('empty', data), self.module, native, Mock)
+                    return auth.classify_empty_key(code, output, rows, data)
+                if exception is None:
+                    self.assertEqual(boundary(), {'no_pubkey': True})
+                else:
                     with self.assertRaisesRegex(exception, reason):
-                        container.install()
-                    self.assertIs(self.globals['call'], original_call)
-                    self.assertEqual(inventory.call_count, 2 if name == 'signature' else 1)
-                    native.assert_called_once()
+                        boundary()
+                self.assertEqual(self.module['ENV'], environment)
+                native.assert_called_once()
                 self.assertEqual(len(owned), 2)
                 for path in owned:
                     self.assertFalse(path.exists())
                     self.assertFalse(path.is_symlink())
+
+    def test_current_container_missing_pin_callback_reaches_real_transaction(self):
+        class BoundaryReached(Exception):
+            pass
+        original_call = self.globals['call']
+        original_pins = dict(self.module['PINS'])
+        calls, roots = [], []
+        def native(args, seconds, env=None):
+            calls.append(container.apt_stage(args))
+            source = Path(next(a.split('=', 1)[1] for a in args if a.startswith('Dir::Etc::sourcelist=')))
+            roots.append(source.parent)
+            self.assertEqual(source.read_text(), auth.PRODUCTION_SOURCES)
+            self.assertIn('signed-by=' + auth.KEY, source.read_text())
+            if '--simulate' in args:
+                self.assertIn('qemu-system-x86=999:0.invalid', args)
+                return 100, b"Version '999:0.invalid' for 'qemu-system-x86' was not found"
+            self.assertIn(calls[-1], ('update', 'check'))
+            return 0, b''
+        inventory = Mock(side_effect=[{}, BoundaryReached()])
+        with patch.dict(self.globals, {'preflight': lambda: {}, 'installed': inventory}), \
+             patch.dict(self.module, {'installed': inventory}), \
+             patch.object(container, 'transport', return_value={}), \
+             patch.object(container.runpy, 'run_path', return_value=self.module), \
+             patch.object(container, 'bounded', side_effect=native), \
+             patch.object(Path, 'rglob', return_value=[]):
+            with self.assertRaises(BoundaryReached):
+                container.install()
+        self.assertEqual(calls, ['update', 'check', 'simulate'])
+        self.assertIs(self.globals['call'], original_call)
+        self.assertEqual(self.module['PINS'], original_pins)
+        self.assertTrue(all(not root.exists() for root in roots))
 
 
 class WitnessTests(unittest.TestCase):
@@ -592,9 +635,15 @@ class OwnershipTests(ownership.CleanupTests):
             fake.chmod(0o755)
             state_path = root / 'state.json'
             state_path.write_text(json.dumps({'containers': {}, 'images': {}, 'calls': []}))
+            script = root / 'test-qemu.sh'
+            source = Path(__file__).with_name(script.name).read_text()
+            source = source.replace('[[ -x /usr/bin/docker ]]', 'true')
+            source = source.replace('/usr/bin/docker --host unix:///var/run/docker.sock',
+                                    f'FAKE_DOCKER_STATE={state_path} FAKE_DOCKER_MODE={mode} {fake}')
+            script.write_text(source)
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        FAKE_DOCKER_STATE=str(state_path), FAKE_DOCKER_MODE=mode)
-            result = subprocess.run(['bash', str(Path(__file__).with_name('test-qemu.sh'))],
+            result = subprocess.run(['bash', str(script)],
                                     env=env, capture_output=True, text=True, timeout=10)
             return result, json.loads(state_path.read_text())
 
