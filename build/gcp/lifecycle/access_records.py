@@ -122,7 +122,13 @@ class Context:
     @classmethod
     def from_slot(cls, slot):
         try:
-            if (type(slot['schema']) is not int or slot['schema'] != 1 or slot['slot'] != SLOT or
+            if isinstance(slot, dict) and slot.get('schema') == 2:
+                from .inline_history import HistoryError, validate
+                try:
+                    validate(slot, reserve=True, adding=True)
+                except HistoryError as exc:
+                    raise AccessError(str(exc)) from exc
+            if (type(slot['schema']) is not int or slot['schema'] not in (1, 2) or slot['slot'] != SLOT or
                     slot['state'] not in ('ACTIVE', 'CLEANUP_FAILED') or
                     slot['profile'] not in (spec.UBUNTU_BASE_BUILD, spec.UBUNTU_VLAB_CORE) or
                     slot['boot_image_id'] != spec.COMPONENT_IMAGE_ID):

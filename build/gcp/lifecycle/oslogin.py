@@ -263,6 +263,8 @@ class OwnKeyImport:
         gen, won = self.records.create(self.context, 'intent', value)
         if not won:
             raise AccessError('existing intent cannot authorize a second import')
+        if type(gen) is not int or not 0 < gen <= 2**63 - 1:
+            raise AccessError('intent generation cannot be represented in a receipt')
         self._permit = _ImportCapability(value, gen)
         return value, gen
 

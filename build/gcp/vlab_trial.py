@@ -231,6 +231,7 @@ class OwnerRegistration:
                       and {k: rec.get(k) for k in SNAPSHOT_FIELDS} == self.expected,
                       'owner lease changed')
         self.__controller._lease_kinds(rec)
+        self.__controller._accounting(rec, reserve=True, adding=True)
         guest.require(all(rec['ids'].values()))
         op = self.cloud.call('zoneOperations', 'get', name=rec['operation'])
         proof, error = self.__controller._insert_target_id(rec, [op])

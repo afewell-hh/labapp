@@ -550,6 +550,17 @@ class OwnKeyTests(unittest.TestCase):
             with self.assertRaises(AccessError): f.session().prepare(key())
         self.assertEqual(len(f.posts()), 1)
 
+    def test_uint64_storage_generation_cannot_authorize_unrepresentable_intent_receipt(self):
+        f = Fixture()
+        f.gcs.seq = 2**63 - 1
+        session = f.session()
+        with self.assertRaisesRegex(AccessError, 'intent generation'):
+            session.prepare(key())
+        self.assertIn(f.context.path('intent'), f.gcs.objects)
+        self.assertEqual(f.gcs.objects[f.context.path('intent')][1], 2**63)
+        with self.assertRaises(AccessError): session.import_once()
+        self.assertFalse(f.posts())
+
     def test_concurrent_and_copied_invocation_consumes_shared_capability_once(self):
         f = Fixture(); s = f.session(); s.prepare(key())
         copied = copy.copy(s)
@@ -827,8 +838,10 @@ class AccessController(unittest.TestCase):
         r, gen = f.w.store.read(f.w.cfg.key)
         r['access_history'] *= 16
         f.w.store.write(f.w.cfg.key, r, if_generation_match=gen)
-        f.w.ctl.admit(2, 1, U2); f.w.ctl.submit(U2); f.w.ctl.confirm_created(U2)
-        with self.assertRaisesRegex(Refused, 'accounting limit'): f.register(U2, key(4))
+        calls, writes = len(f.w.raw.calls), len(f.w.store.writes)
+        with self.assertRaisesRegex(Refused, 'accounting limit'): f.w.ctl.admit(2, 1, U2)
+        self.assertEqual(len(f.w.raw.calls), calls)
+        self.assertEqual(len(f.w.store.writes), writes)
 
     def test_binding_and_archival_cannot_regress(self):
         f = Fixture(); prev = f.w.record()

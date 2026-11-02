@@ -715,7 +715,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual({p.name for p in files}, {
                     '__init__.py', 'auth_http.py', 'cloud.py', 'compute.py',
                     'controller.py', 'gcs.py', 'spec.py', 'store.py', 'cli.py',
-                    'access_records.py', 'oslogin.py'})
+                    'access_records.py', 'oslogin.py', 'inline_history.py'})
                 self.assertTrue(all(url.endswith('?ref=' + 'a' * 40) for url in requested))
                 self.assertEqual(credentials.read_text(), 'unchanged')
                 self.assertEqual((Path(tmp) / 'labapp-trusted-lifecycle/lifecycle/cli.py').read_bytes(),
@@ -727,7 +727,7 @@ class WorkflowTests(unittest.TestCase):
                                  'isolated fetched CLI import and trust validation passed')
                 # Demonstrate this check detects the original omission rather
                 # than importing already-loaded modules from this test process.
-                for missing in ('access_records.py', 'oslogin.py'):
+                for missing in ('access_records.py', 'oslogin.py', 'inline_history.py'):
                     path = fetched / 'lifecycle' / missing
                     content = path.read_bytes()
                     path.unlink()

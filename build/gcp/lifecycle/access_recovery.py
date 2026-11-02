@@ -12,6 +12,7 @@ import re
 from urllib.parse import quote, urlencode
 
 from . import spec
+from . import inline_history
 from .access_records import (AccessError, Context, KINDS, SLOT, canonical, digest,
                              timestamp, validate_binding, validate_record)
 from .cloud import ForbiddenOperation, NotFound
@@ -84,6 +85,11 @@ def validate_local(value, slot, decision, now):
 
 def validate_proof(value):
     bounded(value)
+    if isinstance(value, dict) and isinstance(value.get('slot'), dict) and value['slot'].get('schema') == 2:
+        try:
+            inline_history.proof_budget(value)
+        except inline_history.HistoryError as exc:
+            raise AccessError(str(exc)) from exc
     exact(value, ('schema', 'policy', 'trial', 'import', 'disposition', 'slot',
                   'slot_generation', 'slot_sha256', 'observations', 'decision', 'evidence_sha256'))
     require(type(value['schema']) is int and value['schema'] == 1 and value['policy'] == POLICY and
@@ -197,7 +203,12 @@ class FailedAccessRecovery:
         require(context.binding['self_user'] == self.__login.user == OWNER_SELF)
         self.__controller._lease_kinds(slot)
         history = slot.get('access_history', [])
-        require(type(history) is list and len(history) < 16, 'retained access accounting exhausted')
+        try:
+            inline_history.validate(slot, reserve=True, adding=True)
+        except inline_history.HistoryError as exc:
+            raise AccessError(str(exc)) from exc
+        limit = inline_history.HISTORY_LIMIT if slot['schema'] == 2 else inline_history.LEGACY_LIMIT
+        require(type(history) is list and len(history) < limit, 'retained access accounting exhausted')
         leases, keys = set(), set()
         for item in history:
             validate_binding(item['binding'])
@@ -332,6 +343,13 @@ class FailedAccessRecovery:
                         request_id=slot['request_id'], ids=slot['ids'],
                         released_at=spec.rfc3339(self.__now()), evidence=slot['evidence'],
                         outcome='FAILED_DISPOSED', trial='FAILED', import_status='UNKNOWN', recovery=ref))
+        if slot['schema'] == 2:
+            try:
+                free.update(schema=2, legacy_history=copy.deepcopy(slot['legacy_history']))
+                free = inline_history.carry(slot, free)
+                inline_history.free_budget(free)
+            except inline_history.HistoryError as exc:
+                raise AccessError(str(exc)) from exc
         bounded(free)
         self.__current(expected_slot)
         try:

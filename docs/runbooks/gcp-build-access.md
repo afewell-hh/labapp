@@ -639,3 +639,30 @@ already-expired permanently retired key. Keep occupied quarantine if that risk
 is unacceptable. Existing bucket-wide WIF objectUser grants provide no proof
 prefix isolation. Network/protected-resource cleanup and acceptance remain
 independent mandatory gates; this recovery authorizes no new trial.
+
+### Finite inline ledger compatibility and migration boundary
+
+Schema1 retains its sixteen-entry access-history ceiling and refuses further
+admission before RESERVED/VM creation. Schema2 is a distinct, finite inline
+format restricted to canonical VLAB without capture; 24 completed entries is
+only a ceiling. Actual serialized history/inventory and worst permitted
+occupied, normal FREE, failed FREE and embedded-proof continuations must fit
+before admission, submission and registration. See the
+[inline schema2 contract](../../build/gcp/README.md#finite-inline-schema2).
+The 64KiB/depth32 media envelope, WIF identities and resource permissions do
+not expand. Both fixed source loaders need the new codec before ROOT CI.
+
+The offline planner does not authenticate history or authorize migration.
+Do not invoke migration on startup or admission. A separate ROOT plan must
+authenticate all existing history and trusted failed-disposal approval
+provenance, establish exact compatible FREE with explicit empty quarantine and
+absent access/capture, and compare the entire record plus generation before
+one separately authorized CAS. Unknown legacy content must remain preserved
+or cause refusal. Retain the immutable prefix and UNKNOWN meanings; never
+downgrade, prune or drop inventory to obtain headroom.
+
+Semantic history/capacity failure blocks access and unsafe FREE, not deletion
+of independently verified owned VM/disks. Reconciliation may physically dispose
+of them while retaining the opaque ledger and occupied capacity for assessment.
+Ownership corruption still blocks deletion. Source or CI qualification alone
+does not authorize live migration or VM17.
