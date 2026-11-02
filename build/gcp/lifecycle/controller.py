@@ -26,11 +26,10 @@ from typing import Callable, Optional
 
 from . import spec
 from . import inline_history
-from .access_records import AccessError, Context, KINDS, canonical, digest, public_key
+from .access_records import AccessError, Context, KINDS, digest, public_key
 from .oslogin import check_receipt
 from .cloud import ApiError, NotFound, PolicyCloud, Uncertain
 from .store import PreconditionFailed, SlotStore
-from .gcs import MAX_RECORD_BYTES
 
 FREE, RESERVED, ACTIVE, CLEANUP_FAILED = (
     "FREE", "RESERVED", "ACTIVE", "CLEANUP_FAILED")
@@ -155,6 +154,8 @@ class Controller:
     def _accounting(self, rec, *, reserve=False, adding=False):
         try:
             inline_history.validate(rec, reserve=reserve, adding=adding)
+            if rec.get("schema") == 2 and rec.get("state") != FREE:
+                inline_history.cleanup_budget(rec)
         except inline_history.HistoryError as exc:
             raise Refused("access retention/accounting limit or invalid history: " + str(exc)) from exc
 
@@ -174,6 +175,20 @@ class Controller:
         if any(value is not None and rec["ids"].get(kind) != value
                for kind, value in prev["ids"].items()):
             raise Refused("physical cleanup cannot replace immutable IDs")
+        if (rec["evidence"][:len(prev["evidence"])] != prev["evidence"] or
+                rec["evidence"] != inline_history.cleanup_evidence(
+                    prev["evidence"], rec["evidence"][len(prev["evidence"]):])):
+            raise Refused("physical cleanup cannot rewrite or duplicate evidence")
+        facts = [inline_history.cleanup_fact(kind, name)
+                 for kind, name in rec["names"].items()]
+        facts += [inline_history.cleanup_fact(kind, rec["names"][kind], value)
+                  for kind, value in rec["ids"].items() if value is not None]
+        if any(fact not in facts for fact in rec["evidence"][len(prev["evidence"]):]):
+            raise Refused("physical cleanup can append only fixed child observations")
+        try:
+            inline_history.cleanup_budget(rec)
+        except inline_history.HistoryError as exc:
+            raise Refused(str(exc)) from exc
         try:
             return self.store.write(self.cfg.key, rec, if_generation_match=gen)
         except PreconditionFailed as exc:
@@ -374,12 +389,14 @@ class Controller:
         if new:
             prev = dict(rec)
             rec["ids"] = dict(rec["ids"], **new)
-            if physical and rec.get("schema") == 2 and len(canonical(rec)) > MAX_RECORD_BYTES:
-                # The verified preflight IDs still fence each immediate delete.
-                # Corrupt opaque history must not make physical disposal depend
-                # on growing an unwritable ledger. No FREE/access write follows
-                # without the separate accounting gates below.
-                return rec, gen
+            if physical and rec.get("schema") == 2:
+                try:
+                    inline_history.cleanup_budget(rec)
+                except inline_history.HistoryError:
+                    # The verified preflight IDs still fence each immediate delete.
+                    # Bad accounting cannot require an unwritable progress CAS.
+                    # The separate accounting gate must still refuse unsafe FREE.
+                    return rec, gen
             gen = (self._physical_cas if physical else self._cas)(prev, rec, gen)
         return rec, gen
 
@@ -641,13 +658,34 @@ class Controller:
         return inst is not None and inst.get("status") in NOT_RUNNING
 
     def _fail(self, rec: dict, gen: int, reason: str, ev: list) -> Outcome:
+        if rec.get("schema") == 2:
+            prev = dict(rec)
+            rec.update(state=CLEANUP_FAILED, reason=reason,
+                       evidence=inline_history.cleanup_evidence(rec["evidence"], ev))
+            if rec != prev:
+                self._physical_cas(prev, rec, gen)
+            return Outcome("cleanup-failed", reason)
         if not (rec["state"] == CLEANUP_FAILED and rec["reason"] == reason):
             prev = dict(rec)
             rec.update(state=CLEANUP_FAILED, reason=reason,
-                       evidence=(rec["evidence"] + ev) if rec.get("schema") == 2
-                       else (rec["evidence"] + ev)[-50:])
+                       evidence=(rec["evidence"] + ev)[-50:])
             self._physical_cas(prev, rec, gen)
         return Outcome("cleanup-failed", reason)
+
+    def _remember_cleanup(self, rec, gen, ev):
+        """Retain progress even if a later read, operation or access gate blocks."""
+        if rec.get("schema") == 2:
+            prev = dict(rec)
+            rec["evidence"] = inline_history.cleanup_evidence(rec["evidence"], ev)
+            if rec != prev:
+                try:
+                    gen = self._physical_cas(prev, rec, gen)
+                except Refused:
+                    # Already-invalid accounting may leave no writable headroom.
+                    # Preserve old bytes and continue independently owned deletion;
+                    # _accounting still refuses FREE after physical disposal.
+                    return prev, gen
+        return rec, gen
 
     def _delete_owned(self, rec, gen, kind, resource, found, proof, ev):
         """Delete one resource by exact name after identity verification.
@@ -660,7 +698,7 @@ class Controller:
         name = rec["names"][kind]
         res = self._get(resource, name)
         if res is None:
-            ev.append(f"{kind} {name}: absent (404)")
+            ev.append(inline_history.cleanup_fact(kind, name))
             return rec, gen, None
         reason = None if kind in found else "appeared-during-cleanup"
         reason = reason or self._verify(kind, res, rec, proof)
@@ -672,6 +710,11 @@ class Controller:
         try:
             op = self.cloud.call(resource, "delete", name=name)
         except (ApiError, Uncertain) as exc:
+            if rec.get("schema") == 2:
+                code = "uncertain" if isinstance(exc, Uncertain) else "api-error"
+                outcome = self._fail(rec, gen, f"delete-{kind}:{code}", ev)
+                outcome.detail = f"delete-{kind}:{exc}"
+                return rec, gen, outcome
             return rec, gen, self._fail(rec, gen, f"delete-{kind}:{exc}", ev)
         done = self._wait(op["name"])
         if done is None:
@@ -680,7 +723,7 @@ class Controller:
             return rec, gen, self._fail(rec, gen, f"delete-{kind}-op-error", ev)
         if self._get(resource, name) is not None:
             return rec, gen, self._fail(rec, gen, f"{kind}-still-exists", ev)
-        ev.append(f"{kind} {name} id {res['id']}: deleted, 404 confirmed")
+        ev.append(inline_history.cleanup_fact(kind, name, res["id"]))
         return rec, gen, None
 
     def _reconcile_once(self, rec: dict, gen: int, force: bool) -> Outcome:
@@ -740,10 +783,12 @@ class Controller:
             else:
                 rec, gen, c = self._dispose_image(rec, gen, c, image)
         for kind, resource in self._lease_kinds(rec):
+            rec, gen = self._remember_cleanup(rec, gen, ev)
             rec, gen, blocked = self._delete_owned(
                 rec, gen, kind, resource, found, proof, ev)
             if blocked:
                 return blocked
+        rec, gen = self._remember_cleanup(rec, gen, ev)
         create_resolved = (
             rec["submit_attempts"] == 0 or rec["ids"]["instance"] is not None
             or bool(own_inserts))
@@ -772,7 +817,7 @@ class Controller:
                     "run_id": rec["run_id"], "attempt": rec["attempt"],
                     "request_id": rec["request_id"], "ids": rec["ids"],
                     "released_at": spec.rfc3339(cfg.now()),
-                    "evidence": (rec["evidence"] + ev) if rec.get("schema") == 2
+                    "evidence": inline_history.cleanup_evidence(rec["evidence"], ev) if rec.get("schema") == 2
                     else (rec["evidence"] + ev)[-50:]}}
         if rec["schema"] == 2:
             free.update(schema=2, legacy_history=dict(rec["legacy_history"]))
