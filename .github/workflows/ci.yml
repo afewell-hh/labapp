@@ -567,6 +567,31 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(0 if result.wasSuccessful() else 1)
           PY
+      - name: Required student kubeconfig offline regressions
+        run: |
+          test -f build/provision/test_configure_student_kubeconfig.py
+          test_home=$(mktemp -d /tmp/labapp-kubeconfig-tests.XXXXXX)
+          mkdir -m 700 "$test_home/tmp"
+          trap 'rmdir "$test_home/tmp" "$test_home"' EXIT
+          umask 022
+          timeout --kill-after=5s 120s env -i HOME="$test_home" TMPDIR="$test_home/tmp" PATH=/usr/bin:/bin python3 -I -B - <<'PY'
+          import os
+          import sys
+          import unittest
+          def audit(event, args):
+            if event.startswith(('socket.', 'subprocess.')) or event in {
+              'os.system', 'os.posix_spawn', 'os.fork', 'os.forkpty', 'os.exec'}:
+              raise RuntimeError('offline kubeconfig suite forbids processes and network')
+          sys.addaudithook(audit)
+          root = os.path.abspath('build/provision')
+          sys.path.insert(0, root)
+          suite = unittest.TestLoader().discover(root, pattern='test_configure_student_kubeconfig.py')
+          if suite.countTestCases() == 0:
+            raise SystemExit('Required student kubeconfig suite discovered no tests')
+          print(f'Required student kubeconfig tests: {suite.countTestCases()}', flush=True)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
       - name: Required kubectl-fabric installer offline regressions
         run: |
           test -f build/provision/test_install_kubectl_fabric.py
