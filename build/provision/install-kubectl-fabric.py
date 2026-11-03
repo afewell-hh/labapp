@@ -143,6 +143,9 @@ def extract_member(archive, target, pin):
                     dst.write(block)
                     total.update(block)
                     remaining -= len(block)
+            trailer = tar.fileobj.read(tarfile.RECORDSIZE + 1)
+            if len(trailer) > tarfile.RECORDSIZE or trailer.strip(b"\0"):
+                raise Refusal("unexpected release archive trailer")
     except (tarfile.TarError, gzip.BadGzipFile, EOFError, zlib.error):
         raise Refusal("unreadable release archive") from None
     return member.size, total.hexdigest()

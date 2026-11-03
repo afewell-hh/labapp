@@ -157,7 +157,7 @@ class InstallTests(unittest.TestCase):
         other = self.root / "other"
         other.write_bytes(PAYLOAD)
         for shape in ("symlink", "directory", "hardlink", "fifo"):
-            with contextlib.suppress(FileNotFoundError):
+            with contextlib.suppress(FileNotFoundError, IsADirectoryError):
                 self.target.unlink()
             if self.target.is_dir():
                 self.target.rmdir()

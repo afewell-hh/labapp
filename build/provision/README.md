@@ -447,7 +447,7 @@ python3 /absolute/path/build/provision/install-kubectl-fabric.py --version 0.96.
 # Caller-owned alternate directory and a local archive (verified before any mutation):
 python3 /absolute/path/build/provision/install-kubectl-fabric.py --version 0.96.2 --platform linux/amd64 \
   --install-dir /absolute/owned/bin --archive /absolute/hhfctl-linux-amd64-v0.96.2.tar.gz
-# Offline synthetic tests (no network, no real hhfctl, nothing executed):
+# Offline synthetic tests (no network, no real hhfctl, no installed-byte execution):
 python3 -m unittest discover -s build/provision -p test_install_kubectl_fabric.py -v
 ```
 
@@ -455,7 +455,8 @@ The member's uncompressed size and hash are **unobserved**; the repo pins only t
 After the archive size/SHA256 match, the sole member is streamed (no `tar.extract`) into an owned
 `.kubectl-fabric-stage-*` directory with at most 256 MiB (a finite assumption), hashing as it is
 written; links, directories, extra, duplicate, unsafe or empty members and truncated or corrupt
-streams are refused. The installed bytes are compared with that derived content. Behavior for
+streams are refused. Trailing zero padding is capped at one 10 KiB tar record and consumed through
+gzip EOF to verify stream integrity. The installed bytes are compared with that derived content. Behavior for
 `DIR/kubectl-fabric`: absent installs 0755 atomically (no-clobber link); derived-equal 0755 is
 unchanged; derived-equal bytes with another mode are replaced atomically; any other existing
 bytes are refused and preserved. Because no member pin exists, even an unchanged rerun needs the
