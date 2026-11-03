@@ -64,7 +64,11 @@ def real_parents(path):
     if not path.is_absolute() or ".." in path.parts or path != Path(os.path.normpath(path)):
         raise Refusal("paths must be absolute and normalized")
     for component in reversed(path.parents):
-        if not stat.S_ISDIR(component.lstat().st_mode):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            raise Refusal("path directory missing") from None
+        if not stat.S_ISDIR(info.st_mode):
             raise Refusal("path components must be real directories")
 
 
