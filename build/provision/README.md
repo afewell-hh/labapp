@@ -1485,6 +1485,44 @@ cleanup body, and an explicitly synthetic real-installer archive with recomputed
 pins. They never execute Helm or real curl. Checksum-only trust does not prove
 GPG/provenance, installed baseline metadata, runtime or full image/course equivalence.
 
+## Native observability render inputs
+
+`observability-inputs.yaml` (schemaVersion 1) pins the Helm client (v3.16.4
+linux-amd64 URL and published SHA256; size UNKNOWN), the packaged chart
+`kube-prometheus-stack` 65.2.0 (source commit, package URL, size 591234, SHA256),
+and the render settings (release `kube-prometheus-stack`, namespace `monitoring`,
+`observability-values.yaml`, test kube version 1.30.4). Source checksum and index
+URLs are provenance, not a signature claim. Kube version 1.30.4 is a native render
+test target only, not a chosen K3s version or deployed override.
+
+`observability-values.yaml` contains only
+`prometheus.prometheusSpec.enableRemoteWriteReceiver: true`, `retention: 7d` and
+`grafana.enabled: true`. Seven days is a proposed test-profile override of the
+chart default (10d); it is not equivalent to the course's stated retention. No
+credentials, hostnames, targets, URLs, dashboards, ports, PVCs or images are set.
+
+Intended use is an offline render from an explicitly verified, unpacked Helm client
+and the pinned packaged chart, never `install`, `upgrade`, dependency management,
+server dry-run, a post-renderer or the current kubeconfig:
+
+```bash
+helm template kube-prometheus-stack CHART.tgz --namespace monitoring \
+  --kube-version 1.30.4 --values observability-values.yaml
+```
+
+Send output to a private location: the chart may generate Secrets or random
+credential fields, so do not display or log raw manifests or treat them as existing
+credentials. Use a fresh isolated `HOME`/`HELM_*` state, no `KUBECONFIG` and no
+network; no cluster is involved.
+
+Pinned metadata is not byte verification: hash the actual client and chart bytes
+before use. The packaged dependency closure and images are unknown until observed
+by a render. Everything else uses chart defaults, with Services as ClusterIP.
+Persistent storage, live TLS, RBAC, ingestion, Loki, genuine course dashboards,
+boot integration and a full recipe are separate gates. Rendered Kubernetes
+dashboards are not Hedgehog course assets. This is not a deployable, security or
+management-cluster profile.
+
 ## Pinned public serializer/default asymmetry fixture
 
 `fixtures/pinned-api/main.go` (#394, extended by #400) runs three public inputs

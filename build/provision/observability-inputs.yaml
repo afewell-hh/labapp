@@ -1,0 +1,32 @@
+# Versioned input ledger for native offline Helm rendering of the pinned
+# kube-prometheus-stack chart with observability-values.yaml.
+# Operational input data only: metadata pins, not byte verification. The pins
+# below are not signature claims and nothing here has been downloaded or run.
+schemaVersion: 1
+
+helmClient:
+  version: v3.16.4
+  platform: linux-amd64
+  url: https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz
+  sha256: fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179
+  # Published checksum metadata (provenance only); archive size is UNKNOWN.
+  size: UNKNOWN
+
+chart:
+  name: kube-prometheus-stack
+  version: 65.2.0
+  sourceCommit: 05fcb4c017ba41efa5de0c11c03f6ed62902f880
+  packageUrl: https://github.com/prometheus-community/helm-charts/releases/download/kube-prometheus-stack-65.2.0/kube-prometheus-stack-65.2.0.tgz
+  size: 591234
+  sha256: fa80a64847ba4e59224554ef57a3d243088d43375a75caffbd4592e34f3923e7
+  # Published chart metadata/index pinned at this index-source commit (provenance
+  # only, with attribution to the prometheus-community/helm-charts project).
+  indexSourceCommit: 50009606d7e0c357ee808344a4cb579890d98277
+
+render:
+  release: kube-prometheus-stack
+  namespace: monitoring
+  valuesFile: observability-values.yaml
+  # Explicit TEST target for native rendering only. This is not a chosen K3s
+  # engine version and not a deployed override.
+  kubeVersion: 1.30.4

@@ -1,0 +1,9 @@
+# Native Helm values for kube-prometheus-stack 65.2.0 (see observability-inputs.yaml).
+# Only the verified public fragment; every other setting stays at the chart default.
+prometheus:
+  prometheusSpec:
+    enableRemoteWriteReceiver: true
+    # Proposed test-profile override (chart default 10d), not course-equivalent.
+    retention: 7d
+grafana:
+  enabled: true
