@@ -737,7 +737,7 @@ class PostCommitTests(Base):
         return outcome
 
     def test_handled_signal_during_link_commit_is_committed_but_incomplete(self):
-        for sig in (signal.SIGTERM, signal.SIGALRM):
+        for sig in (signal.SIGTERM, signal.SIGALRM, signal.SIGINT):
             with self.subTest(sig=sig):
                 self.out.unlink(missing_ok=True)
                 code, out, err = self.commit_with_signal("link", sig)
@@ -783,6 +783,27 @@ class PostCommitTests(Base):
         self.assertEqual(code, 130)
         self.assertEqual(err, "configure-student-kubeconfig: interrupted\n"
                               "configure-student-kubeconfig: owned stage cleanup incomplete\n")
+
+    def test_failed_owned_unlink_keeps_primary_error_and_previous_output(self):
+        self.install()
+        before = self.snapshot()
+        real_unlink = csk.os.unlink
+
+        def fail_owned_unlink(path, *args, **kwargs):
+            if Path(path).name == "vlab-source":
+                raise OSError("synthetic unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        self.hook = lambda number, args: (1, b"")
+        with patch.object(csk.os, "unlink", fail_owned_unlink):
+            code, out, err = self.run_main()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "configure-student-kubeconfig: native kubectl view failed\n"
+                              "configure-student-kubeconfig: owned stage cleanup incomplete\n")
+        self.assertEqual(self.snapshot(), before)
+        stages = [path for path in self.state.iterdir() if path.name != "config"]
+        self.assertEqual(len(stages), 1)
+        self.assertEqual([path.name for path in stages[0].iterdir()], ["vlab-source"])
 
     def test_sigterm_handler_restored_and_maps_to_interrupt(self):
         before = signal.getsignal(signal.SIGTERM)
