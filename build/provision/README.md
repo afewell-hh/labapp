@@ -1529,6 +1529,171 @@ boot integration and a full recipe are separate gates. Rendered Kubernetes
 dashboards are not Hedgehog course assets. This is not a deployable, security or
 management-cluster profile.
 
+## Native management-cluster configuration (issue #503, configuration only)
+
+`management-cluster.yaml` (k3d 5.7.4 `k3d.io/v1alpha5` Simple, cluster `labapp-mgmt`, one server,
+no agents) and `management-observability-values.yaml` (a second Helm values file layered after the
+unchanged `observability-values.yaml`) express a disposable-pilot management stage with native tools.
+Nothing here was executed: no k3d, Helm, Docker, cluster, ingestion, student, boot or performance
+check has run. The lead validates the data separately.
+
+* **Source gate and limits.** Authored from the #502 lead source gate. Helm 3.19.4, chart
+  kube-prometheus-stack 65.2.0 and the base values are unchanged. No K3s line is selected or
+  upgraded: prometheus-operator 0.77.1 builds on client-go 0.31.1 and its E2E uses Kubernetes 1.31.0,
+  so the chart minimum and a Helm render do not prove maintained-line support. Compatibility needs a
+  separately scoped experiment. Fabricator 0.43.1, Fabric 0.96.2 and private SONiC 4.5.0 are not
+  changed. No image bytes or digests are verified here.
+* **Required inputs.** `LABAPP_MANAGEMENT_IMAGE` and `LABAPP_PROMETHEUS_BIND_ADDRESS` must be exported
+  into the k3d PROCESS environment: k3d expands the config text with Go `os.ExpandEnv`, so a shell
+  variable that is unset or not exported can silently become empty. The stage 1 commands below are a dedicated
+  Bash script (run with `bash`, never sourced) whose `set -euo pipefail` stops before any mutating
+  command when a check fails. The image check requires a registry host (containing `.` or `:`), a
+  repository path and `@sha256:` plus 64 lowercase hex characters; the bind check accepts a dotted IPv4
+  literal and rejects empty and wildcard `0.0.0.0` (IPv6 binds are not supported by this guard). These
+  are format checks only: actual interface, source-boundary and route observations remain operator
+  prerequisites and are not validated here. Digest strings pass through to Docker per the lead's source
+  gate, but native digest use is unrun; source plumbing is not runtime proof. The guards are in the
+  stage 1 block below.
+
+* **Preflight (operator observations; none supplied here).**
+  * The image digest comes from an operator-verified source. Native k3d 5.7.4 use of a digest
+    reference is unrun.
+  * The bind address is a real host address on a real interface, observed to be reachable from the
+    control Alloy pod network and from the switches through the Fabric proxy, and not colliding with
+    Docker or VLAB networks. Ports 6550, 9090 and 3000 must be free.
+  * `network`, `subnet` and `hostAliases` are omitted: a named `network` selects an external one in
+    k3d 5.7.4, and an explicit subnet with an external network is rejected. k3d owns the default
+    network; observe its subnet for collisions.
+  * `/var/lib/labapp/management-storage` must be verified by the operator as new, owned by the
+    intended user and not a symlink before creation. No blanket chmod, chown or removal of existing
+    state is given. It is the bind source for local-path storage.
+  * The Grafana admin Secret `labapp-grafana-admin` (keys `admin-user`, `admin-password`) in namespace
+    `monitoring` is a separate private-credential prerequisite, created by an authorized operator in the
+    new namespace between stage 2 and stage 3 below. No secret bytes or credential-logging commands
+    are given here.
+  * No automatic install or upgrade, blind reuse or deletion, global kubeconfig context write or
+    privileged fallback.
+
+* **Commands.** Absolute verified paths replace `/ABS/...`. They run the same interactively or from CI
+  once runtime authority is reviewed; no new runner, wrapper or stage marker is added. These snippets
+  are for future reviewed runtime use only and were not executed. There are three separate stages. Save
+  each stage as its own script and run it with `bash`, never sourced. Every stage starts with
+  `set -euo pipefail` so a failed check stops before any later mutating command.
+
+  **Stage 1: clean cluster and private kubeconfig creation.** Run once on a clean host. Do not rerun
+  this stage after it has succeeded: `k3d cluster create` fails on an existing cluster, and no retry,
+  reuse or removal of existing state is given. Failure reconciliation and cleanup belong to the
+  original reviewed runtime authority, not to a manual or retained checkpoint.
+
+  ```bash
+  set -euo pipefail
+  image_re='^[A-Za-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+  : "${LABAPP_MANAGEMENT_IMAGE:?set to a fully qualified registry/repo@sha256:<64 hex> candidate}"
+  : "${LABAPP_PROMETHEUS_BIND_ADDRESS:?set to the observed receiver IPv4 address}"
+  [[ $LABAPP_MANAGEMENT_IMAGE =~ $image_re && ${LABAPP_MANAGEMENT_IMAGE%%/*} == *[.:]* ]] \
+    || { echo "image must be registry/repo@sha256:<64 lowercase hex>" >&2; exit 1; }
+  [[ $LABAPP_PROMETHEUS_BIND_ADDRESS =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ \
+    && $LABAPP_PROMETHEUS_BIND_ADDRESS != 0.0.0.0 ]] \
+    || { echo "bind must be a specific IPv4 address, not a wildcard" >&2; exit 1; }
+  export LABAPP_MANAGEMENT_IMAGE LABAPP_PROMETHEUS_BIND_ADDRESS
+
+  umask 077
+  install -d -m 0700 /ABS/private
+  /ABS/verified/k3d cluster create --config /ABS/verified/management-cluster.yaml \
+    --kubeconfig-update-default=false --kubeconfig-switch-context=false
+  /ABS/verified/k3d kubeconfig write labapp-mgmt --output /ABS/private/management-kubeconfig \
+    --kubeconfig-switch-context=false
+  ```
+
+  **Stage 2: namespace bootstrap.** The `monitoring` namespace cannot exist before the fresh cluster, so
+  it is created only after the private kubeconfig is written. `create` fails if it already exists; there
+  is no apply, reuse or delete.
+
+  ```bash
+  set -euo pipefail
+  umask 077
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt create namespace monitoring
+  ```
+
+  **Between stages 2 and 3: private Grafana Secret setup (operator boundary).** An authorized operator
+  creates Secret `labapp-grafana-admin` in the newly created `monitoring` namespace, using the private
+  kubeconfig and context above, with keys `admin-user` and `admin-password`. No command, secret value,
+  student account or credential-creation implementation is given here; never place secret values in
+  command lines, logs, raw Secret JSON/YAML or this repository.
+
+  **Stage 3: Helm install and health.** The two `get` checks print only object names, never Secret data,
+  and stop before Helm when a prerequisite is missing. They confirm the Secret object exists, not its key
+  names or values.
+
+  ```bash
+  set -euo pipefail
+  umask 077
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt get namespace monitoring --output=name
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt --namespace monitoring get secret labapp-grafana-admin --output=name
+  /ABS/verified/helm upgrade --install kube-prometheus-stack /ABS/verified/CHART.tgz \
+    --kubeconfig /ABS/private/management-kubeconfig --kube-context k3d-labapp-mgmt \
+    --namespace monitoring \
+    --values /ABS/verified/observability-values.yaml \
+    --values /ABS/verified/management-observability-values.yaml --wait --timeout 10m
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt --namespace monitoring get pvc,pods
+  ```
+
+  The `kubeconfig write` command keeps the explicit `--output` path, the private `umask` and the
+  downstream `k3d-labapp-mgmt` context; `--kubeconfig-switch-context=false` (default true) is added so it
+  cannot switch a current context. `--output` is rejected together with `--kubeconfig-merge-default`, and
+  `--overwrite` stays false, so use a fresh path in the private directory. The native `300s`
+  `options.k3d.timeout` is reused as a separate deadline in separate phases (network preparation, node
+  creation, cluster start); it is not an aggregate deadline and not an overall readiness-only bound, and
+  source notes that time already spent is not subtracted. The overall deadline comes from the reviewed
+  runtime authority. None of this was executed.
+
+* **Source references (k3d v5.7.4 raw files, read 2026-11-03).**
+  * Env expansion: `cmd/util/config/config.go`, `os.ExpandEnv(string(originalcontent))` on a temporary
+    copy; the file shows no unset-variable check.
+  * Flags: `cmd/kubeconfig/kubeconfigMerge.go`: `--output/-o` (default empty),
+    `--kubeconfig-merge-default/-d` (false), `--update/-u` (true), `--kubeconfig-switch-context/-s`
+    (true; bound to `UpdateCurrentContext`, passed to `client.KubeconfigGetWrite`), `--overwrite`
+    (false). That file sets no umask or file mode; modes inside `client` were not read, so the explicit
+    `umask 077` and 0700 directory are the operator's controls. That `write` aliases `merge` rests on the
+    lead's #502 gate; the alias line was not separately read.
+  * Timeout: `pkg/client/cluster.go`: `context.WithTimeout` separately in `ClusterPrep` (network
+    preparation), `ClusterCreate` (server/agent `NodeCreate`; the loadbalancer uses the unwrapped
+    context) and `ClusterStart`; `ClusterRun` carries a TODO about time already used.
+  * Digest to Docker: stated by the lead's #502 source gate; image handling is not shown in the cited
+    files, so that claim rests on the gate and runtime use is unrun.
+
+* **Access and identity.** The written kubeconfig is an admin config, not student RBAC, and exporting
+  it does not reduce privilege. Loopback binding of the API (6550) and Grafana (127.0.0.1:3000) is
+  not a tunnel; no tunnel or ordinary student account is defined or fabricated. The accepted
+  `configure-student-kubeconfig.py` normalizes names: the raw management source may carry
+  `k3d-labapp-mgmt`, while its output remains `k3d-k3d-observability` / `labapp-management`.
+  Accepted aliases are not renamed.
+* **Values.** Prometheus is NodePort 30090 with `retentionSize` 6GB on an 8Gi `local-path` RWO claim
+  (the base 7d retention still applies). Grafana is NodePort 30300 with a 1Gi `local-path` RWO claim,
+  `existingSecret` key names only, and anonymous access and sign-up disabled through the chart's
+  `grafana.ini`. Sizes and 7d are disposable-pilot choices, not release, course or total-disk claims;
+  account for WAL, head and filesystem overhead. Persistence adds the chart's root init-chown-data
+  container with the declared `busybox:1.31.1` image to the image ledger (declared by the chart, not
+  a pin chosen here); no image bytes or security closure are accepted.
+* **Exposure.** Prometheus has no authentication. Binding it to one address is not allowed-source
+  authorization; a later proof must census other node and container paths. No real TLS, principal
+  or source boundary exists yet, and no endpoint beyond those above is guessed.
+* **Health versus ingestion.** Native cluster, PVC and pod health is not ingestion. Success needs
+  fresh samples carrying control and switch producer labels, tested from the control Alloy pod
+  network and for the switch through the Fabric proxy (target URL ends `/api/v1/write`), then a user
+  Grafana browser and datasource query. None has been run.
+* **Persistence semantics.** local-path claims can use WaitForFirstConsumer. Pod restart and VM
+  reboot differ from PVC deletion (reclaim policy delete removes data) and from `k3d cluster delete`
+  or recreate. The host bind directory outlives cluster deletion but nothing reattaches it.
+  Server and load-balancer restart policy is `unless-stopped` per source; Docker/reboot recovery is
+  unrun.
+* **Unrun gates.** Release image, seal, full course, logs, GitOps, dashboards and performance. An
+  engine compatibility experiment or any current-maintained selection needs separate scope.
+
 ## Pinned public serializer/default asymmetry fixture
 
 `fixtures/pinned-api/main.go` (#394, extended by #400) runs three public inputs
