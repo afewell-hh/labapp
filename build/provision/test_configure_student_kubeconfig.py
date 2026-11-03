@@ -779,7 +779,7 @@ class PostCommitTests(Base):
         repl.assert_not_called()
         self.assertEqual(real(signal.SIG_BLOCK, []), before)  # exact old mask, incl. preexisting
         self.assertFalse(self.out.exists())
-        self.assertEqual(self.names(), ["config"])
+        self.assertEqual(self.names(), [])
 
     def test_failed_commit_restores_mask_and_stays_a_refusal(self):
         with patch.object(csk.os, "link", side_effect=OSError("denied")):
