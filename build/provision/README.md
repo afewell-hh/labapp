@@ -477,8 +477,12 @@ python3 -m unittest discover -s build/provision -p test_configure_student_kubeco
   before that point (exit 1, one fixed sanitized line) keeps the prior file and removes only the exact
   owned stage entries (an unknown stage child keeps the stage and is reported). Publication is the
   commit point: a later cleanup, durability, interrupt or reporting failure exits 3
-  (`committed-but-incomplete`) with no rollback or blind retry; reconcile it by hand. A signal between
-  the syscall and the in-memory commit flag is an unavoidable window.
+  (`committed-but-incomplete`) with no rollback or blind retry; reconcile it by hand. Handled
+  SIGALRM/SIGTERM/SIGINT are blocked (deferred, not lost) only around the single link/replace and the
+  in-memory commit flag, and the mask is restored immediately after the flag; no deadline is renewed.
+  SIGKILL or machine loss is not covered. If cleanup is incomplete while a primary failure
+  propagates, the fixed primary line and exit code are kept and a second fixed line,
+  `owned stage cleanup incomplete`, is added.
 * **Limits.** Single writer assumed; no immunity from a hostile concurrent writer, and kubectl is
   executed by path after its hash check (TOCTOU window). No real TLS/RBAC/API/principal/certificate
   validity, native interoperability, student course or image/boot claim. CI requires the synthetic

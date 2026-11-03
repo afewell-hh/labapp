@@ -64,6 +64,10 @@ CONTEXT_KEYS = {"cluster", "user", "namespace", "extensions"}
 class Run:
     """Mutable outcome state read by the reporter; committed is set only by publication."""
     committed = False
+    cleanup_incomplete = False  # set only when cleanup fails while a primary failure is propagating
+
+
+HANDLED_SIGNALS = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
 
 
 class Budget:
@@ -400,21 +404,27 @@ def publish(run, candidate, target, sources, existing):
     if existing is None:
         if os.path.lexists(target):
             raise Refusal("output appeared during the run")
-        try:
-            os.link(candidate, target)  # no-clobber commit
-        except FileExistsError:
-            raise Refusal("output appeared during the run") from None
-        except OSError:
-            raise Refusal("publication failed") from None
     else:
         data, now = read_regular(target, OUTPUT_LIMIT)
         if digest_of(data) != existing[0] or now != existing[1]:
             raise Refusal("output changed during the run")
+    # Handled signals are deferred (kernel-pending, not lost) only around the single commit syscall
+    # and the outcome flag, so a handler cannot run between them. The mask is restored right after
+    # the flag; no deadline is renewed and nothing is rolled back or retried.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    try:
         try:
-            os.replace(candidate, target)  # atomic commit
+            if existing is None:
+                os.link(candidate, target)  # no-clobber commit
+            else:
+                os.replace(candidate, target)  # atomic commit
+        except FileExistsError:
+            raise Refusal("output appeared during the run") from None
         except OSError:
             raise Refusal("publication failed") from None
-    run.committed = True
+        run.committed = True
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     sync_directory(target.parent)
 
 
@@ -491,7 +501,9 @@ def configure(args, run):
     try:
         status = stage_and_validate(args, run, stage, budget)
     except BaseException:
-        cleanup(stage)  # primary failure wins; incomplete cleanup is not reported over it
+        # The primary failure stays the reported outcome; incomplete cleanup is recorded separately.
+        if not cleanup(stage):
+            run.cleanup_incomplete = True
         raise
     if not cleanup(stage):
         raise Refusal("owned stage cleanup failed")
@@ -504,13 +516,17 @@ def report(error, run):
     if run.committed:
         print("configure-student-kubeconfig: committed-but-incomplete; do not retry blindly",
               file=sys.stderr)
-        return EXIT_COMMITTED_INCOMPLETE
-    if isinstance(error, KeyboardInterrupt):
+        code = EXIT_COMMITTED_INCOMPLETE
+    elif isinstance(error, KeyboardInterrupt):
         print("configure-student-kubeconfig: interrupted", file=sys.stderr)
-        return 130
-    text = str(error) if isinstance(error, Refusal) else "operational failure"
-    print("configure-student-kubeconfig: " + text, file=sys.stderr)
-    return 1
+        code = 130
+    else:
+        text = str(error) if isinstance(error, Refusal) else "operational failure"
+        print("configure-student-kubeconfig: " + text, file=sys.stderr)
+        code = 1
+    if run.cleanup_incomplete:
+        print("configure-student-kubeconfig: owned stage cleanup incomplete", file=sys.stderr)
+    return code
 
 
 def main(argv=None):

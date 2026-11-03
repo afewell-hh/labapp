@@ -721,6 +721,69 @@ class PostCommitTests(Base):
         self.assertEqual((code, err.getvalue()), (3, self.COMMITTED))
         self.assertEqual(self.names(), ["config"])
 
+    def commit_with_signal(self, name, sig):
+        """Wrap the real commit syscall; the signal is raised inside it and must be deferred."""
+        real, seen = getattr(csk.os, name), {}
+
+        def wrapped(*args, **kwargs):
+            seen["masked"] = csk.HANDLED_SIGNALS <= signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            result = real(*args, **kwargs)
+            signal.raise_signal(sig)
+            return result
+        with patch.object(csk.os, name, wrapped):
+            outcome = self.run_main()
+        self.assertTrue(seen["masked"])
+        self.assertFalse(csk.HANDLED_SIGNALS & signal.pthread_sigmask(signal.SIG_BLOCK, []))
+        return outcome
+
+    def test_handled_signal_during_link_commit_is_committed_but_incomplete(self):
+        for sig in (signal.SIGTERM, signal.SIGALRM):
+            with self.subTest(sig=sig):
+                self.out.unlink(missing_ok=True)
+                code, out, err = self.commit_with_signal("link", sig)
+                self.assertEqual((code, out, err), (3, "", self.COMMITTED))
+                self.assertEqual(self.published()[1], "vlab")
+                self.assertEqual(self.names(), ["config"])
+
+    def test_handled_signal_during_replace_commit_is_committed_but_incomplete(self):
+        self.install()
+        self.mg = binding("mgmt", 2)
+        self.write_sources()
+        code, out, err = self.commit_with_signal("replace", signal.SIGTERM)
+        self.assertEqual((code, out, err), (3, "", self.COMMITTED))
+        self.assertEqual(self.published()[0]["k3d-k3d-observability"]["cert"], self.mg["cert"])
+        self.assertEqual(self.names(), ["config"])
+
+    def test_failed_commit_restores_mask_and_stays_a_refusal(self):
+        with patch.object(csk.os, "link", side_effect=OSError("denied")):
+            code, _, err = self.run_main()
+        self.assertEqual((code, err), (1, "configure-student-kubeconfig: publication failed\n"))
+        self.assertFalse(csk.HANDLED_SIGNALS & signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+    def test_cleanup_incomplete_accompanies_primary_failure_without_replacing_it(self):
+        def stray_then_fail(number, args):
+            if number == 1:
+                (Path(args[2]).parent / "stray").write_bytes(b"not ours")
+            if number == 2:
+                return 1, b""  # primary native failure
+        self.hook = stray_then_fail
+        code, out, err = self.run_main()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "configure-student-kubeconfig: native kubectl view failed\n"
+                              "configure-student-kubeconfig: owned stage cleanup incomplete\n")
+        left = [p for p in self.state.iterdir()]
+        self.assertEqual([[c.name for c in p.iterdir()] for p in left], [["stray"]])
+
+    def test_cleanup_incomplete_after_interrupt_keeps_interrupt_report(self):
+        def stray_then_interrupt(number, args):
+            (Path(args[2]).parent / "stray").write_bytes(b"not ours")
+            raise KeyboardInterrupt
+        self.hook = stray_then_interrupt
+        code, _, err = self.run_main()
+        self.assertEqual(code, 130)
+        self.assertEqual(err, "configure-student-kubeconfig: interrupted\n"
+                              "configure-student-kubeconfig: owned stage cleanup incomplete\n")
+
     def test_sigterm_handler_restored_and_maps_to_interrupt(self):
         before = signal.getsignal(signal.SIGTERM)
 
