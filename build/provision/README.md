@@ -1545,7 +1545,7 @@ check has run. The lead validates the data separately.
   changed. No image bytes or digests are verified here.
 * **Required inputs.** `LABAPP_MANAGEMENT_IMAGE` and `LABAPP_PROMETHEUS_BIND_ADDRESS` must be exported
   into the k3d PROCESS environment: k3d expands the config text with Go `os.ExpandEnv`, so a shell
-  variable that is unset or not exported can silently become empty. The commands below are one dedicated
+  variable that is unset or not exported can silently become empty. The stage 1 commands below are a dedicated
   Bash script (run with `bash`, never sourced) whose `set -euo pipefail` stops before any mutating
   command when a check fails. The image check requires a registry host (containing `.` or `:`), a
   repository path and `@sha256:` plus 64 lowercase hex characters; the bind check accepts a dotted IPv4
@@ -1553,7 +1553,7 @@ check has run. The lead validates the data separately.
   are format checks only: actual interface, source-boundary and route observations remain operator
   prerequisites and are not validated here. Digest strings pass through to Docker per the lead's source
   gate, but native digest use is unrun; source plumbing is not runtime proof. The guards are in the
-  commands block below.
+  stage 1 block below.
 
 * **Preflight (operator observations; none supplied here).**
   * The image digest comes from an operator-verified source. Native k3d 5.7.4 use of a digest
@@ -1568,14 +1568,22 @@ check has run. The lead validates the data separately.
     intended user and not a symlink before creation. No blanket chmod, chown or removal of existing
     state is given. It is the bind source for local-path storage.
   * The Grafana admin Secret `labapp-grafana-admin` (keys `admin-user`, `admin-password`) in namespace
-    `monitoring` is a separate private-credential prerequisite created before install. No secret bytes
-    or credential-logging commands are given here.
+    `monitoring` is a separate private-credential prerequisite, created by an authorized operator in the
+    new namespace between stage 2 and stage 3 below. No secret bytes or credential-logging commands
+    are given here.
   * No automatic install or upgrade, blind reuse or deletion, global kubeconfig context write or
     privileged fallback.
 
 * **Commands.** Absolute verified paths replace `/ABS/...`. They run the same interactively or from CI
-  once runtime authority is reviewed; no new runner, wrapper or stage marker is added. Save as one
-  script and run it with `bash`:
+  once runtime authority is reviewed; no new runner, wrapper or stage marker is added. These snippets
+  are for future reviewed runtime use only and were not executed. There are three separate stages. Save
+  each stage as its own script and run it with `bash`, never sourced. Every stage starts with
+  `set -euo pipefail` so a failed check stops before any later mutating command.
+
+  **Stage 1: clean cluster and private kubeconfig creation.** Run once on a clean host. Do not rerun
+  this stage after it has succeeded: `k3d cluster create` fails on an existing cluster, and no retry,
+  reuse or removal of existing state is given. Failure reconciliation and cleanup belong to the
+  original reviewed runtime authority, not to a manual or retained checkpoint.
 
   ```bash
   set -euo pipefail
@@ -1595,6 +1603,36 @@ check has run. The lead validates the data separately.
     --kubeconfig-update-default=false --kubeconfig-switch-context=false
   /ABS/verified/k3d kubeconfig write labapp-mgmt --output /ABS/private/management-kubeconfig \
     --kubeconfig-switch-context=false
+  ```
+
+  **Stage 2: namespace bootstrap.** The `monitoring` namespace cannot exist before the fresh cluster, so
+  it is created only after the private kubeconfig is written. `create` fails if it already exists; there
+  is no apply, reuse or delete.
+
+  ```bash
+  set -euo pipefail
+  umask 077
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt create namespace monitoring
+  ```
+
+  **Between stages 2 and 3: private Grafana Secret setup (operator boundary).** An authorized operator
+  creates Secret `labapp-grafana-admin` in the newly created `monitoring` namespace, using the private
+  kubeconfig and context above, with keys `admin-user` and `admin-password`. No command, secret value,
+  student account or credential-creation implementation is given here; never place secret values in
+  command lines, logs, raw Secret JSON/YAML or this repository.
+
+  **Stage 3: Helm install and health.** The two `get` checks print only object names, never Secret data,
+  and stop before Helm when a prerequisite is missing. They confirm the Secret object exists, not its key
+  names or values.
+
+  ```bash
+  set -euo pipefail
+  umask 077
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt get namespace monitoring --output=name
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt --namespace monitoring get secret labapp-grafana-admin --output=name
   /ABS/verified/helm upgrade --install kube-prometheus-stack /ABS/verified/CHART.tgz \
     --kubeconfig /ABS/private/management-kubeconfig --kube-context k3d-labapp-mgmt \
     --namespace monitoring \
@@ -1604,10 +1642,9 @@ check has run. The lead validates the data separately.
     --context k3d-labapp-mgmt --namespace monitoring get pvc,pods
   ```
 
-  The namespace and Secret must exist before the Helm step (no secret commands are given here). The
-  `kubeconfig write` command keeps the explicit `--output` path, the private `umask` and the downstream
-  `k3d-labapp-mgmt` context; `--kubeconfig-switch-context=false` (default true) is added so it cannot
-  switch a current context. `--output` is rejected together with `--kubeconfig-merge-default`, and
+  The `kubeconfig write` command keeps the explicit `--output` path, the private `umask` and the
+  downstream `k3d-labapp-mgmt` context; `--kubeconfig-switch-context=false` (default true) is added so it
+  cannot switch a current context. `--output` is rejected together with `--kubeconfig-merge-default`, and
   `--overwrite` stays false, so use a fresh path in the private directory. The native `300s`
   `options.k3d.timeout` is reused as a separate deadline in separate phases (network preparation, node
   creation, cluster start); it is not an aggregate deadline and not an overall readiness-only bound, and
@@ -1626,14 +1663,8 @@ check has run. The lead validates the data separately.
   * Timeout: `pkg/client/cluster.go`: `context.WithTimeout` separately in `ClusterPrep` (network
     preparation), `ClusterCreate` (server/agent `NodeCreate`; the loadbalancer uses the unwrapped
     context) and `ClusterStart`; `ClusterRun` carries a TODO about time already used.
-  * Digest to Docker: stated by the lead's #502 source gate; image handling was not visible in the files
-    read for this revision, so that claim rests on the gate and runtime use is unrun.
-
-* **Reading attribution.** The first #503 author pass did not read the full workflow document, the named
-  #502 source gate, the current parents, the configurator or the GCP access runbook before editing. For
-  this revision I read `docs/contributing/agent-workflow.md`, #502 comment 6615684965, and the #145 and
-  #503 body checkpoints. The configurator and the access runbook were not read; conclusions touching
-  them rest on the gate and are provisional.
+  * Digest to Docker: stated by the lead's #502 source gate; image handling is not shown in the cited
+    files, so that claim rests on the gate and runtime use is unrun.
 
 * **Access and identity.** The written kubeconfig is an admin config, not student RBAC, and exporting
   it does not reduce privilege. Loopback binding of the API (6550) and Grafana (127.0.0.1:3000) is
