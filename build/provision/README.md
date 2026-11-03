@@ -431,6 +431,46 @@ are refused before mutation; an over-budget final report refuses after publicati
 behavior, installation-time fit and equivalence to the baseline image's kubectl path,
 owner and mode are not verified (`not_verified`; cosign is outside this slice).
 
+## Pinned native kubectl-fabric installer
+
+`install-kubectl-fabric.py` installs the `kubectl-fabric` plugin name from the pinned Fabric
+v0.96.2 linux/amd64 hhfctl archive only: `https://github.com/githedgehog/fabric/releases/download/v0.96.2/hhfctl-linux-amd64-v0.96.2.tar.gz`,
+exactly 13,620,070 bytes, SHA256 `379b7ae4210f766fab733024bbb3313333135bfbde04ecf1bdf1d38e735aabca`.
+The sole expected regular member is `hhfctl-linux-amd64/hhfctl` (per the Fabric v0.96.2 justfile
+`tar -czvf` packaging). No bare binary, force or upgrade mode exists. It is not called by
+cloud-init or Packer. No download, install, rerun or runtime check of the real archive has been run.
+
+```bash
+# Ubuntu 24.04: Python 3.12 stdlib and curl; root for /usr/local/bin (no automatic sudo).
+# Keep hhfab_release.py alongside the module. Paths must be absolute; cwd is irrelevant.
+python3 /absolute/path/build/provision/install-kubectl-fabric.py --version 0.96.2 --platform linux/amd64
+# Caller-owned alternate directory and a local archive (verified before any mutation):
+python3 /absolute/path/build/provision/install-kubectl-fabric.py --version 0.96.2 --platform linux/amd64 \
+  --install-dir /absolute/owned/bin --archive /absolute/hhfctl-linux-amd64-v0.96.2.tar.gz
+# Offline synthetic tests (no network, no real hhfctl, no installed-byte execution):
+python3 -m unittest discover -s build/provision -p test_install_kubectl_fabric.py -v
+```
+
+The member's uncompressed size and hash are **unobserved**; the repo pins only the archive.
+After the archive size/SHA256 match, the sole member is streamed (no `tar.extract`) into an owned
+`.kubectl-fabric-stage-*` directory with at most 256 MiB (a finite assumption), hashing as it is
+written; links, directories, extra, duplicate, unsafe or empty members and truncated or corrupt
+streams are refused. Trailing zero padding is capped at one 10 KiB tar record and consumed through
+gzip EOF to verify stream integrity. The installed bytes are compared with that derived content. Behavior for
+`DIR/kubectl-fabric`: absent installs 0755 atomically (no-clobber link); derived-equal 0755 is
+unchanged; derived-equal bytes with another mode are replaced atomically; any other existing
+bytes are refused and preserved. Because no member pin exists, even an unchanged rerun needs the
+verified archive again (download or `--archive`); input-free or network-free recognition is not
+offered. Callers' archives are copied, never modified. Directory, symlink/hardlink/special-file and
+ownership rules, download bounds (120s transfer, 125s child, 180s total, HTTPS-only, no retries,
+no proxy/curlrc/credential variables), cleanup and trust assumptions match the kubectl installer
+above. The installed or archived bytes are never executed and no kubeconfig is read.
+
+The one-line JSON result (at most 4096 bytes) binds the archive pin, the derived member size and
+SHA256, the target path, hash and mode, and the status. It does not verify signatures, runtime
+compatibility, plugin discovery or student access (all UNRUN). Standalone component success is not
+course, image, service or efficiency proof.
+
 ### Native kubectl install and rerun proof
 
 `kubectl_native_proof.py` runs the unchanged `install-kubectl.py` CLI twice
