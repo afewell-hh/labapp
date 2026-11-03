@@ -1529,6 +1529,97 @@ boot integration and a full recipe are separate gates. Rendered Kubernetes
 dashboards are not Hedgehog course assets. This is not a deployable, security or
 management-cluster profile.
 
+## Native management-cluster configuration (issue #503, configuration only)
+
+`management-cluster.yaml` (k3d 5.7.4 `k3d.io/v1alpha5` Simple, cluster `labapp-mgmt`, one server,
+no agents) and `management-observability-values.yaml` (a second Helm values file layered after the
+unchanged `observability-values.yaml`) express a disposable-pilot management stage with native tools.
+Nothing here was executed: no k3d, Helm, Docker, cluster, ingestion, student, boot or performance
+check has run. The lead validates the data separately.
+
+* **Source gate and limits.** Authored from the #502 lead source gate. Helm 3.19.4, chart
+  kube-prometheus-stack 65.2.0 and the base values are unchanged. No K3s line is selected or
+  upgraded: prometheus-operator 0.77.1 builds on client-go 0.31.1 and its E2E uses Kubernetes 1.31.0,
+  so the chart minimum and a Helm render do not prove maintained-line support. Compatibility needs a
+  separately scoped experiment. Fabricator 0.43.1, Fabric 0.96.2 and private SONiC 4.5.0 are not
+  changed. No image bytes or digests are verified here.
+* **Required inputs.** The operator sets both in the shell; the config uses k3d environment
+  expansion, so an unset variable can silently become empty. Guard before any k3d call:
+
+  ```bash
+  : "${LABAPP_MANAGEMENT_IMAGE:?set to a fully qualified registry/repo@sha256:<digest> candidate}"
+  : "${LABAPP_PROMETHEUS_BIND_ADDRESS:?set to the observed receiver address, never 0.0.0.0}"
+  case "$LABAPP_MANAGEMENT_IMAGE" in *@sha256:*) ;; *) echo "image must pin @sha256" >&2; false ;; esac
+  ```
+
+* **Preflight (operator observations; none supplied here).**
+  * The image digest comes from an operator-verified source. Whether k3d 5.7.4 accepts a
+    digest reference is unverified.
+  * The bind address is a real host address on a real interface, observed to be reachable from the
+    control Alloy pod network and from the switches through the Fabric proxy, and not colliding with
+    Docker or VLAB networks. Ports 6550, 9090 and 3000 must be free.
+  * `network`, `subnet` and `hostAliases` are omitted: a named `network` selects an external one in
+    k3d 5.7.4, and an explicit subnet with an external network is rejected. k3d owns the default
+    network; observe its subnet for collisions.
+  * `/var/lib/labapp/management-storage` must be verified by the operator as new, owned by the
+    intended user and not a symlink before creation. No blanket chmod, chown or removal of existing
+    state is given. It is the bind source for local-path storage.
+  * The Grafana admin Secret `labapp-grafana-admin` (keys `admin-user`, `admin-password`) in namespace
+    `monitoring` is a separate private-credential prerequisite created before install. No secret bytes
+    or credential-logging commands are given here.
+  * No automatic install or upgrade, blind reuse or deletion, global kubeconfig context write or
+    privileged fallback.
+
+* **Commands.** Absolute verified paths replace `/ABS/...`. They run the same interactively or from CI
+  once runtime authority is reviewed; no new runner, wrapper or stage marker is added.
+
+  ```bash
+  umask 077
+  install -d -m 0700 /ABS/private
+  /ABS/verified/k3d cluster create --config /ABS/verified/management-cluster.yaml \
+    --kubeconfig-update-default=false --kubeconfig-switch-context=false
+  /ABS/verified/k3d kubeconfig write labapp-mgmt --output /ABS/private/management-kubeconfig
+  /ABS/verified/helm upgrade --install kube-prometheus-stack /ABS/verified/CHART.tgz \
+    --kubeconfig /ABS/private/management-kubeconfig --kube-context k3d-labapp-mgmt \
+    --namespace monitoring \
+    --values /ABS/verified/observability-values.yaml \
+    --values /ABS/verified/management-observability-values.yaml --wait --timeout 10m
+  /ABS/verified/kubectl --kubeconfig /ABS/private/management-kubeconfig \
+    --context k3d-labapp-mgmt --namespace monitoring get pvc,pods
+  ```
+
+  The namespace and Secret must exist before the Helm step. The native 300s `options.k3d.timeout`
+  bounds cluster readiness only, not the sequence; the aggregate deadline comes from the reviewed
+  runtime authority. The actual CLI was not executed.
+
+* **Access and identity.** The written kubeconfig is an admin config, not student RBAC, and exporting
+  it does not reduce privilege. Loopback binding of the API (6550) and Grafana (127.0.0.1:3000) is
+  not a tunnel; no tunnel or ordinary student account is defined or fabricated. The accepted
+  `configure-student-kubeconfig.py` normalizes names: the raw management source may carry
+  `k3d-labapp-mgmt`, while its output remains `k3d-k3d-observability` / `labapp-management`.
+  Accepted aliases are not renamed.
+* **Values.** Prometheus is NodePort 30090 with `retentionSize` 6GB on an 8Gi `local-path` RWO claim
+  (the base 7d retention still applies). Grafana is NodePort 30300 with a 1Gi `local-path` RWO claim,
+  `existingSecret` key names only, and anonymous access and sign-up disabled through the chart's
+  `grafana.ini`. Sizes and 7d are disposable-pilot choices, not release, course or total-disk claims;
+  account for WAL, head and filesystem overhead. Persistence adds the chart's root init-chown-data
+  container with the declared `busybox:1.31.1` image to the image ledger (declared by the chart, not
+  a pin chosen here); no image bytes or security closure are accepted.
+* **Exposure.** Prometheus has no authentication. Binding it to one address is not allowed-source
+  authorization; a later proof must census other node and container paths. No real TLS, principal
+  or source boundary exists yet, and no endpoint beyond those above is guessed.
+* **Health versus ingestion.** Native cluster, PVC and pod health is not ingestion. Success needs
+  fresh samples carrying control and switch producer labels, tested from the control Alloy pod
+  network and for the switch through the Fabric proxy (target URL ends `/api/v1/write`), then a user
+  Grafana browser and datasource query. None has been run.
+* **Persistence semantics.** local-path claims can use WaitForFirstConsumer. Pod restart and VM
+  reboot differ from PVC deletion (reclaim policy delete removes data) and from `k3d cluster delete`
+  or recreate. The host bind directory outlives cluster deletion but nothing reattaches it.
+  Server and load-balancer restart policy is `unless-stopped` per source; Docker/reboot recovery is
+  unrun.
+* **Unrun gates.** Release image, seal, full course, logs, GitOps, dashboards and performance. An
+  engine compatibility experiment or any current-maintained selection needs separate scope.
+
 ## Pinned public serializer/default asymmetry fixture
 
 `fixtures/pinned-api/main.go` (#394, extended by #400) runs three public inputs

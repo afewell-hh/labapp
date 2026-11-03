@@ -1,0 +1,39 @@
+# k3d 5.7.4 Simple config for the disposable-pilot management stage (issue #503).
+# Configuration only: no engine is selected here. LABAPP_MANAGEMENT_IMAGE must be a
+# fully qualified image@sha256:<digest> supplied by the operator (see README).
+# `network` and `subnet` are omitted on purpose: k3d 5.7.4 treats a named `network`
+# as an EXTERNAL network, so k3d owns the default one.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: labapp-mgmt
+servers: 1
+agents: 0
+image: ${LABAPP_MANAGEMENT_IMAGE}
+kubeAPI:
+  host: "127.0.0.1"
+  hostIP: "127.0.0.1"
+  hostPort: "6550"
+volumes:
+  - volume: /var/lib/labapp/management-storage:/var/lib/rancher/k3s/storage
+    nodeFilters:
+      - server:0
+ports:
+  - port: ${LABAPP_PROMETHEUS_BIND_ADDRESS}:9090:30090
+    nodeFilters:
+      - loadbalancer
+  - port: 127.0.0.1:3000:30300
+    nodeFilters:
+      - loadbalancer
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+  kubeconfig:
+    updateDefaultKubeconfig: false
+    switchCurrentContext: false
