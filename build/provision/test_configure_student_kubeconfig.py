@@ -179,7 +179,8 @@ class InstallTests(Base):
             if Path(args[2]).name == "candidate-input.json":
                 captured["input"] = Path(args[2]).read_bytes()
         self.hook = hook
-        self.install()
+        code, out, err = self.run_main()
+        self.assertEqual((code, json.loads(out), err), (0, {"status": "installed"}, ""))
         self.assertEqual(self.names(), ["config"])
         info = self.out.stat()
         self.assertEqual((stat.S_IMODE(info.st_mode), info.st_nlink, info.st_uid),
@@ -268,6 +269,24 @@ class InstallTests(Base):
         self.write_sources()
         self.assertEqual(self.run_main()[1], '{"status": "updated"}\n')
         self.assertEqual(self.published()[1], "vlab")
+
+    def test_combined_output_uses_output_bound_on_rerun_and_refresh(self):
+        self.vl["cert"] = b64("PUBLIC INVENTED VLAB CERTIFICATE " + "V" * 26000)
+        self.mg["cert"] = b64("PUBLIC INVENTED MANAGEMENT CERTIFICATE " + "M" * 26000)
+        self.write_sources()
+        self.assertLess(self.vlab.stat().st_size, csk.INPUT_LIMIT)
+        self.assertLess(self.mgmt.stat().st_size, csk.INPUT_LIMIT)
+        self.install()
+        self.assertGreater(self.out.stat().st_size, csk.INPUT_LIMIT)
+        self.assertLess(self.out.stat().st_size, csk.OUTPUT_LIMIT)
+        before = self.snapshot()
+        self.assertEqual(self.run_main()[1], '{"status": "unchanged"}\n')
+        self.assertEqual(self.snapshot(), before)
+        self.mg["key"] = b64("PUBLIC INVENTED RENEWED MANAGEMENT KEY")
+        self.write_sources()
+        self.assertEqual(self.run_main()[1], '{"status": "updated"}\n')
+        self.assertEqual(self.published()[0]["k3d-k3d-observability"]["key"], self.mg["key"])
+        self.assertEqual(self.names(), ["config"])
 
 
 class RefusalTests(Base):
@@ -413,7 +432,7 @@ class RefusalTests(Base):
             "mode": lambda: self.out.chmod(0o644),
             "hardlink": lambda: os.link(self.out, self.root / "second-name"),
             "symlink": lambda: (self.out.unlink(), self.out.symlink_to(self.vlab)),
-            "oversize": lambda: private_write(self.out, b"#" * (csk.INPUT_LIMIT + 1)),
+            "oversize": lambda: private_write(self.out, b"#" * (csk.OUTPUT_LIMIT + 1)),
             "garbage": lambda: private_write(self.out, b"\x00 not a config"),
         }.items():
             with self.subTest(name):

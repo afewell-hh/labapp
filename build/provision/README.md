@@ -436,8 +436,7 @@ owner and mode are not verified (`not_verified`; cosign is outside this slice).
 `configure-student-kubeconfig.py` stages the two-binding student kubeconfig as native YAML from two
 caller-supplied source configs (Ubuntu 24.04, Python 3.12 stdlib, linux/amd64; keep `hhfab_release.py`
 alongside). It is a provisioning component, not a student command, service or kubeconfig manager.
-Source-authored from main 9f45236 under #493 (replaces held JSON-only PR #491); **no part has been
-executed**: no unittest, binary, native kubectl or cluster run. Mocked tests are not native proof.
+Mocked regression tests cover standalone staging logic, not native YAML interoperability or live access.
 
 ```bash
 python3 /absolute/path/build/provision/configure-student-kubeconfig.py --kubectl /abs/kubectl \
@@ -449,7 +448,8 @@ python3 -m unittest discover -s build/provision -p test_configure_student_kubeco
 * **Inputs.** All four paths are explicit, absolute and normalized; the output's directory must be an
   existing caller-owned 0700 directory with real components (the component creates only its own
   `.student-kubeconfig-stage-*` subdirectory there). Each source and an existing output must be a
-  caller-owned 0600 single-link regular file of at most 64 KiB, not a symlink, and the paths must not
+  caller-owned 0600 single-link regular file, not a symlink; sources are bounded at 64 KiB each and
+  an existing output at 256 KiB. The paths must not
   alias. Each file is snapshotted into the private stage first; kubectl never reads an original.
 * **Native boundary.** Only the pinned kubectl 1.35.0 (58,597,560 bytes, SHA256 as in
   `install-kubectl.py`, rechecked before every call) runs, by absolute path with fixed arguments
@@ -466,7 +466,7 @@ python3 -m unittest discover -s build/provision -p test_configure_student_kubeco
   state; original raw fields are never re-passed.
 * **Result.** Contexts `vlab` and `k3d-k3d-observability` link cluster/user aliases `labapp-vlab` and
   `labapp-management`; CA, server and namespace are preserved, and identical server+CA is refused. A
-  fresh output selects `vlab` (an authoring choice, to be confirmed by the lead). An existing output
+  fresh output selects `vlab`. An existing output
   (native YAML or JSON, any list order, normal native `use-context` selection) must hold exactly those
   two bindings with matching CA/server/namespace; otherwise it is refused and kept. Identical state
   prints `unchanged` without touching the file; changed cert/key for the same binding prints `updated`
@@ -481,8 +481,9 @@ python3 -m unittest discover -s build/provision -p test_configure_student_kubeco
   the syscall and the in-memory commit flag is an unavoidable window.
 * **Limits.** Single writer assumed; no immunity from a hostile concurrent writer, and kubectl is
   executed by path after its hash check (TOCTOU window). No real TLS/RBAC/API/principal/certificate
-  validity, native interoperability, student course or image/boot claim. It is not wired into CI or
-  cloud-init; a separate pinned native offline trial is still required. Whether kubectl leaves files in
+  validity, native interoperability, student course or image/boot claim. CI requires the synthetic
+  suite; there is no cloud-init integration. A separate pinned native offline trial is still required.
+  Whether kubectl leaves files in
   its private `HOME` is unobserved; such files would surface as incomplete cleanup.
 
 ## Pinned native kubectl-fabric installer

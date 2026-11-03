@@ -9,7 +9,7 @@ cluster. The only native operation is the pinned kubectl 1.35.0 linux/amd64
 `--kubeconfig <private snapshot> config view --raw=true -o json|yaml`.
 
 The caller owns a 0700 directory holding --output. Sources and an existing output must be owned
-0600 single-link regular files of at most 64 KiB. Student output is native YAML; native JSON is
+0600 single-link regular files, bounded at 64 KiB per source and 256 KiB for output. Native JSON is
 internal validation only. One writer is assumed; this is not defense against a hostile writer.
 Status (stdout, one JSON line): installed, unchanged or updated. Any refusal before publication
 preserves the prior output. Publication (no-clobber link or atomic replace) is the commit point; a
@@ -407,7 +407,7 @@ def publish(run, candidate, target, sources, existing):
         except OSError:
             raise Refusal("publication failed") from None
     else:
-        data, now = read_regular(target, INPUT_LIMIT)
+        data, now = read_regular(target, OUTPUT_LIMIT)
         if digest_of(data) != existing[0] or now != existing[1]:
             raise Refusal("output changed during the run")
         try:
@@ -448,7 +448,7 @@ def stage_and_validate(args, run, stage, budget):
         bindings[context] = source_binding(parse_config(load_native_json(native.view(stage / label, "json"))))
     existing = None
     if os.path.lexists(args.output):
-        data, ident = read_regular(args.output, INPUT_LIMIT)
+        data, ident = read_regular(args.output, OUTPUT_LIMIT)
         existing = (digest_of(data), ident)
         identities.append(ident[:2])
         write_private(stage / "target-snapshot", data)
