@@ -1,16 +1,21 @@
 # Versioned input ledger for native offline Helm rendering of the pinned
 # kube-prometheus-stack chart with observability-values.yaml.
-# Operational input data only: metadata pins, not byte verification. The pins
-# below are not signature claims and nothing here has been downloaded or run.
+# Operational input data only: metadata pins, not byte verification, and not
+# signature claims. Bytes must be verified against these pins before use.
 schemaVersion: 1
 
+# Inherited source pins from the existing build/provision/install-helm.py
+# (unchanged); no new Helm client and no version upgrade.
 helmClient:
-  version: v3.16.4
-  platform: linux-amd64
-  url: https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz
-  sha256: fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179
-  # Published checksum metadata (provenance only); archive size is UNKNOWN.
-  size: UNKNOWN
+  version: 3.19.4
+  platform: linux/amd64
+  url: https://get.helm.sh/helm-v3.19.4-linux-amd64.tar.gz
+  size: 18014603
+  sha256: 759c656fbd9c11e6a47784ecbeac6ad1eb16a9e76d202e51163ab78504848862
+  checksumSourceUrl: https://get.helm.sh/helm-v3.19.4-linux-amd64.tar.gz.sha256sum
+  memberName: linux-amd64/helm
+  memberSize: 60182712
+  memberSha256: ea22096683b9b61005584501e36168a1eadc5b6883a89df299f5a55e4e2dd283
 
 chart:
   name: kube-prometheus-stack
@@ -22,6 +27,7 @@ chart:
   # Published chart metadata/index pinned at this index-source commit (provenance
   # only, with attribution to the prometheus-community/helm-charts project).
   indexSourceCommit: 50009606d7e0c357ee808344a4cb579890d98277
+  indexSourceUrl: https://raw.githubusercontent.com/prometheus-community/helm-charts/50009606d7e0c357ee808344a4cb579890d98277/index.yaml
 
 render:
   release: kube-prometheus-stack

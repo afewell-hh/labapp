@@ -1487,9 +1487,12 @@ GPG/provenance, installed baseline metadata, runtime or full image/course equiva
 
 ## Native observability render inputs
 
-`observability-inputs.yaml` (schemaVersion 1) pins the Helm client (v3.16.4
-linux-amd64 URL and published SHA256; size UNKNOWN), the packaged chart
-`kube-prometheus-stack` 65.2.0 (source commit, package URL, size 591234, SHA256),
+`observability-inputs.yaml` (schemaVersion 1) records the Helm client pins inherited
+from the existing `install-helm.py` (3.19.4 linux/amd64: archive URL, size 18014603,
+SHA256, checksum source URL, member `linux-amd64/helm` size 60182712 and SHA256; the
+module is unchanged, with no second older 3.16.4 client and no upgrade), the packaged chart
+`kube-prometheus-stack` 65.2.0 (source commit, package URL, size 591234, SHA256,
+index source commit and URL),
 and the render settings (release `kube-prometheus-stack`, namespace `monitoring`,
 `observability-values.yaml`, test kube version 1.30.4). Source checksum and index
 URLs are provenance, not a signature claim. Kube version 1.30.4 is a native render
@@ -1506,18 +1509,21 @@ and the pinned packaged chart, never `install`, `upgrade`, dependency management
 server dry-run, a post-renderer or the current kubeconfig:
 
 ```bash
-helm template kube-prometheus-stack CHART.tgz --namespace monitoring \
-  --kube-version 1.30.4 --values observability-values.yaml
+/ABS/verified/helm template kube-prometheus-stack /ABS/verified/CHART.tgz \
+  --namespace monitoring --kube-version 1.30.4 \
+  --values /ABS/verified/observability-values.yaml > /ABS/private/rendered.yaml
 ```
 
-Send output to a private location: the chart may generate Secrets or random
+Use absolute paths for the verified Helm executable, chart and values, and redirect
+to an explicit private output file in a private directory: the chart may generate Secrets or random
 credential fields, so do not display or log raw manifests or treat them as existing
 credentials. Use a fresh isolated `HOME`/`HELM_*` state, no `KUBECONFIG` and no
 network; no cluster is involved.
 
 Pinned metadata is not byte verification: hash the actual client and chart bytes
-before use. The packaged dependency closure and images are unknown until observed
-by a render. Everything else uses chart defaults, with Services as ClusterIP.
+before use. The source package contents must be inspected for dependencies; a render
+enumerates resources and images but does not prove all archive members, dependencies
+or image bytes. Everything else uses chart defaults, with Services as ClusterIP.
 Persistent storage, live TLS, RBAC, ingestion, Loki, genuine course dashboards,
 boot integration and a full recipe are separate gates. Rendered Kubernetes
 dashboards are not Hedgehog course assets. This is not a deployable, security or
