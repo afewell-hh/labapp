@@ -1543,18 +1543,21 @@ check has run. The lead validates the data separately.
   so the chart minimum and a Helm render do not prove maintained-line support. Compatibility needs a
   separately scoped experiment. Fabricator 0.43.1, Fabric 0.96.2 and private SONiC 4.5.0 are not
   changed. No image bytes or digests are verified here.
-* **Required inputs.** The operator sets both in the shell; the config uses k3d environment
-  expansion, so an unset variable can silently become empty. Guard before any k3d call:
-
-  ```bash
-  : "${LABAPP_MANAGEMENT_IMAGE:?set to a fully qualified registry/repo@sha256:<digest> candidate}"
-  : "${LABAPP_PROMETHEUS_BIND_ADDRESS:?set to the observed receiver address, never 0.0.0.0}"
-  case "$LABAPP_MANAGEMENT_IMAGE" in *@sha256:*) ;; *) echo "image must pin @sha256" >&2; false ;; esac
-  ```
+* **Required inputs.** `LABAPP_MANAGEMENT_IMAGE` and `LABAPP_PROMETHEUS_BIND_ADDRESS` must be exported
+  into the k3d PROCESS environment: k3d expands the config text with Go `os.ExpandEnv`, so a shell
+  variable that is unset or not exported can silently become empty. The commands below are one dedicated
+  Bash script (run with `bash`, never sourced) whose `set -euo pipefail` stops before any mutating
+  command when a check fails. The image check requires a registry host (containing `.` or `:`), a
+  repository path and `@sha256:` plus 64 lowercase hex characters; the bind check accepts a dotted IPv4
+  literal and rejects empty and wildcard `0.0.0.0` (IPv6 binds are not supported by this guard). These
+  are format checks only: actual interface, source-boundary and route observations remain operator
+  prerequisites and are not validated here. Digest strings pass through to Docker per the lead's source
+  gate, but native digest use is unrun; source plumbing is not runtime proof. The guards are in the
+  commands block below.
 
 * **Preflight (operator observations; none supplied here).**
-  * The image digest comes from an operator-verified source. Whether k3d 5.7.4 accepts a
-    digest reference is unverified.
+  * The image digest comes from an operator-verified source. Native k3d 5.7.4 use of a digest
+    reference is unrun.
   * The bind address is a real host address on a real interface, observed to be reachable from the
     control Alloy pod network and from the switches through the Fabric proxy, and not colliding with
     Docker or VLAB networks. Ports 6550, 9090 and 3000 must be free.
@@ -1571,14 +1574,27 @@ check has run. The lead validates the data separately.
     privileged fallback.
 
 * **Commands.** Absolute verified paths replace `/ABS/...`. They run the same interactively or from CI
-  once runtime authority is reviewed; no new runner, wrapper or stage marker is added.
+  once runtime authority is reviewed; no new runner, wrapper or stage marker is added. Save as one
+  script and run it with `bash`:
 
   ```bash
+  set -euo pipefail
+  image_re='^[A-Za-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+  : "${LABAPP_MANAGEMENT_IMAGE:?set to a fully qualified registry/repo@sha256:<64 hex> candidate}"
+  : "${LABAPP_PROMETHEUS_BIND_ADDRESS:?set to the observed receiver IPv4 address}"
+  [[ $LABAPP_MANAGEMENT_IMAGE =~ $image_re && ${LABAPP_MANAGEMENT_IMAGE%%/*} == *[.:]* ]] \
+    || { echo "image must be registry/repo@sha256:<64 lowercase hex>" >&2; exit 1; }
+  [[ $LABAPP_PROMETHEUS_BIND_ADDRESS =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ \
+    && $LABAPP_PROMETHEUS_BIND_ADDRESS != 0.0.0.0 ]] \
+    || { echo "bind must be a specific IPv4 address, not a wildcard" >&2; exit 1; }
+  export LABAPP_MANAGEMENT_IMAGE LABAPP_PROMETHEUS_BIND_ADDRESS
+
   umask 077
   install -d -m 0700 /ABS/private
   /ABS/verified/k3d cluster create --config /ABS/verified/management-cluster.yaml \
     --kubeconfig-update-default=false --kubeconfig-switch-context=false
-  /ABS/verified/k3d kubeconfig write labapp-mgmt --output /ABS/private/management-kubeconfig
+  /ABS/verified/k3d kubeconfig write labapp-mgmt --output /ABS/private/management-kubeconfig \
+    --kubeconfig-switch-context=false
   /ABS/verified/helm upgrade --install kube-prometheus-stack /ABS/verified/CHART.tgz \
     --kubeconfig /ABS/private/management-kubeconfig --kube-context k3d-labapp-mgmt \
     --namespace monitoring \
@@ -1588,9 +1604,36 @@ check has run. The lead validates the data separately.
     --context k3d-labapp-mgmt --namespace monitoring get pvc,pods
   ```
 
-  The namespace and Secret must exist before the Helm step. The native 300s `options.k3d.timeout`
-  bounds cluster readiness only, not the sequence; the aggregate deadline comes from the reviewed
-  runtime authority. The actual CLI was not executed.
+  The namespace and Secret must exist before the Helm step (no secret commands are given here). The
+  `kubeconfig write` command keeps the explicit `--output` path, the private `umask` and the downstream
+  `k3d-labapp-mgmt` context; `--kubeconfig-switch-context=false` (default true) is added so it cannot
+  switch a current context. `--output` is rejected together with `--kubeconfig-merge-default`, and
+  `--overwrite` stays false, so use a fresh path in the private directory. The native `300s`
+  `options.k3d.timeout` is reused as a separate deadline in separate phases (network preparation, node
+  creation, cluster start); it is not an aggregate deadline and not an overall readiness-only bound, and
+  source notes that time already spent is not subtracted. The overall deadline comes from the reviewed
+  runtime authority. None of this was executed.
+
+* **Source references (k3d v5.7.4 raw files, read 2026-11-03).**
+  * Env expansion: `cmd/util/config/config.go`, `os.ExpandEnv(string(originalcontent))` on a temporary
+    copy; the file shows no unset-variable check.
+  * Flags: `cmd/kubeconfig/kubeconfigMerge.go`: `--output/-o` (default empty),
+    `--kubeconfig-merge-default/-d` (false), `--update/-u` (true), `--kubeconfig-switch-context/-s`
+    (true; bound to `UpdateCurrentContext`, passed to `client.KubeconfigGetWrite`), `--overwrite`
+    (false). That file sets no umask or file mode; modes inside `client` were not read, so the explicit
+    `umask 077` and 0700 directory are the operator's controls. That `write` aliases `merge` rests on the
+    lead's #502 gate; the alias line was not separately read.
+  * Timeout: `pkg/client/cluster.go`: `context.WithTimeout` separately in `ClusterPrep` (network
+    preparation), `ClusterCreate` (server/agent `NodeCreate`; the loadbalancer uses the unwrapped
+    context) and `ClusterStart`; `ClusterRun` carries a TODO about time already used.
+  * Digest to Docker: stated by the lead's #502 source gate; image handling was not visible in the files
+    read for this revision, so that claim rests on the gate and runtime use is unrun.
+
+* **Reading attribution.** The first #503 author pass did not read the full workflow document, the named
+  #502 source gate, the current parents, the configurator or the GCP access runbook before editing. For
+  this revision I read `docs/contributing/agent-workflow.md`, #502 comment 6615684965, and the #145 and
+  #503 body checkpoints. The configurator and the access runbook were not read; conclusions touching
+  them rest on the gate and are provisional.
 
 * **Access and identity.** The written kubeconfig is an admin config, not student RBAC, and exporting
   it does not reduce privilege. Loopback binding of the API (6550) and Grafana (127.0.0.1:3000) is
