@@ -431,6 +431,60 @@ are refused before mutation; an over-budget final report refuses after publicati
 behavior, installation-time fit and equivalence to the baseline image's kubectl path,
 owner and mode are not verified (`not_verified`; cosign is outside this slice).
 
+## Student kubeconfig staging (native YAML, #494)
+
+`configure-student-kubeconfig.py` stages the two-binding student kubeconfig as native YAML from two
+caller-supplied source configs (Ubuntu 24.04, Python 3.12 stdlib, linux/amd64; keep `hhfab_release.py`
+alongside). It is a provisioning component, not a student command, service or kubeconfig manager.
+Source-authored from main 9f45236 under #493 (replaces held JSON-only PR #491); **no part has been
+executed**: no unittest, binary, native kubectl or cluster run. Mocked tests are not native proof.
+
+```bash
+python3 /absolute/path/build/provision/configure-student-kubeconfig.py --kubectl /abs/kubectl \
+  --vlab-config /abs/vlab-source --management-config /abs/management-source --output /abs/private-dir/config
+# Offline synthetic tests (mocked native boundary, public invented data, no network or credentials):
+python3 -m unittest discover -s build/provision -p test_configure_student_kubeconfig.py -v
+```
+
+* **Inputs.** All four paths are explicit, absolute and normalized; the output's directory must be an
+  existing caller-owned 0700 directory with real components (the component creates only its own
+  `.student-kubeconfig-stage-*` subdirectory there). Each source and an existing output must be a
+  caller-owned 0600 single-link regular file of at most 64 KiB, not a symlink, and the paths must not
+  alias. Each file is snapshotted into the private stage first; kubectl never reads an original.
+* **Native boundary.** Only the pinned kubectl 1.35.0 (58,597,560 bytes, SHA256 as in
+  `install-kubectl.py`, rechecked before every call) runs, by absolute path with fixed arguments
+  `--kubeconfig <stage file> config view --raw=true -o json|yaml`: no `--flatten`, `--minify`, shell,
+  PATH lookup, download, auth/cluster verb or retry. The environment is only `PATH`, `LC_ALL` and a
+  private stage `HOME`. Output (stderr merged) is capped at 256 KiB during capture; each child is bounded
+  by 10 s and the whole run by 30 s. Any stderr noise fails closed as malformed output.
+* **Closed field policy.** The native JSON view is validated against the closed Kubernetes v1.35.0
+  clientcmd v1 field set: HTTPS server and strict normalized base64 CA/client certificate/key only;
+  file references, token/tokenFile, username/password, impersonation, `exec`, `auth-provider`, proxy,
+  `tls-server-name`, insecure/compression flags and non-empty extensions are refused, as are unknown
+  keys and wrong types. Native loading normalizes YAML, so raw duplicate keys or base64 spelling are
+  **not** strictly rejected at the token level. Later native inputs are rebuilt only from validated
+  state; original raw fields are never re-passed.
+* **Result.** Contexts `vlab` and `k3d-k3d-observability` link cluster/user aliases `labapp-vlab` and
+  `labapp-management`; CA, server and namespace are preserved, and identical server+CA is refused. A
+  fresh output selects `vlab` (an authoring choice, to be confirmed by the lead). An existing output
+  (native YAML or JSON, any list order, normal native `use-context` selection) must hold exactly those
+  two bindings with matching CA/server/namespace; otherwise it is refused and kept. Identical state
+  prints `unchanged` without touching the file; changed cert/key for the same binding prints `updated`
+  and keeps the selection. Output status is one JSON line: `installed`, `unchanged` or `updated`.
+* **Publication.** The native-rendered candidate YAML is re-read through the native JSON view and must
+  equal the intended state, then sources and target are rechecked and the candidate is published at
+  mode 0600 by no-clobber link (absent target) or atomic replace (unchanged owned target). Any failure
+  before that point (exit 1, one fixed sanitized line) keeps the prior file and removes only the exact
+  owned stage entries (an unknown stage child keeps the stage and is reported). Publication is the
+  commit point: a later cleanup, durability, interrupt or reporting failure exits 3
+  (`committed-but-incomplete`) with no rollback or blind retry; reconcile it by hand. A signal between
+  the syscall and the in-memory commit flag is an unavoidable window.
+* **Limits.** Single writer assumed; no immunity from a hostile concurrent writer, and kubectl is
+  executed by path after its hash check (TOCTOU window). No real TLS/RBAC/API/principal/certificate
+  validity, native interoperability, student course or image/boot claim. It is not wired into CI or
+  cloud-init; a separate pinned native offline trial is still required. Whether kubectl leaves files in
+  its private `HOME` is unobserved; such files would surface as incomplete cleanup.
+
 ## Pinned native kubectl-fabric installer
 
 `install-kubectl-fabric.py` installs the `kubectl-fabric` plugin name from the pinned Fabric
