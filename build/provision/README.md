@@ -378,6 +378,43 @@ to `latest` and `/usr/local/bin`; this module deliberately requires explicit
 version selection. The docs overview was unavailable through the research browser;
 no installation claim relies on that page.
 
+## Student kubeconfig assembly (JSON)
+
+`configure-student-kubeconfig.py` (#490, contract in #489) merges two single-context
+Kubernetes Config **JSON** files into one private student config: contexts `vlab` and
+`k3d-k3d-observability` (cluster/user aliases `labapp-vlab` / `labapp-management`), initial
+current-context `vlab`. It is configuration assembly only, not a student CLI, wrapper,
+manager or daemon; students keep using native `kubectl`/`hhfab`. Python 3.12 stdlib only:
+no child processes, network, YAML, kubectl or ambient config. Native YAML-to-JSON export is
+a separate explicit step outside this component and is neither run nor designed here.
+
+```bash
+python3 /absolute/path/build/provision/configure-student-kubeconfig.py \
+  --vlab-json /abs/vlab.json --management-json /abs/management.json --output /abs/0700-dir/config
+# Offline synthetic tests (invented public fixture values only):
+python3 -m unittest discover -s build/provision -p test_configure_student_kubeconfig.py -v
+```
+
+Inputs must be caller-owned 0600 single-link regular files (64 KiB max) under real-directory
+paths, each exactly one `v1` Config with embedded base64 CA and client certificate/key and an
+HTTPS server. Tokens, exec/auth providers, file references, proxy, insecure TLS, extensions,
+unknown keys, duplicate JSON keys, numbers and identical endpoint+CA across the two inputs
+are refused. The output directory must exist and be caller-owned 0700; the output is mode
+0600 (256 KiB max). Rerun: identical content is left untouched (`unchanged`); changed
+credentials with the same per-context endpoint, CA bytes and namespace replace the file
+atomically (`updated`) and keep its current-context; any other existing file, mode, link,
+key, alias or binding drift is refused with the previous bytes kept. Absent output is
+published no-clobber from an owned `.student-kubeconfig-stage-*` file; there is no rollback
+after publication. Public output is a fixed JSON status or a fixed error message with no
+credential or config content and no digest. 30s alarm (assumption, not measured fit).
+
+Limits: base64 shape and linkage do not prove a valid certificate, principal,
+authorization or real server identity; endpoint comparison lowercases the host, defaults
+port 443 and ignores a trailing slash only, with no DNS or network inference. The output
+holds private key material and must stay private. Live principal choice, management export,
+renewal and unique-identity checks remain unresolved integration gates. Do not run it on
+real credentials without separate lead scope.
+
 ## Pinned kubectl installer
 
 `install-kubectl.py` installs only kubectl 1.35.0 linux/amd64 from
