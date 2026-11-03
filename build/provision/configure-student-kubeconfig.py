@@ -411,8 +411,12 @@ def publish(run, candidate, target, sources, existing):
     # Handled signals are deferred (kernel-pending, not lost) only around the single commit syscall
     # and the outcome flag, so a handler cannot run between them. The mask is restored right after
     # the flag; no deadline is renewed and nothing is rolled back or retried.
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    # The old mask is captured by a non-mutating query first, so even if the blocking call itself
+    # mutates the OS mask and then raises (a pending handler running on return), the finally
+    # restores the exact old mask.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
     try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
         try:
             if existing is None:
                 os.link(candidate, target)  # no-clobber commit

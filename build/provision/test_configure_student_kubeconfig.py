@@ -754,6 +754,33 @@ class PostCommitTests(Base):
         self.assertEqual(self.published()[0]["k3d-k3d-observability"]["cert"], self.mg["cert"])
         self.assertEqual(self.names(), ["config"])
 
+    def test_block_entry_failure_after_real_mask_change_restores_exact_old_mask(self):
+        # Simulates the CPython pending-handler path (mask changed, then an exception is raised
+        # before the call returns); it is not a native timing reproduction.
+        real = signal.pthread_sigmask
+        original = real(signal.SIG_BLOCK, [])
+        preexisting = {signal.SIGUSR1}
+        real(signal.SIG_SETMASK, original | preexisting)
+        self.addCleanup(real, signal.SIG_SETMASK, original)
+        before = real(signal.SIG_BLOCK, [])
+        self.assertTrue(preexisting <= before)
+
+        def mutate_then_raise(how, mask):
+            if how == signal.SIG_BLOCK and csk.HANDLED_SIGNALS <= set(mask):
+                real(how, mask)  # real mask change first
+                raise KeyboardInterrupt
+            return real(how, mask)
+        with patch.object(csk.signal, "pthread_sigmask", mutate_then_raise), \
+                patch.object(csk.os, "link") as link, patch.object(csk.os, "replace") as repl:
+            code, out, err = self.run_main()
+        self.assertEqual((code, out), (130, ""))
+        self.assertEqual(err, "configure-student-kubeconfig: interrupted\n")
+        link.assert_not_called()
+        repl.assert_not_called()
+        self.assertEqual(real(signal.SIG_BLOCK, []), before)  # exact old mask, incl. preexisting
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.names(), ["config"])
+
     def test_failed_commit_restores_mask_and_stays_a_refusal(self):
         with patch.object(csk.os, "link", side_effect=OSError("denied")):
             code, _, err = self.run_main()
