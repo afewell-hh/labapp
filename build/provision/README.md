@@ -1697,8 +1697,9 @@ check has run. The lead validates the data separately.
 ## Fixed management guest sequence (issue #506, SOURCE-INACTIVE)
 
 `management_trial.py` (guest) and `../gcp/management_trial.py` (owner-local caller) author ONE closed
-program over the accepted #503 inputs: a fixed table of 18 steps, not a command loader. Nothing here was
-executed: no import, test, native CLI, Docker, VM, cloud, cluster, forward or browser has run.
+program over the accepted #503 inputs: a fixed table of 18 steps, not a command loader. Offline tests
+exercise synthetic APIs and stdlib fixture children; they do not establish native installation,
+cluster, forward, browser or cloud behavior.
 **Activation is held.** `refuse_activation` always raises while `ACTIVATION_BLOCKERS` is non-empty;
 `main`, `bootstrap` and the caller's `main`/`trial` call it first, there is no flag, argument or
 environment bypass, and the source records no approval. `sequence` in the caller is the internal body a
@@ -1714,8 +1715,9 @@ later, separately reviewed activation would expose; only offline synthetic tests
   management clock below.
 * **No selector.** The host can name only a step from `STEP_NAMES` (argparse `choices`, plus a host-side
   enum check) or one of `heartbeat`, `export-viewer`, `result`, `teardown`. No path, argv, script or command
-  comes from the caller, guest output or a file. The root stub in `STUB` hash-verifies `vlab_trial.py` and
-  `management_trial.py` against host-held digests BEFORE executing either.
+  comes from the caller, guest output or a file. The root stub in `STUB` hash-verifies each of
+  `vlab_trial.py`, `owned_process.py` and `management_trial.py` against its host-held digest before
+  executing that module. The ownership helper is included in the fixed staged source table.
 * **Not a guardian.** Unlike the VLAB trial there is no autonomous in-guest supervisor. Each step re-checks
   contract, boot id, a heartbeat at most 30 seconds old and the management clock before every child. An
   orphaned guest child after host loss is contained only by those gates and by lease/VM expiry; `contained`
@@ -1726,6 +1728,8 @@ later, separately reviewed activation would expose; only offline synthetic tests
   provider envelope is NOT changed: `contract` still requires exactly 7200 seconds, and running this 60-minute
   component inside it (an exception) versus a separately reviewed provider change is an open owner/runtime
   decision. This work grants no 120-minute exception and does not classify the component as a full build.
+  Each in-process `Context` retains one monotonic anchor across native children, HTTP and polling;
+  there is still no independently surviving owner retaining that anchor across step processes.
 * **Inputs.** Docker, kubectl 1.35.0, k3d 5.7.4, Helm 3.19.4 and chart 65.2.0 reuse the accepted installers and
   pins; Grafana 11.2.1, operator 0.77.1, hhfab 0.43.1, Fabric 0.96.2 and private SONiC 4.5 are unchanged. The only
   management image candidate is `docker.io/rancher/k3s@sha256:81fc7349…e4` (EXPERIMENTAL, not a maintained or
@@ -1741,13 +1745,17 @@ later, separately reviewed activation would expose; only offline synthetic tests
   storage directory (0700, inode recorded), `k3d cluster create` with the accepted config, a private 0600
   kubeconfig, namespace, guest-local random throwaway Grafana admin Secret (from private files, never argv), Helm
   install, actual Bound-PVC and Ready-workload checks; `kubectl exec -i` of the Prometheus container's native
-  `/bin/promtool push metrics --timeout=10s` to its own loopback `/api/v1/write`, one uniquely nonce-labelled
-  gauge on stdin; read-back of exact nonce, value and SAMPLE timestamp with bounded freshness; an unused nonce
+  `/bin/promtool push metrics --label=job=promtool --timeout=10s` to its own loopback `/api/v1/write`, one uniquely nonce-labelled
+  gauge on stdin; exact read-back labels are the metric name, nonce and native `job=promtool` label.
+  Read-back verifies value and SAMPLE timestamp with bounded freshness; an unused nonce
   must return successful EMPTY data (a query error raises, distinct); unchanged repeat reads; Pod deletion (never
   PVC, namespace, release or cluster deletion) of Prometheus and Grafana with unchanged PVC UIDs; a historical
   query AT the recorded sample timestamp with no second push; a persisted TEST Viewer principal and datasource set.
   Every kubectl/helm call names the private kubeconfig and context explicitly; no global kubeconfig is touched.
   This test sample is NOT Alloy, switch-proxy, target-page or course telemetry.
+  Polling checks the retained phase clock and original polling deadline both before attempts and
+  before accepting readiness. Native command caps, HTTP timeouts and retry sleeps are clipped to
+  the remaining polling allowance; a transient empty Pod set does not renew that allowance.
 * **Private non-admin browser contract.** The TEST Viewer is created by the native Grafana API with admin
   credentials that stay in guest 0600 files; its role is verified to be `Viewer` (never elevated; admin settings
   access must be refused). `viewer-ready` writes a fixed Viewer-only handoff (schema, nonce, login, password,
@@ -1770,8 +1778,12 @@ later, separately reviewed activation would expose; only offline synthetic tests
   There is no guarantee the UI works until a separately authorized runtime run.
 * **Continuous supervision.** `stdin_bounded` runs the fixed gate (kernel boot, heartbeat freshness, management
   clock) every <=0.1s while any child is live; heartbeat loss, boot change, phase cutoff, deadline, signal or
-  interruption kill the child's exact process group, and the group is killed after every exit so no step leaves a
-  descendant. Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
+  interruption request closure of the child's exact group through the unchanged `owned_process.OwnedGroup`.
+  The helper observes without reaping, signals while identity remains anchored, is the sole reaper and
+  requires positive group absence. Closure also follows clean exit and has reserved time within the
+  command cap. Uncertainty survives a primary failure and prevents a complete teardown claim.
+  An observed native exit or signal remains the primary failure if group closure is uncertain.
+  Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
   guardian and `vlab_trial.py` are unchanged. Loss of the step runner process itself is still bounded only by
   lease/VM expiry.
 * **Outcome.** A closed nonsecret typed result (`validate_result`: per-step ok/failed/not-run, one first failure

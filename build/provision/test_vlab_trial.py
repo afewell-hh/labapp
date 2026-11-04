@@ -4564,7 +4564,7 @@ class ManagementModel:
             self.uids[name.split('-')[0]] += 'x'
         return 0, b''
 
-    def http(self, method, url, *, auth=None, body=None):
+    def http(self, method, url, *, auth=None, body=None, timeout=None):
         parsed = urllib.parse.urlparse(url)
         if parsed.port == 9090:
             if parsed.path == '/-/ready':
@@ -4574,7 +4574,7 @@ class ManagementModel:
             query = urllib.parse.parse_qs(parsed.query)
             expression = query['query'][0]
             label = re.search(r'nonce="([a-f0-9]{16})"', expression).group(1)
-            metric = {'__name__': self.m.PROBE_METRIC, 'nonce': label}
+            metric = {'__name__': self.m.PROBE_METRIC, 'nonce': label, 'job': 'promtool'}
             found = self.samples.get(label)
             if expression.endswith('[2m]'):
                 rows = [] if found is None else [{'metric': metric, 'values': [[found[0], found[1]]]}]
@@ -4757,6 +4757,25 @@ class ManagementProgram(unittest.TestCase):
         with self.assertRaises(trial.Failure):
             trial.contract(bad)
 
+    def test_watch_http_and_poll_keep_the_original_context_clock_after_wall_rollback(self):
+        m = self.m
+        wall, mono = [time.time()], [time.monotonic()]
+        clock = m.ManagementClock(self.value, wall=lambda: wall[0], mono=lambda: mono[0])
+        ctx = m.Context(self.value, clock, m.load_state(NONCE))
+        remaining = clock.remaining('work')
+        watch = m.watcher(ctx, 'work', False)
+        watch()
+        m.ctx_gate(ctx)
+        self.assertIs(m.gate(ctx.value, ctx.clock), clock)
+        wall[0] -= 3600
+        mono[0] += remaining + 1
+        for check in (watch, lambda: m.ctx_gate(ctx), lambda: m.poll(ctx, 'work', 10, lambda: None)):
+            with self.subTest(check=check), self.assertRaises(trial.Failure) as raised:
+                check()
+            self.assertEqual(raised.exception.category, 'phase-cutoff')
+            self.assertIs(ctx.clock, clock)
+        self.assertGreater(m.watcher(ctx, None, True)(), 0)
+
     def test_exhausted_work_keeps_the_cleanup_reserve_and_stops_new_steps(self):
         self.reset(self.admitted_ago(55))  # work ended at minute 50/54; cleanup runs to minute 60
         clock = self.m.ManagementClock(self.value)
@@ -4879,6 +4898,7 @@ class ManagementProgram(unittest.TestCase):
         self.assertEqual(self.model.pushes, 1)
         push = next(c for c in self.model.calls if is_push(c))
         self.assertEqual(push[push.index('exec'):push.index('exec') + 4], ['exec', '-i', 'prometheus-0', '-c'])
+        self.assertIn('--label=job=promtool', push)
         self.assertIn('--timeout=10s', push)
         self.assertEqual(push[-1], 'http://127.0.0.1:9090/api/v1/write')
         self.assertEqual(self.model.stdin[0].decode(),
@@ -4897,6 +4917,69 @@ class ManagementProgram(unittest.TestCase):
         self.model.sample_age = 600  # sample timestamp far outside the freshness window
         with self.assertRaises(trial.Failure):
             self.push_and_read()
+
+    def test_native_probe_label_contract_refuses_missing_wrong_and_extra_labels(self):
+        m = self.m
+        ctx = self.push_and_read()
+        probe = ctx.private['probe']
+        labels = {'__name__': m.PROBE_METRIC, 'nonce': probe['label'], 'job': 'promtool'}
+        for invalid in ({key: val for key, val in labels.items() if key != 'job'},
+                        dict(labels, job='other'), dict(labels, unexpected='other')):
+            with self.subTest(labels=invalid):
+                with patch.object(m, 'prom', return_value={
+                        'resultType': 'matrix', 'result': [{'metric': invalid,
+                        'values': [[probe['timestamp'], str(probe['value'])]]}]}):
+                    with self.assertRaises(trial.Failure):
+                        m.probe_series(ctx, probe['label'], probe['value'])
+                with patch.object(m, 'prom', return_value={
+                        'resultType': 'vector', 'result': [{'metric': invalid,
+                        'value': [probe['timestamp'], str(probe['value'])]}]}):
+                    with self.assertRaises(trial.Failure):
+                        m.step_historical(ctx)
+
+    def test_pod_replacement_retries_empty_set_but_refuses_ambiguous_and_malformed_sets(self):
+        m = self.m
+        ctx = self.context()
+        ready = m.kget(ctx, 'pods', '--selector', m.PROMETHEUS_SELECTOR)
+        with patch.object(m, 'kget', side_effect=[{'items': []}, ready]) as reads:
+            self.assertEqual(m.wait_pod(ctx, m.PROMETHEUS_SELECTOR, 10), ('prometheus-0', 'p-1'))
+            self.assertEqual(reads.call_count, 2)
+        for invalid in (ready['items'] * 2, {}, None):
+            with self.subTest(items=invalid), patch.object(m, 'kget', return_value={'items': invalid}):
+                with self.assertRaises(trial.Failure):
+                    m.wait_pod(ctx, m.PROMETHEUS_SELECTOR, 10)
+
+    def test_pod_poll_refuses_late_success_and_clips_attempt_and_sleep_budgets(self):
+        m = self.m
+        ctx = self.context()
+        ready = m.kget(ctx, 'pods', '--selector', m.PROMETHEUS_SELECTOR)
+        ticks = [time.monotonic()]
+
+        def advance(seconds):
+            ticks[0] += seconds
+
+        with patch.object(m.time, 'monotonic', side_effect=lambda: ticks[0]), \
+             patch.object(m.time, 'sleep', side_effect=advance) as sleeps:
+            with patch.object(m, 'kget', side_effect=[{'items': []}, ready]) as reads:
+                with self.assertRaises(trial.Failure) as raised:
+                    m.wait_pod(ctx, m.PROMETHEUS_SELECTOR, 1)
+                self.assertEqual(raised.exception.category, 'child-timeout')
+                self.assertEqual(reads.call_count, 1)
+                sleeps.assert_called_once_with(1)
+
+            def late(*args):
+                advance(2)
+                return ready
+
+            with patch.object(m, 'kget', side_effect=late):
+                with self.assertRaises(trial.Failure) as raised:
+                    m.wait_pod(ctx, m.PROMETHEUS_SELECTOR, 1)
+                self.assertEqual(raised.exception.category, 'child-timeout')
+            m.poll(ctx, 'work', 1, lambda: m.kubectl(ctx, ['get', 'pods']) == b'')
+            self.assertLessEqual(m.stdin_bounded.call_args.args[1], 1)
+            m.poll(ctx, 'work', 1, lambda: m._grafana_healthy(ctx))
+            self.assertLessEqual(m.http.call_args.kwargs['timeout'], 1)
+        self.assertEqual(ctx.poll_deadlines, [])
 
     def test_query_error_is_not_treated_as_not_yet_visible(self):
         ctx = self.context()
@@ -5044,6 +5127,7 @@ class ManagementProgram(unittest.TestCase):
                 self.assertFalse((m.WORK / 'viewer-handoff.json').exists())
         # a nested (collapsed-row) panel and the timeseries migration of the same panel are accepted
         self.model.search_rows, self.model.dashboard, self.model.datasources = deepcopy(original)
+        self.model.search_status, self.model.role, self.model.viewer_admin = 200, 'Viewer', False
         nested = dash()['panels']
         dash()['panels'] = [{'id': 1, 'type': 'row', 'panels': [dict(nested[1], type='timeseries')]}]
         m.step_viewer_ready(self.context())
@@ -5136,6 +5220,40 @@ class ManagementBounded(unittest.TestCase):
     """stdin_bounded with stdlib fixture children only (no native tool)."""
     def setUp(self):
         self.m = load_management()
+
+    def test_group_closure_is_the_sole_reaper_and_uncertainty_preserves_the_primary_failure(self):
+        m = self.m
+        echo = [sys.executable, '-I', '-c', 'print(7)']
+        original = m.owned_process.OwnedGroup.close
+        closures = []
+
+        def uncertain(group, *args, **kwargs):
+            closures.append((group.proc.returncode, group.reaping))
+            self.assertTrue(original(group, *args, **kwargs))
+            return False
+
+        with patch.object(m.owned_process.OwnedGroup, 'close', uncertain):
+            with self.assertRaises(trial.Failure) as raised:
+                m.stdin_bounded(echo, 10, b'', {'PATH': '/usr/bin:/bin'})
+            self.assertTrue(raised.exception.cleanup_uncertain)
+            primary = trial.Failure('heartbeat lost', 1, 'heartbeat-loss')
+
+            def lost():
+                raise primary
+
+            with self.assertRaises(trial.Failure) as raised:
+                m.stdin_bounded(echo, 10, b'', {'PATH': '/usr/bin:/bin'}, watch=lost)
+            self.assertIs(raised.exception, primary)
+            self.assertTrue(primary.cleanup_uncertain)
+            for script, status in (('import sys;sys.exit(17)', 17),
+                                   ('import os,signal;os.kill(os.getpid(),signal.SIGTERM)', -15)):
+                with self.subTest(status=status), self.assertRaises(trial.Failure) as raised:
+                    m.stdin_bounded([sys.executable, '-I', '-c', script], 10, b'', {'PATH': '/usr/bin:/bin'})
+                expected = trial.child_failure(status, 'fixed child failed')
+                self.assertEqual((raised.exception.code, raised.exception.category, raised.exception.child_status),
+                                 (expected.code, expected.category, expected.child_status))
+                self.assertTrue(raised.exception.cleanup_uncertain)
+        self.assertEqual(closures, [(None, False)] * 4)
 
     def test_stdin_is_delivered_and_output_and_time_are_bounded(self):
         echo = [sys.executable, '-I', '-c', 'import sys;sys.stdout.write(sys.stdin.read())']
@@ -5290,7 +5408,7 @@ class ManagementSupervision(unittest.TestCase):
         late = value()
         late['admitted_at'] = start.strftime('%Y-%m-%dT%H:%M:%SZ')
         late['deadline'] = (start + timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        self.ctx.value = late
+        self.fresh(late)
         with self.assertRaises(trial.Failure) as raised:
             self.m.run_tool(self.ctx, [sys.executable, '-I', '-c', 'print(7)'], None, 30, env=self.env, cleanup=True)
         self.assertEqual(raised.exception.category, 'phase-cutoff')

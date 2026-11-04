@@ -1865,3 +1865,18 @@ quota/shape/budget; see the exact blocker list in
 The caller's tests are in the two existing `test_vlab_trial.py` homes and use fake masters, registrations and
 processes only; they do not need or authorize live admission. Source/CI acceptance of this surface is not
 activation.
+
+Enrollment checks the canonical caller's pinned Google Cloud SDK 575.0.0 before key generation.
+Before staging appliance source, it revalidates registration/source and round-trips a harmless nonce
+marker through the original master and its transfer path. A mismatched marker refuses staging.
+The bootstrap individually authenticates the fixed primitive, ownership-helper and management modules.
+
+The browser handoff requires an owned 0700 private directory and refuses a pre-existing completion
+file. On every attempted browser session exit it removes only matching owned 0600 handoff/completion
+files. Changed inode, directory, ownership, permissions or removal failure reports cleanup uncertainty;
+foreign replacements are preserved. Completion remains owner-attested, never verified browser evidence.
+Handoff creation records the exclusive file identity before writing, so partial-write failures enter
+the same finalizer. A forwarding attempt is recorded before the request; even an installed-forward
+then-command-error path attempts original-master cancellation and checks listener absence.
+No authorized verified-browser observer or independently surviving management guardian exists, so
+the whole-trial success contract remains incomplete and activation stays held.

@@ -15,7 +15,8 @@ Supervision: this is not the VLAB guardian service and adds no unit or controlle
 re-checks contract, boot, heartbeat freshness and the management clock before each child, and
 ``stdin_bounded`` re-runs that same gate on every <=0.1s tick while a child is live, so heartbeat
 loss, boot change, phase cutoff, deadline, interruption or cancel kill the child's exact process
-group before the failure propagates (also after every clean exit, so no child outlives its step).
+group through ``owned_process`` before reaping its leader, including after clean exit. Positive
+group absence is required; uncertainty is retained on the failure and in private teardown state.
 Teardown children honor only the immutable 60-minute ceiling. An orphan left by SIGKILL of the
 step runner itself is still bounded only by lease/VM expiry. Nothing here ever claims ``contained``.
 """
@@ -40,8 +41,10 @@ import urllib.request
 
 try:  # package import (host tests); plain sibling import (guest script / provision tests)
     from . import vlab_trial as base
+    from . import owned_process
 except ImportError:
     import vlab_trial as base
+    import owned_process
 
 MROOT = Path('/var/lib/labapp-management-trial')
 WORK = MROOT / 'work'
@@ -71,6 +74,7 @@ ACTIVATION_BLOCKERS = (
     'viewer-dashboard-runtime-discovery-unobserved',
     'private-viewer-handoff-and-browser-forward-review',
     'no-authorized-verified-browser-observer',
+    'independent-lifetime-supervision-and-cross-step-monotonic-anchor-unimplemented',
     'quota-shape-budget-unresolved',
     'reviewed-activation-and-separate-experiment-authorization',
 )
@@ -83,7 +87,7 @@ def refuse_activation():
 
 # ---- Fixed source and payload tables ---------------------------------------------------------
 SOURCES = {name: 'build/provision/' + name for name in (
-    'management_trial.py', 'vlab_trial.py', 'hhfab_release.py',
+    'management_trial.py', 'vlab_trial.py', 'hhfab_release.py', 'owned_process.py',
     'install-docker.py', 'install-kubectl.py', 'install-helm.py', 'install-k3d.sh',
     'management-cluster.yaml', 'management-observability-values.yaml', 'observability-values.yaml')}
 # Binary acquisition table. kubectl reuses the VLAB pin object. Helm client archive and the
@@ -284,16 +288,18 @@ def stdin_bounded(argv, seconds, data, env, limit=1024**2, watch=None):
 
     ``watch`` (the fixed gate from ``run_tool``) runs on every poll tick (<=0.1s), during output
     reads AND while waiting for exit. Whatever it raises (heartbeat/owner loss, boot change, phase
-    or cleanup cutoff) or any interruption/cancel kills the child's whole process group and reaps
-    the leader before propagating. The group is also killed after a clean exit so no descendant of
-    a finished step outlives it.
+    or cleanup cutoff) or any interruption/cancel requests group closure while the leader remains
+    unreaped. The accepted ownership helper is the sole reaper; failed absence proof propagates
+    cleanup uncertainty, including when another failure is primary. Closure also follows clean exit.
     """
     base.require(type(data) is bytes and len(data) <= 4096)
+    finish = time.monotonic() + seconds
+    deadline = finish - min(owned_process.CLEANUP_SECONDS, seconds / 2)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
-    clean = False
+    group = owned_process.OwnedGroup(proc)
+    primary = observed_failure = None
     try:
-        deadline = time.monotonic() + seconds
         try:
             proc.stdin.write(data)
             proc.stdin.close()
@@ -326,50 +332,57 @@ def stdin_bounded(argv, seconds, data, env, limit=1024**2, watch=None):
             left = deadline - time.monotonic()
             if left <= 0:
                 raise base.Failure('bounded child failed', 124, 'child-timeout')
-            try:
-                code = proc.wait(timeout=min(left, .1))
+            code = group.status()
+            if code is not None:
+                if code:
+                    observed_failure = base.child_failure(code, 'fixed child failed')
                 break
-            except subprocess.TimeoutExpired:
-                continue
-        clean = True
+            time.sleep(min(left, .01))
         return code, bytes(output)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        # Exact owned-process teardown on EVERY path: this child's own session/group only.
-        failure = None
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except BaseException as error:
-            failure = error
-        try:
-            proc.wait(timeout=3)
-        except BaseException as error:
-            failure = failure or error
+            closed = group.close(0, until=finish)
+        except BaseException:
+            closed = False
         for pipe in (proc.stdin, proc.stdout):
             try:
                 pipe.close()
             except BaseException:
                 pass
-        if failure is not None and clean:
-            raise base.Failure('owned child teardown uncertain', 1, 'exception')
+        if not closed:
+            failure = primary if primary is not None else observed_failure
+            if failure is None:
+                failure = base.Failure('owned child teardown uncertain', 1, 'exception')
+            failure.cleanup_uncertain = True
+            if primary is None:
+                raise failure
 
 
 def watcher(ctx, phase, cleanup):
     """Fixed continuous gate for a live child. Cleanup honors only the immutable ceiling: host,
     heartbeat or phase loss must never stop teardown itself."""
     if cleanup:
-        return lambda: ManagementClock(ctx.value).cleanup_remaining()
+        return lambda: ctx.clock.cleanup_remaining()
 
     def watch():
-        gate(ctx.value).remaining(phase)
+        gate(ctx.value, ctx.clock).remaining(phase)
     return watch
 
 
 class Context:
     def __init__(self, value, clock, state):
-        self.value, self.clock, self.state = value, clock, state
+        self.value, self.state = value, state
+        self.clock = clock if clock is not None else ManagementClock(value)
         self.private = state['private']
+        self.poll_deadlines = []
+
+    def poll_remaining(self):
+        left = min(self.poll_deadlines) - time.monotonic() if self.poll_deadlines else float('inf')
+        base.require(left > 0, 'bounded wait elapsed', 'child-timeout')
+        return left
 
     def observe(self, key):
         self.state['observed'][key] = True
@@ -380,17 +393,20 @@ def heartbeat_fresh():
     base.require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
 
 
-def gate(value):
+def gate(value, clock=None):
     """Contract, boot, heartbeat and management clock; evaluated before every step and child."""
     base.require(base.kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
     heartbeat_fresh()
+    if clock is not None:
+        base.require(clock.value == value, 'clock contract differs')
+        return clock
     return ManagementClock(value)
 
 
 def run_tool(ctx, argv, phase, cap, *, data=None, env=None, cleanup=False):
     """ONE bounded child. Re-checks the gate; the cap is clipped to the remaining phase/cleanup time."""
-    clock = gate(ctx.value) if not cleanup else ManagementClock(ctx.value)
-    seconds = min(cap, clock.cleanup_remaining() if cleanup else clock.remaining(phase))
+    clock = gate(ctx.value, ctx.clock) if not cleanup else ctx.clock
+    seconds = min(cap, clock.cleanup_remaining() if cleanup else clock.remaining(phase), ctx.poll_remaining())
     args = [str(a) for a in argv]
     environment = env if env is not None else tool_env()
     # Every child is supervised continuously (heartbeat/boot/clock on each tick), with or without stdin.
@@ -409,9 +425,10 @@ def kget(ctx, resource, *extra):
     return base.data(kubectl(ctx, ['--namespace', NAMESPACE, 'get', resource, *extra, '--output', 'json']))
 
 
-def http(method, url, *, auth=None, body=None):
+def http(method, url, *, auth=None, body=None, timeout=QUERY_TIMEOUT):
     """Loopback-only bounded HTTP. Response bodies of failures are never read or reported."""
     base.require(url.startswith((PROMETHEUS_URL + '/', GRAFANA_URL + '/')), 'endpoint refused')
+    base.require(0 < timeout <= QUERY_TIMEOUT, 'HTTP timeout refused')
     headers = {'Accept': 'application/json'}
     payload = None
     if body is not None:
@@ -422,7 +439,7 @@ def http(method, url, *, auth=None, body=None):
     request = urllib.request.Request(url, data=payload, method=method, headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=QUERY_TIMEOUT) as response:
+        with opener.open(request, timeout=timeout) as response:
             raw = response.read(HTTP_LIMIT + 1)
             status = response.status
     except urllib.error.HTTPError as error:
@@ -440,7 +457,8 @@ def prom(ctx, query, at=None):
     params = {'query': query}
     if at is not None:
         params['time'] = '%.3f' % at
-    status, raw = http('GET', PROMETHEUS_URL + '/api/v1/query?' + urllib.parse.urlencode(params))
+    status, raw = http('GET', PROMETHEUS_URL + '/api/v1/query?' + urllib.parse.urlencode(params),
+                       timeout=min(QUERY_TIMEOUT, ctx.poll_remaining()))
     base.require(status == 200, 'query error', 'status-invalid')
     body = base.data(raw)
     base.require(type(body) is dict and body.get('status') == 'success' and type(body.get('data')) is dict
@@ -449,12 +467,14 @@ def prom(ctx, query, at=None):
 
 
 def ctx_gate(ctx):
-    gate(ctx.value).remaining('work')
+    gate(ctx.value, ctx.clock).remaining('work')
+    ctx.poll_remaining()
 
 
 def grafana(ctx, method, path, auth, body=None):
     ctx_gate(ctx)
-    status, raw = http(method, GRAFANA_URL + path, auth=auth, body=body)
+    status, raw = http(method, GRAFANA_URL + path, auth=auth, body=body,
+                       timeout=min(QUERY_TIMEOUT, ctx.poll_remaining()))
     return status, (base.data(raw) if raw else None)
 
 
@@ -469,19 +489,26 @@ def admin_auth():
 def poll(ctx, phase, seconds, attempt):
     """Bounded retry under the original clock; ``attempt`` returns a truthy value when finished."""
     end = time.monotonic() + seconds
-    while True:
-        result = attempt()
-        if result:
-            return result
-        base.require(time.monotonic() < end, 'bounded wait elapsed', 'child-timeout')
-        ctx.clock = gate(ctx.value)
-        ctx.clock.remaining(phase)
-        time.sleep(2)
+    ctx.poll_deadlines.append(end)
+    try:
+        while True:
+            gate(ctx.value, ctx.clock).remaining(phase)
+            ctx.poll_remaining()
+            result = attempt()
+            gate(ctx.value, ctx.clock).remaining(phase)
+            left = ctx.poll_remaining()
+            if result:
+                return result
+            time.sleep(min(2, left))
+    finally:
+        ctx.poll_deadlines.pop()
 
 
 def ready_pod(ctx, selector):
     items = kget(ctx, 'pods', '--selector', selector)['items']
-    base.require(len(items) == 1, 'workload pod set refused')
+    base.require(type(items) is list and len(items) <= 1, 'workload pod set refused')
+    if not items:
+        return None, None, False
     meta, status = items[0]['metadata'], items[0]['status']
     name, uid = meta['name'], meta['uid']
     base.require(re.fullmatch(r'[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?', name) is not None)
@@ -525,7 +552,7 @@ def install_script(ctx, script, args, cap, env=None):
 
 def step_install_docker(ctx):
     for name in ('docker.socket', 'docker.service', 'containerd.service'):
-        clock = gate(ctx.value)
+        clock = gate(ctx.value, ctx.clock)
         code, raw = base.call_bounded([SYSTEMCTL, 'show', name, '-p', 'LoadState'], min(10, clock.remaining('stage')))
         base.require(code in (0, 1, 5) and raw == b'LoadState=not-found\n', 'preexisting daemon refused')
     base.exclusive(MROOT / 'daemon-intent.json',
@@ -637,7 +664,7 @@ def step_probe_push(ctx):
     save_state(ctx.state)
     text = (probe_query(label) + ' ' + str(value) + '\n').encode()  # no explicit timestamp: promtool assigns now
     kubectl(ctx, ['--namespace', NAMESPACE, 'exec', '-i', pod, '-c', 'prometheus', '--', '/bin/promtool',
-                  'push', 'metrics', '--timeout=10s', PROMETHEUS_URL + '/api/v1/write'], 30, data=text)
+                  'push', 'metrics', '--label=job=promtool', '--timeout=10s', PROMETHEUS_URL + '/api/v1/write'], 30, data=text)
     ctx.observe('probe_pushed')
 
 
@@ -645,7 +672,7 @@ def probe_series(ctx, label, value):
     data = prom(ctx, probe_query(label) + '[2m]')
     base.require(data.get('resultType') == 'matrix' and len(data['result']) == 1, 'probe series refused')
     series = data['result'][0]
-    base.require(series['metric'] == {'__name__': PROBE_METRIC, 'nonce': label}, 'probe labels differ')
+    base.require(series['metric'] == {'__name__': PROBE_METRIC, 'nonce': label, 'job': 'promtool'}, 'probe labels differ')
     samples = series['values']
     base.require(type(samples) is list and samples and all(len(s) == 2 and s[1] == str(value) for s in samples),
                  'probe value differs')
@@ -736,12 +763,13 @@ def step_restart(ctx):
         ctx.observe(key)
     base.require(claims(ctx) == before, 'claim identity changed')
     ctx.observe('pvc_uid_unchanged')
-    poll(ctx, 'work', 120, _prometheus_ready)
+    poll(ctx, 'work', 120, lambda: _prometheus_ready(ctx))
 
 
-def _prometheus_ready():
+def _prometheus_ready(ctx):
     try:
-        return http('GET', PROMETHEUS_URL + '/-/ready')[0] == 200
+        ctx_gate(ctx)
+        return http('GET', PROMETHEUS_URL + '/-/ready', timeout=min(QUERY_TIMEOUT, ctx.poll_remaining()))[0] == 200
     except base.Failure as error:
         if error.category == 'capability':
             return False  # connection refused while the restarted pod comes up
@@ -755,7 +783,8 @@ def step_historical(ctx):
     data = prom(ctx, probe_query(label), at=timestamp)
     base.require(data.get('resultType') == 'vector' and len(data['result']) == 1, 'historical sample missing')
     row = data['result'][0]
-    base.require(row['metric'] == {'__name__': PROBE_METRIC, 'nonce': label} and row['value'][1] == str(value),
+    base.require(row['metric'] == {'__name__': PROBE_METRIC, 'nonce': label, 'job': 'promtool'}
+                 and row['value'][1] == str(value),
                  'historical sample differs')
     ctx.observe('historical_sample')
 
@@ -862,12 +891,14 @@ def run_step(nonce, name):
                  'step order refused')
     ctx = Context(value, None, state)
     try:
-        ctx.clock = gate(value)
+        ctx.clock = gate(value, ctx.clock)
         ctx.clock.remaining(STEP_PHASE[name])
         STEP_FUNCTIONS[name](ctx)
     except BaseException as error:
         state['steps'][name] = 'failed'
         state['failure'] = failure_record(name, error)
+        if getattr(error, 'cleanup_uncertain', False):
+            state['private']['child_cleanup_uncertain'] = True
         try:
             save_state(state)
         except BaseException:
@@ -910,7 +941,8 @@ def teardown(nonce):
     if state['teardown'] == 'complete':
         return 0
     ctx = Context(value, ManagementClock(value), state)
-    private, clean = state['private'], True
+    private = state['private']
+    clean = not private.get('child_cleanup_uncertain', False)
 
     def attempt(argv, cap):
         try:

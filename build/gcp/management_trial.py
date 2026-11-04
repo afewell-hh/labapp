@@ -78,8 +78,9 @@ def load(name,expected,module):
     exec(compile(b,str(p/name),'exec'),m.__dict__)
     return m
 load('vlab_trial.py',sys.argv[2],'vlab_trial')
-m=load('management_trial.py',sys.argv[3],'management_trial')
-m.bootstrap(p,sys.argv[4])
+load('owned_process.py',sys.argv[3],'owned_process')
+m=load('management_trial.py',sys.argv[4],'management_trial')
+m.bootstrap(p,sys.argv[5])
 """
 MANAGEMENT_SCRIPT = str(program.MROOT / 'management_trial.py')
 SUDO = ['/usr/bin/sudo', '-n', '/usr/bin/python3']
@@ -129,7 +130,7 @@ def stage_program(snapshot, payloads, output, initial):
 
 def bootstrap_command(incoming, source, table):
     return [*SUDO, '-I', '-c', STUB, incoming, source['vlab_trial.py']['sha256'],
-            source['management_trial.py']['sha256'], guest.sha(canonical(table))]
+            source['owned_process.py']['sha256'], source['management_trial.py']['sha256'], guest.sha(canonical(table))]
 
 
 def management_result(raw, nonce):
@@ -175,13 +176,42 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
         return 'skipped', True  # nothing was opened by this program
     handoff = private / ('viewer-handoff-' + lease + '.json')
     done = private / ('browser-complete-' + lease + '.json')
-    guest.exclusive(handoff, raw_handoff)  # bounded private owner file, Viewer-only schema
-    status, opened = 'forward-failed', False
+    guest.no_links(private)
+    directory = private.lstat()
+    guest.require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.geteuid()
+                  and stat.S_IMODE(directory.st_mode) == 0o700 and not os.path.lexists(done)
+                  and not os.path.lexists(handoff), 'private handoff refused')
+    owned = {}
+
+    def remember(path):
+        info = path.lstat()
+        guest.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                      and stat.S_IMODE(info.st_mode) == 0o600, 'private file identity refused')
+        identity = info.st_dev, info.st_ino
+        guest.require(path not in owned or owned[path] == identity, 'private file replaced')
+        owned[path] = identity
+
+    status, attempted = 'forward-failed', False
     try:
+        program.validate_handoff(guest.data(raw_handoff), nonce)
+        fd = os.open(handoff, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            owned[handoff] = info.st_dev, info.st_ino
+            stream = os.fdopen(fd, 'wb')
+            fd = None
+            with stream:
+                stream.write(raw_handoff)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        remember(handoff)
         until = owned_process.monotonic() + min(15, left)
         master.check(until)
+        attempted = True
         owner.command(forward_command(master, 'forward'), owner.Master.slice(15, until), until=until, failed=failed)
-        opened = True
         master.check()
         guest.require(listening(), 'forward not listening')
         status = 'timeout'
@@ -191,9 +221,7 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
             master.check()  # original socket identity + liveness on every poll: no reconnect, no new auth
             guest.require(listening(), 'forward lost')
             if done.exists():
-                info = done.lstat()
-                guest.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-                              and stat.S_IMODE(info.st_mode) == 0o600)
+                remember(done)
                 value = guest.data(guest.regular(done, 512, os.geteuid(), 0o600))
                 expected = guest.data(raw_handoff)
                 uid, panel = re.fullmatch(r'/d/([A-Za-z0-9_-]{1,40})\?viewPanel=([0-9]{1,6})', expected['path']).groups()
@@ -213,8 +241,8 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
         if status == 'timeout':
             status = 'forward-failed'
     finally:
-        absent = not opened
-        if opened:
+        absent = not attempted
+        if attempted:
             try:
                 owner.command(forward_command(master, 'cancel'), 10)
             except BaseException as error:
@@ -222,6 +250,19 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
                     process_uncertain.set()
             absent = not listening()
         if not absent:
+            process_uncertain.set()
+        try:
+            current = private.lstat()
+            guest.require((current.st_dev, current.st_ino) == (directory.st_dev, directory.st_ino)
+                          and stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
+                          and stat.S_IMODE(current.st_mode) == 0o700, 'private directory replaced')
+            for path in (handoff, done):
+                if os.path.lexists(path):
+                    guest.require(path in owned or path == done and attempted, 'unowned private file')
+                    remember(path)
+                    path.unlink()
+                guest.require(not os.path.lexists(path), 'private file remains')
+        except BaseException:
             process_uncertain.set()
     return status, absent
 
@@ -255,6 +296,8 @@ def enroll(snapshot, output, registration, records, login, rec, clock, failed, i
                   'owner impersonation unsupported')
     profile = guest.data(owner.command(['gcloud', 'compute', 'os-login', 'describe-profile', '--format=json'], 20))
     guest.require(profile_user(profile.get('name')) == snapshot['self_user'] == login.user, 'canonical SELF identity differs')
+    version = guest.data(owner.command(['gcloud', 'version', '--format=json'], 15))
+    guest.require(version.get('Google Cloud SDK') == '575.0.0')
     held.operation = 'key-generation'
     owner.command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(output / 'oslogin')], 10)
     public_key = guest.regular(output / 'oslogin.pub', 4096, os.geteuid()).decode().strip()
@@ -309,8 +352,14 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
         clock.remaining('access')
         rec = enroll(snapshot, output, registration, records, login, rec, clock, failed, initial, held)
         master = held.master
+        registration.current()
+        owner.trusted_source(snapshot)
         incoming = '/tmp/labapp-vlab-' + nonce
         master.remote(['/usr/bin/mkdir', '-m', '0700', incoming], 'access')
+        guest.exclusive(output / 'marker', nonce.encode())
+        master.transfer(incoming, ['marker'], 'access')
+        guest.require(master.remote(['/usr/bin/cat', incoming + '/marker'], 'access') == nonce.encode())
+        master.remote(['/usr/bin/rm', '--', incoming + '/marker'], 'access')
         phase, held.operation = 'program-stage', 'program-stage'
         source, table = stage_program(snapshot, payloads, output, initial)
         registration.current()
