@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -152,11 +153,12 @@ def forward_command(master, verb):
 
 
 def listening():
+    """True for a listener, False only for definite refusal, None for indeterminate failure."""
     try:
         with socket.create_connection((FORWARD_HOST, FORWARD_PORT), timeout=2):
             return True
-    except OSError:
-        return False
+    except OSError as error:
+        return False if error.errno == errno.ECONNREFUSED else None
 
 
 def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, process_uncertain):
@@ -172,8 +174,13 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
         left = clock.remaining('work')
     except guest.Failure:
         return 'skipped', True
-    if left < BROWSER_MIN_SECONDS or listening():
+    if left < BROWSER_MIN_SECONDS:
         return 'skipped', True  # nothing was opened by this program
+    present = listening()
+    if present is not False:
+        if present is None:
+            process_uncertain.set()
+        return 'skipped', present is True
     handoff = private / ('viewer-handoff-' + lease + '.json')
     done = private / ('browser-complete-' + lease + '.json')
     guest.no_links(private)
@@ -213,13 +220,13 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
         attempted = True
         owner.command(forward_command(master, 'forward'), owner.Master.slice(15, until), until=until, failed=failed)
         master.check()
-        guest.require(listening(), 'forward not listening')
+        guest.require(listening() is True, 'forward not listening')
         status = 'timeout'
         end = owned_process.monotonic() + min(BROWSER_WAIT_SECONDS, clock.remaining('work') - 30)
         while owned_process.monotonic() < end:
             guest.require(not failed.is_set(), 'heartbeat/master failed')
             master.check()  # original socket identity + liveness on every poll: no reconnect, no new auth
-            guest.require(listening(), 'forward lost')
+            guest.require(listening() is True, 'forward lost')
             if done.exists():
                 remember(done)
                 value = guest.data(guest.regular(done, 512, os.geteuid(), 0o600))
@@ -248,7 +255,10 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
             except BaseException as error:
                 if getattr(error, 'cleanup_uncertain', False):
                     process_uncertain.set()
-            absent = not listening()
+            try:
+                absent = listening() is False
+            except BaseException:
+                absent = False
         if not absent:
             process_uncertain.set()
         try:

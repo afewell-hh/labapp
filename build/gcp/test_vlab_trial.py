@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import errno
 from pathlib import Path
 import runpy
 import stat
@@ -3058,13 +3059,14 @@ class ManagementCaller(unittest.TestCase):
 
     # -- browser: original-master loopback forward -----------------------------------------------------
     def browser(self, *, outcome='viewer-panel-seen', mode=0o600, lost=False, listening_start=False, cancel_fails=False,
-                private='default', wait=0.05, write=True, override=None, replace_handoff=False, forward_fails=False):
+                private='default', wait=0.05, write=True, override=None, replace_handoff=False, forward_fails=False,
+                post_cancel_probe=None):
         caller, program = self.caller, self.program
         master = FakeManagementMaster(program)
         master.lost_after = 1 if lost else None  # first guard passes, the next socket check finds it gone
         value = snapshot()
         clock = program.ManagementClock({'admitted_at': value['reserved_at'], 'deadline': value['deadline']})
-        state, commands = {'open': listening_start}, []
+        state, commands = {'open': listening_start, 'cancel_attempted': False}, []
         nonce, lease = 'a' * 32, value['request_id']
         if private == 'default':  # fresh owned private dir per call: the exclusive-create handoff file is never reused
             private = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-priv-')))
@@ -3074,6 +3076,8 @@ class ManagementCaller(unittest.TestCase):
         def command(argv, seconds, **kw):
             commands.append(list(argv))
             verb = argv[argv.index('-O') + 1]
+            if verb == 'cancel':
+                state['cancel_attempted'] = True
             if verb == 'forward':
                 handoff = private / ('viewer-handoff-' + lease + '.json')
                 self.last_handoff = handoff.read_bytes(), stat.S_IMODE(handoff.stat().st_mode)
@@ -3098,7 +3102,10 @@ class ManagementCaller(unittest.TestCase):
             state['open'] = verb == 'forward'
             return b''
         uncertain = threading.Event()
-        with patch.object(host, 'command', side_effect=command), patch.object(caller, 'listening', side_effect=lambda: state['open']), \
+        def probe():
+            return post_cancel_probe() if state['cancel_attempted'] and post_cancel_probe else state['open']
+
+        with patch.object(host, 'command', side_effect=command), patch.object(caller, 'listening', side_effect=probe), \
              patch.object(caller.time, 'sleep'), patch.object(caller, 'BROWSER_WAIT_SECONDS', wait):
             status = caller.browser_session(master, clock, nonce, lease, handoff_bytes(nonce), private,
                                             threading.Event(), uncertain)
@@ -3161,6 +3168,30 @@ class ManagementCaller(unittest.TestCase):
         status, _, _, uncertain, _ = self.browser(forward_fails=True, cancel_fails=True)
         self.assertEqual(status, ('forward-failed', False))
         self.assertTrue(uncertain.is_set())
+
+    def test_listener_probe_requires_definite_refusal_for_absence(self):
+        caller = self.caller
+        for error, expected in ((ConnectionRefusedError(errno.ECONNREFUSED, 'synthetic refusal'), False),
+                                (TimeoutError('synthetic timeout'), None),
+                                (OSError(errno.EMFILE, 'synthetic descriptor exhaustion'), None),
+                                (PermissionError(errno.EACCES, 'synthetic permission failure'), None)):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(caller.socket, 'create_connection', side_effect=error):
+                self.assertIs(caller.listening(), expected)
+
+    def test_failed_cancel_with_indeterminate_probe_never_proves_forward_absence(self):
+        caller = self.caller
+        original = caller.listening
+        for error in (TimeoutError('synthetic timeout'), OSError(errno.EMFILE, 'synthetic descriptor exhaustion'),
+                  KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(caller.socket, 'create_connection', side_effect=error):
+                status, _, commands, uncertain, _ = self.browser(
+                    forward_fails=True, cancel_fails=True, post_cancel_probe=original)
+            self.assertEqual(status, ('forward-failed', False))
+            self.assertEqual([cmd[cmd.index('-O') + 1] for cmd in commands], ['forward', 'cancel'])
+            self.assertTrue(uncertain.is_set())
+            self.assertEqual(list(self.last_private.iterdir()), [])
 
     def test_browser_refuses_preexisting_completion_without_removing_it(self):
         lease = snapshot()['request_id']

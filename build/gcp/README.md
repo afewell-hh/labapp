@@ -1878,5 +1878,7 @@ foreign replacements are preserved. Completion remains owner-attested, never ver
 Handoff creation records the exclusive file identity before writing, so partial-write failures enter
 the same finalizer. A forwarding attempt is recorded before the request; even an installed-forward
 then-command-error path attempts original-master cancellation and checks listener absence.
+Only definite connection refusal proves listener absence. Timeouts, descriptor exhaustion,
+permission errors or interruption leave forward cleanup uncertain without skipping private-file cleanup.
 No authorized verified-browser observer or independently surviving management guardian exists, so
 the whole-trial success contract remains incomplete and activation stays held.
