@@ -3017,7 +3017,10 @@ class ManagementCaller(unittest.TestCase):
         clock = program.ManagementClock({'admitted_at': value['reserved_at'], 'deadline': value['deadline']})
         state, commands = {'open': listening_start}, []
         nonce, lease = 'a' * 32, value['request_id']
-        private = self.private if private == 'default' else private
+        if private == 'default':  # fresh owned private dir per call: the exclusive-create handoff file is never reused
+            private = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-priv-')))
+            private.chmod(0o700)
+        self.last_private = private
         if write and private is not None:
             done = private / ('browser-complete-' + lease + '.json')
             done.write_text(json.dumps({'schema': 1, 'nonce': nonce, 'result': outcome}))
@@ -3050,7 +3053,7 @@ class ManagementCaller(unittest.TestCase):
             self.assertNotIn(forbidden, forward)
         self.assertEqual(forward[-1], 'labapp-trial-1234')
         self.assertGreater(master.checks, 1)  # original socket identity checked around and during the forward
-        handoff = self.private / ('viewer-handoff-' + lease + '.json')
+        handoff = self.last_private / ('viewer-handoff-' + lease + '.json')
         self.assertEqual(stat.S_IMODE(handoff.stat().st_mode), 0o600)
         record = guest.data(handoff.read_bytes())
         self.assertEqual(set(record), self.program.HANDOFF_FIELDS)
