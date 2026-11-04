@@ -1886,12 +1886,15 @@ activation stays held.
 #### Guest lifetime ownership and clock capsule (issue #508, source-inactive)
 
 The caller no longer executes steps: it takes ONE fixed guest clock sample through the original Master
-(`guest_clock_capsule`; round trip <= 10 s, guest wall within the caller bracket +/- 5 s, remaining time computed
+(`guest_clock_capsule`; round trip <= 10 s, guest wall within the ORIGINAL effective-clock bracket +/- 5 s with
+the raw caller wall only cross-checked, remaining time computed
 from the caller's retained clock at RESPONSE reception, safety allowance subtracted, round trip never added back),
 stages the resulting immutable `capsule.json` and the three fixed units in the manifest, bootstraps once, then
 only heartbeats, polls the read-only `result`, exports the Viewer handoff, runs the unchanged browser session and
 sends `cancel`. The guest's fixed guardian/timer/stop units and poststop own cleanup and write the typed receipt;
-a still-`pending` receipt after the bounded wait is reported unknown. There is no reconnect, resample after an
+a still-`pending` receipt after the bounded wait is reported unknown. A `cancel` acknowledgement is a request only,
+and a non-`pending` `teardown` is not by itself terminal proof of the contract. A public native failure keeps its
+exit (positive) or signal (negative status -> 128 + signal); only non-native categories collapse to 1. There is no reconnect, resample after an
 ambiguous bootstrap, per-step command or host teardown command. Assumptions, the budget and unverified systemd
 behavior are listed in
 [build/provision/README.md](../provision/README.md#fixed-lifetime-ownership-and-clock-capsule-issue-508-source-inactive).

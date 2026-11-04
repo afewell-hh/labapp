@@ -41,6 +41,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -99,7 +100,10 @@ STOP_UNIT = 'labapp-management-expiry.service'
 UNIT_NAMES = (GUARDIAN_UNIT, TIMER_UNIT, STOP_UNIT)
 UNIT_DIR = Path('/etc/systemd/system')
 RUNTIME_DIR = Path('/run/systemd/system')
-CGROUP_PROCS = Path('/sys/fs/cgroup/system.slice') / GUARDIAN_UNIT / 'cgroup.procs'
+CGROUP_DIR = Path('/sys/fs/cgroup/system.slice') / GUARDIAN_UNIT   # the guardian cgroup AND its descendants
+CGROUP_PROCS = CGROUP_DIR / 'cgroup.procs'
+DAEMON_UNITS = ('docker.socket', 'docker.service', 'containerd.service')
+DAEMON_CGROUPS = tuple(Path('/sys/fs/cgroup/system.slice') / name for name in DAEMON_UNITS[1:])
 # Fixed guest clock sample program. Its digest is bound into the capsule; it is not a command loader.
 SAMPLE_STUB = (
     "import json,sys,time\n"
@@ -113,6 +117,7 @@ ACTIVATION_BLOCKERS = (
     'private-viewer-handoff-and-browser-forward-review',
     'no-authorized-verified-browser-observer',
     'native-systemd-guardian-timer-and-clock-capsule-runtime-behavior-unobserved',
+    'poststop-all-work-deadline-unenforceable-for-uninterruptible-filesystem-calls-in-process',
     'quota-shape-budget-unresolved',
     'reviewed-activation-and-separate-experiment-authorization',
 )
@@ -264,7 +269,7 @@ CAPSULE_COPIED = ('nonce', 'lease', 'epoch', 'run_id', 'attempt', 'body_sha256',
                   'source_sha', 'boot_uuid', 'admitted_at', 'deadline')
 CAPSULE_FIELDS = {'schema', 'stub_sha256', 'sample', 'caller', 'safety', 'left', 'cutoffs', *CAPSULE_COPIED}
 SAMPLE_FIELDS = {'boot', 'nonce', 'wall', 'mono'}
-CALLER_FIELDS = {'send_wall', 'recv_wall', 'roundtrip'}
+CALLER_FIELDS = {'send_wall', 'recv_wall', 'send_eff', 'recv_eff', 'roundtrip'}
 
 
 def _number(value):
@@ -295,11 +300,18 @@ def build_capsule(contract, clock, sample, sample_nonce, send, receive):
     sample = sample_valid(sample, contract, sample_nonce)
     roundtrip = recv_mono - send_mono
     base.require(0 <= roundtrip <= CLOCK_ROUNDTRIP_MAX and recv_wall >= send_wall, 'clock round trip refused')
-    base.require(send_wall - CLOCK_SKEW_MAX <= sample['wall'] <= recv_wall + CLOCK_SKEW_MAX, 'guest clock skew refused')
+    # The ORIGINAL effective clock (admission-anchored, monotonic-derived) brackets the sample; the raw
+    # caller wall is only a cross-check, so a caller wall rollback or jump cannot widen the correlation.
+    send_eff = clock.started_wall + (send_mono - clock.started_mono)
+    recv_eff = clock.started_wall + (recv_mono - clock.started_mono)
+    base.require(abs(send_wall - send_eff) <= CLOCK_SKEW_MAX and abs(recv_wall - recv_eff) <= CLOCK_SKEW_MAX,
+                 'caller wall differs from the original effective clock')
+    base.require(send_eff - CLOCK_SKEW_MAX <= sample['wall'] <= recv_eff + CLOCK_SKEW_MAX, 'guest clock skew refused')
     left = {key: clock.left_at(minutes, recv_wall, recv_mono) for key, minutes in PHASE_MINUTES.items()}
     cutoffs = {key: sample['mono'] + seconds - CLOCK_SAFETY_SECONDS for key, seconds in left.items()}
     capsule = {'schema': 1, 'stub_sha256': base.sha(SAMPLE_STUB.encode()), 'sample': dict(sample),
-               'caller': {'send_wall': send_wall, 'recv_wall': recv_wall, 'roundtrip': roundtrip},
+               'caller': {'send_wall': send_wall, 'recv_wall': recv_wall, 'send_eff': send_eff,
+                          'recv_eff': recv_eff, 'roundtrip': roundtrip},
                'safety': CLOCK_SAFETY_SECONDS, 'left': left, 'cutoffs': cutoffs,
                **{key: contract[key] for key in CAPSULE_COPIED}}
     return validate_capsule(capsule, contract)
@@ -319,7 +331,10 @@ def validate_capsule(value, contract, now=None):
     caller, left, cutoffs = value['caller'], value['left'], value['cutoffs']
     base.require(type(caller) is dict and set(caller) == CALLER_FIELDS and all(_number(v) for v in caller.values())
                  and 0 <= caller['roundtrip'] <= CLOCK_ROUNDTRIP_MAX and caller['recv_wall'] >= caller['send_wall']
-                 and caller['send_wall'] - CLOCK_SKEW_MAX <= sample['wall'] <= caller['recv_wall'] + CLOCK_SKEW_MAX,
+                 and abs(caller['send_wall'] - caller['send_eff']) <= CLOCK_SKEW_MAX
+                 and abs(caller['recv_wall'] - caller['recv_eff']) <= CLOCK_SKEW_MAX
+                 and abs((caller['recv_eff'] - caller['send_eff']) - caller['roundtrip']) <= 1e-6
+                 and caller['send_eff'] - CLOCK_SKEW_MAX <= sample['wall'] <= caller['recv_eff'] + CLOCK_SKEW_MAX,
                  'capsule clock bracket refused')
     base.require(type(left) is dict and type(cutoffs) is dict and set(left) == set(cutoffs) == set(PHASE_MINUTES)
                  and all(_number(v) for v in (*left.values(), *cutoffs.values())), 'capsule cutoffs refused')
@@ -401,12 +416,15 @@ class state_lock:
         os.close(self.fd)  # closing the descriptor releases the lock
 
 
-def save_state(state, *, poststop=False):
+def save_state(state, *, poststop=False, until=None):
     """Single-writer discipline: the worker writes until poststop CLAIMS the state under the same lock
-    (exclusive poststop.json); afterwards worker writes are refused and only poststop may write."""
-    with state_lock():
+    (exclusive poststop.json); afterwards worker writes are refused and only poststop may write.
+    With ``until`` (the poststop outer deadline) a ``complete`` receipt is never published late."""
+    with state_lock() if until is None else state_lock(max(.1, min(5.0, until - time.monotonic()))):
         claimed = os.path.lexists(MROOT / POSTSTOP_CLAIM)
         base.require(claimed == poststop, 'state writer superseded')
+        if until is not None and state['teardown'] == 'complete' and time.monotonic() >= until:
+            state['teardown'] = 'uncertain'
         base.atomic(MROOT / 'steps.json', state)
 
 
@@ -780,10 +798,13 @@ def step_storage(ctx):
     base.require(not os.path.lexists(STORAGE), 'preexisting storage refused')
     base.no_links(STORAGE.parent)
     os.makedirs(STORAGE.parent, mode=0o755, exist_ok=True)
+    ctx.private['storage_intent'] = True  # durable BEFORE the effect: an unrecorded creation stays uncertain
+    save_state(ctx.state)
     os.mkdir(STORAGE, 0o700)
     info = os.lstat(STORAGE)
     base.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
     ctx.private['storage_ino'] = [info.st_dev, info.st_ino]
+    save_state(ctx.state)  # identity durable immediately, not only when the whole step completes
     ctx.observe('storage_new')
 
 
@@ -1153,8 +1174,11 @@ def bounded_rmtree(path, deadline):
     root_dev = os.lstat(path).st_dev
 
     def walk(directory):
+        entries = []
         with os.scandir(directory) as scan:
-            entries = list(scan)
+            for entry in scan:  # a Python-level loop: the deadline also bounds the enumeration itself
+                base.require(time.monotonic() < deadline, 'cleanup deadline elapsed', 'child-timeout')
+                entries.append(entry)
         for entry in entries:
             base.require(time.monotonic() < deadline, 'cleanup deadline elapsed', 'child-timeout')
             info = entry.stat(follow_symlinks=False)
@@ -1168,7 +1192,8 @@ def bounded_rmtree(path, deadline):
     os.rmdir(path)
 
 
-def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False, extra_private=None):
+def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False, extra_private=None,
+             outcome=None):
     """Positive, idempotent removal of exactly what this program created; uncertainty is reported.
 
     ``outer`` (monotonic) is ONE deadline for ALL work including filesystem work; ``storage_allowed``
@@ -1185,7 +1210,21 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
     private = state['private']
     if extra_private:
         private.update(extra_private)
+    if outcome is not None:
+        apply_terminal(state, outcome)
+        try:
+            validate_result(public_record(state), nonce)
+        except BaseException:  # an inexpressible terminal outcome is never published as a half record
+            state['failure'] = None
+            state['steps'] = {n: ('not-run' if s == 'failed' else s) for n, s in state['steps'].items()}
+            private['terminal_unpublished'] = True
+            private['child_cleanup_uncertain'] = True  # receipt cannot be clean without its terminal outcome
     clean = not private.get('child_cleanup_uncertain', False) and storage_allowed
+    # ``absent`` = POSITIVE evidence that nothing can still write the storage: the worker (storage_allowed),
+    # the cluster/containers and the daemons. Any failed, unknown or unobserved proof withholds the
+    # destructive step below and makes the receipt uncertain; credentials are removed regardless.
+    absent = storage_allowed
+    deadline = outer if outer is not None else time.monotonic() + 120
 
     def in_time():
         return outer is None or time.monotonic() < outer
@@ -1198,12 +1237,14 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
 
     if private.get('cluster_attempted'):
         if attempt([K3D, 'cluster', 'delete', CLUSTER], 120) is None:
-            clean = False
+            clean = absent = False
         listing = attempt([DOCKER, 'ps', '--all', '--quiet', '--filter', 'name=k3d-' + CLUSTER], 30)
-        clean = clean and listing is not None and listing.strip() == b''
+        if listing is None or listing.strip() != b'':
+            clean = absent = False
     if private.get('docker_started') or private.get('docker_intent'):
-        units = [SYSTEMCTL, 'stop', 'docker.socket', 'docker.service', 'containerd.service']
-        clean = attempt(units, 30) is not None and clean
+        units = [SYSTEMCTL, 'stop', *DAEMON_UNITS]
+        if attempt(units, 30) is None or not daemons_absent(deadline):  # a successful stop is not absence
+            clean = absent = False
     for name in PRIVATE_FILES:  # protective: credentials are removed even when worker absence is unproven
         path = WORK / name
         try:
@@ -1218,11 +1259,13 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
         except BaseException:
             clean = False
     recorded = private.get('storage_ino')
-    if recorded is not None and storage_allowed:  # destructive: only after worker absence was shown
+    if recorded is None and private.get('storage_intent') and os.path.lexists(STORAGE):
+        clean = False  # creation was attempted but never recorded: unresolved, never adopted or deleted
+    if recorded is not None and absent:  # destructive: only after worker, container and daemon absence
         try:
             info = os.lstat(STORAGE)
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and [info.st_dev, info.st_ino] == recorded:
-                bounded_rmtree(STORAGE, outer if outer is not None else time.monotonic() + 120)
+                bounded_rmtree(STORAGE, deadline)
             clean = clean and not os.path.lexists(STORAGE)
         except FileNotFoundError:
             pass
@@ -1230,8 +1273,8 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
             clean = False
     clean = clean and in_time()
     state['teardown'] = 'complete' if clean else 'uncertain'
-    save_state(state, poststop=final)
-    return 0 if clean else 1
+    save_state(state, poststop=final, until=outer)  # a late 'complete' is downgraded inside the lock
+    return 0 if state['teardown'] == 'complete' else 1
 
 
 # ---- Guardian, expiry and poststop (fixed units; #508) -------------------------------------------------
@@ -1278,6 +1321,18 @@ def supervise(value, clock):
         raise Cancelled()
 
 
+def supervise_worker(value, clock):
+    """The guardian's OWN immutable phase cutoffs while the worker runs, independent of any worker or
+    host progress: nothing the worker does may outlive the work cutoff, and the first unfinished step's
+    phase cutoff (derived read-only from the step record; cutoffs only grow with later phases) must not
+    have passed. The persistence cutoff applies only to the completed worker's Viewer hold."""
+    clock.remaining('work')
+    state = load_state(value['nonce'])
+    unfinished = [n for n in STEP_NAMES if state['steps'][n] != 'ok']
+    if unfinished:
+        clock.remaining(STEP_PHASE[unfinished[0]])
+
+
 def wait_release(value, clock):
     while True:
         supervise(value, clock)
@@ -1305,12 +1360,15 @@ def guardian():
         group = owned_process.OwnedGroup(proc)
         while True:
             supervise(value, clock)
+            supervise_worker(value, clock)
             status = group.status()
             if status is not None:
                 outcome['worker'], code = status, (status if status >= 0 else 128 - status)
                 break
             time.sleep(.2)
         if status == 0:  # keep the cluster up for the private Viewer handoff until cancel/expiry/loss
+            base.require(all(load_state(value['nonce'])['steps'][n] == 'ok' for n in STEP_NAMES),
+                         'worker ended before the Viewer hold', 'status-invalid')
             while True:
                 supervise(value, clock)
                 time.sleep(.2)
@@ -1340,29 +1398,63 @@ def expire():
     """Fixed expiry stop service body: close the release gate, then ask systemd to stop the guardian
     (a stop job also replaces a still-pending start job). Never blocks beyond its own 10s bound and
     never restarts, rearms or renews anything."""
-    value = contract_any()
-    close_release(value)
-    code, _ = base.call_bounded([SYSTEMCTL, 'stop', '--no-block', GUARDIAN_UNIT], 10)
-    if code:
-        raise base.child_failure(code, 'fixed child failed')
+    primary = None
+    try:
+        close_release(contract_any())
+    except BaseException as error:  # the stop below is failure-independent; this stays the primary failure
+        primary = error
+    stop_error = None
+    try:  # the guardian unit is a constant: no contract or gate record selects the target
+        code, _ = base.call_bounded([SYSTEMCTL, 'stop', '--no-block', GUARDIAN_UNIT], 10)
+        if code:
+            stop_error = base.child_failure(code, 'fixed child failed')
+    except BaseException as error:
+        stop_error = error
+    if primary is not None:
+        raise primary
+    if stop_error is not None:
+        raise stop_error
     return 0
 
 
-def unit_processes():
-    with CGROUP_PROCS.open('rb') as stream:
-        raw = stream.read(65537)  # cgroup pseudo-files report zero size: separate byte bound
-    base.require(len(raw) <= 65536 and all(re.fullmatch(rb'[1-9][0-9]{0,9}', p) for p in raw.split()))
-    return {int(p) for p in raw.split()}
+CGROUP_MAX_DIRS, CGROUP_MAX_DEPTH = 256, 8
 
 
-def workers_absent(outer):
-    """True only when the guardian cgroup holds nothing but this poststop process. Entering poststop
-    proves nothing (v255 enters it even when SIGKILL survivors remain); any read error is uncertainty."""
+def cgroup_processes(directory, deadline=None):
+    """Every pid in this cgroup AND all descendant cgroups (subgroup survivors count). Links are never
+    followed; a read error, a bound overrun or a vanished subgroup raises, so it is never absence."""
+    found, seen = set(), [0]
+
+    def walk(path, depth):
+        base.require(depth <= CGROUP_MAX_DEPTH and seen[0] < CGROUP_MAX_DIRS, 'cgroup tree too large')
+        base.require(deadline is None or time.monotonic() < deadline, 'cleanup deadline elapsed', 'child-timeout')
+        seen[0] += 1
+        with (path / 'cgroup.procs').open('rb') as stream:
+            raw = stream.read(65537)  # cgroup pseudo-files report zero size: separate byte bound
+        base.require(len(raw) <= 65536 and all(re.fullmatch(rb'[1-9][0-9]{0,9}', p) for p in raw.split()))
+        found.update(int(p) for p in raw.split())
+        children = []
+        with os.scandir(path) as scan:
+            for entry in scan:
+                base.require(len(children) < CGROUP_MAX_DIRS, 'cgroup tree too large')
+                if entry.is_dir(follow_symlinks=False):
+                    children.append(entry.path)
+        for child in children:
+            walk(Path(child), depth + 1)
+    walk(directory, 0)
+    return found
+
+
+def unit_processes(deadline=None):
+    return cgroup_processes(CGROUP_DIR, deadline)
+
+
+def poll_absent(check, outer):
+    """Retry a positive-absence ``check(deadline)`` until ``outer``/ABSENCE_SECONDS; any error is False."""
     until = min(outer, time.monotonic() + ABSENCE_SECONDS)
-    me = os.getpid()
     while True:
         try:
-            if unit_processes() <= {me}:
+            if check(until):
                 return True
         except BaseException:
             return False
@@ -1371,8 +1463,79 @@ def workers_absent(outer):
         time.sleep(.2)
 
 
+def workers_absent(outer):
+    """True only when the guardian cgroup AND every descendant cgroup hold nothing but this poststop
+    process. Entering poststop proves nothing (v255 enters it even when SIGKILL survivors remain)."""
+    me = os.getpid()
+    return poll_absent(lambda until: unit_processes(until) <= {me}, outer)
+
+
+def daemon_cgroups_empty(until):
+    parent = DAEMON_CGROUPS[0].parent
+    base.require(stat.S_ISREG(os.lstat(parent / 'cgroup.procs').st_mode) and parent.is_dir(),
+                 'cgroup hierarchy unobserved')  # an unreadable hierarchy is never "absent"
+    with os.scandir(parent) as scan:
+        if any(re.fullmatch(r'(docker|containerd)-.*\.scope', entry.name) for entry in scan):
+            return False
+    for path in DAEMON_CGROUPS:
+        if os.path.lexists(path) and cgroup_processes(path, until):
+            return False
+    return True
+
+
+def daemons_absent(outer):
+    """Positive daemon-process absence after the stop request: no docker/containerd unit or container
+    scope cgroup holds any process. A successful ``systemctl stop`` alone is not evidence."""
+    return poll_absent(daemon_cgroups_empty, outer)
+
+
+def _alarm(_signum, _frame):
+    raise base.Failure('cleanup deadline elapsed', 124, 'child-timeout')
+
+
 def poststop():
-    """Fixed ExecStopPost body: ONE outer deadline, serialized single writer, absence before storage."""
+    """Fixed ExecStopPost body. The outer deadline starts at ENTRY (before the first read). Where the
+    interpreter can express it, a one-shot ITIMER_REAL interrupts interruptible blocking calls at that
+    deadline; the process is still bounded in the end only by systemd's TimeoutStopSec, and a stall in an
+    uninterruptible filesystem call cannot be preempted in-process (ACTIVATION_BLOCKERS). A receipt is
+    never published ``complete`` late, and a killed poststop leaves ``pending`` (fail closed)."""
+    entry = time.monotonic()
+    previous = None
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, 'setitimer'):
+        previous = signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, POSTSTOP_OUTER_SECONDS)
+    try:
+        return _poststop(entry)
+    finally:
+        if previous is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+
+def apply_terminal(state, outcome):
+    """Carry the authoritative terminal outcome into the strict public record when the worker could not
+    (SIGKILL, guardian-side loss, cancel): native exit/signal first, else the guardian's own category.
+    An already recorded failure stays primary; nothing is invented once every step is ok."""
+    if state['failure'] is not None or outcome is None:
+        return
+    pending = [n for n in STEP_NAMES if state['steps'][n] != 'ok']
+    if not pending or any(state['steps'][n] != 'not-run' for n in pending):
+        return
+    worker, guardian = outcome.get('worker'), outcome.get('guardian')
+    if type(worker) is int and worker != 0:
+        category, status = ('child-signal', worker) if worker < 0 else ('child-exit', worker)
+    elif type(guardian) is dict:
+        category, status = guardian.get('category'), guardian.get('child_status')
+    else:
+        return
+    if not (type(category) is str and category in base.CATEGORIES and category != 'none'
+            and base.child_status_ok(category, status)):
+        category, status = 'exception', None
+    state['steps'][pending[0]] = 'failed'
+    state['failure'] = {'step': pending[0], 'category': category, 'child_status': status}
+
+
+def _poststop(entry):
     value = contract_any()
     nonce = value['nonce']
     clock = production_clock(value)
@@ -1380,7 +1543,7 @@ def poststop():
         left = clock.cleanup_remaining()
     except base.Failure:
         left = 0
-    outer = time.monotonic() + max(0, min(POSTSTOP_OUTER_SECONDS, left))
+    outer = entry + max(0, min(POSTSTOP_OUTER_SECONDS, left))
     close_release(value)
     duplicate = False
     with state_lock(max(1.0, outer - time.monotonic())):
@@ -1402,7 +1565,28 @@ def poststop():
         extra['worker_uncertain'] = True  # sticky: never cleared
     if outcome is not None and type(outcome.get('worker')) is int:
         extra['worker_exit'] = outcome['worker']  # the native primary exit/signal, preserved
-    return teardown(nonce, clock=clock, outer=outer, storage_allowed=not uncertain, final=True, extra_private=extra)
+    return teardown(nonce, clock=clock, outer=outer, storage_allowed=not uncertain, final=True, extra_private=extra,
+                    outcome=outcome)
+
+
+TIMER_TOLERANCE_SECONDS = 2.0
+TIMESPAN_UNITS = {'us': 1e-6, 'ms': 1e-3, 's': 1.0, 'min': 60.0, 'h': 3600.0, 'd': 86400.0}
+
+
+def timespan_seconds(text):
+    """Seconds from a ``systemctl show`` time span: bare microseconds or ``1h 3min 5.5s`` tokens.
+    Anything else (empty, ``infinity``, unknown unit) raises: fail closed, never a guess."""
+    base.require(type(text) is str and 0 < len(text) <= 64, 'timespan refused')
+    if re.fullmatch(r'[0-9]{1,18}', text):
+        return int(text) / 1e6
+    tokens = text.split(' ')
+    total = 0.0
+    for token in tokens:
+        match = re.fullmatch(r'([0-9]{1,9}(?:\.[0-9]{1,6})?)(us|ms|s|min|h|d)', token)
+        base.require(match is not None, 'timespan refused')
+        total += float(match.group(1)) * TIMESPAN_UNITS[match.group(2)]
+    base.require(total > 0, 'timespan refused')
+    return total
 
 
 # ---- Root bootstrap (executed by the host's hash-verifying stub) -----------------------------------
@@ -1464,11 +1648,15 @@ def _bootstrap(incoming, expected_manifest):
         sys.path.insert(0, str(MROOT))
         base.run([SYSTEMCTL, 'daemon-reload'], clock, 'stage', 10)
         base.run([SYSTEMCTL, 'start', TIMER_UNIT], clock, 'stage', 10)
-        shown = base.run([SYSTEMCTL, 'show', TIMER_UNIT, '-p', 'ActiveState', '-p', 'NextElapseUSecMonotonic'],
-                         clock, 'stage', 5)
+        shown = base.run([SYSTEMCTL, 'show', TIMER_UNIT, '-p', 'ActiveState', '-p', 'Unit',
+                          '-p', 'NextElapseUSecMonotonic'], clock, 'stage', 5)
         fields = dict(line.split('=', 1) for line in shown.decode().splitlines())
-        base.require(set(fields) == {'ActiveState', 'NextElapseUSecMonotonic'} and fields['ActiveState'] == 'active'
-                     and fields['NextElapseUSecMonotonic'] not in ('', '0', 'infinity'), 'expiry timer unconfirmed')
+        # The ACTUAL loaded deadline must equal the capsule-derived trigger written above (not a constant
+        # or any non-empty string); an unknown rendering fails closed (runtime format is unobserved).
+        base.require(set(fields) == {'ActiveState', 'Unit', 'NextElapseUSecMonotonic'}
+                     and fields['ActiveState'] == 'active' and fields['Unit'] == STOP_UNIT
+                     and abs(timespan_seconds(fields['NextElapseUSecMonotonic']) - expiry) <= TIMER_TOLERANCE_SECONDS,
+                     'expiry timer unconfirmed')
         base.run([SYSTEMCTL, 'start', GUARDIAN_UNIT], clock, 'stage', 15)
         until = time.monotonic() + min(10, clock.remaining('stage'))
         while not (MROOT / 'guardian.json').exists():

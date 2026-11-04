@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import tempfile
 import time
 import stat
@@ -5188,7 +5189,8 @@ class ManagementProgram(unittest.TestCase):
         m.save_state(ctx.state)
         for name in m.PRIVATE_FILES:
             trial.exclusive(m.WORK / name, b'private')
-        self.assertEqual(m.teardown(NONCE), 0)
+        with patch.object(m, 'daemons_absent', return_value=True):  # positive proof is tested in ManagementLifetime
+            self.assertEqual(m.teardown(NONCE), 0)
         self.assertEqual(m.load_state(NONCE)['teardown'], 'complete')
         self.assertFalse(m.STORAGE.exists())
         self.assertFalse(any((m.WORK / name).exists() for name in m.PRIVATE_FILES))
@@ -5438,8 +5440,10 @@ class ManagementLifetime(unittest.TestCase):
         self.root = self.temp / 'root'
         (self.root / 'work').mkdir(parents=True, mode=0o700)
         self.root.chmod(0o700)
+        self.cg = self.temp / 'cg'
+        self.cg.mkdir()
         for name, path in (('MROOT', self.root), ('WORK', self.root / 'work'), ('STORAGE', self.temp / 'storage'),
-                           ('CGROUP_PROCS', self.temp / 'cgroup.procs')):
+                           ('CGROUP_DIR', self.cg), ('CGROUP_PROCS', self.cg / 'cgroup.procs')):
             self.stack.enter_context(patch.object(self.m, name, path))
         self.stack.enter_context(patch.object(trial, 'regular',
                                  side_effect=lambda p, limit, uid=None, mode=None: REAL_REGULAR(p, limit, None, mode)))
@@ -5450,7 +5454,7 @@ class ManagementLifetime(unittest.TestCase):
         trial.exclusive(self.root / 'capsule.json', trial.encoded(self.capsule))
         trial.exclusive(self.root / 'steps.json', trial.encoded(self.m.initial_state(NONCE)))
         self.beat()
-        (self.temp / 'cgroup.procs').write_text('')
+        (self.cg / 'cgroup.procs').write_text('')
 
     def make_capsule(self, contract, nonce='e' * 32):
         clock = self.m.ManagementClock(contract)
@@ -5636,7 +5640,7 @@ class ManagementLifetime(unittest.TestCase):
                 m.cancel(NONCE)
 
     # -- A1: bootstrap ordering --------------------------------------------------------------------------
-    def bootstrap_fixture(self, timer_state='active'):
+    def bootstrap_fixture(self, timer_state='active', timer_next=None):
         m = self.m
         nonce = self.value['nonce']
         incoming = Path('/tmp/labapp-vlab-' + nonce)
@@ -5676,7 +5680,10 @@ class ManagementLifetime(unittest.TestCase):
         def systemctl(args, seconds, env=None):
             events.append(args[1:])
             if args[1:3] == ['show', m.TIMER_UNIT]:
-                return 0, ('ActiveState=%s\nNextElapseUSecMonotonic=38min\n' % timer_state).encode()
+                return 0, ('ActiveState=%s\nUnit=%s\nNextElapseUSecMonotonic=%s\n'
+                           % (timer_state, m.STOP_UNIT, (timer_next(capsule) if callable(timer_next) else timer_next)
+                              if timer_next is not None
+                              else '%d' % (int(capsule['cutoffs']['persistence']) * 1000000))).encode()
             if args[1:3] == ['start', m.GUARDIAN_UNIT]:
                 self.root.joinpath('guardian.json').write_bytes(trial.encoded(
                     {'boot': MGMT_BOOT, 'lease': self.value['lease'], 'nonce': nonce, 'guardian_pid': 4242}))
@@ -5691,7 +5698,8 @@ class ManagementLifetime(unittest.TestCase):
         incoming, digest, events, capsule, units, runtime = self.bootstrap_fixture()
         m._bootstrap(incoming, digest)
         self.assertEqual(events, [['daemon-reload'], ['start', m.TIMER_UNIT],
-                                  ['show', m.TIMER_UNIT, '-p', 'ActiveState', '-p', 'NextElapseUSecMonotonic'],
+                                  ['show', m.TIMER_UNIT, '-p', 'ActiveState', '-p', 'Unit',
+                                   '-p', 'NextElapseUSecMonotonic'],
                                   ['start', m.GUARDIAN_UNIT], ['show', m.GUARDIAN_UNIT, '-p', 'MainPID', '-p', 'ActiveState']])
         self.assertEqual(sorted(p.name for p in units.iterdir()), sorted(m.UNIT_NAMES))
         for name in m.UNIT_NAMES:
@@ -5714,6 +5722,22 @@ class ManagementLifetime(unittest.TestCase):
         self.assertEqual(events[-1], ['stop', m.GUARDIAN_UNIT])
         self.assertFalse((self.root / m.RELEASE_OPEN).exists())
         self.assertTrue(self.root.exists())  # the reservation is preserved, never deleted or retried
+
+    def test_bootstrap_verifies_the_actual_loaded_deadline_not_any_nonempty_string(self):
+        m = self.m
+        for name, rendered in (('constant 38min', '38min'), ('wrong trigger', lambda c: '%d' % ((int(c['cutoffs']['persistence']) - 60) * 1000000)),('unknown format', 'soon'),
+                               ('infinity', 'infinity'), ('empty', ''), ('mixed', '1h 3min 5xs')):
+            with self.subTest(name):
+                incoming, digest, events, _, _, _ = self.bootstrap_fixture(timer_next=rendered)
+                with self.assertRaises(trial.Failure):
+                    m._bootstrap(incoming, digest)
+                self.assertNotIn(['start', m.GUARDIAN_UNIT], events)
+                self.assertFalse((self.root / m.RELEASE_OPEN).exists())
+                shutil.rmtree(self.root, True)
+                shutil.rmtree(incoming, True)
+        self.assertAlmostEqual(m.timespan_seconds('37min 59s'), 2279.0)
+        self.assertAlmostEqual(m.timespan_seconds('1h 3min 5.5s'), 3785.5)
+        self.assertEqual(m.timespan_seconds('2280000000'), 2280.0)
 
     def test_bootstrap_refuses_a_stale_capsule_before_any_state_exists(self):
         m = self.m
@@ -5751,6 +5775,10 @@ class ManagementLifetime(unittest.TestCase):
         m = self.m
         marker = self.worker_script(WORKER_EXITS)
         self.open_gate()
+        done = m.load_state(NONCE)
+        done['steps'] = {n: 'ok' for n in m.STEP_NAMES}  # the Viewer hold is only for a COMPLETED worker
+        trial.atomic(self.root / 'steps.json', done)
+
         def late_cancel():
             self.until(marker.exists)
             REAL_SLEEP(.6)  # the guardian polls every 0.2s: it has observed the worker exit by now
@@ -5839,7 +5867,7 @@ class ManagementLifetime(unittest.TestCase):
         m = self.m
         self.with_storage()
         self.write_outcome()
-        (self.temp / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
         self.assertEqual(m.poststop(), 0)
         state = m.load_state(NONCE)
         self.assertEqual((state['teardown'], state['private']['worker_exit']), ('complete', -9))
@@ -5864,9 +5892,9 @@ class ManagementLifetime(unittest.TestCase):
                 self.with_storage()
                 self.write_outcome()
                 if procs is None:
-                    (self.temp / 'cgroup.procs').unlink(missing_ok=True)
+                    (self.cg / 'cgroup.procs').unlink(missing_ok=True)
                 else:
-                    (self.temp / 'cgroup.procs').write_text(procs)
+                    (self.cg / 'cgroup.procs').write_text(procs)
                 with patch.object(m, 'ABSENCE_SECONDS', .3):
                     self.assertEqual(m.poststop(), 1)
                 state = m.load_state(NONCE)
@@ -5878,7 +5906,7 @@ class ManagementLifetime(unittest.TestCase):
         m = self.m
         self.with_storage()
         self.write_outcome(closed=False, worker=None)
-        (self.temp / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
         self.assertEqual(m.poststop(), 1)
         state = m.load_state(NONCE)
         self.assertEqual((state['teardown'], state['private']['worker_uncertain']), ('uncertain', True))
@@ -5907,6 +5935,253 @@ class ManagementLifetime(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
         self.assertTrue(m.STORAGE.exists())
+
+    # -- revision round 1 (R1-R9) ---------------------------------------------------------------------------
+    def run_teardown(self, replies, daemons=True, **private):
+        """teardown with scripted child replies keyed by argv[1:3]; returns (code, calls)."""
+        m = self.m
+        self.with_storage(cluster_attempted=True, docker_started=True, **private)
+        calls = []
+
+        def fake(argv, secs, *a, **k):
+            calls.append(argv)
+            key = (argv[1], argv[2]) if len(argv) > 2 else (argv[0],)
+            return replies.get(key, (0, b''))
+        with patch.object(m, 'stdin_bounded', side_effect=fake), \
+                patch.object(m, 'daemons_absent', return_value=daemons):
+            return m.teardown(NONCE, outer=time.monotonic() + 50, final=False), calls
+
+    def test_r1_storage_is_removed_only_after_positive_cluster_container_and_daemon_absence(self):
+        m = self.m
+        ok = {}
+        cases = {'cluster delete failed': ({('cluster', 'delete'): (1, b'')}, True),
+                 'containers still listed': ({('ps', '--all'): (0, b'abc\n')}, True),
+                 'container listing failed': ({('ps', '--all'): (1, b'')}, True),
+                 'daemon stop failed': ({('stop', 'docker.socket'): (1, b'')}, True),
+                 'daemon processes remain after a successful stop': (ok, False)}
+        for name, (replies, daemons) in cases.items():
+            with self.subTest(name):
+                for stale in (m.STORAGE,):
+                    shutil.rmtree(stale, True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                code, _ = self.run_teardown(replies, daemons)
+                self.assertEqual(code, 1)
+                self.assertTrue((m.STORAGE / 'nested' / 'file').exists())  # destructive removal withheld
+                self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        shutil.rmtree(m.STORAGE, True)
+        trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+        code, calls = self.run_teardown(ok, True)
+        self.assertEqual(code, 0)
+        self.assertFalse(m.STORAGE.exists())
+        self.assertIn([m.SYSTEMCTL, 'stop', *m.DAEMON_UNITS], calls)
+
+    def test_r1_daemon_absence_needs_an_observed_hierarchy_and_empty_daemon_cgroups(self):
+        m = self.m
+        slice_dir = self.temp / 'system.slice'
+        slice_dir.mkdir()
+        (slice_dir / 'cgroup.procs').write_text('')
+        docker, containerd = slice_dir / 'docker.service', slice_dir / 'containerd.service'
+        with patch.object(m, 'DAEMON_CGROUPS', (docker, containerd)):
+            self.assertTrue(m.daemon_cgroups_empty(time.monotonic() + 5))  # units gone, hierarchy observed
+            docker.mkdir()
+            (docker / 'cgroup.procs').write_text('')
+            (docker / 'sub').mkdir()
+            (docker / 'sub' / 'cgroup.procs').write_text('4242\n')  # survivor in a SUBGROUP
+            self.assertFalse(m.daemon_cgroups_empty(time.monotonic() + 5))
+            (docker / 'sub' / 'cgroup.procs').write_text('')
+            self.assertTrue(m.daemon_cgroups_empty(time.monotonic() + 5))
+            (slice_dir / ('docker-' + 'a' * 64 + '.scope')).mkdir()  # a container scope outside the unit
+            self.assertFalse(m.daemon_cgroups_empty(time.monotonic() + 5))
+            (slice_dir / 'cgroup.procs').unlink()  # hierarchy unobserved is never absence
+            with self.assertRaises(OSError):
+                m.daemon_cgroups_empty(time.monotonic() + 5)
+            with patch.object(m, 'ABSENCE_SECONDS', .2):
+                self.assertFalse(m.daemons_absent(time.monotonic() + 5))
+
+    def test_r2_worker_absence_covers_every_descendant_cgroup(self):
+        m = self.m
+        me = os.getpid()
+        (self.cg / 'cgroup.procs').write_text('%d\n' % me)
+        (self.cg / 'child').mkdir()
+        (self.cg / 'child' / 'cgroup.procs').write_text('')
+        (self.cg / 'child' / 'grand').mkdir()
+        (self.cg / 'child' / 'grand' / 'cgroup.procs').write_text('999999\n')
+        self.assertEqual(m.unit_processes(), {me, 999999})
+        with patch.object(m, 'ABSENCE_SECONDS', .2):
+            self.assertFalse(m.workers_absent(time.monotonic() + 5))
+            (self.cg / 'child' / 'grand' / 'cgroup.procs').write_text('')
+            self.assertTrue(m.workers_absent(time.monotonic() + 5))
+            (self.cg / 'child' / 'grand' / 'cgroup.procs').unlink()  # an unreadable subgroup is uncertainty
+            self.assertFalse(m.workers_absent(time.monotonic() + 5))
+        # a subgroup survivor withholds storage removal through poststop as well
+        (self.cg / 'child' / 'grand' / 'cgroup.procs').write_text('999999\n')
+        self.with_storage()
+        self.write_outcome()
+        with patch.object(m, 'ABSENCE_SECONDS', .2):
+            self.assertEqual(m.poststop(), 1)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+
+    def test_r3_expiry_attempts_the_fixed_stop_even_when_contract_or_gate_io_fails(self):
+        m = self.m
+        calls = []
+        stop = [m.SYSTEMCTL, 'stop', '--no-block', m.GUARDIAN_UNIT]
+        with patch.object(m, 'close_release', side_effect=OSError('gate io')), \
+                patch.object(trial, 'call_bounded', side_effect=lambda a, s, env=None: calls.append(a) or (0, b'')):
+            with self.assertRaises(OSError):  # the original failure stays primary
+                m.expire()
+        self.assertEqual(calls, [stop])
+        calls.clear()
+        (self.root / 'contract.json').unlink()
+        with patch.object(trial, 'call_bounded', side_effect=lambda a, s, env=None: calls.append(a) or (0, b'')):
+            with self.assertRaises((trial.Failure, OSError)):
+                m.expire()
+        self.assertEqual(calls, [stop])  # a constant target: nothing from the unreadable contract selected it
+        calls.clear()
+        with patch.object(m, 'close_release', side_effect=OSError('gate io')), \
+                patch.object(trial, 'call_bounded', side_effect=OSError('stop io')):
+            with self.assertRaises(OSError):
+                m.expire()
+
+    def test_r4_poststop_deadline_starts_at_entry_restores_the_alarm_and_never_publishes_late_complete(self):
+        m = self.m
+        before = signal.getsignal(signal.SIGALRM)
+        self.with_storage()
+        self.write_outcome()
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        seen = []
+        original = m._poststop
+        with patch.object(m, '_poststop', side_effect=lambda entry: seen.append(entry) or original(entry)):
+            start = time.monotonic()
+            self.assertEqual(m.poststop(), 0)
+        self.assertTrue(start <= seen[0] <= time.monotonic())
+        self.assertIs(signal.getsignal(signal.SIGALRM), before)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        # a 'complete' receipt that would be written after the outer deadline is downgraded inside the lock
+        state = m.load_state(NONCE)
+        state['teardown'] = 'complete'
+        m.save_state(state, poststop=True, until=time.monotonic() - 1)
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        # enumeration itself is bounded by the same deadline
+        tree = self.temp / 'wide'
+        tree.mkdir()
+        for index in range(20):
+            (tree / str(index)).write_text('x')
+        with self.assertRaises(trial.Failure):
+            m.bounded_rmtree(tree, time.monotonic() - 1)
+        self.assertEqual(len(list(tree.iterdir())), 20)
+
+    def test_r5_storage_intent_is_durable_before_mkdir_and_an_unrecorded_creation_stays_uncertain(self):
+        m = self.m
+        ctx = m.Context(self.value, m.ManagementClock(self.value), m.load_state(NONCE))
+        seen = []
+        real = os.mkdir
+
+        def crash(path, mode=0o777, **kw):
+            if str(path) == str(m.STORAGE):
+                seen.append(m.load_state(NONCE)['private'].get('storage_intent'))
+                real(path, mode)  # the effect happens, then the process is lost before recording the inode
+                raise OSError('lost between mkdir and save')
+            return real(path, mode, **kw)
+        with patch.object(m.os, 'mkdir', side_effect=crash), self.assertRaises(OSError):
+            m.step_storage(ctx)
+        self.assertEqual(seen, [True])
+        state = m.load_state(NONCE)
+        self.assertIsNone(state['private'].get('storage_ino'))
+        self.assertTrue(m.STORAGE.exists())
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 1)  # never adopted
+        self.assertTrue(m.STORAGE.exists())
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        shutil.rmtree(m.STORAGE)  # intent recorded but nothing created: nothing unresolved
+        trial.atomic(self.root / 'steps.json', dict(m.load_state(NONCE), teardown='pending'))
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 0)
+
+    def test_r6_terminal_outcome_reaches_the_strict_public_receipt_with_native_precedence(self):
+        m = self.m
+        first = m.STEP_NAMES[0]
+        cases = {'sigkill': ({'worker': -9, 'guardian': None}, ('child-signal', -9)),
+                 'exit': ({'worker': 17, 'guardian': None}, ('child-exit', 17)),
+                 'worker beats guardian': ({'worker': -9, 'guardian': {'category': 'heartbeat-loss', 'child_status': None}},
+                                           ('child-signal', -9)),
+                 'guardian loss': ({'worker': None, 'guardian': {'category': 'heartbeat-loss', 'child_status': None}},
+                                   ('heartbeat-loss', None)),
+                 'cancel': ({'worker': None, 'guardian': {'category': 'interrupted', 'child_status': None}},
+                            ('interrupted', None)),
+                 'forged category': ({'worker': None, 'guardian': {'category': 'none', 'child_status': None}},
+                                     ('exception', None))}
+        for name, (outcome, (category, status)) in cases.items():
+            with self.subTest(name):
+                state = m.initial_state(NONCE)
+                m.apply_terminal(state, dict(outcome, nonce=NONCE))
+                self.assertEqual(state['failure'], {'step': first, 'category': category, 'child_status': status})
+                self.assertEqual(state['steps'][first], 'failed')
+                m.validate_result(m.public_record(state), NONCE)
+        recorded = m.initial_state(NONCE)
+        recorded['steps'][first] = 'failed'
+        recorded['failure'] = {'step': first, 'category': 'phase-cutoff', 'child_status': None}
+        m.apply_terminal(recorded, {'worker': -9, 'guardian': None})
+        self.assertEqual(recorded['failure']['category'], 'phase-cutoff')  # the worker's own primary is kept
+        done = m.initial_state(NONCE)
+        done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+        m.apply_terminal(done, {'worker': -9, 'guardian': None})
+        self.assertIsNone(done['failure'])  # nothing is invented once every step finished
+        # through poststop: the public record carries the signal AND the sticky uncertainty
+        self.with_storage()
+        self.write_outcome(worker=-9, closed=False)
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.assertEqual(m.poststop(), 1)
+        public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
+        self.assertEqual((public['failure']['category'], public['failure']['child_status'], public['teardown']),
+                         ('child-signal', -9, 'uncertain'))
+
+    def test_r7_guardian_enforces_the_current_phase_cutoff_independently_of_worker_progress(self):
+        m = self.m
+        now = time.monotonic()
+        late = deepcopy(self.capsule)
+        late['cutoffs']['stage'] = now - 1  # only the stage cutoff has passed
+        clock = m.ManagementClock(self.value, capsule=late)
+        with self.assertRaises(trial.Failure) as raised:  # a stuck stage step is killed at ITS cutoff
+            m.supervise_worker(self.value, clock)
+        self.assertEqual(raised.exception.category, 'phase-cutoff')
+        state = m.load_state(NONCE)
+        for name in m.STEP_NAMES[:m.STEP_NAMES.index('storage')]:
+            state['steps'][name] = 'ok'
+        trial.atomic(self.root / 'steps.json', state)
+        m.supervise_worker(self.value, clock)  # the first unfinished step is a work step: its own cutoff governs
+        gone = deepcopy(self.capsule)
+        gone['cutoffs']['work'] = now - 1
+        with self.assertRaises(trial.Failure):  # nothing the worker runs outlives the work cutoff
+            m.supervise_worker(self.value, m.ManagementClock(self.value, capsule=gone))
+        state['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+        trial.atomic(self.root / 'steps.json', state)
+        with self.assertRaises(trial.Failure):
+            m.supervise_worker(self.value, m.ManagementClock(self.value, capsule=gone))
+
+    def test_r7_a_worker_that_exits_cleanly_before_finishing_gets_no_persistence_hold(self):
+        marker = self.worker_script(WORKER_EXITS)
+        self.open_gate()
+        code = self.run_guardian()  # steps are still not-run: there is no Viewer to hold
+        self.assertTrue(marker.exists())
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.outcome()['guardian']['category'], 'status-invalid')
+        self.assertIs(self.outcome()['closed'], True)
+
+    def test_r9_correlation_uses_the_original_effective_bracket_not_the_raw_caller_wall(self):
+        m = self.m
+        clock = m.ManagementClock(self.value)
+        wall, mono = time.time(), time.monotonic()
+        sample = {'boot': MGMT_BOOT, 'nonce': 'e' * 32, 'wall': wall - 3600, 'mono': 5000.0}
+        # a caller wall rolled back an hour (retained monotonic-derived wall unchanged) cannot legitimise
+        # a guest sample from that earlier wall time
+        with self.assertRaises(trial.Failure):
+            m.build_capsule(self.value, clock, sample, 'e' * 32, (wall - 3600, mono), (wall - 3599, mono + 1))
+        ok = m.build_capsule(self.value, clock, dict(sample, wall=wall), 'e' * 32, (wall, mono), (wall + 1, mono + 1))
+        self.assertAlmostEqual(ok['caller']['recv_eff'] - ok['caller']['send_eff'], ok['caller']['roundtrip'])
+        forged = deepcopy(ok)
+        forged['sample']['wall'] = wall - 3600
+        forged['caller'].update(send_wall=wall - 3600, recv_wall=wall - 3599)
+        with self.assertRaises(trial.Failure):
+            m.validate_capsule(forged, self.value)
 
     def test_teardown_children_run_inside_the_single_outer_deadline(self):
         m = self.m

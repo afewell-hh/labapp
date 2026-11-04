@@ -2660,7 +2660,8 @@ class FakeManagementMaster:
             record['steps'][name] = 'ok'
         if self.failing_step:
             record['steps'][self.failing_step] = 'failed'
-            record['failure'] = {'step': self.failing_step, 'category': 'child-exit', 'child_status': 17}
+            record['failure'] = {'step': self.failing_step, 'category': getattr(self, 'failure_category', 'child-exit'),
+                                 'child_status': getattr(self, 'failure_status', 17)}
         elif len(self.ran) == len(p.STEP_NAMES):
             record['observed'] = {k: True for k in p.OBSERVED}
         record['teardown'] = 'complete' if self.torn else 'pending'
@@ -3052,6 +3053,16 @@ class ManagementCaller(unittest.TestCase):
         self.assertEqual(calls.call_count, 4)
         self.assertEqual(calls.call_args.args[0], ['gcloud', 'version', '--format=json'])
         self.assertIsNone(held.context)
+
+    def test_native_signal_status_in_the_public_receipt_keeps_its_128_plus_signal_code(self):
+        for category, status, expected in (('child-signal', -9, 137), ('child-exit', 17, 17),
+                                           ('heartbeat-loss', None, 1), ('child-timeout', None, 1)):
+            with self.subTest(category):
+                master = FakeManagementMaster(self.program)
+                master.failing_step = 'helm'
+                master.failure_category, master.failure_status = category, status
+                code, receipt, spy = self.sequence(master, private=self.private)
+                self.assertEqual(code, expected)
 
     def test_first_step_failure_stops_work_but_still_tears_down_and_reads_the_typed_result(self):
         master = FakeManagementMaster(self.program)

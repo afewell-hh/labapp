@@ -1841,9 +1841,34 @@ systemd v255, cgroup, timer or Docker behavior.
   worker writes are refused; a second poststop is a read-only duplicate. It never reconstructs an `OwnedGroup` from
   a saved PID and never treats entering poststop as absence (v255 enters it even when `SIGKILL` survivors remain,
   per the `service.c` v255 `Processes still around after SIGKILL. Ignoring.` path): it requires the guardian
-  cgroup to contain only itself (`CGROUP_PROCS`) and the guardian's recorded closure to be positive. Otherwise
-  protective native deletes and private-file removal still run, storage is NEVER removed, and the receipt is
-  `uncertain` with `worker_uncertain` recorded. No claim is made that a killed or uninterruptible task is gone.
+  cgroup AND every descendant cgroup (`CGROUP_DIR`, recursive, bounded, links never followed) to contain only
+  itself, and the guardian's recorded closure to be positive. Destructive storage removal additionally needs
+  positive cluster delete, an empty container listing and positive daemon-process absence
+  (`daemons_absent`: the docker/containerd unit cgroups and `docker-*`/`containerd-*` scopes hold no process; a
+  successful `systemctl stop` is not absence). Otherwise protective native deletes and private-file removal still
+  run, storage is NEVER removed, and the receipt is `uncertain` with `worker_uncertain` recorded. Storage creation
+  intent is persisted before `mkdir`; an existing but unrecorded storage directory is never adopted or deleted and
+  keeps the receipt `uncertain`. The terminal outcome (native worker exit/signal, else the guardian's own category)
+  is carried into the strict public record on the first unfinished step (`apply_terminal`; a recorded worker
+  failure stays primary). No claim is made that a killed or uninterruptible task is gone.
+* **Cleanup deadline (R4, partially enforced).** The 235 s outer deadline starts at poststop ENTRY, directory
+  enumeration and removal check it per entry, a one-shot `ITIMER_REAL` interrupts interruptible blocking calls, and
+  a `complete` receipt is downgraded to `uncertain` inside the state lock when written late. A stall in an
+  uninterruptible filesystem call (including the final state write itself) cannot be preempted by this process; only
+  systemd's `TimeoutStopSec` bounds it, and a killed poststop leaves `pending` (never `complete`). This is NOT a
+  hard real-time bound. It is recorded as an explicit unimplemented activation blocker
+  (`poststop-all-work-deadline-unenforceable-...`); closing it needs a separately owned supervisor outside this
+  scope (alternatives: a second owned watchdog process under `OwnedGroup`, or a cgroup `TimeoutStopSec`/`SIGKILL`
+  contract verified at runtime).
+* **Expiry independence and timer proof.** `expire` attempts the fixed `systemctl stop --no-block` even when the
+  contract read or gate closure fails (original failure stays primary). Bootstrap parses the ACTUAL loaded
+  `NextElapseUSecMonotonic` and the timer's `Unit`, and requires the deadline to equal the capsule-derived
+  `OnBootSec` value (tolerance 2 s); an unknown rendering refuses (runtime format unobserved).
+* **Guardian phase cutoffs.** While the worker runs the guardian enforces the `work` cutoff and the cutoff of
+  the first unfinished step (read-only step record); the persistence cutoff governs only the completed worker's
+  Viewer hold, which is refused if the worker exited 0 before all 18 steps were ok.
+* **Clock correlation.** The sample is bracketed by the original effective (admission-anchored, monotonic-derived)
+  wall at send/receive; the raw caller wall must agree within the skew limit and cannot widen the bracket.
 * **Host.** After the one-shot bootstrap the host only heartbeats, polls the read-only `result`, exports the
   Viewer handoff, runs the unchanged loopback-forward browser session (still `owner-attested` at best,
   `browser_verified=false`), then sends `cancel` and waits a bounded time for the guest's own receipt.
@@ -1854,6 +1879,12 @@ ranges 599-611/4075-4243); the `systemd.service`, `systemd.timer`, `systemd.unit
 sections were NOT read, so `OnBootSec` semantics (assumed `CLOCK_MONOTONIC` since boot), `stop --no-block`
 superseding a pending start job, `NextElapseUSecMonotonic` output and cgroup membership of `ExecStopPost` are
 unverified assumptions for the runtime gate.
+
+Revision round 1 late reading (honest, no retroactive claim): the independent exact-head report 509/6644075777 could
+not be fetched in full by the author worker (`gh api` denied); the R1-R9 summary in the trigger comment was used.
+The documents skipped in the first authoring (#145/#476, the #506/#507 design reports, the full shared workflow,
+`STUDENT_QUICK_START.md`, the systemd man pages, raw `service.c` ranges) were also NOT read in this revision round;
+only `AGENTS.md`, the affected modules/tests/units and the trigger comment were. No project code was executed.
 
 **Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
 (2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,

@@ -434,7 +434,14 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
                 failure = record['failure']
                 if failure is not None:
                     status = failure['child_status']
-                    raise guest.Failure('fixed child failed', status if type(status) is int and 0 < status < 256 else 1)
+                    # Native precedence: a positive exit stays itself, a negative raw signal maps to 128+signal
+                    # exactly like ``child_failure``; only non-native categories collapse to 1.
+                    code = 1
+                    if type(status) is int and 0 < status < 256:
+                        code = status
+                    elif type(status) is int and -64 <= status < 0:
+                        code = 128 - status
+                    raise guest.Failure('fixed child failed', code)
                 guest.require(record['teardown'] == 'pending', 'guest ended before the steps finished')
                 if all(v == 'ok' for v in record['steps'].values()):
                     break
