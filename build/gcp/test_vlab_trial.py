@@ -2659,11 +2659,18 @@ class FakeManagementMaster:
         for name in self.ran:
             record['steps'][name] = 'ok'
         if self.failing_step:
+            status = getattr(self, 'failure_status', 17)
+            if self.torn and getattr(self, 'late_status', None) is not None:
+                status = self.late_status  # the receipt read AFTER cancel differs from the primary seen earlier
             record['steps'][self.failing_step] = 'failed'
             record['failure'] = {'step': self.failing_step, 'category': getattr(self, 'failure_category', 'child-exit'),
-                                 'child_status': getattr(self, 'failure_status', 17)}
+                                 'child_status': status}
         elif len(self.ran) == len(p.STEP_NAMES):
             record['observed'] = {k: True for k in p.OBSERVED}
+            final = getattr(self, 'final_failure', None)
+            if self.torn and final is not None:  # a native worker failure first discovered during finalization
+                record['steps'][p.STEP_NAMES[-1]] = 'failed'
+                record['failure'] = {'step': p.STEP_NAMES[-1], 'category': final[0], 'child_status': final[1]}
         record['teardown'] = 'complete' if self.torn else 'pending'
         return guest.encoded(record)
 
@@ -3063,6 +3070,22 @@ class ManagementCaller(unittest.TestCase):
                 master.failure_category, master.failure_status = category, status
                 code, receipt, spy = self.sequence(master, private=self.private)
                 self.assertEqual(code, expected)
+
+    def test_f2_final_native_failure_is_reconciled_into_return_and_receipt_but_never_replaces_an_earlier_primary(self):
+        for category, status, expected in (('child-signal', -15, 143), ('child-exit', 17, 17)):
+            with self.subTest(category):
+                master = FakeManagementMaster(self.program)
+                master.final_failure = (category, status)
+                code, receipt, spy = self.sequence(master, private=self.private)
+                self.assertEqual((code, receipt['code']), (expected, expected))
+                self.assertEqual(receipt['failure_category'], 'guest')
+                self.assertEqual(receipt['management']['failure']['child_status'], status)
+                self.assertFalse(self.program.succeeded(receipt['management']))
+        master = FakeManagementMaster(self.program)  # an earlier primary (17) keeps its code and category
+        master.failing_step, master.late_status = 'helm', 9
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertEqual((code, receipt['code']), (17, 17))
+        self.assertEqual(receipt['management']['failure']['child_status'], 9)  # the receipt shows what the guest said
 
     def test_first_step_failure_stops_work_but_still_tears_down_and_reads_the_typed_result(self):
         master = FakeManagementMaster(self.program)

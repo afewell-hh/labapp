@@ -387,6 +387,27 @@ def load_state(nonce):
     return state
 
 
+def present(path):
+    """Strict observation: False ONLY for a genuine FileNotFoundError. Any other lstat error (EACCES, EIO,
+    ENOTDIR, ...) raises, so an unobservable path is unknown and is never read as absent."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def durable_atomic(path, value):
+    """Management-local durable publication: file fsync + rename (``base.atomic``, unchanged) THEN the
+    parent directory fsync, so a published record survives a crash before any effect depends on it."""
+    base.atomic(path, value)
+    fd = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 POSTSTOP_CLAIM = 'poststop.json'
 RELEASE_OPEN, RELEASE_CLOSED, CANCEL_MARK = 'release.json', 'release-closed.json', 'cancel.json'
 
@@ -416,16 +437,18 @@ class state_lock:
         os.close(self.fd)  # closing the descriptor releases the lock
 
 
-def save_state(state, *, poststop=False, until=None):
+def save_state(state, *, poststop=False, until=None, durable=False):
     """Single-writer discipline: the worker writes until poststop CLAIMS the state under the same lock
     (exclusive poststop.json); afterwards worker writes are refused and only poststop may write.
-    With ``until`` (the poststop outer deadline) a ``complete`` receipt is never published late."""
+    A ``complete`` receipt is NEVER published: the timeliness of the fsync/rename that would publish it
+    cannot be proven in-process (ACTIVATION_BLOCKERS), so it is written as ``uncertain``. ``durable``
+    also fsyncs the parent directory (used before an effect that depends on the record)."""
     with state_lock() if until is None else state_lock(max(.1, min(5.0, until - time.monotonic()))):
-        claimed = os.path.lexists(MROOT / POSTSTOP_CLAIM)
+        claimed = present(MROOT / POSTSTOP_CLAIM)
         base.require(claimed == poststop, 'state writer superseded')
-        if until is not None and state['teardown'] == 'complete' and time.monotonic() >= until:
+        if state['teardown'] == 'complete':
             state['teardown'] = 'uncertain'
-        base.atomic(MROOT / 'steps.json', state)
+        (durable_atomic if durable else base.atomic)(MROOT / 'steps.json', state)
 
 
 def public_record(state):
@@ -795,16 +818,16 @@ def step_daemon_start(ctx):
 
 def step_storage(ctx):
     base.no_links(STORAGE)
-    base.require(not os.path.lexists(STORAGE), 'preexisting storage refused')
+    base.require(not present(STORAGE), 'preexisting storage refused')
     base.no_links(STORAGE.parent)
     os.makedirs(STORAGE.parent, mode=0o755, exist_ok=True)
-    ctx.private['storage_intent'] = True  # durable BEFORE the effect: an unrecorded creation stays uncertain
-    save_state(ctx.state)
+    ctx.private['storage_intent'] = True  # crash-durable (file, rename AND directory fsync) BEFORE the effect
+    save_state(ctx.state, durable=True)    # a failure here refuses the mkdir below
     os.mkdir(STORAGE, 0o700)
     info = os.lstat(STORAGE)
     base.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
     ctx.private['storage_ino'] = [info.st_dev, info.st_ino]
-    save_state(ctx.state)  # identity durable immediately, not only when the whole step completes
+    save_state(ctx.state, durable=True)  # identity durable immediately, not only when the whole step completes
     ctx.observe('storage_new')
 
 
@@ -1194,16 +1217,16 @@ def bounded_rmtree(path, deadline):
 
 def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False, extra_private=None,
              outcome=None):
-    """Positive, idempotent removal of exactly what this program created; uncertainty is reported.
+    """Idempotent removal of exactly what this program created; uncertainty is reported and the
+    published receipt is never ``complete`` (always returns 1: final-publication timeliness is unproved).
 
-    ``outer`` (monotonic) is ONE deadline for ALL work including filesystem work; ``storage_allowed``
-    is False when worker absence is unproven (storage is never removed then and the receipt cannot be
-    clean); ``final`` marks the poststop writer, which already holds the state claim.
+    ``outer`` (monotonic) bounds the child, polling and enumeration steps this function performs; it is
+    NOT a hard bound on an uninterruptible filesystem call or the final state write. ``storage_allowed``
+    is False when worker absence is unproven (storage is never removed then); ``final`` marks the
+    poststop writer, which already holds the state claim.
     """
     value = contract_value(nonce)
-    state = load_state(nonce)
-    if state['teardown'] == 'complete':
-        return 0
+    state = load_state(nonce)  # a stored ``complete`` is not trusted: cleanup is idempotent and re-observed
     ctx = Context(value, clock if clock is not None else ManagementClock(value), state)
     if outer is not None:
         ctx.poll_deadlines.append(outer)
@@ -1259,22 +1282,32 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
         except BaseException:
             clean = False
     recorded = private.get('storage_ino')
-    if recorded is None and private.get('storage_intent') and os.path.lexists(STORAGE):
-        clean = False  # creation was attempted but never recorded: unresolved, never adopted or deleted
-    if recorded is not None and absent:  # destructive: only after worker, container and daemon absence
+    try:
+        exists = present(STORAGE)  # None = unobservable (EACCES/EIO/...): unknown, never absent
+    except BaseException:
+        exists, clean, absent = None, False, False
+    if recorded is None and private.get('storage_intent') and exists is not False:
+        clean = False  # creation was attempted but never recorded (or is unobservable): never adopted or deleted
+    if recorded is not None and absent and exists:  # destructive: only after worker, container and daemon absence
         try:
             info = os.lstat(STORAGE)
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and [info.st_dev, info.st_ino] == recorded:
                 bounded_rmtree(STORAGE, deadline)
-            clean = clean and not os.path.lexists(STORAGE)
         except FileNotFoundError:
             pass
         except BaseException:
             clean = False
+        try:
+            clean = clean and not present(STORAGE)  # final deletion is observed, not assumed
+        except BaseException:
+            clean = False
     clean = clean and in_time()
-    state['teardown'] = 'complete' if clean else 'uncertain'
-    save_state(state, poststop=final, until=outer)  # a late 'complete' is downgraded inside the lock
-    return 0 if state['teardown'] == 'complete' else 1
+    # Diagnostic only (private): whether every observed absence held. It is NEVER published as ``complete``:
+    # ``save_state`` refuses a positive complete while final-publication timeliness is unproved.
+    private['teardown_observed_clean'] = bool(clean)
+    state['teardown'] = 'uncertain'
+    save_state(state, poststop=final, until=outer)
+    return 1
 
 
 # ---- Guardian, expiry and poststop (fixed units; #508) -------------------------------------------------
@@ -1285,9 +1318,9 @@ class Cancelled(Exception):
 def gate_state(value):
     """'closed' once the expiry/poststop marker exists (permanent), 'open' once bootstrap released the
     worker, else 'unopened'. Closure always wins; nothing ever reopens the gate."""
-    if os.path.lexists(MROOT / RELEASE_CLOSED):
+    if present(MROOT / RELEASE_CLOSED):
         return 'closed'
-    if os.path.lexists(MROOT / RELEASE_OPEN):
+    if present(MROOT / RELEASE_OPEN):
         record = base.data(base.regular(MROOT / RELEASE_OPEN, 4096, 0, 0o600))
         base.require(type(record) is dict and record.get('nonce') == value['nonce'], 'release binding differs')
         return 'open'
@@ -1317,7 +1350,7 @@ def supervise(value, clock):
     fresh_heartbeat()
     clock.remaining('persistence')
     base.require(gate_state(value) != 'closed', 'release closed', 'phase-cutoff')
-    if os.path.lexists(MROOT / CANCEL_MARK):
+    if present(MROOT / CANCEL_MARK):
         raise Cancelled()
 
 
@@ -1359,12 +1392,12 @@ def guardian():
                                 start_new_session=True)
         group = owned_process.OwnedGroup(proc)
         while True:
-            supervise(value, clock)
-            supervise_worker(value, clock)
-            status = group.status()
+            status = group.status()  # non-reaping and FIRST: an already exited native status is never obscured
             if status is not None:
                 outcome['worker'], code = status, (status if status >= 0 else 128 - status)
                 break
+            supervise(value, clock)
+            supervise_worker(value, clock)
             time.sleep(.2)
         if status == 0:  # keep the cluster up for the private Viewer handoff until cancel/expiry/loss
             base.require(all(load_state(value['nonce'])['steps'][n] == 'ok' for n in STEP_NAMES),
@@ -1383,6 +1416,13 @@ def guardian():
         if group is None:
             outcome['closed'] = True
         else:
+            if outcome['worker'] is None:
+                try:  # last non-reaping look BEFORE closure signals anything: a status seen now is native
+                    seen = group.status()
+                    if seen is not None:
+                        outcome['worker'] = seen
+                except BaseException:
+                    pass  # unknown stays unknown (a status produced by our own closure is never recorded)
             try:
                 outcome['closed'] = bool(group.close(owned_process.TERM_GRACE_SECONDS, until=time.monotonic() + 15))
             except BaseException:
@@ -1395,21 +1435,24 @@ def guardian():
 
 
 def expire():
-    """Fixed expiry stop service body: close the release gate, then ask systemd to stop the guardian
-    (a stop job also replaces a still-pending start job). Never blocks beyond its own 10s bound and
-    never restarts, rearms or renews anything."""
-    primary = None
-    try:
-        close_release(contract_any())
-    except BaseException as error:  # the stop below is failure-independent; this stays the primary failure
-        primary = error
+    """Fixed expiry stop service body. The fixed non-blocking native stop request is initiated FIRST,
+    before and independent of any contract or gate I/O (a stop job also replaces a still-pending start
+    job); the permanent gate closure is then still attempted and verified. Never restarts, rearms or
+    renews anything; the guardian unit is a constant, so no record selects the target."""
     stop_error = None
-    try:  # the guardian unit is a constant: no contract or gate record selects the target
+    try:
         code, _ = base.call_bounded([SYSTEMCTL, 'stop', '--no-block', GUARDIAN_UNIT], 10)
         if code:
             stop_error = base.child_failure(code, 'fixed child failed')
     except BaseException as error:
         stop_error = error
+    primary = None
+    try:  # a gate/contract failure stays the primary failure; it can no longer prevent the stop above
+        value = contract_any()
+        close_release(value)
+        base.require(gate_state(value) == 'closed', 'release closure unconfirmed')
+    except BaseException as error:
+        primary = error
     if primary is not None:
         raise primary
     if stop_error is not None:
@@ -1445,6 +1488,18 @@ def cgroup_processes(directory, deadline=None):
     return found
 
 
+def quiescent_processes(directory, deadline=None):
+    """Conservative absence evidence for ONE cgroup. The recursive walk above is a survivor DIAGNOSTIC:
+    sequential reads are not migration-safe, so a tree with ANY descendant cgroup has unprovable
+    quiescence and raises (never absence). Only a flat cgroup is accepted, read before AND after the
+    child check; no stronger kernel-backed recursive emptiness exists within this ownership boundary."""
+    first = cgroup_processes(directory, deadline)
+    with os.scandir(directory) as scan:
+        if any(entry.is_dir(follow_symlinks=False) for entry in scan):
+            raise base.Failure('descendant cgroup present: quiescence unprovable', 1, 'status-invalid')
+    return first | cgroup_processes(directory, deadline)
+
+
 def unit_processes(deadline=None):
     return cgroup_processes(CGROUP_DIR, deadline)
 
@@ -1464,10 +1519,11 @@ def poll_absent(check, outer):
 
 
 def workers_absent(outer):
-    """True only when the guardian cgroup AND every descendant cgroup hold nothing but this poststop
-    process. Entering poststop proves nothing (v255 enters it even when SIGKILL survivors remain)."""
+    """True only when the guardian cgroup is flat (no descendant cgroup: quiescence is otherwise
+    unprovable) and holds nothing but this poststop process. Entering poststop proves nothing (v255
+    enters it even when SIGKILL survivors remain)."""
     me = os.getpid()
-    return poll_absent(lambda until: unit_processes(until) <= {me}, outer)
+    return poll_absent(lambda until: quiescent_processes(CGROUP_DIR, until) <= {me}, outer)
 
 
 def daemon_cgroups_empty(until):
@@ -1478,7 +1534,7 @@ def daemon_cgroups_empty(until):
         if any(re.fullmatch(r'(docker|containerd)-.*\.scope', entry.name) for entry in scan):
             return False
     for path in DAEMON_CGROUPS:
-        if os.path.lexists(path) and cgroup_processes(path, until):
+        if present(path) and quiescent_processes(path, until):  # unobservable raises: never absence
             return False
     return True
 
@@ -1495,17 +1551,24 @@ def _alarm(_signum, _frame):
 
 def poststop():
     """Fixed ExecStopPost body. The outer deadline starts at ENTRY (before the first read). Where the
-    interpreter can express it, a one-shot ITIMER_REAL interrupts interruptible blocking calls at that
-    deadline; the process is still bounded in the end only by systemd's TimeoutStopSec, and a stall in an
-    uninterruptible filesystem call cannot be preempted in-process (ACTIVATION_BLOCKERS). A receipt is
-    never published ``complete`` late, and a killed poststop leaves ``pending`` (fail closed)."""
+    interpreter can express it, a one-shot ITIMER_REAL interrupts INTERRUPTIBLE blocking calls: first at
+    entry+235s, then clipped (never extended) to the original remaining cleanup deadline once that is
+    known. It does NOT bound preparation reads before that point, an uninterruptible filesystem call, or
+    the final state write, and nothing here proves publication timeliness: a positive ``complete`` is
+    therefore never published (ACTIVATION_BLOCKERS). A receipt this process does not finish is whatever
+    state was last published (``pending`` is not evidence of anything)."""
     entry = time.monotonic()
     previous = None
-    if threading.current_thread() is threading.main_thread() and hasattr(signal, 'setitimer'):
+    armed = threading.current_thread() is threading.main_thread() and hasattr(signal, 'setitimer')
+
+    def clip(outer):
+        if armed:  # outer <= entry + POSTSTOP_OUTER_SECONDS, so this can only shorten the armed alarm
+            signal.setitimer(signal.ITIMER_REAL, max(.001, outer - time.monotonic()))
+    if armed:
         previous = signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, POSTSTOP_OUTER_SECONDS)
     try:
-        return _poststop(entry)
+        return _poststop(entry, clip)
     finally:
         if previous is not None:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1515,14 +1578,24 @@ def poststop():
 def apply_terminal(state, outcome):
     """Carry the authoritative terminal outcome into the strict public record when the worker could not
     (SIGKILL, guardian-side loss, cancel): native exit/signal first, else the guardian's own category.
-    An already recorded failure stays primary; nothing is invented once every step is ok."""
+    An already recorded failure stays primary. A nonzero NATIVE worker status is kept even after all 18
+    steps are ok: the strict result shape has no separate terminal field, so the last step carries it as
+    ``failed`` (``succeeded`` is then false and the Viewer export is refused). Nothing else is invented
+    once every step is ok, and a missing outcome adds nothing (the caller records it as unknown)."""
     if state['failure'] is not None or outcome is None:
         return
-    pending = [n for n in STEP_NAMES if state['steps'][n] != 'ok']
-    if not pending or any(state['steps'][n] != 'not-run' for n in pending):
-        return
     worker, guardian = outcome.get('worker'), outcome.get('guardian')
-    if type(worker) is int and worker != 0:
+    native = type(worker) is int and worker != 0
+    pending = [n for n in STEP_NAMES if state['steps'][n] != 'ok']
+    if pending:
+        if any(state['steps'][n] != 'not-run' for n in pending):
+            return
+        carrier = pending[0]
+    elif native:
+        carrier = STEP_NAMES[-1]
+    else:
+        return
+    if native:
         category, status = ('child-signal', worker) if worker < 0 else ('child-exit', worker)
     elif type(guardian) is dict:
         category, status = guardian.get('category'), guardian.get('child_status')
@@ -1531,11 +1604,11 @@ def apply_terminal(state, outcome):
     if not (type(category) is str and category in base.CATEGORIES and category != 'none'
             and base.child_status_ok(category, status)):
         category, status = 'exception', None
-    state['steps'][pending[0]] = 'failed'
-    state['failure'] = {'step': pending[0], 'category': category, 'child_status': status}
+    state['steps'][carrier] = 'failed'
+    state['failure'] = {'step': carrier, 'category': category, 'child_status': status}
 
 
-def _poststop(entry):
+def _poststop(entry, clip=None):
     value = contract_any()
     nonce = value['nonce']
     clock = production_clock(value)
@@ -1544,6 +1617,8 @@ def _poststop(entry):
     except base.Failure:
         left = 0
     outer = entry + max(0, min(POSTSTOP_OUTER_SECONDS, left))
+    if clip is not None:
+        clip(outer)  # derived once from the original clock; no later read renews it
     close_release(value)
     duplicate = False
     with state_lock(max(1.0, outer - time.monotonic())):
@@ -1551,15 +1626,15 @@ def _poststop(entry):
             base.exclusive(MROOT / POSTSTOP_CLAIM, base.encoded({'nonce': nonce, 'pid': os.getpid()}))
         except FileExistsError:
             duplicate = True
-    if duplicate:  # read-only duplicate: never a second writer
-        return 0 if load_state(nonce)['teardown'] == 'complete' else 1
+    if duplicate:  # read-only duplicate: never a second writer, never a positive completion
+        return 1
     absent = workers_absent(outer)
     try:
         outcome = base.data(base.regular(MROOT / 'outcome.json', 4096, 0))
         base.require(type(outcome) is dict and outcome.get('nonce') == nonce)
     except Exception:
-        outcome = None  # a missing guardian record is not by itself uncertainty; the cgroup is the evidence
-    uncertain = not absent or (outcome is not None and outcome.get('closed') is not True)
+        outcome = None  # missing/invalid guardian record: the terminal result is UNKNOWN (sticky uncertainty)
+    uncertain = not absent or outcome is None or outcome.get('closed') is not True
     extra = {}
     if uncertain:
         extra['worker_uncertain'] = True  # sticky: never cleared

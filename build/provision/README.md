@@ -1806,9 +1806,9 @@ systemd v255, cgroup, timer or Docker behavior.
 * **Budget.** `TimeoutStopSec` T=240 s; J=60 s (timer accuracy, dispatch, stop-request policy); 60 s slack. The
   fixed expiry E is the persistence cutoff, `E <= D - (5T + J + 60) = D - 1320 s = admission + 38 min` for the
   60-minute ceiling D, so `E + J + 5T <= D - 60 s`. Phase cutoffs 15/30/37/38 minutes. Native cleanup caps
-  (120+30+30 s) leave 60 s inside one 240 s interval; poststop enforces ONE outer deadline (235 s, clipped to the
-  ceiling) over native children AND filesystem work (`bounded_rmtree`; no link following, no device crossing) and
-  reports `uncertain` rather than finishing late. Timer: no randomized delay, `AccuracySec=1us`, no persistence.
+  (120+30+30 s) leave 60 s inside one 240 s interval; poststop uses ONE outer deadline (235 s, clipped to the
+  ceiling) for native children, polling and directory enumeration (`bounded_rmtree`; no link following, no device
+  crossing). It is NOT a bound on every filesystem call or the final state write (see R4 below). Timer: no randomized delay, `AccuracySec=1us`, no persistence.
 * **Clock capsule.** The caller (`build/gcp/management_trial.py:guest_clock_capsule`) takes ONE fixed guest sample
   (`SAMPLE_STUB`: boot id, one-shot nonce, wall, monotonic) through the original Master, reads its own
   ONCE-retained wall/monotonic clock immediately before sending and at RESPONSE reception, and computes every
@@ -1841,27 +1841,44 @@ systemd v255, cgroup, timer or Docker behavior.
   worker writes are refused; a second poststop is a read-only duplicate. It never reconstructs an `OwnedGroup` from
   a saved PID and never treats entering poststop as absence (v255 enters it even when `SIGKILL` survivors remain,
   per the `service.c` v255 `Processes still around after SIGKILL. Ignoring.` path): it requires the guardian
-  cgroup AND every descendant cgroup (`CGROUP_DIR`, recursive, bounded, links never followed) to contain only
-  itself, and the guardian's recorded closure to be positive. Destructive storage removal additionally needs
+  cgroup (`CGROUP_DIR`) to be FLAT (any descendant cgroup makes quiescence unprovable: sequential recursive reads
+  are a survivor diagnostic, not migration-safe absence, and repeated snapshots are not proof) and to contain only
+  itself (read before and after the child check), the guardian's recorded closure to be positive, and a PRESENT
+  `outcome.json` (a missing or invalid one is an unknown terminal result: sticky uncertainty). Absence uses strict
+  `lstat` (`present`): only a genuine `FileNotFoundError` is absent, any other error (EACCES/EIO/...) is unknown and
+  never permits storage removal or a clean observation. Destructive storage removal additionally needs
   positive cluster delete, an empty container listing and positive daemon-process absence
   (`daemons_absent`: the docker/containerd unit cgroups and `docker-*`/`containerd-*` scopes hold no process; a
   successful `systemctl stop` is not absence). Otherwise protective native deletes and private-file removal still
   run, storage is NEVER removed, and the receipt is `uncertain` with `worker_uncertain` recorded. Storage creation
-  intent is persisted before `mkdir`; an existing but unrecorded storage directory is never adopted or deleted and
-  keeps the receipt `uncertain`. The terminal outcome (native worker exit/signal, else the guardian's own category)
-  is carried into the strict public record on the first unfinished step (`apply_terminal`; a recorded worker
-  failure stays primary). No claim is made that a killed or uninterruptible task is gone.
-* **Cleanup deadline (R4, partially enforced).** The 235 s outer deadline starts at poststop ENTRY, directory
-  enumeration and removal check it per entry, a one-shot `ITIMER_REAL` interrupts interruptible blocking calls, and
-  a `complete` receipt is downgraded to `uncertain` inside the state lock when written late. A stall in an
-  uninterruptible filesystem call (including the final state write itself) cannot be preempted by this process; only
-  systemd's `TimeoutStopSec` bounds it, and a killed poststop leaves `pending` (never `complete`). This is NOT a
-  hard real-time bound. It is recorded as an explicit unimplemented activation blocker
-  (`poststop-all-work-deadline-unenforceable-...`); closing it needs a separately owned supervisor outside this
-  scope (alternatives: a second owned watchdog process under `OwnedGroup`, or a cgroup `TimeoutStopSec`/`SIGKILL`
-  contract verified at runtime).
-* **Expiry independence and timer proof.** `expire` attempts the fixed `systemctl stop --no-block` even when the
-  contract read or gate closure fails (original failure stays primary). Bootstrap parses the ACTUAL loaded
+  intent is persisted (file, rename AND parent-directory fsync, `durable_atomic`, management-local; the base atomic
+  helper is unchanged) before `mkdir`, and a failed durable publication refuses the `mkdir`; an existing but
+  unrecorded storage directory is never adopted or deleted and keeps the receipt `uncertain`. The terminal outcome
+  (native worker exit/signal, else the guardian's own category) is carried into the strict public record
+  (`apply_terminal`; a recorded worker failure stays primary). A nonzero NATIVE worker status that arrives after all
+  18 steps are ok is kept too: the strict result shape has no terminal field, so the last step (`viewer-ready`)
+  carries it as `failed` and `succeeded` is false. The guardian observes the non-reaping `OwnedGroup.status()` BEFORE
+  supervision and once more before closure signals anything, so an already exited native status is not obscured by
+  a concurrent cutoff; a status produced by its own closure is never recorded as native. No claim is made that a
+  killed or uninterruptible task is gone.
+* **Positive completion is refused (R4, NOT closed).** `save_state` never publishes `teardown=complete` (and
+  `teardown` always returns 1, including direct, poststop and duplicate paths, and never trusts a stored
+  `complete`), because the timeliness of the final fsync/rename publication cannot be proved in this process. The
+  receipt is `uncertain`; whether the observed cleanup was clean is recorded only privately
+  (`teardown_observed_clean`, diagnostic, not a completion). The 235 s deadline starts at poststop ENTRY; once the
+  original-clock remaining time is known the one-shot `ITIMER_REAL` is clipped to it (never extended or renewed by
+  later reads) and interrupts only INTERRUPTIBLE blocking calls. Preparation reads before that point, an
+  uninterruptible filesystem call and the final state write are NOT bounded in-process, and a poststop that does
+  not finish leaves whatever was last published (`pending` is not evidence of anything). This is NOT a real-time
+  bound and no "all work", "never late" or "killed leaves pending" guarantee is made. Explicit unimplemented
+  activation blocker `poststop-all-work-deadline-unenforceable-for-uninterruptible-filesystem-calls-in-process`;
+  the broader options (a second independently owned watchdog under `OwnedGroup`, a runtime-verified cgroup
+  `TimeoutStopSec`/`SIGKILL` contract, or a kernel-backed recursive emptiness/freeze mechanism for R2) need separate
+  design authority and are NOT implemented. Credentials and protective native deletes still run when uncertain.
+* **Expiry independence and timer proof.** `expire` requests the fixed `systemctl stop --no-block` FIRST, before and
+  independent of any contract or gate I/O, then still attempts the permanent gate closure and checks it is closed
+  (a gate/contract failure stays the primary failure; a blocked gate read can no longer delay the stop request).
+  Bootstrap parses the ACTUAL loaded
   `NextElapseUSecMonotonic` and the timer's `Unit`, and requires the deadline to equal the capsule-derived
   `OnBootSec` value (tolerance 2 s); an unknown rendering refuses (runtime format unobserved).
 * **Guardian phase cutoffs.** While the worker runs the guardian enforces the `work` cutoff and the cutoff of
@@ -1885,6 +1902,15 @@ not be fetched in full by the author worker (`gh api` denied); the R1-R9 summary
 The documents skipped in the first authoring (#145/#476, the #506/#507 design reports, the full shared workflow,
 `STUDENT_QUICK_START.md`, the systemd man pages, raw `service.c` ranges) were also NOT read in this revision round;
 only `AGENTS.md`, the affected modules/tests/units and the trigger comment were. No project code was executed.
+
+Revision round 2 (final) reading, stated exactly: `AGENTS.md`, the trigger comment, the full independent ed6 report
+509/6644742183 (read through `gh pr view 509 --json comments`), both management modules, the affected provision
+and caller test sections, the unchanged `owned_process.OwnedGroup` and `vlab_trial.atomic`, the three units and the
+nearest README sections were read. NOT read in this round either: #145/#476 bodies, the #506/#507 design and
+proposal reports, `docs/contributing/agent-workflow.md` in full, `STUDENT_QUICK_START.md`, the systemd man pages,
+raw `service.c` ranges and the kernel cgroup-v2 documents. That late reading does not erase the first-authoring
+gaps. Nothing was executed, imported, compiled or tested by the author; native systemd/cgroup/timer behavior stays
+unobserved.
 
 **Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
 (2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,

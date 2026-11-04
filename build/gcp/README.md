@@ -1894,7 +1894,10 @@ only heartbeats, polls the read-only `result`, exports the Viewer handoff, runs 
 sends `cancel`. The guest's fixed guardian/timer/stop units and poststop own cleanup and write the typed receipt;
 a still-`pending` receipt after the bounded wait is reported unknown. A `cancel` acknowledgement is a request only,
 and a non-`pending` `teardown` is not by itself terminal proof of the contract. A public native failure keeps its
-exit (positive) or signal (negative status -> 128 + signal); only non-native categories collapse to 1. There is no reconnect, resample after an
+exit (positive) or signal (negative status -> 128 + signal); only non-native categories collapse to 1. A native
+failure first discovered in the receipt read after `cancel` is reconciled into both the return code and the printed
+receipt, but never replaces an earlier primary failure. The guest never publishes `teardown=complete` (see the
+provision README), so the whole-trial success stays unattainable. There is no reconnect, resample after an
 ambiguous bootstrap, per-step command or host teardown command. Assumptions, the budget and unverified systemd
 behavior are listed in
 [build/provision/README.md](../provision/README.md#fixed-lifetime-ownership-and-clock-capsule-issue-508-source-inactive).

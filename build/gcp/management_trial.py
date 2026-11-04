@@ -361,6 +361,17 @@ def enroll(snapshot, output, registration, records, login, rec, clock, failed, i
     return rec
 
 
+def native_code(failure):
+    """Process code for a typed guest failure. Native precedence: a positive exit stays itself, a negative
+    raw signal maps to 128+signal exactly like ``child_failure``; only non-native categories collapse to 1."""
+    status = failure['child_status']
+    if type(status) is int and 0 < status < 256:
+        return status
+    if type(status) is int and -64 <= status < 0:
+        return 128 - status
+    return 1
+
+
 def sequence(snapshot, payloads, output, *, registration, records, login, private=None):
     """INTERNAL body; never reachable from ``main``/``trial`` while activation is held."""
     owner.expected_snapshot(snapshot)
@@ -433,15 +444,7 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
                 invalid = 0
                 failure = record['failure']
                 if failure is not None:
-                    status = failure['child_status']
-                    # Native precedence: a positive exit stays itself, a negative raw signal maps to 128+signal
-                    # exactly like ``child_failure``; only non-native categories collapse to 1.
-                    code = 1
-                    if type(status) is int and 0 < status < 256:
-                        code = status
-                    elif type(status) is int and -64 <= status < 0:
-                        code = 128 - status
-                    raise guest.Failure('fixed child failed', code)
+                    raise guest.Failure('fixed child failed', native_code(failure))
                 guest.require(record['teardown'] == 'pending', 'guest ended before the steps finished')
                 if all(v == 'ok' for v in record['steps'].values()):
                     break
@@ -503,6 +506,11 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
                             or owned_process.monotonic() >= receipt_until:
                         break
                     time.sleep(PROGRESS_INTERVAL)
+                # A native failure first discovered during finalization is reconciled into BOTH the return
+                # code and the printed receipt, but never replaces an earlier primary failure. A cancel
+                # acknowledgement or a non-pending receipt is not terminal proof of anything.
+                if result == 0 and typed_state == 'valid' and typed['failure'] is not None:
+                    result, category, phase = native_code(typed['failure']), 'guest', 'guest-result'
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

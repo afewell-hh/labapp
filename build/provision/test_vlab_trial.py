@@ -4791,7 +4791,8 @@ class ManagementProgram(unittest.TestCase):
             self.m.run_step(NONCE, 'install-docker')
         self.assertEqual(self.m.load_state(NONCE)['failure']['category'], 'phase-cutoff')
         self.assertEqual(self.model.calls, [])  # no child started after the cutoff
-        self.assertEqual(self.m.teardown(NONCE), 0)  # cleanup still runs inside the reserve
+        self.assertEqual(self.m.teardown(NONCE), 1)  # cleanup still runs inside the reserve; never 'complete'
+        self.assertTrue(self.m.load_state(NONCE)['private']['teardown_observed_clean'])
         self.reset(self.admitted_ago(61))
         with self.assertRaises(trial.Failure):
             self.m.ManagementClock(self.value).cleanup_remaining()
@@ -5190,14 +5191,17 @@ class ManagementProgram(unittest.TestCase):
         for name in m.PRIVATE_FILES:
             trial.exclusive(m.WORK / name, b'private')
         with patch.object(m, 'daemons_absent', return_value=True):  # positive proof is tested in ManagementLifetime
-            self.assertEqual(m.teardown(NONCE), 0)
-        self.assertEqual(m.load_state(NONCE)['teardown'], 'complete')
+            self.assertEqual(m.teardown(NONCE), 1)  # publication timeliness is unproved: never positive
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
         self.assertFalse(m.STORAGE.exists())
         self.assertFalse(any((m.WORK / name).exists() for name in m.PRIVATE_FILES))
         deletes = [c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'delete']]
         self.assertEqual(deletes, [[m.K3D, 'cluster', 'delete', m.CLUSTER]])
-        self.assertEqual(m.teardown(NONCE), 0)
-        self.assertEqual(len([c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'delete']]), 1)
+        with patch.object(m, 'daemons_absent', return_value=True):
+            self.assertEqual(m.teardown(NONCE), 1)  # a stored non-complete receipt is simply re-observed
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        self.assertFalse(m.STORAGE.exists())
 
     def test_teardown_never_removes_foreign_storage_and_cluster_failure_is_uncertain(self):
         m = self.m
@@ -5871,15 +5875,16 @@ class ManagementLifetime(unittest.TestCase):
         self.with_storage()
         self.write_outcome()
         (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
-        self.assertEqual(m.poststop(), 0)
+        self.assertEqual(m.poststop(), 1)  # never a positive completion
         state = m.load_state(NONCE)
-        self.assertEqual((state['teardown'], state['private']['worker_exit']), ('complete', -9))
+        self.assertEqual((state['teardown'], state['private']['worker_exit']), ('uncertain', -9))
+        self.assertIs(state['private']['teardown_observed_clean'], True)
         self.assertFalse(m.STORAGE.exists())
         self.assertTrue((self.root / m.RELEASE_CLOSED).exists())
         with self.assertRaises(trial.Failure):  # the worker/any other writer is refused after the claim
             m.save_state(state)
         before = (self.root / 'steps.json').read_bytes()
-        self.assertEqual(m.poststop(), 0)  # read-only duplicate
+        self.assertEqual(m.poststop(), 1)  # read-only duplicate, never positive
         self.assertEqual((self.root / 'steps.json').read_bytes(), before)
 
     def test_surviving_or_unreadable_worker_cgroup_withholds_storage_removal_and_clean_receipt(self):
@@ -5974,7 +5979,9 @@ class ManagementLifetime(unittest.TestCase):
         shutil.rmtree(m.STORAGE, True)
         trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
         code, calls = self.run_teardown(ok, True)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)  # observed clean, but a positive 'complete' is never published
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
         self.assertFalse(m.STORAGE.exists())
         self.assertIn([m.SYSTEMCTL, 'stop', *m.DAEMON_UNITS], calls)
 
@@ -5992,6 +5999,9 @@ class ManagementLifetime(unittest.TestCase):
             (docker / 'sub' / 'cgroup.procs').write_text('4242\n')  # survivor in a SUBGROUP
             self.assertFalse(m.daemon_cgroups_empty(time.monotonic() + 5))
             (docker / 'sub' / 'cgroup.procs').write_text('')
+            with self.assertRaises(trial.Failure):  # an empty SUBGROUP: quiescence is unprovable, never absence
+                m.daemon_cgroups_empty(time.monotonic() + 5)
+            shutil.rmtree(docker / 'sub')
             self.assertTrue(m.daemon_cgroups_empty(time.monotonic() + 5))
             (slice_dir / ('docker-' + 'a' * 64 + '.scope')).mkdir()  # a container scope outside the unit
             self.assertFalse(m.daemon_cgroups_empty(time.monotonic() + 5))
@@ -6013,9 +6023,17 @@ class ManagementLifetime(unittest.TestCase):
         with patch.object(m, 'ABSENCE_SECONDS', .2):
             self.assertFalse(m.workers_absent(time.monotonic() + 5))
             (self.cg / 'child' / 'grand' / 'cgroup.procs').write_text('')
-            self.assertTrue(m.workers_absent(time.monotonic() + 5))
+            # empty subgroups are NOT absence: a sequential walk cannot exclude a process migrating between
+            # not-yet-read and already-read subgroups, so unknown quiescence stays uncertain
+            self.assertFalse(m.workers_absent(time.monotonic() + 5))
+            with self.assertRaises(trial.Failure):
+                m.quiescent_processes(self.cg)
             (self.cg / 'child' / 'grand' / 'cgroup.procs').unlink()  # an unreadable subgroup is uncertainty
             self.assertFalse(m.workers_absent(time.monotonic() + 5))
+            shutil.rmtree(self.cg / 'child')  # a flat cgroup holding only this process is the one accepted proof
+            self.assertTrue(m.workers_absent(time.monotonic() + 5))
+        (self.cg / 'child' / 'grand').mkdir(parents=True)
+        (self.cg / 'child' / 'cgroup.procs').write_text('')
         # a subgroup survivor withholds storage removal through poststop as well
         (self.cg / 'child' / 'grand' / 'cgroup.procs').write_text('999999\n')
         self.with_storage()
@@ -6054,17 +6072,18 @@ class ManagementLifetime(unittest.TestCase):
         (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
         seen = []
         original = m._poststop
-        with patch.object(m, '_poststop', side_effect=lambda entry: seen.append(entry) or original(entry)):
+        with patch.object(m, '_poststop', side_effect=lambda entry, clip=None: seen.append(entry) or original(entry, clip)):
             start = time.monotonic()
-            self.assertEqual(m.poststop(), 0)
+            self.assertEqual(m.poststop(), 1)
         self.assertTrue(start <= seen[0] <= time.monotonic())
         self.assertIs(signal.getsignal(signal.SIGALRM), before)
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
-        # a 'complete' receipt that would be written after the outer deadline is downgraded inside the lock
-        state = m.load_state(NONCE)
-        state['teardown'] = 'complete'
-        m.save_state(state, poststop=True, until=time.monotonic() - 1)
-        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        # a positive 'complete' is never published, in time or late, by any writer path
+        for until in (time.monotonic() - 1, time.monotonic() + 30, None):
+            state = m.load_state(NONCE)
+            state['teardown'] = 'complete'
+            m.save_state(state, poststop=True, until=until)
+            self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
         # enumeration itself is bounded by the same deadline
         tree = self.temp / 'wide'
         tree.mkdir()
@@ -6097,7 +6116,8 @@ class ManagementLifetime(unittest.TestCase):
         self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
         shutil.rmtree(m.STORAGE)  # intent recorded but nothing created: nothing unresolved
         trial.atomic(self.root / 'steps.json', dict(m.load_state(NONCE), teardown='pending'))
-        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 0)
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 1)
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
 
     def test_r6_terminal_outcome_reaches_the_strict_public_receipt_with_native_precedence(self):
         m = self.m
@@ -6126,8 +6146,22 @@ class ManagementLifetime(unittest.TestCase):
         self.assertEqual(recorded['failure']['category'], 'phase-cutoff')  # the worker's own primary is kept
         done = m.initial_state(NONCE)
         done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
-        m.apply_terminal(done, {'worker': -9, 'guardian': None})
-        self.assertIsNone(done['failure'])  # nothing is invented once every step finished
+        m.apply_terminal(done, {'worker': 0, 'guardian': {'category': 'interrupted', 'child_status': None}})
+        self.assertIsNone(done['failure'])  # nothing is invented once every step finished and the worker exited 0
+        for status, expected in ((17, ('child-exit', 17)), (-15, ('child-signal', -15)), (-9, ('child-signal', -9))):
+            late = m.initial_state(NONCE)
+            late['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+            late['observed'] = {k: True for k in m.OBSERVED}
+            m.apply_terminal(late, {'worker': status, 'guardian': None})  # native status AFTER all 18 ok is kept
+            self.assertEqual(late['failure'], {'step': m.STEP_NAMES[-1], 'category': expected[0],
+                                               'child_status': expected[1]})
+            self.assertFalse(m.succeeded(m.validate_result(m.public_record(late), NONCE)))
+        earlier = m.initial_state(NONCE)
+        earlier['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+        earlier['steps'][m.STEP_NAMES[-1]] = 'failed'
+        earlier['failure'] = {'step': m.STEP_NAMES[-1], 'category': 'phase-cutoff', 'child_status': None}
+        m.apply_terminal(earlier, {'worker': 17, 'guardian': None})
+        self.assertEqual(earlier['failure']['category'], 'phase-cutoff')  # an earlier primary always wins
         # through poststop: the public record carries the signal AND the sticky uncertainty
         self.with_storage()
         self.write_outcome(worker=-9, closed=False)
@@ -6185,6 +6219,236 @@ class ManagementLifetime(unittest.TestCase):
         forged['caller'].update(send_wall=wall - 3600, recv_wall=wall - 3599)
         with self.assertRaises(trial.Failure):
             m.validate_capsule(forged, self.value)
+
+    # -- revision round 2 (final): F1-F6 --------------------------------------------------------------------
+    def poststop_fixture(self, **outcome):
+        self.with_storage()
+        self.write_outcome(**outcome)
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+
+    def test_f1_slow_publication_crossing_the_deadline_and_every_path_never_publish_complete(self):
+        m = self.m
+        self.poststop_fixture()
+        self.assertEqual(m.poststop(), 1)
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        published, real = [], trial.atomic
+
+        def slow(path, value):
+            published.append(value['teardown'])
+            REAL_SLEEP(.3)  # the write itself crosses the deadline
+            return real(path, value)
+        state = m.load_state(NONCE)
+        state['teardown'] = 'complete'
+        with patch.object(trial, 'atomic', side_effect=slow):
+            m.save_state(state, poststop=True, until=time.monotonic() + .1)
+        self.assertEqual(published, ['uncertain'])
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        self.assertEqual(m.poststop(), 1)  # the duplicate path is never positive either
+        stored = m.load_state(NONCE)
+        stored['teardown'] = 'complete'  # a stored 'complete' is not trusted by a direct teardown
+        trial.atomic(self.root / 'steps.json', stored)
+        (self.root / m.POSTSTOP_CLAIM).unlink()
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 1)
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+
+    def test_f1_the_interruptible_alarm_is_clipped_to_the_original_remaining_deadline_and_never_renewed(self):
+        m = self.m
+        self.poststop_fixture()
+        calls, real = [], signal.setitimer
+
+        def record(which, seconds, *rest):
+            calls.append(seconds)
+            return real(which, seconds, *rest)
+        with patch.object(m.ManagementClock, 'cleanup_remaining', return_value=7.0), \
+                patch.object(signal, 'setitimer', side_effect=record):
+            m.poststop()
+        self.assertEqual(calls[0], m.POSTSTOP_OUTER_SECONDS)
+        self.assertTrue(0 < calls[1] <= 7.0)  # clipped to the clock-derived remainder, only ever shorter
+        self.assertEqual(calls[2:], [0])      # no later read re-arms or extends it
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    def test_f2_native_failure_after_all_steps_ok_reaches_the_public_receipt_with_sticky_uncertainty(self):
+        m = self.m
+        for status, expected in ((17, ('child-exit', 17)), (-15, ('child-signal', -15))):
+            with self.subTest(status):
+                for stale in (self.root / m.POSTSTOP_CLAIM, self.root / m.RELEASE_CLOSED):
+                    stale.unlink(missing_ok=True)
+                shutil.rmtree(m.STORAGE, True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                self.poststop_fixture(worker=status, closed=True)
+                done = m.load_state(NONCE)
+                done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+                done['observed'] = {k: True for k in m.OBSERVED}
+                trial.atomic(self.root / 'steps.json', done)
+                self.assertEqual(m.poststop(), 1)
+                public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
+                self.assertEqual((public['failure']['category'], public['failure']['child_status']), expected)
+                self.assertEqual(public['failure']['step'], m.STEP_NAMES[-1])
+                self.assertFalse(m.succeeded(public))
+                self.assertEqual(m.load_state(NONCE)['private']['worker_exit'], status)
+
+    def test_f2_missing_or_invalid_outcome_is_unknown_and_sticky_uncertain(self):
+        m = self.m
+        for name, writer in (('missing', lambda: None), ('invalid', lambda: (self.root / 'outcome.json').write_text('{'))):
+            with self.subTest(name):
+                for stale in (self.root / m.POSTSTOP_CLAIM, self.root / m.RELEASE_CLOSED, self.root / 'outcome.json'):
+                    stale.unlink(missing_ok=True)
+                shutil.rmtree(m.STORAGE, True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                self.with_storage()
+                (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+                writer()
+                with patch.object(m, 'ABSENCE_SECONDS', .3):
+                    self.assertEqual(m.poststop(), 1)
+                state = m.load_state(NONCE)
+                self.assertEqual(state['teardown'], 'uncertain')
+                self.assertIs(state['private']['worker_uncertain'], True)
+                self.assertTrue((m.STORAGE / 'nested' / 'file').exists())  # no destructive removal without evidence
+
+    def test_f2_an_already_exited_native_status_is_observed_before_a_concurrent_cutoff_can_obscure_it(self):
+        m = self.m
+        marker = self.worker_script('import sys\nopen(%r, "a").write("w")\nsys.exit(17)\n')
+        self.open_gate()
+        real = m.owned_process.OwnedGroup
+
+        class Exited(real):
+            def status(self):  # the worker has already exited when the guardian first looks
+                end = time.monotonic() + 10
+                while True:
+                    seen = super().status()
+                    if seen is not None or time.monotonic() > end:
+                        return seen
+                    REAL_SLEEP(.02)
+        cutoff = trial.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+        with patch.object(m.owned_process, 'OwnedGroup', Exited), patch.object(m, 'supervise_worker', side_effect=cutoff):
+            code = self.run_guardian()
+        self.assertEqual(marker.read_text(), 'w')
+        self.assertEqual(code, 17)
+        self.assertEqual(self.outcome()['worker'], 17)
+        self.assertIsNone(self.outcome()['guardian'])  # the cutoff did not replace the native status
+
+    def test_f3_only_a_genuine_missing_path_is_absent(self):
+        m = self.m
+        self.assertFalse(m.present(self.temp / 'missing'))
+        self.assertTrue(m.present(self.temp))
+        for error in (PermissionError(13, 'denied'), OSError(5, 'io'), NotADirectoryError(20, 'notdir')):
+            with patch.object(m.os, 'lstat', side_effect=error), self.assertRaises(OSError):
+                m.present(self.temp / 'x')
+        # storage that cannot be observed is never deleted and never reported clean
+        self.with_storage()
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if str(path) == str(m.STORAGE):
+                raise PermissionError(13, 'denied')
+            return real(path, *args, **kwargs)
+        with patch.object(m.os, 'lstat', side_effect=lstat):
+            self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 1)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        state = m.load_state(NONCE)
+        self.assertEqual(state['teardown'], 'uncertain')
+        self.assertIs(state['private']['teardown_observed_clean'], False)
+        # an unrecorded creation whose path cannot be observed also stays unresolved
+        shutil.rmtree(m.STORAGE)
+        fresh = m.initial_state(NONCE)
+        fresh['private']['storage_intent'] = True
+        trial.atomic(self.root / 'steps.json', fresh)
+        with patch.object(m.os, 'lstat', side_effect=lstat):
+            m.teardown(NONCE, outer=time.monotonic() + 30, final=False)
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], False)
+        # an unobservable daemon cgroup is unknown, never absence
+        slice_dir = self.temp / 'system.slice'
+        slice_dir.mkdir()
+        (slice_dir / 'cgroup.procs').write_text('')
+        with patch.object(m, 'DAEMON_CGROUPS', (slice_dir / 'docker.service', slice_dir / 'containerd.service')), \
+                patch.object(m, 'present', side_effect=PermissionError(13, 'denied')), \
+                patch.object(m, 'ABSENCE_SECONDS', .2):
+            with self.assertRaises(OSError):
+                m.daemon_cgroups_empty(time.monotonic() + 5)
+            self.assertFalse(m.daemons_absent(time.monotonic() + 5))
+
+    def test_f4_a_process_moving_between_subgroups_is_never_proven_absent(self):
+        m = self.m
+        me = os.getpid()
+        (self.cg / 'cgroup.procs').write_text('%d\n' % me)
+        for name in ('a', 'b'):
+            (self.cg / name).mkdir()
+            (self.cg / name / 'cgroup.procs').write_text('')
+        real = m.cgroup_processes
+        moved = []
+
+        def migrate(directory, deadline=None):
+            found = real(directory, deadline)
+            if not moved:  # the survivor hops from the not-yet-read subgroup into the already-read one
+                moved.append(True)
+                (self.cg / 'a' / 'cgroup.procs').write_text('424242\n')
+            return found
+        with patch.object(m, 'cgroup_processes', side_effect=migrate), patch.object(m, 'ABSENCE_SECONDS', .2):
+            self.assertFalse(m.workers_absent(time.monotonic() + 5))
+        self.poststop_fixture()
+        with patch.object(m, 'ABSENCE_SECONDS', .2):
+            self.assertEqual(m.poststop(), 1)  # subgroups present: unknown quiescence, no destructive removal
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        self.assertIs(m.load_state(NONCE)['private']['worker_uncertain'], True)
+
+    def test_f5_the_native_stop_is_requested_before_and_independent_of_blocking_gate_io(self):
+        m = self.m
+        events = []
+
+        def stop(argv, seconds, env=None):
+            events.append(('stop', argv))
+            return 0, b''
+
+        def blocked():
+            events.append(('contract',))
+            raise OSError('blocked gate io')
+        with patch.object(trial, 'call_bounded', side_effect=stop), patch.object(m, 'contract_any', side_effect=blocked):
+            with self.assertRaises(OSError):  # the gate failure stays primary
+                m.expire()
+        self.assertEqual(events, [('stop', [m.SYSTEMCTL, 'stop', '--no-block', m.GUARDIAN_UNIT]), ('contract',)])
+        events.clear()
+        with patch.object(trial, 'call_bounded', side_effect=stop), patch.object(m, 'close_release'):
+            with self.assertRaises(trial.Failure):  # closure that cannot be confirmed is a failure, not success
+                m.expire()
+        self.assertEqual([e[0] for e in events], ['stop'])
+        events.clear()
+        with patch.object(trial, 'call_bounded', side_effect=stop):
+            self.assertEqual(m.expire(), 0)  # normal path: stop first, then permanent closure verified
+        self.assertEqual(m.gate_state(self.value), 'closed')
+
+    def test_f6_intent_is_file_rename_and_directory_fsynced_before_mkdir_and_failure_refuses_the_effect(self):
+        m = self.m
+        events = []
+        real_fsync, real_replace, real_mkdir = os.fsync, os.replace, os.mkdir
+
+        def fsync(fd):
+            events.append('fsync-dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'fsync-file')
+            return real_fsync(fd)
+
+        def replace(source, target, *args, **kwargs):
+            events.append('replace')
+            return real_replace(source, target, *args, **kwargs)
+
+        def mkdir(path, mode=0o777, **kwargs):
+            if str(path) == str(m.STORAGE):
+                events.append('mkdir')
+            return real_mkdir(path, mode, **kwargs)
+        ctx = m.Context(self.value, m.ManagementClock(self.value), m.load_state(NONCE))
+        with patch.object(os, 'fsync', side_effect=fsync), patch.object(os, 'replace', side_effect=replace), \
+                patch.object(os, 'mkdir', side_effect=mkdir):
+            m.step_storage(ctx)
+        self.assertEqual(events[:4], ['fsync-file', 'replace', 'fsync-dir', 'mkdir'])
+        shutil.rmtree(m.STORAGE)
+        trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+        ctx = m.Context(self.value, m.ManagementClock(self.value), m.load_state(NONCE))
+
+        def failing(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, 'directory fsync failed')
+            return real_fsync(fd)
+        with patch.object(os, 'fsync', side_effect=failing), self.assertRaises(OSError):
+            m.step_storage(ctx)
+        self.assertFalse(m.STORAGE.exists())  # a failed durable publication refuses the effect
 
     def test_teardown_children_run_inside_the_single_outer_deadline(self):
         m = self.m
