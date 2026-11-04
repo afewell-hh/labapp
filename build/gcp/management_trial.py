@@ -52,8 +52,14 @@ BROWSER_MIN_SECONDS = 60       # less work time than this -> browser step skippe
 BROWSER_WAIT_SECONDS = 600     # upper bound; always clipped to the original remaining work time
 FORWARD_HOST, FORWARD_PORT = '127.0.0.1', program.GRAFANA_PORT
 FORWARD_SPEC = '%s:%d:%s:%d' % (FORWARD_HOST, FORWARD_PORT, program.BIND_ADDRESS, program.GRAFANA_PORT)
-BROWSER_FIELDS = {'schema', 'nonce', 'result'}
+# Private OWNER-ATTESTED completion record. It binds the attestation to this trial's nonce, lease,
+# Viewer identity and the discovered dashboard UID/panel. No source here observes a browser, so no
+# input can ever make the status ``verified``: the highest status is ``owner-attested``.
+BROWSER_FIELDS = {'schema', 'nonce', 'lease', 'attestation', 'login', 'role', 'dashboard_uid', 'panel_id',
+                  'datasource_type', 'ui_result'}
 BROWSER_RESULTS = ('viewer-panel-seen', 'viewer-panel-failed')
+BROWSER_ATTESTATION = 'owner-attested'
+BROWSER_VERIFIED = 'verified'  # reserved; no code path in this source produces it
 
 # Hash-verifying root stub. It authenticates BOTH vlab_trial.py (primitives) and management_trial.py
 # against host-held digests BEFORE executing either, then calls the (activation-gated) bootstrap.
@@ -155,8 +161,9 @@ def listening():
 def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, process_uncertain):
     """Original-master loopback forward -> owner-completed browser check -> explicit teardown.
 
-    -> (browser_status, forward_absent). The result is ONLY what the owner attested in the private
-    completion file under the original clock; curl/API/admin evidence can never produce it.
+    -> (browser_status, forward_absent). The best status is ``owner-attested``: what the owner wrote
+    in the private completion file under the original clock, bound to nonce/lease/Viewer/dashboard.
+    It is NOT verified browser evidence; curl/API/admin evidence can never produce either.
     """
     if private is None:
         return 'skipped', True
@@ -188,9 +195,16 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
                 guest.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
                               and stat.S_IMODE(info.st_mode) == 0o600)
                 value = guest.data(guest.regular(done, 512, os.geteuid(), 0o600))
-                guest.require(type(value) is dict and set(value) == BROWSER_FIELDS and value['schema'] == 1
-                              and value['nonce'] == nonce and value['result'] in BROWSER_RESULTS)
-                status = 'complete' if value['result'] == 'viewer-panel-seen' else 'failed'
+                expected = guest.data(raw_handoff)
+                uid, panel = re.fullmatch(r'/d/([A-Za-z0-9_-]{1,40})\?viewPanel=([0-9]{1,6})', expected['path']).groups()
+                guest.require(type(value) is dict and set(value) == BROWSER_FIELDS and value['schema'] == 2
+                              and value['nonce'] == nonce and value['lease'] == lease
+                              and value['attestation'] == BROWSER_ATTESTATION
+                              and value['login'] == expected['login'] and value['role'] == 'Viewer'
+                              and value['dashboard_uid'] == uid and type(value['panel_id']) is int
+                              and value['panel_id'] == int(panel) and value['datasource_type'] == 'prometheus'
+                              and value['ui_result'] in BROWSER_RESULTS)
+                status = BROWSER_ATTESTATION if value['ui_result'] == 'viewer-panel-seen' else 'failed'
                 break
             time.sleep(2)
     except BaseException as error:
@@ -413,11 +427,12 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
                    'failure_category': category, 'host_operation': held.operation, 'own_key_absent': key_absent,
                    'local_files_absent': local_absent, 'independent_cleanup_dispatched': dispatched,
                    'lease': rec['request_id'], 'forward_absent': forward_absent, 'browser': browser,
+                   'browser_verified': browser == BROWSER_VERIFIED,
                    'management_status': typed_state, 'management': typed}
         print(json.dumps(receipt, sort_keys=True))
     if result:
         return result
-    good = typed_state == 'valid' and program.succeeded(typed) and browser == 'complete' and forward_absent
+    good = typed_state == 'valid' and program.succeeded(typed) and browser == BROWSER_VERIFIED and forward_absent  # owner-attested never suffices
     return 0 if good and all((process_absent, key_absent, local_absent, dispatched)) else 1
 
 

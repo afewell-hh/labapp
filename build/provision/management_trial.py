@@ -11,10 +11,13 @@ Activation is HELD. ``refuse_activation`` always raises while ``ACTIVATION_BLOCK
 non-empty; no flag, environment value or argument bypasses it, and source code does not record
 any approval. Importing this module performs no IO or privileged action.
 
-Not a guardian: unlike the VLAB trial there is no autonomous in-guest supervisor. Every step
+Supervision: this is not the VLAB guardian service and adds no unit or controller. Every step
 re-checks contract, boot, heartbeat freshness and the management clock before each child, and
-containment of an orphaned child after host loss relies on those gates plus lease/VM expiry.
-Nothing here ever claims ``contained``.
+``stdin_bounded`` re-runs that same gate on every <=0.1s tick while a child is live, so heartbeat
+loss, boot change, phase cutoff, deadline, interruption or cancel kill the child's exact process
+group before the failure propagates (also after every clean exit, so no child outlives its step).
+Teardown children honor only the immutable 60-minute ceiling. An orphan left by SIGKILL of the
+step runner itself is still bounded only by lease/VM expiry. Nothing here ever claims ``contained``.
 """
 from __future__ import annotations
 
@@ -65,8 +68,9 @@ PROVIDER_ENVELOPE_SECONDS = 7200
 ACTIVATION_BLOCKERS = (
     'provider-envelope-7200s-versus-60-minute-component-decision',
     'artifact-egress-and-image-inventory-unresolved',
-    'viewer-accessible-chart-panel-unresolved',
+    'viewer-dashboard-runtime-discovery-unobserved',
     'private-viewer-handoff-and-browser-forward-review',
+    'no-authorized-verified-browser-observer',
     'quota-shape-budget-unresolved',
     'reviewed-activation-and-separate-experiment-authorization',
 )
@@ -136,9 +140,16 @@ PROBE_METRIC = 'labapp_management_trial_probe'
 PROBE_FRESH_SECONDS = 120
 QUERY_TIMEOUT = 5
 HTTP_LIMIT = 262144
-# Source-backed Viewer-accessible chart-provided panel is NOT resolved. A Grafana 11.2.1
-# Viewer lacks Explore, so None refuses the viewer-ready step instead of inventing a marker.
-VIEWER_PANEL = None  # when resolved: {'uid': str, 'panel_id': int}
+# Existing chart dashboard, read from the RAW pinned source (prometheus-community/helm-charts
+# 05fcb4c0, kube-prometheus-stack/templates/grafana/dashboards-1.14/prometheus.yaml; read through a
+# summarising fetch, so the constants are qualified until the lead re-reads the bytes): title
+# "Prometheus / Overview", tag "prometheus-mixin", uid "" (Grafana assigns the UID at runtime), panel
+# id 7 "Head Series", type graph, datasource "$datasource" from a template variable of type
+# datasource / query prometheus. The runtime UID is DISCOVERED as the Viewer, never pinned. Viewer
+# Explore, editing and ViewersCanEdit are not used. Runtime behavior is unobserved.
+VIEWER_DASHBOARD = {'title': 'Prometheus / Overview', 'tag': 'prometheus-mixin', 'panel_id': 7,
+                    'panel_title': 'Head Series', 'panel_types': ('graph', 'timeseries'),
+                    'datasource_variable': 'datasource', 'datasource_type': 'prometheus'}
 VIEWER_LOGIN = r'labapp-viewer-[a-f0-9]{6}'
 VIEWER_PASSWORD = r'[A-Za-z0-9_-]{16,64}'
 HANDOFF_FIELDS = {'schema', 'nonce', 'login', 'password', 'path', 'port'}
@@ -268,21 +279,33 @@ def tool_env(extra=None):
     return env  # never KUBECONFIG: every kubectl/helm call names the private file explicitly
 
 
-def stdin_bounded(argv, seconds, data, env, limit=1024**2):
-    """Like hhfab_release.bounded plus a bounded stdin; kills the whole group on every failure."""
+def stdin_bounded(argv, seconds, data, env, limit=1024**2, watch=None):
+    """ONE supervised child: bounded stdin/output/time plus continuous ``watch`` while it is live.
+
+    ``watch`` (the fixed gate from ``run_tool``) runs on every poll tick (<=0.1s), during output
+    reads AND while waiting for exit. Whatever it raises (heartbeat/owner loss, boot change, phase
+    or cleanup cutoff) or any interruption/cancel kills the child's whole process group and reaps
+    the leader before propagating. The group is also killed after a clean exit so no descendant of
+    a finished step outlives it.
+    """
     base.require(type(data) is bytes and len(data) <= 4096)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
     clean = False
     try:
         deadline = time.monotonic() + seconds
-        proc.stdin.write(data)
-        proc.stdin.close()
+        try:
+            proc.stdin.write(data)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass  # child exited before reading; its exit status is judged below
         output = bytearray()
         os.set_blocking(proc.stdout.fileno(), False)
         with selectors.DefaultSelector() as select:
             select.register(proc.stdout, selectors.EVENT_READ)
             while select.get_map():
+                if watch is not None:
+                    watch()
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise base.Failure('bounded child failed', 124, 'child-timeout')
@@ -297,30 +320,50 @@ def stdin_bounded(argv, seconds, data, env, limit=1024**2):
                     if len(output) + len(block) > limit:
                         raise base.Failure('bounded child failed', 1, 'output-overflow')
                     output.extend(block)
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise base.Failure('bounded child failed', 124, 'child-timeout')
-        try:
-            code = proc.wait(timeout=left)
-        except subprocess.TimeoutExpired:
-            raise base.Failure('bounded child failed', 124, 'child-timeout') from None
+        while True:
+            if watch is not None:
+                watch()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise base.Failure('bounded child failed', 124, 'child-timeout')
+            try:
+                code = proc.wait(timeout=min(left, .1))
+                break
+            except subprocess.TimeoutExpired:
+                continue
         clean = True
         return code, bytes(output)
     finally:
-        if not clean:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except BaseException:
-                pass
-            try:
-                proc.wait(timeout=3)
-            except BaseException:
-                pass
+        # Exact owned-process teardown on EVERY path: this child's own session/group only.
+        failure = None
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            failure = error
+        try:
+            proc.wait(timeout=3)
+        except BaseException as error:
+            failure = failure or error
         for pipe in (proc.stdin, proc.stdout):
             try:
                 pipe.close()
             except BaseException:
                 pass
+        if failure is not None and clean:
+            raise base.Failure('owned child teardown uncertain', 1, 'exception')
+
+
+def watcher(ctx, phase, cleanup):
+    """Fixed continuous gate for a live child. Cleanup honors only the immutable ceiling: host,
+    heartbeat or phase loss must never stop teardown itself."""
+    if cleanup:
+        return lambda: ManagementClock(ctx.value).cleanup_remaining()
+
+    def watch():
+        gate(ctx.value).remaining(phase)
+    return watch
 
 
 class Context:
@@ -350,10 +393,8 @@ def run_tool(ctx, argv, phase, cap, *, data=None, env=None, cleanup=False):
     seconds = min(cap, clock.cleanup_remaining() if cleanup else clock.remaining(phase))
     args = [str(a) for a in argv]
     environment = env if env is not None else tool_env()
-    if data is None:
-        code, out = base.call_bounded(args, seconds, env=environment)
-    else:
-        code, out = stdin_bounded(args, seconds, data, environment)
+    # Every child is supervised continuously (heartbeat/boot/clock on each tick), with or without stdin.
+    code, out = stdin_bounded(args, seconds, data or b'', environment, watch=watcher(ctx, phase, cleanup))
     if code:
         raise base.child_failure(code, 'fixed child failed')
     return out
@@ -729,16 +770,61 @@ def step_persisted_principal(ctx):
     ctx.observe('principal_persisted')
 
 
+def panel_matches(dashboard):
+    """Panels (top level or inside collapsed rows) with the pinned source panel id."""
+    found = []
+    for item in dashboard.get('panels') or []:
+        if type(item) is not dict:
+            continue
+        found.extend([item] if item.get('id') == VIEWER_DASHBOARD['panel_id'] else [])
+        found.extend(p for p in item.get('panels') or [] if type(p) is dict and p.get('id') == VIEWER_DASHBOARD['panel_id'])
+    return found
+
+
+def discover_viewer_panel(ctx, viewer):
+    """Find the ONE existing chart dashboard as the Viewer; the runtime UID is only ever read, never invented.
+
+    The pinned chart source has uid "" so Grafana assigns the UID at provisioning time. Zero or
+    several matches, a wrong title/panel/datasource, or a Viewer that can edit/save/administer
+    the dashboard all refuse. Nothing is created, edited, shared or elevated here.
+    """
+    spec = VIEWER_DASHBOARD
+    query = urllib.parse.urlencode({'type': 'dash-db', 'query': spec['title'], 'tag': spec['tag'], 'limit': 20})
+    status, rows = grafana(ctx, 'GET', '/api/search?' + query, viewer)
+    base.require(status == 200 and type(rows) is list, 'viewer dashboard search unavailable')
+    rows = [r for r in rows if type(r) is dict and r.get('title') == spec['title'] and r.get('type') == 'dash-db']
+    base.require(len(rows) == 1, 'viewer dashboard missing or ambiguous')
+    uid = rows[0].get('uid')
+    base.require(type(uid) is str and re.fullmatch(r'[A-Za-z0-9_-]{1,40}', uid) is not None, 'dashboard uid refused')
+    status, body = grafana(ctx, 'GET', '/api/dashboards/uid/' + uid, viewer)
+    base.require(status == 200 and type(body) is dict and type(body.get('dashboard')) is dict
+                 and type(body.get('meta')) is dict, 'viewer cannot read panel dashboard')
+    dashboard, meta = body['dashboard'], body['meta']
+    base.require(dashboard.get('title') == spec['title'] and dashboard.get('uid') == uid, 'dashboard identity differs')
+    base.require(all(meta.get(k) is False for k in ('canSave', 'canEdit', 'canAdmin')), 'viewer can modify dashboard')
+    matches = panel_matches(dashboard)
+    base.require(len(matches) == 1, 'panel absent or ambiguous')
+    panel = matches[0]
+    base.require(panel.get('title') == spec['panel_title'] and panel.get('type') in spec['panel_types'], 'panel differs')
+    source = panel.get('datasource')
+    source = source.get('uid') if type(source) is dict else source
+    base.require(source in ('$datasource', '${datasource}'), 'panel datasource differs')
+    variables = [v for v in (dashboard.get('templating') or {}).get('list') or []
+                 if type(v) is dict and v.get('name') == spec['datasource_variable']]
+    base.require(len(variables) == 1 and variables[0].get('type') == 'datasource'
+                 and variables[0].get('query') == spec['datasource_type'], 'datasource variable differs')
+    return {'uid': uid, 'panel_id': spec['panel_id']}
+
+
 def step_viewer_ready(ctx):
-    panel = VIEWER_PANEL
-    base.require(panel is not None, 'viewer panel unresolved')
-    base.require(type(panel) is dict and set(panel) == {'uid', 'panel_id'} and type(panel['panel_id']) is int
-                 and re.fullmatch(r'[A-Za-z0-9_-]{1,40}', panel['uid']) is not None, 'viewer panel refused')
-    viewer = viewer_credentials()
-    status, dashboard = grafana(ctx, 'GET', '/api/dashboards/uid/' + panel['uid'], viewer)  # as the Viewer
-    base.require(status == 200 and type(dashboard) is dict, 'viewer cannot read panel dashboard')
-    panels = dashboard.get('dashboard', {}).get('panels') or []
-    base.require(any(p.get('id') == panel['panel_id'] for p in panels), 'panel absent')
+    admin, viewer = admin_auth(), viewer_credentials()
+    verify_viewer(ctx, admin, viewer)  # still exactly a non-admin Viewer before any dashboard is read
+    status, datasources = grafana(ctx, 'GET', '/api/datasources', admin)
+    base.require(status == 200 and type(datasources) is list
+                 and len([d for d in datasources if d.get('type') == VIEWER_DASHBOARD['datasource_type']]) == 1,
+                 'prometheus datasource missing or ambiguous')
+    panel = discover_viewer_panel(ctx, viewer)
+    ctx.private['viewer_panel'] = panel
     record = {'schema': 1, 'nonce': ctx.value['nonce'], 'login': viewer[0], 'password': viewer[1],
               'path': '/d/%s?viewPanel=%d' % (panel['uid'], panel['panel_id']), 'port': GRAFANA_PORT}
     validate_handoff(record, ctx.value['nonce'])

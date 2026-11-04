@@ -2707,7 +2707,7 @@ class ManagementCaller(unittest.TestCase):
         self.directory.chmod(0o700)
         self.private.chmod(0o700)
 
-    def sequence(self, master, *, private=None, value=None, registration=None, browser=('complete', True),
+    def sequence(self, master, *, private=None, value=None, registration=None, browser=('verified', True),
                  trusted=None, clock=None):
         caller, program = self.caller, self.program
         value = value or snapshot()
@@ -2876,12 +2876,23 @@ class ManagementCaller(unittest.TestCase):
         return args[4] in ('heartbeat', 'export-viewer', 'result', 'teardown', 'step') and (
             args[4] != 'step' or args[-1] in program.STEP_NAMES)
 
+    def test_owner_attested_or_unobserved_browser_never_yields_whole_trial_success(self):
+        for browser in (('owner-attested', True), ('failed', True), ('skipped', True), ('timeout', True),
+                        ('complete', True)):
+            with self.subTest(browser=browser[0]):
+                code, receipt, _ = self.sequence(FakeManagementMaster(self.program), private=self.private, browser=browser)
+                self.assertEqual(code, 1)
+                self.assertFalse(receipt['browser_verified'])
+        self.assertFalse(hasattr(self.caller, 'verify_browser'))  # no verifier exists in this source
+
     def test_valid_sequence_preserves_order_clock_and_original_master_for_every_call(self):
         program = self.program
         master = FakeManagementMaster(program)
         code, receipt, spy = self.sequence(master, private=self.private)
         self.assertEqual(code, 0)
-        self.assertEqual((receipt['management_status'], receipt['browser'], receipt['forward_absent']), ('valid', 'complete', True))
+        # 'verified' is injected here ONLY to exercise the success predicate: this source cannot produce it.
+        self.assertEqual((receipt['management_status'], receipt['browser'], receipt['forward_absent']), ('valid', 'verified', True))
+        self.assertTrue(receipt['browser_verified'])
         self.assertTrue(program.succeeded(receipt['management']))
         calls = [c for c in master.calls if 'heartbeat' not in c[0]]
         self.assertTrue(all(self.allowed(c[0]) for c in master.calls), [c[0] for c in master.calls])
@@ -3009,7 +3020,7 @@ class ManagementCaller(unittest.TestCase):
 
     # -- browser: original-master loopback forward -----------------------------------------------------
     def browser(self, *, outcome='viewer-panel-seen', mode=0o600, lost=False, listening_start=False, cancel_fails=False,
-                private='default', wait=0.05, write=True):
+                private='default', wait=0.05, write=True, override=None):
         caller, program = self.caller, self.program
         master = FakeManagementMaster(program)
         master.lost_after = 1 if lost else None  # first guard passes, the next socket check finds it gone
@@ -3023,7 +3034,11 @@ class ManagementCaller(unittest.TestCase):
         self.last_private = private
         if write and private is not None:
             done = private / ('browser-complete-' + lease + '.json')
-            done.write_text(json.dumps({'schema': 1, 'nonce': nonce, 'result': outcome}))
+            attestation = {'schema': 2, 'nonce': nonce, 'lease': lease, 'attestation': 'owner-attested',
+                           'login': 'labapp-viewer-abc123', 'role': 'Viewer', 'dashboard_uid': 'chartpanel',
+                           'panel_id': 7, 'datasource_type': 'prometheus', 'ui_result': outcome}
+            attestation.update(override or {})
+            done.write_text(json.dumps(attestation))
             done.chmod(mode)
 
         def command(argv, seconds, **kw):
@@ -3040,9 +3055,21 @@ class ManagementCaller(unittest.TestCase):
                                             threading.Event(), uncertain)
         return status, master, commands, uncertain, lease
 
+    def test_browser_attestation_must_bind_nonce_lease_viewer_dashboard_and_panel(self):
+        for override in ({'nonce': 'b' * 32}, {'lease': 'other-lease'}, {'login': 'labapp-viewer-fffff0'},
+                         {'role': 'Editor'}, {'dashboard_uid': 'other'}, {'panel_id': 8}, {'panel_id': '7'},
+                         {'datasource_type': 'loki'}, {'attestation': 'verified'}, {'schema': 1}, {'extra': 1},
+                         {'ui_result': 'seen'}):
+            with self.subTest(override=override):
+                status, _, commands, *_ = self.browser(override=override)
+                self.assertEqual(status, ('forward-failed', True))
+                self.assertEqual(commands[-1][commands[-1].index('-O') + 1], 'cancel')
+        status, *_ = self.browser(override={'result': 'viewer-panel-seen'})  # old marker field is not a schema
+        self.assertEqual(status, ('forward-failed', True))
+
     def test_browser_forward_is_original_master_loopback_only_and_complete_only_by_owner_attestation(self):
         status, master, commands, uncertain, lease = self.browser()
-        self.assertEqual(status, ('complete', True))
+        self.assertEqual(status, ('owner-attested', True))  # attested by the owner, NOT verified browser evidence
         self.assertEqual([c[c.index('-O') + 1] for c in commands], ['forward', 'cancel'])
         forward = commands[0]
         self.assertEqual(forward[0], '/usr/bin/ssh')
@@ -3079,7 +3106,7 @@ class ManagementCaller(unittest.TestCase):
 
     def test_browser_cancel_failure_with_surviving_listener_marks_cleanup_uncertain(self):
         status, master, commands, uncertain, _ = self.browser(cancel_fails=True)
-        self.assertEqual(status, ('complete', False))
+        self.assertEqual(status, ('owner-attested', False))
         self.assertTrue(uncertain.is_set())
 
 

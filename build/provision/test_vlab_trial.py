@@ -19,6 +19,7 @@ import tempfile
 import time
 import stat
 import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -4514,6 +4515,20 @@ class ManagementModel:
         self.role, self.viewer_admin, self.viewer_settings, self.users = 'Viewer', False, 403, {}
         self.admin = None
         self.sample_age = 0
+        self.datasources = [{'uid': 'prom-uid', 'type': 'prometheus'}, {'uid': 'am-uid', 'type': 'alertmanager'}]
+        # Grafana assigns the UID at provisioning (the pinned chart source has uid ""); the stand-in generates one.
+        self.generated_uid = 'Gx7-generated_01'
+        self.search_status = 200
+        self.search_rows = [{'uid': self.generated_uid, 'title': 'Prometheus / Overview', 'type': 'dash-db',
+                             'tags': ['prometheus-mixin']}]
+        self.dashboard = {'meta': {'canSave': False, 'canEdit': False, 'canAdmin': False},
+                          'dashboard': {'uid': self.generated_uid, 'title': 'Prometheus / Overview',
+                                        'templating': {'list': [{'name': 'datasource', 'type': 'datasource',
+                                                                 'query': 'prometheus'}]},
+                                        'panels': [{'id': 1, 'type': 'row', 'panels': [],
+                                                    'title': 'Prometheus Stats'},
+                                                   {'id': 7, 'title': 'Head Series', 'type': 'graph',
+                                                    'datasource': '$datasource'}]}}
 
     def run(self, args, env=None, data=None):
         args = [str(a) for a in args]
@@ -4585,9 +4600,17 @@ class ManagementModel:
         if path == '/api/admin/settings':
             return self.viewer_settings, b'{}'
         if path == '/api/datasources':
-            return 200, b'[{"uid":"prom-uid"}]'
+            return 200, json.dumps(self.datasources).encode()
+        if path == '/api/search':
+            self.test.assertEqual(auth[0][:14], 'labapp-viewer-')  # discovery runs as the Viewer only
+            query = urllib.parse.parse_qs(parsed.query)
+            self.test.assertEqual((query['type'], query['tag'], query['query']),
+                                  (['dash-db'], ['prometheus-mixin'], ['Prometheus / Overview']))
+            return self.search_status, json.dumps(self.search_rows).encode()
         if path.startswith('/api/dashboards/uid/'):
-            return 200, b'{"dashboard":{"panels":[{"id":7}]}}'
+            self.test.assertEqual(auth[0][:14], 'labapp-viewer-')
+            self.test.assertEqual(path.rsplit('/', 1)[1], self.search_rows[0]['uid'])
+            return 200, json.dumps(self.dashboard).encode()
         raise AssertionError('unmodelled endpoint ' + path)
 
 
@@ -4616,7 +4639,8 @@ class ManagementProgram(unittest.TestCase):
         self.stack.enter_context(patch.object(trial, 'call_bounded',
                                  side_effect=lambda args, seconds, env=None: self.model.run(args, env)))
         self.stack.enter_context(patch.object(self.m, 'stdin_bounded',
-                                 side_effect=lambda argv, seconds, data, env, limit=1024**2: self.model.run(argv, env, data)))
+                                 side_effect=lambda argv, seconds, data, env, limit=1024**2, watch=None:
+                                 self.model.run(argv, env, data or None)))
         self.stack.enter_context(patch.object(self.m, 'http', side_effect=self.model.http))
         self.reset(value())
 
@@ -4962,23 +4986,68 @@ class ManagementProgram(unittest.TestCase):
             with self.assertRaises(trial.Failure):
                 self.prepared_principal()
 
-    def test_viewer_ready_refuses_unresolved_panel_and_hands_off_viewer_only_when_resolved(self):
+    def test_viewer_ready_discovers_the_generated_uid_as_viewer_and_hands_off_viewer_only(self):
         m = self.m
         self.prepared_principal()
-        with self.assertRaises(trial.Failure) as raised:
-            m.step_viewer_ready(self.context())
-        self.assertEqual(str(raised.exception), 'viewer panel unresolved')
-        self.assertFalse((m.WORK / 'viewer-handoff.json').exists())
-        with patch.object(m, 'VIEWER_PANEL', {'uid': 'chartpanel', 'panel_id': 7}):
-            m.step_viewer_ready(self.context())
+        self.assertFalse(hasattr(m, 'VIEWER_PANEL'))  # no pinned/invented UID anywhere
+        m.step_viewer_ready(self.context())
         record = trial.data((m.WORK / 'viewer-handoff.json').read_bytes())
         self.assertEqual(set(record), m.HANDOFF_FIELDS)
-        self.assertEqual(record['path'], '/d/chartpanel?viewPanel=7')
+        self.assertEqual(record['path'], '/d/%s?viewPanel=7' % self.model.generated_uid)
         self.assertNotIn(self.model.admin[1], json.dumps(record))
         for bad in (dict(record, password='short'), dict(record, login='admin'), dict(record, port=3001),
                     dict(record, admin='x'), dict(record, nonce='b' * 32), dict(record, path='/api/admin')):
             with self.assertRaises(trial.Failure):
                 m.validate_handoff(bad, NONCE)
+
+    def test_viewer_dashboard_discovery_refuses_missing_duplicate_wrong_and_privileged(self):
+        m = self.m
+        self.prepared_principal()
+
+        def dash():
+            return self.model.dashboard['dashboard']
+        row = dict(self.model.search_rows[0])
+        cases = {
+            'missing': lambda: setattr(self.model, 'search_rows', []),
+            'duplicate': lambda: setattr(self.model, 'search_rows', [row, dict(row, uid='other')]),
+            'wrong title': lambda: setattr(self.model, 'search_rows', [dict(row, title='Other')]),
+            'wrong type': lambda: setattr(self.model, 'search_rows', [dict(row, type='dash-folder')]),
+            'empty uid': lambda: setattr(self.model, 'search_rows', [dict(row, uid='')]),
+            'unsafe uid': lambda: setattr(self.model, 'search_rows', [dict(row, uid='a/../b')]),
+            'search denied': lambda: setattr(self.model, 'search_status', 403),
+            'uid mismatch': lambda: dash().update(uid='other'),
+            'wrong panel id': lambda: dash().update(panels=[dict(dash()['panels'][1], id=8)]),
+            'duplicate panel': lambda: dash().update(panels=[dash()['panels'][1], dict(dash()['panels'][1])]),
+            'wrong panel title': lambda: dash()['panels'][1].update(title='Head Chunks'),
+            'wrong panel type': lambda: dash()['panels'][1].update(type='table'),
+            'wrong datasource': lambda: dash()['panels'][1].update(datasource='loki'),
+            'datasource variable absent': lambda: dash()['templating'].update(list=[]),
+            'datasource variable wrong': lambda: dash()['templating']['list'][0].update(query='loki'),
+            'viewer can save': lambda: self.model.dashboard['meta'].update(canSave=True),
+            'viewer can edit': lambda: self.model.dashboard['meta'].update(canEdit=True),
+            'viewer can admin': lambda: self.model.dashboard['meta'].update(canAdmin=True),
+            'meta absent': lambda: self.model.dashboard.pop('meta'),
+            'no prometheus datasource': lambda: setattr(self.model, 'datasources', [{'uid': 'a', 'type': 'loki'}]),
+            'two prometheus datasources': lambda: setattr(
+                self.model, 'datasources', [{'uid': 'a', 'type': 'prometheus'}, {'uid': 'b', 'type': 'prometheus'}]),
+            'viewer role changed': lambda: setattr(self.model, 'role', 'Editor'),
+            'viewer is admin': lambda: setattr(self.model, 'viewer_admin', True),
+        }
+        original = deepcopy((self.model.search_rows, self.model.dashboard, self.model.datasources))
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                self.model.search_rows, self.model.dashboard, self.model.datasources = deepcopy(original)
+                self.model.search_status, self.model.role, self.model.viewer_admin = 200, 'Viewer', False
+                mutate()
+                with self.assertRaises(trial.Failure):
+                    m.step_viewer_ready(self.context())
+                self.assertFalse((m.WORK / 'viewer-handoff.json').exists())
+        # a nested (collapsed-row) panel and the timeseries migration of the same panel are accepted
+        self.model.search_rows, self.model.dashboard, self.model.datasources = deepcopy(original)
+        nested = dash()['panels']
+        dash()['panels'] = [{'id': 1, 'type': 'row', 'panels': [dict(nested[1], type='timeseries')]}]
+        m.step_viewer_ready(self.context())
+        self.assertTrue((m.WORK / 'viewer-handoff.json').exists())
 
     def test_http_is_loopback_only(self):
         for url in ('http://example.com/', 'http://127.0.0.1:8080/', 'http://127.0.0.1:9090.evil/x', 'file:///etc/passwd'):
@@ -5082,3 +5151,146 @@ class ManagementBounded(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         with self.assertRaises(trial.Failure):
             self.m.stdin_bounded(echo, 10, b'x' * 5000, {'PATH': '/usr/bin'})
+
+
+# Fixture child: records its own and a same-group descendant's pid, then stays alive.
+LIVE_CHILD = ('import os,subprocess,sys,time\n'
+              'g=subprocess.Popen([sys.executable,"-I","-c","import time;time.sleep(60)"],stdout=subprocess.DEVNULL)\n'
+              'open(sys.argv[1],"w").write("%d %d"%(os.getpid(),g.pid))\n'
+              'time.sleep(60)\n')
+EXITING_CHILD = ('import os,subprocess,sys\n'
+                 'g=subprocess.Popen([sys.executable,"-I","-c","import time;time.sleep(60)"],'
+                 'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n'
+                 'open(sys.argv[1],"w").write("%d %d"%(os.getpid(),g.pid))\n')
+
+
+def process_alive(pid):
+    try:
+        text = Path('/proc/%d/stat' % pid).read_text()
+    except OSError:
+        return False
+    return text.rsplit(')', 1)[1].split()[0] != 'Z'  # a reaped-pending zombie is not running
+
+
+class ManagementSupervision(unittest.TestCase):
+    """Continuous supervision of a LIVE child (stdlib fixture children; no native tool, no network)."""
+    def setUp(self):
+        self.m = load_management()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.temp = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-sup-')))
+        self.root = self.temp / 'root'
+        (self.root / 'work').mkdir(parents=True, mode=0o700)
+        self.root.chmod(0o700)
+        self.stack.enter_context(patch.object(self.m, 'MROOT', self.root))
+        self.stack.enter_context(patch.object(self.m, 'WORK', self.root / 'work'))
+        self.stack.enter_context(patch.object(trial, 'regular',
+                                 side_effect=lambda p, limit, uid=None, mode=None: REAL_REGULAR(p, limit, None, mode)))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=MGMT_BOOT))
+        self.pids = self.temp / 'pids'
+        self.env = {'PATH': '/usr/bin:/bin'}
+        self.fresh()
+
+    def fresh(self, contract=None):
+        self.value = contract or value()
+        trial.atomic(self.root / 'heartbeat.json', {'sequence': 0, 'received': time.monotonic()})
+        self.ctx = self.m.Context(self.value, self.m.ManagementClock(self.value), {'private': {}})
+
+    def stale_after_child_starts(self):
+        def lose():
+            until = time.monotonic() + 10
+            while not self.pids.exists() and time.monotonic() < until:
+                REAL_SLEEP(.02)
+            REAL_SLEEP(.2)
+            trial.atomic(self.root / 'heartbeat.json', {'sequence': 0, 'received': time.monotonic() - 60})
+        thread = threading.Thread(target=lose)
+        thread.start()
+        self.addCleanup(thread.join)
+
+    def assert_group_gone(self):
+        pids = [int(p) for p in self.pids.read_text().split()]
+        until = time.monotonic() + 5
+        while any(process_alive(p) for p in pids) and time.monotonic() < until:
+            REAL_SLEEP(.05)
+        self.assertEqual([p for p in pids if process_alive(p)], [])
+
+    def run_live(self, phase='work', cap=30, cleanup=False):
+        return self.m.run_tool(self.ctx, [sys.executable, '-I', '-c', LIVE_CHILD, str(self.pids)], phase, cap,
+                               env=self.env, cleanup=cleanup)
+
+    def test_heartbeat_loss_while_child_is_live_kills_the_exact_group(self):
+        self.stale_after_child_starts()
+        started = time.monotonic()
+        with self.assertRaises(trial.Failure) as raised:
+            self.run_live()
+        self.assertEqual(raised.exception.category, 'heartbeat-loss')
+        self.assertLess(time.monotonic() - started, 15)  # not the 60s child, not the 30s cap
+        self.assert_group_gone()
+
+    def test_phase_deadline_while_child_is_live_kills_the_exact_group(self):
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=49, seconds=57)
+        contract = value()
+        contract['admitted_at'] = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        contract['deadline'] = (start + timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.fresh(contract)
+        started = time.monotonic()
+        with self.assertRaises(trial.Failure) as raised:
+            self.run_live(cap=30)
+        self.assertIn(raised.exception.category, ('phase-cutoff', 'child-timeout'))
+        self.assertLess(time.monotonic() - started, 15)
+        self.assert_group_gone()
+
+    def test_boot_change_while_child_is_live_kills_the_exact_group(self):
+        def reboot():
+            until = time.monotonic() + 10
+            while not self.pids.exists() and time.monotonic() < until:
+                REAL_SLEEP(.02)
+            REAL_SLEEP(.2)
+            trial.kernel_boot.return_value = '33333333-3333-4333-8333-333333333333'
+        thread = threading.Thread(target=reboot)
+        thread.start()
+        self.addCleanup(thread.join)
+        with self.assertRaises(trial.Failure) as raised:
+            self.run_live()
+        self.assertEqual(raised.exception.category, 'boot-change')
+        self.assert_group_gone()
+
+    def test_cancel_or_interrupt_while_child_is_live_kills_the_exact_group(self):
+        def cancel():
+            if self.pids.exists():
+                raise trial.Failure('signal', 143, 'interrupted')  # what the SIGTERM handler raises
+        argv = [sys.executable, '-I', '-c', LIVE_CHILD, str(self.pids)]
+        with self.assertRaises(trial.Failure) as raised:
+            self.m.stdin_bounded(argv, 30, b'', self.env, watch=cancel)
+        self.assertEqual(raised.exception.category, 'interrupted')
+        self.assert_group_gone()
+        self.pids.unlink()
+
+        def interrupt():
+            if self.pids.exists():
+                raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.m.stdin_bounded(argv, 30, b'', self.env, watch=interrupt)
+        self.assert_group_gone()
+
+    def test_a_finished_step_leaves_no_descendant(self):
+        code, _ = self.m.stdin_bounded([sys.executable, '-I', '-c', EXITING_CHILD, str(self.pids)], 30, b'',
+                                       self.env, watch=self.m.watcher(self.ctx, 'work', False))
+        self.assertEqual(code, 0)
+        self.assert_group_gone()
+
+    def test_teardown_children_ignore_heartbeat_loss_but_keep_the_ceiling(self):
+        trial.atomic(self.root / 'heartbeat.json', {'sequence': 0, 'received': time.monotonic() - 60})
+        out = self.m.run_tool(self.ctx, [sys.executable, '-I', '-c', 'print(7)'], None, 30, env=self.env, cleanup=True)
+        self.assertEqual(out, b'7\n')
+        with self.assertRaises(trial.Failure) as raised:  # the normal path refuses the same stale heartbeat
+            self.m.run_tool(self.ctx, [sys.executable, '-I', '-c', 'print(7)'], 'work', 30, env=self.env)
+        self.assertEqual(raised.exception.category, 'heartbeat-loss')
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=61)
+        late = value()
+        late['admitted_at'] = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        late['deadline'] = (start + timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.ctx.value = late
+        with self.assertRaises(trial.Failure) as raised:
+            self.m.run_tool(self.ctx, [sys.executable, '-I', '-c', 'print(7)'], None, 30, env=self.env, cleanup=True)
+        self.assertEqual(raised.exception.category, 'phase-cutoff')

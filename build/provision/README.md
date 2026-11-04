@@ -1754,9 +1754,26 @@ later, separately reviewed activation would expose; only offline synthetic tests
   `/d/<uid>?viewPanel=<id>`, port 3000); admin credentials and the kubeconfig cannot be expressed in it. The
   host writes it to a bounded 0600 file in the lead-owned private directory, opens ONE original-master loopback
   forward `127.0.0.1:3000`, checks the original socket identity on every poll, and tears the forward down
-  explicitly. Browser success is ONLY an owner-written 0600 completion file
-  (`browser-complete-<lease>.json`, `viewer-panel-seen`) within the original work clock; curl/API/admin evidence
-  never produces it, and no browser automation is added.
+  explicitly. The dashboard is DISCOVERED, not pinned: the pinned chart's `prometheus.yaml` (helm-charts
+  `05fcb4c0`, read through a summarising fetch, so re-read the raw bytes) has title `Prometheus / Overview`, tag
+  `prometheus-mixin`, `uid ""` and panel id 7 `Head Series` on the `$datasource` variable. `viewer-ready` searches
+  AS THE VIEWER (`/api/search`), requires exactly one match, reads the generated UID, and checks the Viewer cannot
+  save/edit/administer it, the panel id/title/type, the datasource variable and exactly one `prometheus`
+  datasource; missing, duplicate or wrong results refuse. No Explore, editing, `ViewersCanEdit` or new dashboard.
+  **Browser evidence is OWNER-ATTESTED only.** The host accepts a private 0600 `browser-complete-<lease>.json`
+  (schema 2: nonce, lease, `attestation: owner-attested`, Viewer login, role `Viewer`, discovered dashboard UID,
+  panel id, `datasource_type: prometheus`, `ui_result`) bound to the handoff; the best status is `owner-attested`.
+  No verified-browser observer exists in this source, so `browser_verified` is `false`, the whole-trial success
+  predicate needs `verified`, and the execution gate stays (`no-authorized-verified-browser-observer`). Operator
+  steps (engineering use, not course content, and not run): forward the loopback port, sign in as the TEST Viewer
+  from the private handoff, open the handoff `path`, record what the panel shows, then write the completion file.
+  There is no guarantee the UI works until a separately authorized runtime run.
+* **Continuous supervision.** `stdin_bounded` runs the fixed gate (kernel boot, heartbeat freshness, management
+  clock) every <=0.1s while any child is live; heartbeat loss, boot change, phase cutoff, deadline, signal or
+  interruption kill the child's exact process group, and the group is killed after every exit so no step leaves a
+  descendant. Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
+  guardian and `vlab_trial.py` are unchanged. Loss of the step runner process itself is still bounded only by
+  lease/VM expiry.
 * **Outcome.** A closed nonsecret typed result (`validate_result`: per-step ok/failed/not-run, one first failure
   with category and child status, sixteen booleans, teardown pending/complete/uncertain) is read after the fixed
   `teardown` through the same original master. No secret, argv or raw output enters it or the receipt.
@@ -1766,9 +1783,9 @@ later, separately reviewed activation would expose; only offline synthetic tests
 
 **Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
 (2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,
-K3s-internal and `busybox` images); (3) `VIEWER_PANEL` is `None`: no source-backed chart-provided Viewer-accessible
-datasource panel is resolved (a Grafana 11.2.1 Viewer lacks Explore), so `viewer-ready` refuses instead of
-inventing a marker or elevating a role; (4) review of the private Viewer handoff and the loopback forward;
+K3s-internal and `busybox` images); (3) runtime discovery of the existing Viewer dashboard/panel is unobserved
+(source constants are summariser-read; Viewer permissions on the provisioned dashboard are only checked at runtime);
+(4) review of the private Viewer handoff and the loopback forward, and no authorized verified-browser observer;
 (5) quota, shape and budget, and the existing owner-accessible n2-standard-32/500GiB lease stays unchanged;
 (6) reviewed activation plus a separately authorized experiment. Unverified runtime assumptions (each refuses
 rather than guesses): exactly one pod per `app.kubernetes.io/name=prometheus|grafana`, container name
