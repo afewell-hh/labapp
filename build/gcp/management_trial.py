@@ -1,0 +1,453 @@
+"""Trusted owner-local caller for the ONE fixed management guest program (issue #506).
+
+SOURCE-INACTIVE. ``main`` and ``trial`` refuse unconditionally through
+``program.refuse_activation`` before any file, credential, network or cloud object is touched;
+there is no flag, argument or environment value that bypasses it and this source does not record any
+approval. ``sequence`` is the internal body a later, separately reviewed activation would expose;
+it is exercised only by offline synthetic tests.
+
+It adds NO command selector, controller, provider/profile/IAM change or student CLI. Everything
+that protects the VLAB trial is reused unchanged from ``build.gcp.vlab_trial``: trusted-main source
+binding, owner registration (CAS/lease), OS Login own-key import and cleanup, pinned host key, the
+ONE original ControlMaster with its failing fallback proxy (``Master.remote``/``transfer``/``check``),
+heartbeat, bounded private captures, creator cancellation and positive cleanup. The only differences
+are the fixed management tables (``build.provision.management_trial``) and the admission-anchored
+60-minute management clock. ``contained`` is never claimed: there is no in-guest guardian.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import socket
+import stat
+import sys
+import threading
+import time
+
+from build.provision import management_trial as program
+from build.provision import vlab_trial as guest
+from . import owned_process
+from .inspection.hostkey import extract_ed25519
+from .lifecycle import spec
+from .lifecycle.access_records import AccessError, canonical
+from .lifecycle.oslogin import OwnKeyImport, cleanup_own_key, profile_user
+from . import vlab_trial as owner
+
+STEP_CAPS = {
+    'install-docker': 260, 'install-kubectl': 60, 'install-helm': 150, 'install-k3d': 200, 'daemon-start': 60,
+    'storage': 30, 'cluster': 360, 'namespace': 40, 'secret': 60, 'helm': 640, 'health': 300,
+    'probe-push': 120, 'probe-read': 240, 'principal': 200, 'restart': 900, 'historical': 60,
+    'persisted-principal': 200, 'viewer-ready': 60}
+TEARDOWN_CAP = 240
+RESULT_CAP = 15
+EXPORT_CAP = 15
+BROWSER_MIN_SECONDS = 60       # less work time than this -> browser step skipped, never faked
+BROWSER_WAIT_SECONDS = 600     # upper bound; always clipped to the original remaining work time
+FORWARD_HOST, FORWARD_PORT = '127.0.0.1', program.GRAFANA_PORT
+FORWARD_SPEC = '%s:%d:%s:%d' % (FORWARD_HOST, FORWARD_PORT, program.BIND_ADDRESS, program.GRAFANA_PORT)
+BROWSER_FIELDS = {'schema', 'nonce', 'result'}
+BROWSER_RESULTS = ('viewer-panel-seen', 'viewer-panel-failed')
+
+# Hash-verifying root stub. It authenticates BOTH vlab_trial.py (primitives) and management_trial.py
+# against host-held digests BEFORE executing either, then calls the (activation-gated) bootstrap.
+# It selects nothing: no path, action or command comes from arguments other than the fixed layout.
+STUB = """import hashlib,os,stat,sys,types
+from pathlib import Path
+p=Path(sys.argv[1])
+def load(name,expected,module):
+    f=os.open(p/name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    s=os.fstat(f)
+    assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and 0<s.st_size<=262144
+    b=os.read(f,262145); os.close(f)
+    assert len(b)==s.st_size and hashlib.sha256(b).hexdigest()==expected
+    m=types.ModuleType(module); m.__file__=str(p/name)
+    sys.modules[module]=m
+    exec(compile(b,str(p/name),'exec'),m.__dict__)
+    return m
+load('vlab_trial.py',sys.argv[2],'vlab_trial')
+m=load('management_trial.py',sys.argv[3],'management_trial')
+m.bootstrap(p,sys.argv[4])
+"""
+MANAGEMENT_SCRIPT = str(program.MROOT / 'management_trial.py')
+SUDO = ['/usr/bin/sudo', '-n', '/usr/bin/python3']
+
+
+def step_command(nonce, name):
+    guest.require(name in program.STEP_NAMES and re.fullmatch('[a-f0-9]{32}', nonce))
+    return [*SUDO, MANAGEMENT_SCRIPT, 'step', '--nonce', nonce, '--name', name]
+
+
+def fixed_command(action, nonce, sequence=None):
+    guest.require(action in ('heartbeat', 'export-viewer', 'result', 'teardown') and re.fullmatch('[a-f0-9]{32}', nonce))
+    extra = [] if sequence is None else ['--sequence', str(sequence)]
+    return [*SUDO, MANAGEMENT_SCRIPT, action, '--nonce', nonce, *extra]
+
+
+def management_source_files(snapshot, output):
+    """Management twin of ``vlab_trial.source_files``: the fixed table only, from the trusted-main SHA."""
+    result = {}
+    for name, path in program.SOURCES.items():
+        value = owner.github('contents/' + path + '?ref=' + snapshot['source_sha'], 512 * 1024)
+        guest.require(value.get('type') == 'file' and value.get('path') == path and value.get('encoding') == 'base64'
+                      and type(value.get('size')) is int and 0 < value['size'] <= guest.MAX_SOURCE)
+        raw = base64.b64decode(value['content'].replace('\n', ''), validate=True)
+        guest.require(len(raw) == value['size'])
+        guest.exclusive(output / name, raw)
+        result[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
+    return result
+
+
+def stage_program(snapshot, payloads, output, initial):
+    """Fixed source + hash/size-pinned payloads + contract -> verified manifest table."""
+    source = management_source_files(snapshot, output)
+    for name, pin in program.PAYLOADS.items():
+        raw = guest.regular(guest.no_links(payloads / name), pin[0], os.geteuid())
+        guest.require((len(raw), guest.sha(raw)) == pin, 'payload bytes refused')
+        guest.exclusive(output / name, raw)
+    guest.exclusive(output / 'contract.json', canonical(initial))
+    for name in program.FILES - set(source):
+        raw = guest.regular(output / name, program.PAYLOADS[name][0] if name in program.PAYLOADS else guest.MAX_SOURCE,
+                            os.geteuid())
+        source[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
+    table = program.manifest({'schema': 1, 'source_sha': snapshot['source_sha'], 'files': source})
+    guest.exclusive(output / 'manifest.json', canonical(table))
+    return source, table
+
+
+def bootstrap_command(incoming, source, table):
+    return [*SUDO, '-I', '-c', STUB, incoming, source['vlab_trial.py']['sha256'],
+            source['management_trial.py']['sha256'], guest.sha(canonical(table))]
+
+
+def management_result(raw, nonce):
+    """-> (state, record). Nothing is trusted before the strict closed validator accepts all of it."""
+    if raw == b'absent':
+        return 'absent', None
+    try:
+        guest.require(type(raw) is bytes and 0 < len(raw) <= 4096 and raw != b'invalid')
+        return 'valid', program.validate_result(guest.data(raw), nonce)
+    except Exception:
+        return 'invalid', None
+
+
+def forward_command(master, verb):
+    guest.require(verb in ('forward', 'cancel'))
+    # Same original socket and the same deliberately failing fallback proxy as every other call.
+    return ['/usr/bin/ssh', *master.options, '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false',
+            '-O', verb, '-L', FORWARD_SPEC, master.target]
+
+
+def listening():
+    try:
+        with socket.create_connection((FORWARD_HOST, FORWARD_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, process_uncertain):
+    """Original-master loopback forward -> owner-completed browser check -> explicit teardown.
+
+    -> (browser_status, forward_absent). The result is ONLY what the owner attested in the private
+    completion file under the original clock; curl/API/admin evidence can never produce it.
+    """
+    if private is None:
+        return 'skipped', True
+    try:
+        left = clock.remaining('work')
+    except guest.Failure:
+        return 'skipped', True
+    if left < BROWSER_MIN_SECONDS or listening():
+        return 'skipped', True  # nothing was opened by this program
+    handoff = private / ('viewer-handoff-' + lease + '.json')
+    done = private / ('browser-complete-' + lease + '.json')
+    guest.exclusive(handoff, raw_handoff)  # bounded private owner file, Viewer-only schema
+    status, opened = 'forward-failed', False
+    try:
+        until = owned_process.monotonic() + min(15, left)
+        master.check(until)
+        owner.command(forward_command(master, 'forward'), owner.Master.slice(15, until), until=until, failed=failed)
+        opened = True
+        master.check()
+        guest.require(listening(), 'forward not listening')
+        status = 'timeout'
+        end = owned_process.monotonic() + min(BROWSER_WAIT_SECONDS, clock.remaining('work') - 30)
+        while owned_process.monotonic() < end:
+            guest.require(not failed.is_set(), 'heartbeat/master failed')
+            master.check()  # original socket identity + liveness on every poll: no reconnect, no new auth
+            guest.require(listening(), 'forward lost')
+            if done.exists():
+                info = done.lstat()
+                guest.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                              and stat.S_IMODE(info.st_mode) == 0o600)
+                value = guest.data(guest.regular(done, 512, os.geteuid(), 0o600))
+                guest.require(type(value) is dict and set(value) == BROWSER_FIELDS and value['schema'] == 1
+                              and value['nonce'] == nonce and value['result'] in BROWSER_RESULTS)
+                status = 'complete' if value['result'] == 'viewer-panel-seen' else 'failed'
+                break
+            time.sleep(2)
+    except BaseException as error:
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+        if status == 'timeout':
+            status = 'forward-failed'
+    finally:
+        absent = not opened
+        if opened:
+            try:
+                owner.command(forward_command(master, 'cancel'), 10)
+            except BaseException as error:
+                if getattr(error, 'cleanup_uncertain', False):
+                    process_uncertain.set()
+            absent = not listening()
+        if not absent:
+            process_uncertain.set()
+    return status, absent
+
+
+HOST_OPERATIONS = frozenset({
+    'preflight', 'source-check', 'registration-check', 'owner-check', 'key-generation', 'key-registration',
+    'access-prepare', 'access-import', 'host-key', 'master-start', 'guest-boot', 'guest-probe', 'program-stage',
+    'source-transfer', 'bootstrap', 'heartbeat-start', 'management-step', 'viewer-export', 'browser',
+    'teardown', 'result-read'})
+
+
+class Held:
+    """Resources that the finalizer must release even after a partial enrollment."""
+    def __init__(self):
+        self.master = self.context = self.thread = None
+        self.attempted = False  # a guest bootstrap was attempted, so fixed teardown must be tried
+        self.operation = 'preflight'
+
+
+def enroll(snapshot, output, registration, records, login, rec, clock, failed, initial, held):
+    """Mirror of the VLAB enrollment up to the verified original master (same checks, same order)."""
+    held.operation = 'source-check'
+    owner.trusted_source(snapshot, initial=True)
+    held.operation = 'registration-check'
+    rec = registration.current()
+    held.operation = 'owner-check'
+    account = owner.command(['gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'], 15).decode().strip()
+    guest.require(account == owner.OWNER)
+    impersonation = owner.command(['gcloud', 'config', 'get-value', 'auth/impersonate_service_account', '--quiet'], 15).decode().strip()
+    guest.require(impersonation in ('', '(unset)') and not os.environ.get('CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'),
+                  'owner impersonation unsupported')
+    profile = guest.data(owner.command(['gcloud', 'compute', 'os-login', 'describe-profile', '--format=json'], 20))
+    guest.require(profile_user(profile.get('name')) == snapshot['self_user'] == login.user, 'canonical SELF identity differs')
+    held.operation = 'key-generation'
+    owner.command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(output / 'oslogin')], 10)
+    public_key = guest.regular(output / 'oslogin.pub', 4096, os.geteuid()).decode().strip()
+    held.operation = 'key-registration'
+    held.context = registration.register(public_key)
+    importer = OwnKeyImport(records, held.context, login, producer_run_id=rec['run_id'], producer_attempt=rec['attempt'],
+                            now=lambda: datetime.now(timezone.utc))
+    held.operation = 'access-prepare'
+    intent, _ = importer.prepare(public_key)
+    held.operation = 'access-import'
+    importer.import_once()
+    held.operation = 'registration-check'
+    registration.current()
+    held.operation = 'host-key'
+    hostkey = owner.command(['gcloud', 'compute', 'instances', 'get-guest-attributes', rec['names']['instance'],
+                             '--project=' + spec.PROJECT, '--zone=' + spec.ZONE, '--query-path=hostkeys/ssh-ed25519',
+                             '--format=json'], min(20, clock.remaining('access')), limit=4096)
+    key_line = extract_ed25519(hostkey)
+    registration.current()
+    guest.exclusive(output / 'known_hosts', ('labapp-trial-' + rec['ids']['instance'] + ' ' + key_line).encode())
+    owner.command(['/usr/bin/ssh-keygen', '-l', '-f', str(output / 'known_hosts'), '-E', 'sha256'], 10)
+    held.operation = 'master-start'
+    held.master = owner.Master(output, snapshot, intent['posix']['username'], clock, failed)
+    held.master.start()
+    held.operation = 'guest-boot'
+    boot = held.master.remote(['/usr/bin/cat', '/proc/sys/kernel/random/boot_id'], 'access').decode().strip()
+    guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', boot))
+    initial['boot_uuid'] = boot
+    guest.contract(initial)
+    registration.current()
+    held.operation = 'guest-probe'
+    held.master.remote(['/usr/bin/sudo', '-n', '/usr/bin/true'], 'access')
+    return rec
+
+
+def sequence(snapshot, payloads, output, *, registration, records, login, private=None):
+    """INTERNAL body; never reachable from ``main``/``trial`` while activation is held."""
+    owner.expected_snapshot(snapshot)
+    rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
+    nonce = secrets.token_hex(16)
+    initial = {'schema': 1, 'nonce': nonce, 'lease': rec['request_id'], 'epoch': rec['epoch'],
+               'run_id': rec['run_id'], 'attempt': rec['attempt'], 'body_sha256': rec['body_hash'],
+               'vm_id': rec['ids']['instance'], 'boot_id': rec['ids']['boot'], 'image_id': rec['boot_image_id'],
+               'admitted_at': rec['reserved_at'], 'deadline': rec['deadline'],
+               'boot_uuid': '00000000-0000-0000-0000-000000000000', 'source_sha': snapshot['source_sha']}
+    failed, stop, process_uncertain = threading.Event(), threading.Event(), threading.Event()
+    held = Held()
+    result, phase, category, dispatched, key_absent = 1, 'preflight', 'none', False, False
+    typed_state, typed, browser, forward_absent = 'absent', None, 'skipped', True
+    try:
+        clock = program.ManagementClock(initial)
+        clock.remaining('access')
+        rec = enroll(snapshot, output, registration, records, login, rec, clock, failed, initial, held)
+        master = held.master
+        incoming = '/tmp/labapp-vlab-' + nonce
+        master.remote(['/usr/bin/mkdir', '-m', '0700', incoming], 'access')
+        phase, held.operation = 'program-stage', 'program-stage'
+        source, table = stage_program(snapshot, payloads, output, initial)
+        registration.current()
+        owner.trusted_source(snapshot)
+        held.operation = 'source-transfer'
+        master.transfer(incoming, [*sorted(program.FILES), 'manifest.json'])
+        registration.current()
+        held.operation = 'bootstrap'
+        held.attempted = True
+        master.remote(bootstrap_command(incoming, source, table), 'stage', cap=60)
+
+        def heartbeat():
+            number = 0
+            try:
+                while not stop.is_set():
+                    number += 1
+                    master.remote(fixed_command('heartbeat', nonce, number), 'persistence', cap=8,
+                                  until=owned_process.monotonic() + owner.HEARTBEAT_BUDGET_SECONDS)
+                    stop.wait(10)
+            except BaseException as error:
+                if getattr(error, 'cleanup_uncertain', False):
+                    process_uncertain.set()
+                failed.set()
+        held.operation = 'heartbeat-start'
+        held.thread = threading.Thread(target=heartbeat, daemon=True)
+        held.thread.start()
+        phase = 'guest-work'
+        for name in program.STEP_NAMES:
+            held.operation = 'management-step'
+            guest.require(not failed.is_set(), 'heartbeat failed')
+            registration.current()
+            owner.trusted_source(snapshot)
+            clock.remaining(program.STEP_PHASE[name])
+            master.remote(step_command(nonce, name), program.STEP_PHASE[name], cap=STEP_CAPS[name])
+        phase = 'guest-browser'
+        held.operation = 'viewer-export'
+        raw = master.remote(fixed_command('export-viewer', nonce), 'work', cap=EXPORT_CAP, limit=2048)
+        program.validate_handoff(guest.data(raw), nonce)
+        held.operation = 'browser'
+        browser, forward_absent = browser_session(master, clock, nonce, rec['request_id'], raw, private, failed,
+                                                  process_uncertain)
+        phase = 'guest-result'
+        result = 0
+    except guest.Failure as error:
+        result, category = error.code, 'guest'
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+    except KeyboardInterrupt as error:
+        result, category = 130, 'interrupted'
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+    except Exception as error:
+        result, category = 1, 'access' if isinstance(error, AccessError) else 'unknown'
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
+    finally:
+        stop.set()
+        heartbeat_absent = True
+        if held.thread:
+            try:
+                held.thread.join(timeout=owner.HEARTBEAT_JOIN_SECONDS)
+                heartbeat_absent = not held.thread.is_alive()
+            except BaseException:
+                heartbeat_absent = False
+                process_uncertain.set()
+        master = held.master
+        process_absent = master is None and heartbeat_absent and not process_uncertain.is_set()
+        if master is not None:
+            if heartbeat_absent and held.attempted:
+                # Fixed positive teardown, then the fixed typed result, both through the SAME original master.
+                try:
+                    master.remote(fixed_command('teardown', nonce), 'persistence', cap=TEARDOWN_CAP, cleanup=True)
+                except BaseException as error:
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
+                try:
+                    typed_state, typed = management_result(
+                        master.remote(fixed_command('result', nonce), 'persistence', cap=RESULT_CAP, cleanup=True,
+                                      limit=4096 + 128), nonce)
+                except BaseException as error:
+                    typed_state = 'invalid'
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
+            try:
+                process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
+            except BaseException:
+                process_absent = False
+        owned = {*program.FILES, 'manifest.json', 'oslogin', 'oslogin.pub', 'known_hosts', 'marker', 'sftp.batch', 'master.sock'}
+        local_absent = process_absent
+        for name in (owned if process_absent else ()):
+            path = output / name
+            try:
+                info = path.lstat()
+                guest.require(info.st_uid == os.geteuid() and not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1
+                              and (stat.S_ISREG(info.st_mode) or name == 'master.sock' and stat.S_ISSOCK(info.st_mode)))
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException:
+                local_absent = False
+        local_absent = local_absent and not any(output.iterdir())
+        if held.context is not None and process_absent and local_absent:
+            try:
+                cleanup_own_key(records, held.context, login, now=lambda: datetime.now(timezone.utc))
+                key_absent = True
+            except BaseException:
+                pass
+        try:
+            owner.cleanup_dispatch(snapshot)
+            dispatched = True
+        except BaseException:
+            pass
+        receipt = {'schema': 1, 'code': result, 'process_absent': process_absent, 'phase': phase,
+                   'failure_category': category, 'host_operation': held.operation, 'own_key_absent': key_absent,
+                   'local_files_absent': local_absent, 'independent_cleanup_dispatched': dispatched,
+                   'lease': rec['request_id'], 'forward_absent': forward_absent, 'browser': browser,
+                   'management_status': typed_state, 'management': typed}
+        print(json.dumps(receipt, sort_keys=True))
+    if result:
+        return result
+    good = typed_state == 'valid' and program.succeeded(typed) and browser == 'complete' and forward_absent
+    return 0 if good and all((process_absent, key_absent, local_absent, dispatched)) else 1
+
+
+def trial(*_args, **_kwargs):
+    """Public surface: refuses before reading anything. Activation is a later reviewed change."""
+    program.refuse_activation()
+
+
+def main(argv=None):
+    program.refuse_activation()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument('--snapshot', type=Path, required=True)
+    parser.add_argument('--payloads', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--private-diagnostics', type=Path)
+    parser.parse_args(argv)
+    return trial()
+
+
+if __name__ == '__main__':
+    def interrupted(signum, _frame):
+        raise guest.Failure('signal', 143 if signum == signal.SIGTERM else 130)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        exit_code = main()
+    except guest.Failure as error:
+        print('Management trial held; no activation is authorized.', file=sys.stderr)
+        exit_code = error.code
+    except Exception:
+        print('Management trial failed closed.', file=sys.stderr)
+        exit_code = 1
+    sys.exit(exit_code)

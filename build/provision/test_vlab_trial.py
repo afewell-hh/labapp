@@ -4479,3 +4479,606 @@ class InstallerFailureEvidence(unittest.TestCase):
         for operation in (['aux-update'], None, b'aux-update'):
             self.assertFalse(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': operation,
                                                        'category': 'child-exit', 'child_status': 100}))
+
+
+# ---- Fixed source-inactive management program (#506): synthetic only ---------------------------------
+# No native k3d/Helm/kubectl/Docker/cloud child is ever started: call_bounded/stdin_bounded/http are
+# replaced by in-memory models of the DOCUMENTED responses the program consumes. They model the
+# interface; they are not native validation of Prometheus, Grafana, k3d or Helm behaviour.
+import io
+import subprocess
+import urllib.parse
+
+
+def load_management():
+    import management_trial
+    return management_trial
+
+
+MGMT_BOOT = '22222222-2222-4222-8222-222222222222'
+
+
+def is_push(args):
+    return any(a.endswith('promtool') for a in args)
+
+
+class ManagementModel:
+    """Recorder plus deterministic stand-ins for kubectl, promtool, Prometheus and Grafana."""
+    def __init__(self, m, test):
+        self.m, self.test = m, test
+        self.calls, self.envs, self.stdin = [], [], []
+        self.samples, self.pushes, self.deleted = {}, 0, []
+        self.uids = {'prometheus': 'p-1', 'grafana': 'g-1'}
+        self.claims = {'prom-claim': {'uid': 'c-1', 'storage': '8Gi'}, 'graf-claim': {'uid': 'c-2', 'storage': '1Gi'}}
+        self.query_error = False
+        self.role, self.viewer_admin, self.viewer_settings, self.users = 'Viewer', False, 403, {}
+        self.admin = None
+        self.sample_age = 0
+
+    def run(self, args, env=None, data=None):
+        args = [str(a) for a in args]
+        self.calls.append(args)
+        self.envs.append(env)
+        if data is not None:
+            self.stdin.append(data)
+        m = self.m
+        if args[0] == m.K3D and args[1:3] == ['kubeconfig', 'write']:
+            out = Path(args[args.index('--output') + 1])
+            out.write_bytes(b'synthetic-private-kubeconfig')
+            out.chmod(0o644)
+        if 'LoadState' in args:
+            return 0, b'LoadState=not-found\n'
+        if 'get-contexts' in args:
+            return 0, (m.CONTEXT + '\n').encode()
+        if is_push(args):
+            label, number = re.search(rb'nonce="([a-f0-9]{16})"\} ([0-9]+)', data).groups()
+            self.pushes += 1
+            self.samples[label.decode()] = (time.time() - self.sample_age, number.decode())
+            return 0, b''
+        if args[0] == m.KUBECTL and 'get' in args and '--selector' in args:
+            kind = 'prometheus' if 'prometheus' in args[args.index('--selector') + 1] else 'grafana'
+            return 0, json.dumps({'items': [{'metadata': {'name': kind + '-0', 'uid': self.uids[kind]},
+                'status': {'phase': 'Running', 'containerStatuses': [{'ready': True}],
+                           'conditions': [{'type': 'Ready', 'status': 'True'}]}}]}).encode()
+        if args[0] == m.KUBECTL and 'persistentvolumeclaims' in args:
+            return 0, json.dumps({'items': [{'metadata': {'name': n, 'uid': c['uid']}, 'status': {'phase': 'Bound'},
+                'spec': {'resources': {'requests': {'storage': c['storage']}}}} for n, c in self.claims.items()]}).encode()
+        if args[0] == m.KUBECTL and 'delete' in args and 'pod' in args:
+            name = args[args.index('pod') + 1]
+            self.deleted.append(name)
+            self.uids[name.split('-')[0]] += 'x'
+        return 0, b''
+
+    def http(self, method, url, *, auth=None, body=None):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.port == 9090:
+            if parsed.path == '/-/ready':
+                return 200, b'ready'
+            if self.query_error:
+                return 400, b''
+            query = urllib.parse.parse_qs(parsed.query)
+            expression = query['query'][0]
+            label = re.search(r'nonce="([a-f0-9]{16})"', expression).group(1)
+            metric = {'__name__': self.m.PROBE_METRIC, 'nonce': label}
+            found = self.samples.get(label)
+            if expression.endswith('[2m]'):
+                rows = [] if found is None else [{'metric': metric, 'values': [[found[0], found[1]]]}]
+                data = {'resultType': 'matrix', 'result': rows}
+            else:
+                rows = [] if found is None else [{'metric': metric, 'value': [float(query['time'][0]), found[1]]}]
+                data = {'resultType': 'vector', 'result': rows}
+            return 200, json.dumps({'status': 'success', 'data': data}).encode()
+        path = parsed.path
+        if path == '/api/health':
+            return 200, b'{"database":"ok"}'
+        if path == '/api/admin/users':
+            self.test.assertEqual(auth, self.admin)
+            self.users[body['login']] = body['password']
+            return 200, b'{"id":2}'
+        if path == '/api/org/users':
+            self.test.assertEqual(auth, self.admin)
+            return 200, json.dumps([{'login': 'admin', 'role': 'Admin'}] +
+                                   [{'login': n, 'role': self.role} for n in self.users]).encode()
+        if path == '/api/user':
+            self.test.assertEqual(self.users.get(auth[0]), auth[1])
+            return 200, json.dumps({'login': auth[0], 'isGrafanaAdmin': self.viewer_admin}).encode()
+        if path == '/api/admin/settings':
+            return self.viewer_settings, b'{}'
+        if path == '/api/datasources':
+            return 200, b'[{"uid":"prom-uid"}]'
+        if path.startswith('/api/dashboards/uid/'):
+            return 200, b'{"dashboard":{"panels":[{"id":7}]}}'
+        raise AssertionError('unmodelled endpoint ' + path)
+
+
+class ManagementProgram(unittest.TestCase):
+    def setUp(self):
+        self.m = load_management()
+        self.real_http = self.m.http
+        original = os.umask(0o077)
+        os.umask(original)
+        self.addCleanup(os.umask, original)
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.temp = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-')))
+        self.root = self.temp / 'root'
+        (self.root / 'work').mkdir(parents=True, mode=0o700)
+        self.root.chmod(0o700)
+        for name, path in (('MROOT', self.root), ('WORK', self.root / 'work'),
+                           ('KUBECONFIG', self.root / 'work' / 'kubeconfig'), ('STORAGE', self.temp / 'storage')):
+            self.stack.enter_context(patch.object(self.m, name, path))
+        self.stack.enter_context(patch.object(trial, 'regular',
+                                 side_effect=lambda p, limit, uid=None, mode=None: REAL_REGULAR(p, limit, None, mode)))
+        self.stack.enter_context(patch.object(trial, 'kernel_boot', return_value=MGMT_BOOT))
+        self.stack.enter_context(patch.object(time, 'sleep'))
+        self.stack.enter_context(patch.object(subprocess, 'Popen', side_effect=AssertionError('no native child')))
+        self.model = ManagementModel(self.m, self)
+        self.stack.enter_context(patch.object(trial, 'call_bounded',
+                                 side_effect=lambda args, seconds, env=None: self.model.run(args, env)))
+        self.stack.enter_context(patch.object(self.m, 'stdin_bounded',
+                                 side_effect=lambda argv, seconds, data, env, limit=1024**2: self.model.run(argv, env, data)))
+        self.stack.enter_context(patch.object(self.m, 'http', side_effect=self.model.http))
+        self.reset(value())
+
+    def reset(self, contract):
+        self.value = contract
+        for name in ('contract.json', 'heartbeat.json', 'steps.json'):
+            (self.root / name).unlink(missing_ok=True)
+        trial.exclusive(self.root / 'contract.json', trial.encoded(contract))
+        trial.exclusive(self.root / 'heartbeat.json', trial.encoded({'sequence': 0, 'received': time.monotonic()}))
+        trial.exclusive(self.root / 'steps.json', trial.encoded(self.m.initial_state(NONCE)))
+
+    def context(self):
+        return self.m.Context(self.value, self.m.ManagementClock(self.value), self.m.load_state(NONCE))
+
+    def admitted_ago(self, minutes):
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=minutes)
+        contract = value()
+        contract['admitted_at'] = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        contract['deadline'] = (start + timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return contract
+
+    def redaction_text(self):
+        return json.dumps(self.m.public_record(self.m.load_state(NONCE)))
+
+    # -- activation, tables, unchanged VLAB ---------------------------------------------------
+    def test_activation_is_held_without_any_bypass(self):
+        m = self.m
+        self.assertTrue(m.ACTIVATION_BLOCKERS)
+        with patch.dict(os.environ, {'LABAPP_MANAGEMENT_ACTIVE': '1', 'ACTIVATE': 'yes'}):
+            for call in (m.refuse_activation, lambda: m.main(['step', '--nonce', NONCE, '--name', 'storage']),
+                         lambda: m.bootstrap(self.temp, 'a' * 64)):
+                with self.assertRaises(trial.Failure) as raised:
+                    call()
+                self.assertEqual(str(raised.exception), 'management activation held')
+        import inspect
+        self.assertEqual(list(inspect.signature(m.main).parameters), ['argv'])
+        self.assertEqual(list(inspect.signature(m.bootstrap).parameters), ['incoming', 'expected_manifest'])
+        self.assertEqual(self.model.calls, [])
+
+    def test_fixed_closed_tables_and_unchanged_vlab(self):
+        m = self.m
+        self.assertEqual(set(m.STEP_FUNCTIONS), set(m.STEP_NAMES))
+        self.assertEqual(len(m.STEP_NAMES), len(set(m.STEP_NAMES)))
+        self.assertTrue(set(m.STEP_PHASE.values()) <= set(m.MGMT_PHASES))
+        self.assertEqual(m.FILES, {*m.SOURCES, *m.PAYLOADS, 'contract.json'})
+        for name, path in m.SOURCES.items():
+            self.assertEqual(path, 'build/provision/' + name)
+            self.assertTrue((Path(__file__).parent / name).is_file(), name)
+        self.assertNotIn('k3d', m.PAYLOADS)  # size unpinned: runtime download, never a verified byte count
+        self.assertIsNone(m.IMAGE_INVENTORY['k3d-loadbalancer'])
+        self.assertEqual(m.IMAGE_INVENTORY['k3s-server'], 'docker.io/rancher/k3s@sha256:'
+                         '81fc7349ba265f842f9b67311fabd9e7d72698798ba513b7cdf41ffdf1e923e4')
+        self.assertEqual(m.MANAGEMENT_IMAGE, m.IMAGE_INVENTORY['k3s-server'])
+        self.assertEqual(trial.PHASES, {'access': 15, 'stage': 35, 'fresh': 70, 'strict': 80, 'resume': 95, 'persistence': 105})
+        self.assertEqual(set(trial.PAYLOADS), {'hhfab.tar.gz', 'kubectl'})
+        self.assertFalse(any('management' in name for name in trial.SOURCES))
+
+    def test_pins_reuse_accepted_ledgers_without_a_second_pin(self):
+        import importlib.util
+        for installer in ('install-helm.py', 'install-kubectl.py'):
+            spec_ = importlib.util.spec_from_file_location('pin_' + installer[8:-3], Path(__file__).with_name(installer))
+            module = importlib.util.module_from_spec(spec_)
+            spec_.loader.exec_module(module)
+            pin = module.PINS[module.VERSION]
+            if installer == 'install-helm.py':
+                self.assertEqual(self.m.PAYLOADS['helm.tar.gz'], (pin['archive_size'], pin['archive_sha256']))
+            else:
+                self.assertEqual(self.m.PAYLOADS['kubectl'], (pin['size'], pin['sha256']))
+                self.assertIs(self.m.PAYLOADS['kubectl'], trial.PAYLOADS['kubectl'])
+        ledger = Path(__file__).with_name('observability-inputs.yaml').read_text()
+        chart = self.m.PAYLOADS['kube-prometheus-stack-65.2.0.tgz']
+        self.assertIn('size: %d' % chart[0], ledger)
+        self.assertIn('sha256: ' + chart[1], ledger)
+
+    def test_manifest_rejects_foreign_missing_and_wrong_bytes(self):
+        m = self.m
+        files = {n: {'bytes': 5, 'sha256': 'b' * 64} for n in m.SOURCES}
+        files['contract.json'] = {'bytes': 5, 'sha256': 'b' * 64}
+        for name, pin in m.PAYLOADS.items():
+            files[name] = {'bytes': pin[0], 'sha256': pin[1]}
+        good = {'schema': 1, 'source_sha': 'c' * 40, 'files': files}
+        self.assertIs(m.manifest(good), good)
+        for mutate in (lambda v: v['files'].pop('install-k3d.sh'), lambda v: v['files'].update(extra=files['contract.json']),
+                       lambda v: v['files']['kubectl'].update(sha256='d' * 64),
+                       lambda v: v['files']['helm.tar.gz'].update(bytes=1),
+                       lambda v: v['files']['install-k3d.sh'].update(bytes=trial.MAX_SOURCE + 1),
+                       lambda v: v.update(source_sha='x')):
+            bad = deepcopy(good)
+            mutate(bad)
+            with self.assertRaises(trial.Failure):
+                m.manifest(bad)
+
+    # -- time ------------------------------------------------------------------------------------
+    def test_management_clock_is_admission_anchored_clipped_and_never_renewed(self):
+        m = self.m
+        clock = m.ManagementClock(self.value)
+        self.assertLess(clock.remaining('work'), 50 * 60)
+        self.assertLess(clock.cleanup_remaining(), 60 * 60)
+        self.assertLessEqual(m.CEILING_MINUTES, 60)
+        self.assertGreater(m.CEILING_MINUTES, max(m.MGMT_PHASES.values()))
+        with self.assertRaises(trial.Failure):
+            clock.remaining('fresh')  # VLAB phase names are not management phases
+        # a backwards wall jump cannot renew time: monotonic elapsed still counts
+        wall, mono = [time.time()], [time.monotonic()]
+        timed = m.ManagementClock(self.value, wall=lambda: wall[0], mono=lambda: mono[0])
+        before = timed.remaining('work')
+        wall[0] -= 3600
+        mono[0] += 100
+        self.assertLessEqual(timed.remaining('work'), before - 99)
+        # the provider envelope itself is unchanged and still demanded of the contract
+        bad = deepcopy(self.value)
+        start = datetime.strptime(bad['admitted_at'], '%Y-%m-%dT%H:%M:%SZ')
+        bad['deadline'] = (start + timedelta(minutes=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        with self.assertRaises(trial.Failure):
+            trial.contract(bad)
+
+    def test_exhausted_work_keeps_the_cleanup_reserve_and_stops_new_steps(self):
+        self.reset(self.admitted_ago(55))  # work ended at minute 50/54; cleanup runs to minute 60
+        clock = self.m.ManagementClock(self.value)
+        with self.assertRaises(trial.Failure) as raised:
+            clock.remaining('work')
+        self.assertEqual(raised.exception.code, 124)
+        self.assertGreater(clock.cleanup_remaining(), 3 * 60)
+        with self.assertRaises(trial.Failure):
+            self.m.run_step(NONCE, 'install-docker')
+        self.assertEqual(self.m.load_state(NONCE)['failure']['category'], 'phase-cutoff')
+        self.assertEqual(self.model.calls, [])  # no child started after the cutoff
+        self.assertEqual(self.m.teardown(NONCE), 0)  # cleanup still runs inside the reserve
+        self.reset(self.admitted_ago(61))
+        with self.assertRaises(trial.Failure):
+            self.m.ManagementClock(self.value).cleanup_remaining()
+
+    # -- step gate: order, nonce, heartbeat, selector -------------------------------------------------
+    def test_step_gate_order_nonce_heartbeat_and_no_arbitrary_selector(self):
+        m = self.m
+        with self.assertRaises(trial.Failure):
+            m.run_step(NONCE, 'cluster')  # out of order
+        with self.assertRaises(trial.Failure):
+            m.run_step(NONCE, 'bash -c id')
+        with self.assertRaises(trial.Failure):
+            m.run_step('b' * 32, 'install-docker')  # wrong lease nonce
+        self.assertEqual(self.model.calls, [])
+        trial.atomic(self.root / 'heartbeat.json', {'sequence': 0, 'received': time.monotonic() - 60})
+        with self.assertRaises(trial.Failure):
+            m.run_step(NONCE, 'install-docker')
+        state = m.load_state(NONCE)
+        self.assertEqual((state['steps']['install-docker'], state['failure']['category']), ('failed', 'heartbeat-loss'))
+        self.assertEqual(self.model.calls, [])
+        with self.assertRaises(trial.Failure):
+            m.run_step(NONCE, 'install-kubectl')  # sequence stopped after the first failure
+        with patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit):
+            m.dispatch(['step', '--nonce', NONCE, '--name', 'bash'])
+        with patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit):
+            m.dispatch(['run', '--nonce', NONCE])
+
+    def test_boot_change_is_refused(self):
+        with patch.object(trial, 'kernel_boot', return_value='33333333-3333-4333-8333-333333333333'):
+            with self.assertRaises(trial.Failure):
+                self.m.run_step(NONCE, 'install-docker')
+        self.assertEqual(self.m.load_state(NONCE)['failure']['category'], 'boot-change')
+
+    # -- native sequence -------------------------------------------------------------------------------
+    def test_installers_use_accepted_pins_and_no_digest_or_url_override(self):
+        m = self.m
+        for name in ('install-docker', 'install-kubectl', 'install-helm', 'install-k3d', 'daemon-start'):
+            m.STEP_FUNCTIONS[name](self.context())
+        by_script = {c[1]: c for c in self.model.calls if c[0] in (m.PYTHON, m.BASH)}
+        self.assertEqual(by_script[str(self.root / 'install-kubectl.py')][2:],
+                         ['--version', '1.35.0', '--platform', 'linux/amd64', '--binary', str(self.root / 'kubectl')])
+        self.assertEqual(by_script[str(self.root / 'install-helm.py')][2:],
+                         ['--version', '3.19.4', '--platform', 'linux/amd64', '--archive', str(self.root / 'helm.tar.gz')])
+        k3d_env = self.model.envs[self.model.calls.index(by_script[str(self.root / 'install-k3d.sh')])]
+        self.assertFalse([k for k in k3d_env if k.startswith(('K3D_SHA', 'K3D_BASE', 'K3D_INSTALL', 'K3D_IMAGE', 'K3D_HELPER'))])
+        self.assertIn('K3D_DOWNLOAD_TOTAL_TIMEOUT', k3d_env)
+
+    def test_cluster_uses_private_kubeconfig_context_and_fixed_image(self):
+        m = self.m
+        m.step_storage(self.context())
+        ctx = self.context()
+        m.step_cluster(ctx)
+        create = next(c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'create'])
+        env = self.model.envs[self.model.calls.index(create)]
+        self.assertEqual(env['LABAPP_MANAGEMENT_IMAGE'], m.MANAGEMENT_IMAGE)
+        self.assertEqual(env['LABAPP_PROMETHEUS_BIND_ADDRESS'], '127.0.0.1')
+        self.assertIn('--kubeconfig-update-default=false', create)
+        self.assertIn('--kubeconfig-switch-context=false', create)
+        self.assertEqual(create[create.index('--config') + 1], str(self.root / 'management-cluster.yaml'))
+        self.assertTrue(all('KUBECONFIG' not in (e or {}) for e in self.model.envs))
+        self.assertEqual(stat.S_IMODE(m.KUBECONFIG.stat().st_mode), 0o600)
+        self.assertTrue(ctx.state['observed']['cluster_context'])
+        self.assertTrue(ctx.private['cluster_attempted'])
+
+    def test_every_kubectl_and_helm_names_private_kubeconfig_and_context(self):
+        m = self.m
+        m.step_namespace(self.context())
+        m.step_secret(self.context())
+        m.step_helm(self.context())
+        m.step_health(self.context())
+        kubectls = [c for c in self.model.calls if c[0] == m.KUBECTL]
+        self.assertGreaterEqual(len(kubectls), 4)
+        for call in kubectls:
+            self.assertEqual(call[1:5], ['--kubeconfig', str(m.KUBECONFIG), '--context', m.CONTEXT])
+        helm = next(c for c in self.model.calls if c[0] == m.HELM)
+        self.assertEqual(helm.count('--values'), 2)
+        self.assertEqual(helm[helm.index('--kubeconfig') + 1], str(m.KUBECONFIG))
+        self.assertEqual(helm[helm.index('--kube-context') + 1], m.CONTEXT)
+        self.assertIn('--wait', helm)
+        self.assertFalse(any(a in ('--set', '--set-string', '--set-file') for a in helm))
+
+    def test_grafana_secret_is_generated_private_and_never_in_argv_state_or_result(self):
+        m = self.m
+        ctx = self.context()
+        m.step_secret(ctx)
+        m.save_state(ctx.state)
+        password = (m.WORK / 'grafana-admin-password').read_text()
+        self.assertGreaterEqual(len(password), 24)
+        for name in ('grafana-admin-user', 'grafana-admin-password'):
+            self.assertEqual(stat.S_IMODE((m.WORK / name).stat().st_mode), 0o600)
+        self.assertFalse(any(password in part for call in self.model.calls for part in call))
+        self.assertNotIn(password.encode(), (self.root / 'steps.json').read_bytes())
+        self.assertNotIn(password, self.redaction_text())
+
+    def push_and_read(self):
+        ctx = self.context()
+        self.m.step_probe_push(ctx)
+        self.m.save_state(ctx.state)
+        ctx = self.context()
+        self.m.step_probe_read(ctx)
+        self.m.save_state(ctx.state)
+        return ctx
+
+    def test_probe_is_unique_fresh_and_distinguishes_unused_nonce_from_query_error(self):
+        m = self.m
+        ctx = self.push_and_read()
+        probe = ctx.private['probe']
+        self.assertEqual(self.model.pushes, 1)
+        push = next(c for c in self.model.calls if is_push(c))
+        self.assertEqual(push[push.index('exec'):push.index('exec') + 4], ['exec', '-i', 'prometheus-0', '-c'])
+        self.assertIn('--timeout=10s', push)
+        self.assertEqual(push[-1], 'http://127.0.0.1:9090/api/v1/write')
+        self.assertEqual(self.model.stdin[0].decode(),
+                         m.PROBE_METRIC + '{nonce="%s"} %d\n' % (probe['label'], probe['value']))
+        flags = ctx.state['observed']
+        self.assertTrue(all(flags[k] for k in ('probe_pushed', 'probe_fresh', 'unused_nonce_empty', 'repeat_reads_stable')))
+        self.assertAlmostEqual(probe['timestamp'], self.model.samples[probe['label']][0], places=3)
+        # a successful EMPTY result for an unused nonce is not a query error
+        self.assertEqual(m.prom(ctx, m.probe_query('f' * 16) + '[2m]')['result'], [])
+        self.model.query_error = True
+        with self.assertRaises(trial.Failure) as raised:
+            m.prom(ctx, m.probe_query('f' * 16) + '[2m]')
+        self.assertEqual(raised.exception.category, 'status-invalid')
+
+    def test_stale_probe_sample_is_refused(self):
+        self.model.sample_age = 600  # sample timestamp far outside the freshness window
+        with self.assertRaises(trial.Failure):
+            self.push_and_read()
+
+    def test_query_error_is_not_treated_as_not_yet_visible(self):
+        ctx = self.context()
+        self.m.step_probe_push(ctx)
+        self.m.save_state(ctx.state)
+        self.model.query_error = True
+        with self.assertRaises(trial.Failure) as raised:
+            self.m.step_probe_read(self.context())
+        self.assertEqual(raised.exception.category, 'status-invalid')
+
+    def test_restart_deletes_pods_only_keeps_claims_and_historical_query_never_repushes(self):
+        m = self.m
+        self.push_and_read()
+        seeded = self.context()
+        seeded.private['claims'] = m.claims(seeded)
+        m.save_state(seeded.state)
+        ctx = self.context()
+        m.step_restart(ctx)
+        self.assertEqual(self.model.deleted, ['prometheus-0', 'grafana-0'])
+        deletes = [c[c.index('delete'):] for c in self.model.calls if 'delete' in c]
+        self.assertEqual(len(deletes), 2)
+        self.assertTrue(all(c[:2] == ['delete', 'pod'] for c in deletes))
+        text = ' '.join(' '.join(c) for c in deletes)
+        for forbidden in ('persistentvolumeclaim', 'pvc', 'namespace', 'cluster', 'secret', 'release', 'uninstall'):
+            self.assertNotIn(forbidden, text)
+        self.assertTrue(ctx.state['observed']['pvc_uid_unchanged'])
+        m.save_state(ctx.state)
+        historical = self.context()
+        m.step_historical(historical)
+        self.assertTrue(historical.state['observed']['historical_sample'])
+        self.assertEqual(self.model.pushes, 1)  # retained sample proven without pushing again
+        self.model.samples.clear()  # lost retention is a failure, not masked by instant-query lookback
+        with self.assertRaises(trial.Failure):
+            m.step_historical(self.context())
+
+    def test_changed_claim_identity_fails_restart(self):
+        m = self.m
+        ctx = self.context()
+        ctx.private['claims'] = m.claims(ctx)
+        original = self.model.run
+
+        def replace_claim(args, env=None, data=None):
+            if 'delete' in args:
+                self.model.claims['prom-claim']['uid'] = 'recreated'
+            return original(args, env, data)
+        with patch.object(self.model, 'run', side_effect=replace_claim):
+            with self.assertRaises(trial.Failure):
+                m.step_restart(ctx)
+
+    def prepared_principal(self):
+        m = self.m
+        ctx = self.context()
+        m.step_secret(ctx)
+        m.save_state(ctx.state)
+        self.model.admin = ('admin', (m.WORK / 'grafana-admin-password').read_text())
+        ctx = self.context()
+        m.step_principal(ctx)
+        m.save_state(ctx.state)
+        return ctx
+
+    def test_test_principal_is_verified_viewer_and_credentials_stay_in_private_files(self):
+        m = self.m
+        ctx = self.prepared_principal()
+        self.assertTrue(ctx.state['observed']['principal_viewer'])
+        login, password = m.viewer_credentials()
+        self.assertRegex(login, m.VIEWER_LOGIN)
+        self.assertEqual(stat.S_IMODE((m.WORK / 'viewer.json').stat().st_mode), 0o600)
+        text = ' '.join(' '.join(c) for c in self.model.calls)
+        for secret in (password, self.model.admin[1]):
+            self.assertNotIn(secret, text)
+            self.assertNotIn(secret, self.redaction_text())
+            self.assertNotIn(secret.encode(), (self.root / 'steps.json').read_bytes())
+        m.step_persisted_principal(self.context())
+
+    def test_non_viewer_or_admin_principal_is_refused_not_elevated(self):
+        for change in ('role', 'admin', 'settings'):
+            self.model.users.clear()
+            self.model.role, self.model.viewer_admin, self.model.viewer_settings = 'Viewer', False, 403
+            for name in ('viewer.json', 'grafana-admin-user', 'grafana-admin-password'):
+                (self.m.WORK / name).unlink(missing_ok=True)
+            if change == 'role':
+                self.model.role = 'Editor'
+            elif change == 'admin':
+                self.model.viewer_admin = True
+            else:
+                self.model.viewer_settings = 200
+            with self.assertRaises(trial.Failure):
+                self.prepared_principal()
+
+    def test_viewer_ready_refuses_unresolved_panel_and_hands_off_viewer_only_when_resolved(self):
+        m = self.m
+        self.prepared_principal()
+        with self.assertRaises(trial.Failure) as raised:
+            m.step_viewer_ready(self.context())
+        self.assertEqual(str(raised.exception), 'viewer panel unresolved')
+        self.assertFalse((m.WORK / 'viewer-handoff.json').exists())
+        with patch.object(m, 'VIEWER_PANEL', {'uid': 'chartpanel', 'panel_id': 7}):
+            m.step_viewer_ready(self.context())
+        record = trial.data((m.WORK / 'viewer-handoff.json').read_bytes())
+        self.assertEqual(set(record), m.HANDOFF_FIELDS)
+        self.assertEqual(record['path'], '/d/chartpanel?viewPanel=7')
+        self.assertNotIn(self.model.admin[1], json.dumps(record))
+        for bad in (dict(record, password='short'), dict(record, login='admin'), dict(record, port=3001),
+                    dict(record, admin='x'), dict(record, nonce='b' * 32), dict(record, path='/api/admin')):
+            with self.assertRaises(trial.Failure):
+                m.validate_handoff(bad, NONCE)
+
+    def test_http_is_loopback_only(self):
+        for url in ('http://example.com/', 'http://127.0.0.1:8080/', 'http://127.0.0.1:9090.evil/x', 'file:///etc/passwd'):
+            with self.assertRaises(trial.Failure):
+                self.real_http('GET', url)
+
+    # -- typed result, teardown ----------------------------------------------------------------------------
+    def test_result_is_closed_typed_and_nonsecret(self):
+        m = self.m
+        record = m.public_record(m.initial_state(NONCE))
+        self.assertEqual(m.validate_result(deepcopy(record), NONCE), record)
+        self.assertFalse(m.succeeded(record))
+        done = deepcopy(record)
+        done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+        done['observed'] = {k: True for k in m.OBSERVED}
+        done['teardown'] = 'complete'
+        self.assertTrue(m.succeeded(m.validate_result(done, NONCE)))
+        failed = deepcopy(record)
+        failed['steps'].update({'install-docker': 'ok', 'install-kubectl': 'failed'})
+        failed['failure'] = {'step': 'install-kubectl', 'category': 'child-exit', 'child_status': 7}
+        m.validate_result(failed, NONCE)
+        mutations = [
+            lambda v: v.update(extra=1), lambda v: v.update(nonce='b' * 32), lambda v: v.update(schema=2),
+            lambda v: v['steps'].update({'storage': 'ok'}),               # ok without earlier steps
+            lambda v: v['steps'].update({'install-docker': 'maybe'}),
+            lambda v: v['observed'].update({'probe_fresh': True}),        # observed without its step
+            lambda v: v.update(teardown='done'),
+            lambda v: v.update(failure={'step': 'storage', 'category': 'exception', 'child_status': None}),
+        ]
+        for mutate in mutations:
+            bad = deepcopy(record)
+            mutate(bad)
+            with self.assertRaises(trial.Failure):
+                m.validate_result(bad, NONCE)
+        for change in (lambda f: f.update(step='install-docker'), lambda f: f.update(category='none'),
+                       lambda f: f.update(category='child-signal', child_status=5), lambda f: f.update(argv='x')):
+            bad = deepcopy(failed)
+            change(bad['failure'])
+            with self.assertRaises(trial.Failure):
+                m.validate_result(bad, NONCE)
+        later = deepcopy(failed)
+        later['steps']['install-helm'] = 'ok'  # work after the first failure
+        with self.assertRaises(trial.Failure):
+            m.validate_result(later, NONCE)
+
+    def test_teardown_removes_only_owned_state_and_is_idempotent(self):
+        m = self.m
+        ctx = self.context()
+        m.step_storage(ctx)
+        ctx.private.update(cluster_attempted=True, docker_started=True)
+        m.save_state(ctx.state)
+        for name in m.PRIVATE_FILES:
+            trial.exclusive(m.WORK / name, b'private')
+        self.assertEqual(m.teardown(NONCE), 0)
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'complete')
+        self.assertFalse(m.STORAGE.exists())
+        self.assertFalse(any((m.WORK / name).exists() for name in m.PRIVATE_FILES))
+        deletes = [c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'delete']]
+        self.assertEqual(deletes, [[m.K3D, 'cluster', 'delete', m.CLUSTER]])
+        self.assertEqual(m.teardown(NONCE), 0)
+        self.assertEqual(len([c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'delete']]), 1)
+
+    def test_teardown_never_removes_foreign_storage_and_cluster_failure_is_uncertain(self):
+        m = self.m
+        m.STORAGE.mkdir(mode=0o700)
+        (m.STORAGE / 'foreign').write_text('keep')
+        ctx = self.context()
+        ctx.private['storage_ino'] = [0, 0]  # not the directory this program created
+        m.save_state(ctx.state)
+        self.assertEqual(m.teardown(NONCE), 1)
+        self.assertTrue((m.STORAGE / 'foreign').exists())
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        ctx = self.context()
+        ctx.state['teardown'] = 'pending'
+        ctx.private.pop('storage_ino')
+        ctx.private['cluster_attempted'] = True
+        m.save_state(ctx.state)
+        original = self.model.run
+        with patch.object(self.model, 'run',
+                          side_effect=lambda a, e=None, d=None: (1, b'') if 'delete' in a else original(a, e, d)):
+            self.assertEqual(m.teardown(NONCE), 1)
+        self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+
+
+class ManagementBounded(unittest.TestCase):
+    """stdin_bounded with stdlib fixture children only (no native tool)."""
+    def setUp(self):
+        self.m = load_management()
+
+    def test_stdin_is_delivered_and_output_and_time_are_bounded(self):
+        echo = [sys.executable, '-I', '-c', 'import sys;sys.stdout.write(sys.stdin.read())']
+        self.assertEqual(self.m.stdin_bounded(echo, 10, b'probe\n', {'PATH': '/usr/bin:/bin'}), (0, b'probe\n'))
+        with self.assertRaises(trial.Failure) as raised:
+            self.m.stdin_bounded(echo, 10, b'x' * 100, {'PATH': '/usr/bin'}, limit=10)
+        self.assertEqual(raised.exception.category, 'output-overflow')
+        sleeper = [sys.executable, '-I', '-c', 'import time;time.sleep(30)']
+        started = time.monotonic()
+        with self.assertRaises(trial.Failure) as raised:
+            self.m.stdin_bounded(sleeper, .5, b'', {'PATH': '/usr/bin'})
+        self.assertEqual((raised.exception.category, raised.exception.code), ('child-timeout', 124))
+        self.assertLess(time.monotonic() - started, 10)
+        with self.assertRaises(trial.Failure):
+            self.m.stdin_bounded(echo, 10, b'x' * 5000, {'PATH': '/usr/bin'})

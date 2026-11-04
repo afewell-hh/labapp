@@ -2606,3 +2606,502 @@ class GuestDiagnostics(unittest.TestCase):
         receipt = json.loads(output.call_args.args[0])
         self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic'], receipt['guest_service']),
                          ('unavailable', None, None))
+
+
+# ---- Fixed source-inactive management caller (#506): synthetic only --------------------------------
+# The caller reuses the unchanged Master/OwnerRegistration/trusted_source/cleanup of vlab_trial. These tests use
+# fake masters and in-memory registrations: no ssh, gcloud, GitHub, cloud, Docker or native tool is started.
+import time
+
+
+def load_caller():
+    from build.gcp import management_trial
+    return management_trial
+
+
+VIEWER_PASSWORD = 'Viewer_pw_0123456789'
+
+
+def handoff_bytes(nonce):
+    return guest.encoded({'schema': 1, 'nonce': nonce, 'login': 'labapp-viewer-abc123', 'password': VIEWER_PASSWORD,
+                          'path': '/d/chartpanel?viewPanel=7', 'port': 3000})
+
+
+class FakeManagementMaster:
+    """Records every original-master call; models only the fixed guest command grammar."""
+    def __init__(self, program):
+        self.program = program
+        self.calls, self.transfers, self.checks, self.closed = [], [], 0, 0
+        self.options, self.target = ['-o', 'ControlPath=/fake/master.sock'], 'labapp-trial-1234'
+        self.failing_step, self.fail_heartbeat, self.lost_after = None, False, None
+        self.heartbeat_failed = threading.Event()
+        self.ran, self.torn, self.on_bootstrap = [], False, None
+
+    def check(self, until=None):
+        self.checks += 1
+        if self.lost_after is not None and self.checks > self.lost_after:
+            raise guest.Failure('original master lost', 31)
+
+    def close(self):
+        self.closed += 1
+        return True
+
+    def transfer(self, incoming, names, phase='stage'):
+        self.transfers.append((incoming, list(names), phase))
+
+    def typed(self, nonce):
+        p = self.program
+        record = p.public_record(p.initial_state(nonce))
+        for name in self.ran:
+            record['steps'][name] = 'ok'
+        if self.failing_step:
+            record['steps'][self.failing_step] = 'failed'
+            record['failure'] = {'step': self.failing_step, 'category': 'child-exit', 'child_status': 17}
+        elif len(self.ran) == len(p.STEP_NAMES):
+            record['observed'] = {k: True for k in p.OBSERVED}
+        record['teardown'] = 'complete' if self.torn else 'pending'
+        return guest.encoded(record)
+
+    def remote(self, args, phase, cap=30, cleanup=False, until=None, limit=65536, input_bytes=None):
+        args = list(args)
+        self.calls.append((args, phase, cleanup))
+        if 'heartbeat' in args:
+            if self.fail_heartbeat:
+                self.heartbeat_failed.set()
+                raise guest.Failure('heartbeat transport', 9)
+            return b''
+        if '-I' in args and '-c' in args and self.on_bootstrap:
+            self.on_bootstrap()
+        nonce = args[args.index('--nonce') + 1] if '--nonce' in args else None
+        if 'step' in args:
+            name = args[args.index('--name') + 1]
+            if self.fail_heartbeat:
+                self.heartbeat_failed.wait(2)
+                time.sleep(.1)  # let the heartbeat thread publish its failure to the host loop
+            if name == self.failing_step:
+                raise guest.Failure('fixed child failed', 17)
+            self.ran.append(name)
+            return b''
+        if 'export-viewer' in args:
+            return handoff_bytes(nonce)
+        if 'teardown' in args:
+            self.torn = True
+            return b''
+        if 'result' in args:
+            return self.typed(nonce)
+        return b''
+
+
+class ManagementCaller(unittest.TestCase):
+    def setUp(self):
+        self.caller = load_caller()
+        self.program = self.caller.program
+        original = os.umask(0o077)
+        os.umask(original)
+        self.addCleanup(os.umask, original)
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
+        self.directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-out-')))
+        self.private = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-priv-')))
+        self.directory.chmod(0o700)
+        self.private.chmod(0o700)
+
+    def sequence(self, master, *, private=None, value=None, registration=None, browser=('complete', True),
+                 trusted=None, clock=None):
+        caller, program = self.caller, self.program
+        value = value or snapshot()
+        registration = registration or Mock()
+        source = {'vlab_trial.py': {'bytes': 1, 'sha256': 'a' * 64}, 'management_trial.py': {'bytes': 1, 'sha256': 'b' * 64}}
+
+        def fake_enroll(snap, output, reg, records, login, rec, clk, failed, initial, held):
+            held.master, held.context, held.operation = master, object(), 'guest-probe'
+            initial['boot_uuid'] = '22222222-2222-4222-8222-222222222222'
+            return rec
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(caller, 'enroll', side_effect=fake_enroll))
+            stage = stack.enter_context(patch.object(caller, 'stage_program', return_value=(source, {'files': {}})))
+            stack.enter_context(patch.object(host, 'trusted_source', side_effect=trusted))
+            dispatch = stack.enter_context(patch.object(host, 'cleanup_dispatch'))
+            stack.enter_context(patch.object(caller, 'cleanup_own_key'))
+            session = stack.enter_context(patch.object(caller, 'browser_session', return_value=browser))
+            if clock is not None:
+                stack.enter_context(patch.object(program, 'ManagementClock', clock))
+            printed = stack.enter_context(patch('builtins.print'))
+            code = caller.sequence(value, self.directory, self.directory, registration=registration,
+                                   records=Mock(), login=Mock(), private=private)
+        return code, json.loads(printed.call_args.args[0]), SimpleNamespace(
+            registration=registration, stage=stage, dispatch=dispatch, session=session)
+
+    # -- inactive surface and fixed grammar --------------------------------------------------------
+    def test_activation_is_held_before_any_file_or_cloud_object(self):
+        caller = self.caller
+        with patch.object(host, 'GcsAccessRecords', side_effect=AssertionError('no cloud')), \
+             patch.object(host, 'PolicyCloud', side_effect=AssertionError('no cloud')), \
+             patch.object(host, 'gcloud_token', side_effect=AssertionError('no token')):
+            for call in (lambda: caller.trial(), lambda: caller.trial(snapshot(), self.directory, self.directory),
+                         lambda: caller.main(['--snapshot', '/nonexistent', '--payloads', '/x', '--output', '/y']),
+                         lambda: caller.main(['--snapshot', '/nonexistent', '--payloads', '/x', '--output', '/y',
+                                              '--activate'])):
+                with self.assertRaises(guest.Failure) as raised:
+                    call()
+                self.assertEqual(str(raised.exception), 'management activation held')
+        with patch.object(sys, 'argv', ['management_trial']), patch.object(caller.signal, 'signal'), \
+             patch.object(sys, 'stderr', io.StringIO()):
+            with self.assertRaises(SystemExit) as status:
+                runpy.run_module('build.gcp.management_trial', run_name='__main__')
+        self.assertEqual(status.exception.code, 1)
+        import inspect
+        self.assertNotIn('activate', inspect.signature(caller.sequence).parameters)
+
+    def test_vlab_entrypoint_and_tables_are_unchanged_by_the_management_caller(self):
+        self.assertEqual(set(guest.PAYLOADS), {'hhfab.tar.gz', 'kubectl'})
+        self.assertFalse(any('management' in name for name in guest.SOURCES))
+        self.assertEqual(guest.PHASES['persistence'], 105)
+        import inspect
+        self.assertEqual(list(inspect.signature(host.main).parameters), ['argv'])
+        self.assertEqual(list(inspect.signature(host.trial).parameters),
+                         ['snapshot', 'payloads', 'output', 'registration', 'records', 'login', 'private', 'ghcr'])
+
+    def test_commands_are_a_closed_grammar_with_no_selector(self):
+        caller, program = self.caller, self.program
+        nonce = 'a' * 32
+        self.assertEqual(list(caller.STEP_CAPS), list(program.STEP_NAMES))
+        for name in program.STEP_NAMES:
+            self.assertEqual(caller.step_command(nonce, name), ['/usr/bin/sudo', '-n', '/usr/bin/python3',
+                             str(program.MROOT / 'management_trial.py'), 'step', '--nonce', nonce, '--name', name])
+        for bad in ('bash', 'install-docker; id', '', 'x --y'):
+            with self.assertRaises(guest.Failure):
+                caller.step_command(nonce, bad)
+        with self.assertRaises(guest.Failure):
+            caller.step_command('not-a-nonce', 'storage')
+        for action in ('bootstrap', 'step', 'sh', 'worker'):
+            with self.assertRaises(guest.Failure):
+                caller.fixed_command(action, nonce)
+        self.assertEqual(caller.fixed_command('heartbeat', nonce, 3)[-2:], ['--sequence', '3'])
+
+    def test_stub_authenticates_both_modules_before_executing_either(self):
+        stub = self.caller.STUB
+        self.assertLess(stub.index('hexdigest()==expected'), stub.index('exec('))
+        self.assertEqual(stub.count('exec('), 1)
+        self.assertIn("load('vlab_trial.py',sys.argv[2],'vlab_trial')", stub)
+        self.assertIn("load('management_trial.py',sys.argv[3],'management_trial')", stub)
+        incoming = '/tmp/labapp-vlab-' + 'a' * 32
+        command = self.caller.bootstrap_command(incoming,
+                                                {'vlab_trial.py': {'sha256': 'b' * 64}, 'management_trial.py': {'sha256': 'c' * 64}},
+                                                {'files': {}})
+        self.assertEqual(command[:5], ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c'])
+        self.assertEqual(command[5], stub)
+        self.assertEqual(command[6:], [incoming, 'b' * 64, 'c' * 64, guest.sha(host.canonical({'files': {}}))])
+
+    # -- source staging -------------------------------------------------------------------------------
+    def staging(self):
+        program = self.program
+        payloads = {'kubectl': b'k' * 10, 'helm.tar.gz': b'h' * 11, 'chart.tgz': b'c' * 12}
+        pins = {n: (len(b), guest.sha(b)) for n, b in payloads.items()}
+        (self.private / 'payloads').mkdir(mode=0o700)
+        for name, raw in payloads.items():
+            (self.private / 'payloads' / name).write_bytes(raw)
+        patches = (patch.object(program, 'PAYLOADS', pins), patch.object(program, 'FILES', {*program.SOURCES, *pins, 'contract.json'}))
+        for item in patches:
+            self.stack.enter_context(item)
+        return self.private / 'payloads', pins
+
+    def github(self, sha, **change):
+        def fake(path, limit=0):
+            self.assertTrue(path.endswith('?ref=' + sha))
+            repo_path = path[len('contents/'):path.index('?ref=')]
+            raw = ('synthetic source of ' + repo_path).encode()
+            value = {'type': 'file', 'path': repo_path, 'encoding': 'base64', 'size': len(raw),
+                     'content': base64.b64encode(raw).decode()}
+            value.update(change)
+            return value
+        return fake
+
+    def test_stage_program_binds_fixed_tables_to_the_trusted_source_sha_and_pinned_payloads(self):
+        caller, program = self.caller, self.program
+        payloads, pins = self.staging()
+        value = snapshot()
+        requested = []
+        fake = self.github(value['source_sha'])
+        with patch.object(host, 'github', side_effect=lambda p, limit=0: requested.append(p) or fake(p, limit)):
+            source, table = caller.stage_program(value, payloads, self.directory, {'schema': 1, 'nonce': 'a' * 32})
+        self.assertEqual(sorted(requested), sorted('contents/' + p + '?ref=' + value['source_sha'] for p in program.SOURCES.values()))
+        self.assertEqual(set(table['files']), set(program.FILES))
+        self.assertEqual(table['source_sha'], value['source_sha'])
+        for name, item in table['files'].items():
+            raw = (self.directory / name).read_bytes()
+            self.assertEqual((item['bytes'], item['sha256']), (len(raw), guest.sha(raw)))
+            self.assertEqual(stat.S_IMODE((self.directory / name).stat().st_mode), 0o600)
+        self.assertTrue((self.directory / 'manifest.json').is_file())
+
+    def test_stage_program_refuses_untrusted_source_and_wrong_payload_bytes(self):
+        caller = self.caller
+        for change in ({'path': 'build/provision/other.py'}, {'encoding': 'none'}, {'type': 'symlink'},
+                       {'size': guest.MAX_SOURCE + 1}, {'size': 3}):
+            payloads, _ = self.staging() if not (self.private / 'payloads').exists() else (self.private / 'payloads', None)
+            value = snapshot()
+            with patch.object(host, 'github', side_effect=self.github(value['source_sha'], **change)):
+                with self.assertRaises(guest.Failure):
+                    caller.stage_program(value, payloads, self.directory, {'schema': 1})
+            for child in self.directory.iterdir():
+                child.unlink()
+        payloads = self.private / 'payloads'
+        (payloads / 'kubectl').write_bytes(b'x' * 10)  # same size, wrong digest
+        value = snapshot()
+        with patch.object(host, 'github', side_effect=self.github(value['source_sha'])):
+            with self.assertRaises(guest.Failure):
+                caller.stage_program(value, payloads, self.directory, {'schema': 1})
+
+    def test_management_result_accepts_only_the_closed_validated_record(self):
+        caller, program = self.caller, self.program
+        nonce = 'a' * 32
+        record = program.public_record(program.initial_state(nonce))
+        raw = guest.encoded(record)
+        self.assertEqual(caller.management_result(raw, nonce), ('valid', record))
+        self.assertEqual(caller.management_result(b'absent', nonce), ('absent', None))
+        for bad in (b'invalid', b'', b'{', raw + b'x', guest.encoded(dict(record, nonce='b' * 32)),
+                    guest.encoded(dict(record, extra=1)), b'x' * 5000):
+            self.assertEqual(caller.management_result(bad, nonce), ('invalid', None))
+
+    # -- fixed sequence: success, failure, heartbeat, expiry, stale registration -------------------------
+    def allowed(self, args):
+        program = self.program
+        if args[:2] == ['/usr/bin/mkdir', '-m']:
+            return True
+        if '-I' in args and '-c' in args:
+            return args[:3] == ['/usr/bin/sudo', '-n', '/usr/bin/python3']
+        if args[:3] != ['/usr/bin/sudo', '-n', '/usr/bin/python3'] or args[3] != str(program.MROOT / 'management_trial.py'):
+            return False
+        return args[4] in ('heartbeat', 'export-viewer', 'result', 'teardown', 'step') and (
+            args[4] != 'step' or args[-1] in program.STEP_NAMES)
+
+    def test_valid_sequence_preserves_order_clock_and_original_master_for_every_call(self):
+        program = self.program
+        master = FakeManagementMaster(program)
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertEqual(code, 0)
+        self.assertEqual((receipt['management_status'], receipt['browser'], receipt['forward_absent']), ('valid', 'complete', True))
+        self.assertTrue(program.succeeded(receipt['management']))
+        calls = [c for c in master.calls if 'heartbeat' not in c[0]]
+        self.assertTrue(all(self.allowed(c[0]) for c in master.calls), [c[0] for c in master.calls])
+        verbs = [c[0][4] if c[0][0] == '/usr/bin/sudo' and len(c[0]) > 4 and c[0][3].endswith('management_trial.py') else c[0][0]
+                 for c in calls]
+        steps = [v for v in verbs if v == 'step']
+        self.assertEqual(len(steps), len(program.STEP_NAMES))
+        self.assertEqual([c[0][-1] for c in calls if c[0][4:5] == ['step']], list(program.STEP_NAMES))
+        for args, phase, cleanup in calls:
+            if args[4:5] == ['step']:
+                self.assertEqual((phase, cleanup), (program.STEP_PHASE[args[-1]], False))
+        self.assertEqual(verbs[:2], ['/usr/bin/mkdir', '/usr/bin/sudo'])  # private dir, then the hash-checking stub
+        self.assertEqual(verbs[-3:], ['export-viewer', 'teardown', 'result'])
+        teardown = [c for c in calls if c[0][4:5] == ['teardown']][0]
+        result = [c for c in calls if c[0][4:5] == ['result']][0]
+        self.assertTrue(teardown[2] and result[2])  # both use the cleanup reserve of the ORIGINAL clock
+        self.assertEqual(master.transfers[0][1], [*sorted(program.FILES), 'manifest.json'])
+        self.assertEqual(master.closed, 1)
+        self.assertGreaterEqual(spy.registration.current.call_count, len(program.STEP_NAMES))
+        spy.dispatch.assert_called_once()
+        self.assertNotIn(VIEWER_PASSWORD, json.dumps(receipt))
+        self.assertEqual(spy.session.call_args.args[5], self.private)
+        self.assertEqual(guest.data(spy.session.call_args.args[4])['login'], 'labapp-viewer-abc123')
+
+    def test_first_step_failure_stops_work_but_still_tears_down_and_reads_the_typed_result(self):
+        master = FakeManagementMaster(self.program)
+        master.failing_step = 'helm'
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertEqual(code, 17)
+        self.assertEqual(master.ran, list(self.program.STEP_NAMES[:self.program.STEP_NAMES.index('helm')]))
+        verbs = [c[0][4] for c in master.calls if c[0][0] == '/usr/bin/sudo' and c[0][3].endswith('management_trial.py')]
+        self.assertNotIn('export-viewer', verbs)
+        self.assertIn('teardown', verbs)
+        self.assertEqual(receipt['management']['failure']['step'], 'helm')
+        spy.session.assert_not_called()
+        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] in (['teardown'], ['result'])))
+        self.assertEqual(master.closed, 1)
+
+    def test_heartbeat_failure_stops_the_sequence_and_still_tears_down(self):
+        master = FakeManagementMaster(self.program)
+        master.fail_heartbeat = True
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertNotEqual(code, 0)
+        self.assertLess(len(master.ran), len(self.program.STEP_NAMES))
+        self.assertTrue(master.torn)
+        spy.session.assert_not_called()
+        self.assertFalse(receipt['process_absent'] and code == 0)
+
+    def test_exhausted_original_deadline_refuses_work_but_cleanup_still_runs(self):
+        program = self.program
+        master = FakeManagementMaster(program)
+
+        class Expiring(program.ManagementClock):
+            armed = False
+
+            def remaining(self, phase):
+                if Expiring.armed and phase in ('stage', 'work'):
+                    raise guest.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+                return super().remaining(phase)
+        master.on_bootstrap = lambda: setattr(Expiring, 'armed', True)
+        code, receipt, spy = self.sequence(master, private=self.private, clock=Expiring)
+        self.assertEqual(code, 124)
+        self.assertEqual(master.ran, [])
+        self.assertTrue(master.torn)
+        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] in (['teardown'], ['result'])))
+        spy.session.assert_not_called()
+
+    def test_stale_registration_untrusted_source_stop_before_any_guest_byte(self):
+        program = self.program
+        for kwargs in ({'registration': Mock(current=Mock(side_effect=guest.Failure('owner lease changed')))},
+                       {'trusted': guest.Failure('creator cancelled/completed/untrusted', 23)}):
+            master = FakeManagementMaster(program)
+            code, receipt, spy = self.sequence(master, **kwargs)
+            self.assertNotEqual(code, 0)
+            self.assertEqual(master.transfers, [])
+            self.assertFalse(any('-I' in c[0] for c in master.calls))
+            self.assertFalse(any('teardown' in c[0] for c in master.calls))
+            self.assertEqual(master.closed, 1)
+
+    def test_old_clock_work_beyond_the_ceiling_is_unreachable(self):
+        program = self.program
+        value = snapshot()
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=58)
+        value['reserved_at'] = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        value['deadline'] = (start + timedelta(minutes=120)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        master = FakeManagementMaster(program)
+        code, receipt, spy = self.sequence(master, value=value)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(master.ran, [])  # nothing is renewed: the 'access' allowance already ended
+
+    # -- enrollment mirror -------------------------------------------------------------------------------
+    def enroll(self, account=b'art@githedgehog.com\n', impersonation=b'(unset)\n', profile=None, login_user=None):
+        value = snapshot()
+        calls = []
+
+        def command(argv, seconds, **kw):
+            calls.append(argv)
+            if argv[:3] == ['gcloud', 'auth', 'list']:
+                return account
+            if argv[:3] == ['gcloud', 'config', 'get-value']:
+                return impersonation
+            if argv[:4] == ['gcloud', 'compute', 'os-login', 'describe-profile']:
+                return json.dumps({'name': profile or value['self_user']}).encode()
+            raise guest.Failure('unexpected later command', 99)
+        registration = Mock()
+        registration.current.return_value = dict(value, names={'instance': 'fixed'})
+        held = self.caller.Held()
+        with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source'):
+            try:
+                self.caller.enroll(value, self.directory, registration, Mock(), SimpleNamespace(user=login_user or value['self_user']),
+                                   {}, Mock(), threading.Event(), {}, held)
+            except Exception as error:
+                return error, calls, registration, held
+        return None, calls, registration, held
+
+    def test_enrollment_refuses_wrong_account_impersonation_and_principal_before_key_work(self):
+        for kwargs in ({'account': b'someone@example.com\n'}, {'impersonation': b'robot@x.iam.gserviceaccount.com\n'},
+                       {'profile': 'users/110405050082684214273'}, {'login_user': 'users/110405050082684214274'}):
+            error, calls, registration, held = self.enroll(**kwargs)
+            self.assertIsNotNone(error, kwargs)
+            self.assertNotEqual(str(error), 'unexpected later command')
+            self.assertFalse(any('ssh-keygen' in part for c in calls for part in c))
+            registration.register.assert_not_called()
+            self.assertIsNone(held.master)
+
+    # -- browser: original-master loopback forward -----------------------------------------------------
+    def browser(self, *, outcome='viewer-panel-seen', mode=0o600, lost=False, listening_start=False, cancel_fails=False,
+                private='default', wait=0.05, write=True):
+        caller, program = self.caller, self.program
+        master = FakeManagementMaster(program)
+        master.lost_after = 1 if lost else None  # first guard passes, the next socket check finds it gone
+        value = snapshot()
+        clock = program.ManagementClock({'admitted_at': value['reserved_at'], 'deadline': value['deadline']})
+        state, commands = {'open': listening_start}, []
+        nonce, lease = 'a' * 32, value['request_id']
+        private = self.private if private == 'default' else private
+        if write and private is not None:
+            done = private / ('browser-complete-' + lease + '.json')
+            done.write_text(json.dumps({'schema': 1, 'nonce': nonce, 'result': outcome}))
+            done.chmod(mode)
+
+        def command(argv, seconds, **kw):
+            commands.append(list(argv))
+            verb = argv[argv.index('-O') + 1]
+            if verb == 'cancel' and cancel_fails:
+                raise guest.Failure('cancel failed', 5)
+            state['open'] = verb == 'forward'
+            return b''
+        uncertain = threading.Event()
+        with patch.object(host, 'command', side_effect=command), patch.object(caller, 'listening', side_effect=lambda: state['open']), \
+             patch.object(caller.time, 'sleep'), patch.object(caller, 'BROWSER_WAIT_SECONDS', wait):
+            status = caller.browser_session(master, clock, nonce, lease, handoff_bytes(nonce), private,
+                                            threading.Event(), uncertain)
+        return status, master, commands, uncertain, lease
+
+    def test_browser_forward_is_original_master_loopback_only_and_complete_only_by_owner_attestation(self):
+        status, master, commands, uncertain, lease = self.browser()
+        self.assertEqual(status, ('complete', True))
+        self.assertEqual([c[c.index('-O') + 1] for c in commands], ['forward', 'cancel'])
+        forward = commands[0]
+        self.assertEqual(forward[0], '/usr/bin/ssh')
+        for required in ('ControlMaster=no', 'ProxyCommand=/usr/bin/false', 'ControlPath=/fake/master.sock'):
+            self.assertTrue(any(required in part for part in forward), required)
+        self.assertEqual(forward[forward.index('-L') + 1], '127.0.0.1:3000:127.0.0.1:3000')
+        for forbidden in ('-M', '-N', '-D', '-R', '-W', '-J', '-o ProxyJump'):
+            self.assertNotIn(forbidden, forward)
+        self.assertEqual(forward[-1], 'labapp-trial-1234')
+        self.assertGreater(master.checks, 1)  # original socket identity checked around and during the forward
+        handoff = self.private / ('viewer-handoff-' + lease + '.json')
+        self.assertEqual(stat.S_IMODE(handoff.stat().st_mode), 0o600)
+        record = guest.data(handoff.read_bytes())
+        self.assertEqual(set(record), self.program.HANDOFF_FIELDS)
+        self.assertFalse(any(k in record for k in ('kubeconfig', 'admin', 'token')))
+        self.assertFalse(uncertain.is_set())
+
+    def test_browser_failed_timeout_lax_file_lost_master_and_skips(self):
+        status, *_ = self.browser(outcome='viewer-panel-failed')
+        self.assertEqual(status, ('failed', True))
+        status, master, commands, *_ = self.browser(write=False)  # no owner attestation -> timeout, never inferred
+        self.assertEqual(status, ('timeout', True))
+        self.assertEqual([c[c.index('-O') + 1] for c in commands], ['forward', 'cancel'])
+        status, master, commands, *_ = self.browser(mode=0o644)
+        self.assertEqual(status, ('forward-failed', True))
+        self.assertEqual(commands[-1][commands[-1].index('-O') + 1], 'cancel')
+        status, master, commands, *_ = self.browser(lost=True, write=False)
+        self.assertEqual(status, ('forward-failed', True))
+        self.assertEqual(commands[-1][commands[-1].index('-O') + 1], 'cancel')
+        status, master, commands, *_ = self.browser(listening_start=True)  # port already in use: never touched
+        self.assertEqual((status, commands), (('skipped', True), []))
+        status, master, commands, *_ = self.browser(private=None)
+        self.assertEqual((status, commands), (('skipped', True), []))
+
+    def test_browser_cancel_failure_with_surviving_listener_marks_cleanup_uncertain(self):
+        status, master, commands, uncertain, _ = self.browser(cancel_fails=True)
+        self.assertEqual(status, ('complete', False))
+        self.assertTrue(uncertain.is_set())
+
+
+class ManagementStub(unittest.TestCase):
+    """The REAL stub text run under the stdlib interpreter against synthetic modules (no native tool)."""
+    def setUp(self):
+        self.caller = load_caller()
+        self.temp = Path(tempfile.mkdtemp(prefix='labapp-stub-'))
+        self.addCleanup(lambda: __import__('shutil').rmtree(self.temp, ignore_errors=True))
+        self.marker = self.temp / 'marker'
+        self.vlab = ('open(%r, "a").write("v")\n' % str(self.marker)).encode()
+        self.mgmt = ('def bootstrap(path, manifest):\n    open(%r, "a").write("b" + manifest)\n' % str(self.marker)).encode()
+        (self.temp / 'vlab_trial.py').write_bytes(self.vlab)
+        (self.temp / 'management_trial.py').write_bytes(self.mgmt)
+
+    def run_stub(self, vlab_sha, mgmt_sha):
+        return subprocess.run([sys.executable, '-I', '-c', self.caller.STUB, str(self.temp), vlab_sha, mgmt_sha, 'M' * 4],
+                              capture_output=True, timeout=30)
+
+    def test_only_hash_matching_bytes_are_executed(self):
+        sha = guest.sha
+        self.assertEqual(self.run_stub(sha(self.vlab), sha(self.mgmt)).returncode, 0)
+        self.assertEqual(self.marker.read_text(), 'vbMMMM')
+        self.marker.unlink()
+        self.assertNotEqual(self.run_stub('0' * 64, sha(self.mgmt)).returncode, 0)
+        self.assertFalse(self.marker.exists())  # tampered primitives: nothing executed at all
+        self.assertNotEqual(self.run_stub(sha(self.vlab), '0' * 64).returncode, 0)
+        self.assertEqual(self.marker.read_text(), 'v')  # only the verified module ran; management never did
