@@ -5728,13 +5728,16 @@ class ManagementLifetime(unittest.TestCase):
         for name, rendered in (('constant 38min', '38min'), ('wrong trigger', lambda c: '%d' % ((int(c['cutoffs']['persistence']) - 60) * 1000000)),('unknown format', 'soon'),
                                ('infinity', 'infinity'), ('empty', ''), ('mixed', '1h 3min 5xs')):
             with self.subTest(name):
-                incoming, digest, events, _, _, _ = self.bootstrap_fixture(timer_next=rendered)
-                with self.assertRaises(trial.Failure):
-                    m._bootstrap(incoming, digest)
-                self.assertNotIn(['start', m.GUARDIAN_UNIT], events)
-                self.assertFalse((self.root / m.RELEASE_OPEN).exists())
-                shutil.rmtree(self.root, True)
-                shutil.rmtree(incoming, True)
+                incoming, digest, events, _, units, runtime = self.bootstrap_fixture(timer_next=rendered)
+                try:
+                    with self.assertRaises(trial.Failure):
+                        m._bootstrap(incoming, digest)
+                    self.assertNotIn(['start', m.GUARDIAN_UNIT], events)
+                    self.assertFalse((self.root / m.RELEASE_OPEN).exists())
+                finally:
+                    for directory in (self.root, incoming, units, runtime):
+                        shutil.rmtree(directory, True)
+                    self.root.mkdir(mode=0o700)
         self.assertAlmostEqual(m.timespan_seconds('37min 59s'), 2279.0)
         self.assertAlmostEqual(m.timespan_seconds('1h 3min 5.5s'), 3785.5)
         self.assertEqual(m.timespan_seconds('2280000000'), 2280.0)
