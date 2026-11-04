@@ -1694,6 +1694,121 @@ check has run. The lead validates the data separately.
 * **Unrun gates.** Release image, seal, full course, logs, GitOps, dashboards and performance. An
   engine compatibility experiment or any current-maintained selection needs separate scope.
 
+## Fixed management guest sequence (issue #506, SOURCE-INACTIVE)
+
+`management_trial.py` (guest) and `../gcp/management_trial.py` (owner-local caller) author ONE closed
+program over the accepted #503 inputs: a fixed table of 18 steps, not a command loader. Offline tests
+exercise synthetic APIs and stdlib fixture children; they do not establish native installation,
+cluster, forward, browser or cloud behavior.
+**Activation is held.** `refuse_activation` always raises while `ACTIVATION_BLOCKERS` is non-empty;
+`main`, `bootstrap` and the caller's `main`/`trial` call it first, there is no flag, argument or
+environment bypass, and the source records no approval. `sequence` in the caller is the internal body a
+later, separately reviewed activation would expose; only offline synthetic tests reach it.
+
+* **Reused, unchanged protections.** The caller imports `Master`, `OwnerRegistration`, `trusted_source`,
+  OS Login own-key import/cleanup, the pinned host key, creator cancellation and the private-capture helpers
+  from `build/gcp/vlab_trial.py`, and the guest reuses `vlab_trial` primitives (`Failure`, `contract`,
+  `Clock` rules, private-file helpers, bounded child runner). `build/provision/vlab_trial.py` and
+  `build/gcp/vlab_trial.py` are not edited; the VLAB tables, phases and default are unchanged. Every guest call
+  goes through the ONE original ControlMaster and its deliberately failing fallback proxy, so there is no
+  second master, reconnect or new authentication. The only differences are the fixed management tables and the
+  management clock below.
+* **No selector.** The host can name only a step from `STEP_NAMES` (argparse `choices`, plus a host-side
+  enum check) or one of `heartbeat`, `export-viewer`, `result`, `teardown`. No path, argv, script or command
+  comes from the caller, guest output or a file. The root stub in `STUB` hash-verifies each of
+  `vlab_trial.py`, `owned_process.py` and `management_trial.py` against its host-held digest before
+  executing that module. The ownership helper is included in the fixed staged source table.
+* **Not a guardian.** Unlike the VLAB trial there is no autonomous in-guest supervisor. Each step re-checks
+  contract, boot id, a heartbeat at most 30 seconds old and the management clock before every child. An
+  orphaned guest child after host loss is contained only by those gates and by lease/VM expiry; `contained`
+  is never claimed.
+* **Time (unresolved decision).** `ManagementClock` anchors at durable ADMISSION, never at process start:
+  access 15, stage 30, work 50, persistence 54 minutes, and a 60-minute CEILING for work plus cleanup, so a
+  six-minute cleanup reserve survives failed work. Every bound is clipped to the unchanged provider lease. The
+  provider envelope is NOT changed: `contract` still requires exactly 7200 seconds, and running this 60-minute
+  component inside it (an exception) versus a separately reviewed provider change is an open owner/runtime
+  decision. This work grants no 120-minute exception and does not classify the component as a full build.
+  Each in-process `Context` retains one monotonic anchor across native children, HTTP and polling;
+  there is still no independently surviving owner retaining that anchor across step processes.
+* **Inputs.** Docker, kubectl 1.35.0, k3d 5.7.4, Helm 3.19.4 and chart 65.2.0 reuse the accepted installers and
+  pins; Grafana 11.2.1, operator 0.77.1, hhfab 0.43.1, Fabric 0.96.2 and private SONiC 4.5 are unchanged. The only
+  management image candidate is `docker.io/rancher/k3s@sha256:81fc7349…e4` (EXPERIMENTAL, not a maintained or
+  release selection). Host payloads with enforced size and sha256: kubectl, the Helm archive and the chart
+  package (a test compares them with `install-helm.py`, `install-kubectl.py` and `observability-inputs.yaml`). The
+  k3d binary is NOT a payload: `install-k3d.sh` pins only a sha256 (no size is pinned) and downloads from upstream
+  at run time, so it is future egress and inventory, not a verified byte count. Image inventory
+  (`IMAGE_INVENTORY`): k3s digest known; `busybox:1.31.1` chart-declared without a digest; k3d load-balancer and
+  tools images, chart images and K3s internal images are UNRESOLVED runtime preflight. The
+  `K3D_IMAGE_LOADBALANCER`/`K3D_IMAGE_TOOLS`/`K3D_HELPER_IMAGE_TAG` overrides are not security closure and are not
+  used. Docker installer package sources are also unresolved egress.
+* **Sequence.** install-docker, install-kubectl, install-helm, install-k3d, daemon-start; then a new owned
+  storage directory (0700, inode recorded), `k3d cluster create` with the accepted config, a private 0600
+  kubeconfig, namespace, guest-local random throwaway Grafana admin Secret (from private files, never argv), Helm
+  install, actual Bound-PVC and Ready-workload checks; `kubectl exec -i` of the Prometheus container's native
+  `/bin/promtool push metrics --label=job=promtool --timeout=10s` to its own loopback `/api/v1/write`, one uniquely nonce-labelled
+  gauge on stdin; exact read-back labels are the metric name, nonce and native `job=promtool` label.
+  Read-back verifies value and SAMPLE timestamp with bounded freshness; an unused nonce
+  must return successful EMPTY data (a query error raises, distinct); unchanged repeat reads; Pod deletion (never
+  PVC, namespace, release or cluster deletion) of Prometheus and Grafana with unchanged PVC UIDs; a historical
+  query AT the recorded sample timestamp with no second push; a persisted TEST Viewer principal and datasource set.
+  Every kubectl/helm call names the private kubeconfig and context explicitly; no global kubeconfig is touched.
+  This test sample is NOT Alloy, switch-proxy, target-page or course telemetry.
+  Polling checks the retained phase clock and original polling deadline both before attempts and
+  before accepting readiness. Native command caps, HTTP timeouts and retry sleeps are clipped to
+  the remaining polling allowance; a transient empty Pod set does not renew that allowance.
+* **Private non-admin browser contract.** The TEST Viewer is created by the native Grafana API with admin
+  credentials that stay in guest 0600 files; its role is verified to be `Viewer` (never elevated; admin settings
+  access must be refused). `viewer-ready` writes a fixed Viewer-only handoff (schema, nonce, login, password,
+  `/d/<uid>?viewPanel=<id>`, port 3000); admin credentials and the kubeconfig cannot be expressed in it. The
+  host writes it to a bounded 0600 file in the lead-owned private directory, opens ONE original-master loopback
+  forward `127.0.0.1:3000`, checks the original socket identity on every poll, and tears the forward down
+  explicitly. The dashboard is DISCOVERED, not pinned: the pinned chart's `prometheus.yaml` (helm-charts
+  `05fcb4c0`, read through a summarising fetch, so re-read the raw bytes) has title `Prometheus / Overview`, tag
+  `prometheus-mixin`, `uid ""` and panel id 7 `Head Series` on the `$datasource` variable. `viewer-ready` searches
+  AS THE VIEWER (`/api/search`), requires exactly one match, reads the generated UID, and checks the Viewer cannot
+  save/edit/administer it, the panel id/title/type, the datasource variable and exactly one `prometheus`
+  datasource; missing, duplicate or wrong results refuse. No Explore, editing, `ViewersCanEdit` or new dashboard.
+  **Browser evidence is OWNER-ATTESTED only.** The host accepts a private 0600 `browser-complete-<lease>.json`
+  (schema 2: nonce, lease, `attestation: owner-attested`, Viewer login, role `Viewer`, discovered dashboard UID,
+  panel id, `datasource_type: prometheus`, `ui_result`) bound to the handoff; the best status is `owner-attested`.
+  No verified-browser observer exists in this source, so `browser_verified` is `false`, the whole-trial success
+  predicate needs `verified`, and the execution gate stays (`no-authorized-verified-browser-observer`). Operator
+  steps (engineering use, not course content, and not run): forward the loopback port, sign in as the TEST Viewer
+  from the private handoff, open the handoff `path`, record what the panel shows, then write the completion file.
+  There is no guarantee the UI works until a separately authorized runtime run.
+* **Continuous supervision.** `stdin_bounded` runs the fixed gate (kernel boot, heartbeat freshness, management
+  clock) every <=0.1s while any child is live; heartbeat loss, boot change, phase cutoff, deadline, signal or
+  interruption request closure of the child's exact group through the unchanged `owned_process.OwnedGroup`.
+  The helper observes without reaping, signals while identity remains anchored, is the sole reaper and
+  requires positive group absence. Closure also follows clean exit and has reserved time within the
+  command cap. Uncertainty survives a primary failure and prevents a complete teardown claim.
+  An observed native exit or signal remains the primary failure if group closure is uncertain.
+  Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
+  guardian and `vlab_trial.py` are unchanged. Loss of the step runner process itself is still bounded only by
+  lease/VM expiry.
+* **Outcome.** A closed nonsecret typed result (`validate_result`: per-step ok/failed/not-run, one first failure
+  with category and child status, sixteen booleans, teardown pending/complete/uncertain) is read after the fixed
+  `teardown` through the same original master. No secret, argv or raw output enters it or the receipt.
+  Teardown removes only what this program recorded (the exact cluster name, its Docker units, the private files,
+  the recorded storage inode) and reports `uncertain` otherwise. VM/boot absence, census and own-key authority
+  before slot release remain the existing independent cleanup path and are not weakened.
+
+**Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
+(2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,
+K3s-internal and `busybox` images); (3) runtime discovery of the existing Viewer dashboard/panel is unobserved
+(source constants are summariser-read; Viewer permissions on the provisioned dashboard are only checked at runtime);
+(4) review of the private Viewer handoff and the loopback forward, and no authorized verified-browser observer;
+(5) quota, shape and budget, and the existing owner-accessible n2-standard-32/500GiB lease stays unchanged;
+(6) reviewed activation plus a separately authorized experiment. Unverified runtime assumptions (each refuses
+rather than guesses): exactly one pod per `app.kubernetes.io/name=prometheus|grafana`, container name
+`prometheus`, exactly two claims of `8Gi` and `1Gi`, k3d's default kubeconfig mode, and Grafana serving correctly
+through the forwarded loopback port. No claim is made about runtime compatibility, K3s 1.36 with the unchanged
+chart/operator, browser or Alloy behaviour, reboot, image build, full course or speedup.
+
+Offline checks (lead / existing CI; the worker ran none): `python3 -m unittest` through the existing
+`ci.yml` steps that discover `test_vlab_trial.py` in `build/provision` and `build/gcp` (the new cases live in
+those files), plus `git diff --check`.
+
 ## Pinned public serializer/default asymmetry fixture
 
 `fixtures/pinned-api/main.go` (#394, extended by #400) runs three public inputs

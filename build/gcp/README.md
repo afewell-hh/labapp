@@ -1846,3 +1846,39 @@ Current primary text read2026-10-31: [OpenSSH multiplexing](https://man.openbsd.
 [GitHub captured run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run),
 [v0.43.1 template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml)
 and [template input](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.go).
+
+### Fixed management caller (issue #506): inactive surface
+
+`build/gcp/management_trial.py` is a SOURCE-INACTIVE sibling of the canonical trial caller. Its `main` and
+`trial` refuse unconditionally (`management activation held`) before reading any file, credential, network or
+cloud object; there is no flag, argument or environment bypass, and no approval is recorded in source. It adds no
+command selector, controller, provider/profile/IAM change or student CLI, and `build/gcp/vlab_trial.py` is
+unchanged. Its internal `sequence` reuses `Master`, `OwnerRegistration`, `trusted_source`, own-key import and
+cleanup, the pinned host key, heartbeat, creator cancellation and positive cleanup from the canonical caller, over
+the ONE original ControlMaster with the failing fallback proxy, and drives only the fixed
+`build/provision/management_trial.py` step table, on a 60-minute admission-anchored work+cleanup clock clipped to the
+unchanged 7200-second lease. Running that component inside the provider envelope (an exception) versus a
+separately reviewed provider change is an UNRESOLVED owner/runtime decision, as are the artifact/egress and image
+inventory, the unresolved Viewer-accessible chart panel, the private Viewer handoff/loopback-forward review and
+quota/shape/budget; see the exact blocker list in
+[build/provision/README.md](../provision/README.md#fixed-management-guest-sequence-issue-506-source-inactive).
+The caller's tests are in the two existing `test_vlab_trial.py` homes and use fake masters, registrations and
+processes only; they do not need or authorize live admission. Source/CI acceptance of this surface is not
+activation.
+
+Enrollment checks the canonical caller's pinned Google Cloud SDK 575.0.0 before key generation.
+Before staging appliance source, it revalidates registration/source and round-trips a harmless nonce
+marker through the original master and its transfer path. A mismatched marker refuses staging.
+The bootstrap individually authenticates the fixed primitive, ownership-helper and management modules.
+
+The browser handoff requires an owned 0700 private directory and refuses a pre-existing completion
+file. On every attempted browser session exit it removes only matching owned 0600 handoff/completion
+files. Changed inode, directory, ownership, permissions or removal failure reports cleanup uncertainty;
+foreign replacements are preserved. Completion remains owner-attested, never verified browser evidence.
+Handoff creation records the exclusive file identity before writing, so partial-write failures enter
+the same finalizer. A forwarding attempt is recorded before the request; even an installed-forward
+then-command-error path attempts original-master cancellation and checks listener absence.
+Only definite connection refusal proves listener absence. Timeouts, descriptor exhaustion,
+permission errors or interruption leave forward cleanup uncertain without skipping private-file cleanup.
+No authorized verified-browser observer or independently surviving management guardian exists, so
+the whole-trial success contract remains incomplete and activation stays held.
