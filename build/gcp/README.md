@@ -1880,5 +1880,19 @@ the same finalizer. A forwarding attempt is recorded before the request; even an
 then-command-error path attempts original-master cancellation and checks listener absence.
 Only definite connection refusal proves listener absence. Timeouts, descriptor exhaustion,
 permission errors or interruption leave forward cleanup uncertain without skipping private-file cleanup.
-No authorized verified-browser observer or independently surviving management guardian exists, so
-the whole-trial success contract remains incomplete and activation stays held.
+No authorized verified-browser observer exists, so the whole-trial success contract remains incomplete and
+activation stays held.
+
+#### Guest lifetime ownership and clock capsule (issue #508, source-inactive)
+
+The caller no longer executes steps: it takes ONE fixed guest clock sample through the original Master
+(`guest_clock_capsule`; round trip <= 10 s, guest wall within the caller bracket +/- 5 s, remaining time computed
+from the caller's retained clock at RESPONSE reception, safety allowance subtracted, round trip never added back),
+stages the resulting immutable `capsule.json` and the three fixed units in the manifest, bootstraps once, then
+only heartbeats, polls the read-only `result`, exports the Viewer handoff, runs the unchanged browser session and
+sends `cancel`. The guest's fixed guardian/timer/stop units and poststop own cleanup and write the typed receipt;
+a still-`pending` receipt after the bounded wait is reported unknown. There is no reconnect, resample after an
+ambiguous bootstrap, per-step command or host teardown command. Assumptions, the budget and unverified systemd
+behavior are listed in
+[build/provision/README.md](../provision/README.md#fixed-lifetime-ownership-and-clock-capsule-issue-508-source-inactive).
+Tests (fake masters, no ssh/gcloud/native tool) are in the existing `test_vlab_trial.py` home.

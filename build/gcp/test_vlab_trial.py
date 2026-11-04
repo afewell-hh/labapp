@@ -2639,6 +2639,7 @@ class FakeManagementMaster:
         self.heartbeat_failed = threading.Event()
         self.ran, self.torn, self.on_bootstrap = [], False, None
         self.marker_matches = True
+        self.sample_mono, self.sample_skew, self.sample_delay = 1000.0, 0, 0
 
     def check(self, until=None):
         self.checks += 1
@@ -2675,24 +2676,28 @@ class FakeManagementMaster:
                 self.heartbeat_failed.set()
                 raise guest.Failure('heartbeat transport', 9)
             return b''
-        if '-I' in args and '-c' in args and self.on_bootstrap:
+        if args[:3] == ['/usr/bin/python3', '-I', '-c']:  # the fixed guest clock sample (#508)
+            self.sample_requests = getattr(self, 'sample_requests', 0) + 1
+            time.sleep(self.sample_delay)
+            return json.dumps({'boot': '22222222-2222-4222-8222-222222222222', 'nonce': args[4],
+                               'wall': time.time() + self.sample_skew, 'mono': self.sample_mono}).encode()
+        if args[0] == '/usr/bin/sudo' and '-I' in args and '-c' in args and self.on_bootstrap:
             self.on_bootstrap()
         nonce = args[args.index('--nonce') + 1] if '--nonce' in args else None
-        if 'step' in args:
-            name = args[args.index('--name') + 1]
-            if self.fail_heartbeat:
-                self.heartbeat_failed.wait(2)
-                time.sleep(.1)  # let the heartbeat thread publish its failure to the host loop
-            if name == self.failing_step:
-                raise guest.Failure('fixed child failed', 17)
-            self.ran.append(name)
-            return b''
         if 'export-viewer' in args:
             return handoff_bytes(nonce)
-        if 'teardown' in args:
+        if 'cancel' in args:
             self.torn = True
             return b''
         if 'result' in args:
+            if not self.torn:  # the guest's ONE worker progresses by itself; the host never executes a step
+                if self.fail_heartbeat:
+                    self.heartbeat_failed.wait(2)
+                    time.sleep(.1)  # let the heartbeat thread publish its failure to the host loop
+                elif self.failing_step:
+                    self.ran = list(self.program.STEP_NAMES[:self.program.STEP_NAMES.index(self.failing_step)])
+                else:
+                    self.ran = list(self.program.STEP_NAMES)
             return self.typed(nonce)
         return b''
 
@@ -2707,6 +2712,7 @@ class ManagementCaller(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(host.subprocess, 'Popen', side_effect=AssertionError('no native child')))
+        self.stack.enter_context(patch.object(self.caller, 'PROGRESS_INTERVAL', 0))
         self.directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-out-')))
         self.private = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='labapp-mgmt-priv-')))
         self.directory.chmod(0o700)
@@ -2773,18 +2779,17 @@ class ManagementCaller(unittest.TestCase):
     def test_commands_are_a_closed_grammar_with_no_selector(self):
         caller, program = self.caller, self.program
         nonce = 'a' * 32
-        self.assertEqual(list(caller.STEP_CAPS), list(program.STEP_NAMES))
-        for name in program.STEP_NAMES:
-            self.assertEqual(caller.step_command(nonce, name), ['/usr/bin/sudo', '-n', '/usr/bin/python3',
-                             str(program.MROOT / 'management_trial.py'), 'step', '--nonce', nonce, '--name', name])
-        for bad in ('bash', 'install-docker; id', '', 'x --y'):
-            with self.assertRaises(guest.Failure):
-                caller.step_command(nonce, bad)
-        with self.assertRaises(guest.Failure):
-            caller.step_command('not-a-nonce', 'storage')
-        for action in ('bootstrap', 'step', 'sh', 'worker'):
+        # #508: the host has no per-step or teardown command at all; only the four closed host actions.
+        self.assertFalse(hasattr(caller, 'step_command') or hasattr(caller, 'STEP_CAPS'))
+        self.assertEqual(program.HOST_ACTIONS, ('heartbeat', 'export-viewer', 'result', 'cancel'))
+        for action in program.HOST_ACTIONS:
+            self.assertEqual(caller.fixed_command(action, nonce)[:5], ['/usr/bin/sudo', '-n', '/usr/bin/python3',
+                             str(program.MROOT / 'management_trial.py'), action])
+        for action in ('bootstrap', 'step', 'sh', 'worker', 'guardian', 'poststop', 'expire', 'teardown'):
             with self.assertRaises(guest.Failure):
                 caller.fixed_command(action, nonce)
+        with self.assertRaises(guest.Failure):
+            caller.fixed_command('result', 'not-a-nonce')
         self.assertEqual(caller.fixed_command('heartbeat', nonce, 3)[-2:], ['--sequence', '3'])
 
     def test_stub_authenticates_each_module_before_executing_it(self):
@@ -2874,6 +2879,97 @@ class ManagementCaller(unittest.TestCase):
                     guest.encoded(dict(record, extra=1)), b'x' * 5000):
             self.assertEqual(caller.management_result(bad, nonce), ('invalid', None))
 
+    # -- #508 clock capsule at the caller ------------------------------------------------------------------
+    def initial_contract(self):
+        rec = snapshot()
+        return {'schema': 1, 'nonce': 'a' * 32, 'lease': rec['request_id'], 'epoch': rec['epoch'], 'run_id': rec['run_id'],
+                'attempt': rec['attempt'], 'body_sha256': rec['body_hash'], 'vm_id': rec['ids']['instance'],
+                'boot_id': rec['ids']['boot'], 'image_id': rec['boot_image_id'], 'admitted_at': rec['reserved_at'],
+                'deadline': rec['deadline'], 'boot_uuid': '22222222-2222-4222-8222-222222222222', 'source_sha': 'a' * 40}
+
+    def test_guest_clock_capsule_is_one_fixed_sample_mapped_conservatively_from_the_response_clock(self):
+        caller, program = self.caller, self.program
+        initial = self.initial_contract()
+        ticks = [0.0]
+        wall0, mono0 = time.time(), time.monotonic()
+        clock = program.ManagementClock(initial, wall=lambda: wall0 + ticks[0], mono=lambda: mono0 + ticks[0])
+        master = FakeManagementMaster(program)
+        original = master.remote
+
+        def slow(args, phase, **kw):
+            ticks[0] += 3.0  # round trip as measured by the caller's ONCE-retained original clock
+            return original(args, phase, **kw)
+        master.remote = slow
+        capsule = caller.guest_clock_capsule(master, clock, initial)
+        self.assertEqual(master.sample_requests, 1)
+        call = master.calls[0]
+        self.assertEqual((call[0][:4], call[1]), (['/usr/bin/python3', '-I', '-c', program.SAMPLE_STUB], 'access'))
+        self.assertEqual(capsule['caller']['roundtrip'], 3.0)
+        at_response = clock.left_at(program.MGMT_PHASES['access'], wall0 + 3.0, mono0 + 3.0)
+        self.assertAlmostEqual(capsule['cutoffs']['access'], master.sample_mono + at_response - program.CLOCK_SAFETY_SECONDS)
+        # the round trip is never added back: the cutoff is earlier than the (unknowable) sample-instant mapping
+        self.assertLess(capsule['cutoffs']['access'], master.sample_mono + clock.left_at(15, wall0, mono0))
+        self.assertIs(program.validate_capsule(capsule, initial), capsule)
+
+    def test_guest_clock_capsule_refuses_slow_skewed_or_foreign_samples_fail_closed(self):
+        caller, program = self.caller, self.program
+        initial = self.initial_contract()
+        for name, advance, skew in (('round trip over 10s', 11.0, 0), ('guest ahead beyond bracket', 0.0, 30),
+                                    ('guest behind beyond bracket', 0.0, -30)):
+            with self.subTest(name):
+                ticks = [0.0]
+                wall0, mono0 = time.time(), time.monotonic()
+                clock = program.ManagementClock(initial, wall=lambda: wall0 + ticks[0], mono=lambda: mono0 + ticks[0])
+                master = FakeManagementMaster(program)
+                master.sample_skew = skew
+                original = master.remote
+                master.remote = lambda args, phase, _o=original, _t=ticks, _a=advance, **kw: (
+                    _t.__setitem__(0, _t[0] + _a), _o(args, phase, **kw))[1]
+                with self.assertRaises(guest.Failure):
+                    caller.guest_clock_capsule(master, clock, initial)
+        clock = program.ManagementClock(initial)
+        for mutate in (lambda s: s.update(boot='33333333-3333-4333-8333-333333333333'), lambda s: s.update(nonce='f' * 32),
+                       lambda s: s.update(extra=1), lambda s: s.update(mono=-1.0), lambda s: s.update(wall=float('nan'))):
+            sample = {'boot': initial['boot_uuid'], 'nonce': 'e' * 32, 'wall': time.time(), 'mono': 1000.0}
+            mutate(sample)
+            with self.assertRaises((guest.Failure, ValueError)):
+                program.build_capsule(initial, clock, sample, 'e' * 32, (time.time(), time.monotonic()),
+                                      (time.time(), time.monotonic()))
+
+    def test_stage_program_requires_and_binds_the_capsule(self):
+        caller, program = self.caller, self.program
+        with patch.object(host, 'github', side_effect=AssertionError('no source fetch before the capsule is present')):
+            with self.assertRaises(guest.Failure):
+                caller.stage_program(snapshot(), self.private, self.directory, self.initial_contract())
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertIn('capsule.json', program.FILES)
+        foreign = self.initial_contract()
+        foreign['nonce'] = 'b' * 32
+        sample = {'boot': foreign['boot_uuid'], 'nonce': 'e' * 32, 'wall': time.time(), 'mono': 1000.0}
+        capsule = program.build_capsule(foreign, program.ManagementClock(foreign), sample, 'e' * 32,
+                                        (time.time(), time.monotonic()), (time.time(), time.monotonic()))
+        payloads, _ = self.staging()
+        value = snapshot()
+        with patch.object(host, 'github', side_effect=self.github(value['source_sha'])):
+            with self.assertRaises(guest.Failure):  # a capsule for another contract is never staged
+                caller.stage_program(value, payloads, self.directory, self.initial_contract(), capsule)
+
+    def test_sequence_samples_once_before_staging_and_never_resamples_after_a_bootstrap_failure(self):
+        program = self.program
+        master = FakeManagementMaster(program)
+
+        def lost_reply():
+            raise guest.Failure('ambiguous bootstrap reply', 77)
+        master.on_bootstrap = lost_reply
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertEqual(code, 77)
+        self.assertEqual(master.sample_requests, 1)  # no reissue/resample after the ambiguous effect
+        self.assertEqual(len([c for c in master.calls if '-I' in c[0] and c[0][0] == '/usr/bin/sudo']), 1)
+        capsule = spy.stage.call_args.args[4]
+        self.assertEqual(capsule['nonce'], spy.stage.call_args.args[3]['nonce'])
+        order = [c[0][0] for c in master.calls]
+        self.assertLess(order.index('/usr/bin/python3'), order.index('/usr/bin/sudo'))
+
     # -- fixed sequence: success, failure, heartbeat, expiry, stale registration -------------------------
     def allowed(self, args):
         program = self.program
@@ -2882,12 +2978,13 @@ class ManagementCaller(unittest.TestCase):
         if args[0] in ('/usr/bin/cat', '/usr/bin/rm'):
             return bool(re.fullmatch('/tmp/labapp-vlab-[a-f0-9]{32}/marker', args[-1])) and (
                 len(args) == 2 if args[0] == '/usr/bin/cat' else args[1:-1] == ['--'])
+        if args[:3] == ['/usr/bin/python3', '-I', '-c']:  # the single fixed clock sample
+            return args[3] == program.SAMPLE_STUB and len(args) == 5 and re.fullmatch('[a-f0-9]{32}', args[4]) is not None
         if '-I' in args and '-c' in args:
             return args[:3] == ['/usr/bin/sudo', '-n', '/usr/bin/python3']
         if args[:3] != ['/usr/bin/sudo', '-n', '/usr/bin/python3'] or args[3] != str(program.MROOT / 'management_trial.py'):
             return False
-        return args[4] in ('heartbeat', 'export-viewer', 'result', 'teardown', 'step') and (
-            args[4] != 'step' or args[-1] in program.STEP_NAMES)
+        return args[4] in program.HOST_ACTIONS
 
     def test_owner_attested_or_unobserved_browser_never_yields_whole_trial_success(self):
         for browser in (('owner-attested', True), ('failed', True), ('skipped', True), ('timeout', True),
@@ -2911,21 +3008,21 @@ class ManagementCaller(unittest.TestCase):
         self.assertTrue(all(self.allowed(c[0]) for c in master.calls), [c[0] for c in master.calls])
         verbs = [c[0][4] if c[0][0] == '/usr/bin/sudo' and len(c[0]) > 4 and c[0][3].endswith('management_trial.py') else c[0][0]
                  for c in calls]
-        steps = [v for v in verbs if v == 'step']
-        self.assertEqual(len(steps), len(program.STEP_NAMES))
-        self.assertEqual([c[0][-1] for c in calls if c[0][4:5] == ['step']], list(program.STEP_NAMES))
-        for args, phase, cleanup in calls:
-            if args[4:5] == ['step']:
-                self.assertEqual((phase, cleanup), (program.STEP_PHASE[args[-1]], False))
-        self.assertEqual(verbs[:4], ['/usr/bin/mkdir', '/usr/bin/cat', '/usr/bin/rm', '/usr/bin/sudo'])
-        self.assertEqual(verbs[-3:], ['export-viewer', 'teardown', 'result'])
-        teardown = [c for c in calls if c[0][4:5] == ['teardown']][0]
-        result = [c for c in calls if c[0][4:5] == ['result']][0]
-        self.assertTrue(teardown[2] and result[2])  # both use the cleanup reserve of the ORIGINAL clock
+        self.assertNotIn('step', verbs)  # the host never executes a step: ONE guest worker runs all 18
+        self.assertEqual(verbs[:5], ['/usr/bin/mkdir', '/usr/bin/cat', '/usr/bin/rm', '/usr/bin/python3', '/usr/bin/sudo'])
+        self.assertEqual(verbs.count('/usr/bin/python3'), 1)  # exactly one clock sample, never resampled
+        self.assertEqual(verbs[-4:], ['result', 'export-viewer', 'cancel', 'result'])
+        progress = [c for c in calls if c[0][4:5] == ['result']]
+        self.assertEqual((progress[0][1], progress[0][2]), ('work', False))
+        cancel, final = [c for c in calls if c[0][4:5] == ['cancel']][0], progress[-1]
+        self.assertTrue(cancel[2] and final[2])  # cancel and the final receipt use the cleanup reserve of the ORIGINAL clock
         self.assertEqual(master.transfers[0][1:], (['marker'], 'access'))
         self.assertEqual(master.transfers[1][1], [*sorted(program.FILES), 'manifest.json'])
+        self.assertIn('capsule.json', master.transfers[1][1])
+        for name in program.UNIT_NAMES:
+            self.assertIn(name, master.transfers[1][1])
         self.assertEqual(master.closed, 1)
-        self.assertGreaterEqual(spy.registration.current.call_count, len(program.STEP_NAMES))
+        self.assertGreaterEqual(spy.registration.current.call_count, 1)
         spy.dispatch.assert_called_once()
         self.assertNotIn(VIEWER_PASSWORD, json.dumps(receipt))
         self.assertEqual(spy.session.call_args.args[5], self.private)
@@ -2964,10 +3061,10 @@ class ManagementCaller(unittest.TestCase):
         self.assertEqual(master.ran, list(self.program.STEP_NAMES[:self.program.STEP_NAMES.index('helm')]))
         verbs = [c[0][4] for c in master.calls if c[0][0] == '/usr/bin/sudo' and c[0][3].endswith('management_trial.py')]
         self.assertNotIn('export-viewer', verbs)
-        self.assertIn('teardown', verbs)
+        self.assertIn('cancel', verbs)
         self.assertEqual(receipt['management']['failure']['step'], 'helm')
         spy.session.assert_not_called()
-        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] in (['teardown'], ['result'])))
+        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] == ['cancel'] or (c[0][4:5] == ['result'] and c[2])))
         self.assertEqual(master.closed, 1)
 
     def test_heartbeat_failure_stops_the_sequence_and_still_tears_down(self):
@@ -2996,7 +3093,7 @@ class ManagementCaller(unittest.TestCase):
         self.assertEqual(code, 124)
         self.assertEqual(master.ran, [])
         self.assertTrue(master.torn)
-        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] in (['teardown'], ['result'])))
+        self.assertTrue(all(c[2] for c in master.calls if c[0][4:5] == ['cancel']))
         spy.session.assert_not_called()
 
     def test_stale_registration_untrusted_source_stop_before_any_guest_byte(self):

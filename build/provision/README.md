@@ -1713,23 +1713,26 @@ later, separately reviewed activation would expose; only offline synthetic tests
   goes through the ONE original ControlMaster and its deliberately failing fallback proxy, so there is no
   second master, reconnect or new authentication. The only differences are the fixed management tables and the
   management clock below.
-* **No selector.** The host can name only a step from `STEP_NAMES` (argparse `choices`, plus a host-side
-  enum check) or one of `heartbeat`, `export-viewer`, `result`, `teardown`. No path, argv, script or command
+* **No selector.** Since #508 the host names no step at all: it can send only `heartbeat`, `export-viewer`,
+  `result` or `cancel` (`HOST_ACTIONS`), and the three fixed units run `guardian`, `worker`, `poststop` and
+  `expire` (`UNIT_ACTIONS`, no arguments). No path, argv, script or command
   comes from the caller, guest output or a file. The root stub in `STUB` hash-verifies each of
   `vlab_trial.py`, `owned_process.py` and `management_trial.py` against its host-held digest before
   executing that module. The ownership helper is included in the fixed staged source table.
-* **Not a guardian.** Unlike the VLAB trial there is no autonomous in-guest supervisor. Each step re-checks
-  contract, boot id, a heartbeat at most 30 seconds old and the management clock before every child. An
-  orphaned guest child after host loss is contained only by those gates and by lease/VM expiry; `contained`
-  is never claimed.
+* **Guardian (#508, see the next section).** A fixed guardian service now owns ONE worker. Each step still
+  re-checks contract, boot id, a heartbeat at most 30 seconds old and the management clock before every
+  child. `contained` is never claimed.
 * **Time (unresolved decision).** `ManagementClock` anchors at durable ADMISSION, never at process start:
-  access 15, stage 30, work 50, persistence 54 minutes, and a 60-minute CEILING for work plus cleanup, so a
-  six-minute cleanup reserve survives failed work. Every bound is clipped to the unchanged provider lease. The
+  access 15, stage 30, work 37, persistence 38 minutes (#508; was 50/54), and a 60-minute CEILING for work plus
+  cleanup, so a 22-minute (1320 s) stop reserve survives failed work. Every bound is clipped to the unchanged provider lease. The
   provider envelope is NOT changed: `contract` still requires exactly 7200 seconds, and running this 60-minute
   component inside it (an exception) versus a separately reviewed provider change is an open owner/runtime
   decision. This work grants no 120-minute exception and does not classify the component as a full build.
-  Each in-process `Context` retains one monotonic anchor across native children, HTTP and polling;
-  there is still no independently surviving owner retaining that anchor across step processes.
+  The one worker's `Context` retains one monotonic anchor across all 18 steps, native children, HTTP and polling,
+  and the immutable capsule (next section) carries absolute guest-monotonic cutoffs across processes.
+  **Open budget concern for the lead:** the work window now spans minute 30 (stage end) to minute 37, i.e. seven
+  minutes for `storage`, `cluster` (cap 330 s), `helm` (requires >=120 s) and everything after it. The approved
+  cutoffs were applied exactly; whether they can fit real work is a runtime decision, not a source claim.
 * **Inputs.** Docker, kubectl 1.35.0, k3d 5.7.4, Helm 3.19.4 and chart 65.2.0 reuse the accepted installers and
   pins; Grafana 11.2.1, operator 0.77.1, hhfab 0.43.1, Fabric 0.96.2 and private SONiC 4.5 are unchanged. The only
   management image candidate is `docker.io/rancher/k3s@sha256:81fc7349…e4` (EXPERIMENTAL, not a maintained or
@@ -1783,15 +1786,74 @@ later, separately reviewed activation would expose; only offline synthetic tests
   requires positive group absence. Closure also follows clean exit and has reserved time within the
   command cap. Uncertainty survives a primary failure and prevents a complete teardown claim.
   An observed native exit or signal remains the primary failure if group closure is uncertain.
-  Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
-  guardian and `vlab_trial.py` are unchanged. Loss of the step runner process itself is still bounded only by
-  lease/VM expiry.
+  Teardown children honor only the immutable 60-minute ceiling. The VLAB guardian and `vlab_trial.py` are
+  unchanged.
 * **Outcome.** A closed nonsecret typed result (`validate_result`: per-step ok/failed/not-run, one first failure
-  with category and child status, sixteen booleans, teardown pending/complete/uncertain) is read after the fixed
-  `teardown` through the same original master. No secret, argv or raw output enters it or the receipt.
+  with category and child status, sixteen booleans, teardown pending/complete/uncertain) is polled through the
+  same original master (`result`) and read again after `cancel` once the guest's own poststop has finalized it
+  (a still-`pending` receipt is reported unknown). No secret, argv or raw output enters it or the receipt.
   Teardown removes only what this program recorded (the exact cluster name, its Docker units, the private files,
   the recorded storage inode) and reports `uncertain` otherwise. VM/boot absence, census and own-key authority
   before slot release remain the existing independent cleanup path and are not weakened.
+
+### Fixed lifetime ownership and clock capsule (issue #508, SOURCE-INACTIVE)
+
+Three fixed units (`labapp-management-trial.service`, `labapp-management-expiry.timer`,
+`labapp-management-expiry.service`; hash-authenticated through the same manifest as every other staged byte)
+own ONE worker. Everything below is explicit source policy and offline stdlib tests; none of it is observed
+systemd v255, cgroup, timer or Docker behavior.
+
+* **Budget.** `TimeoutStopSec` T=240 s; J=60 s (timer accuracy, dispatch, stop-request policy); 60 s slack. The
+  fixed expiry E is the persistence cutoff, `E <= D - (5T + J + 60) = D - 1320 s = admission + 38 min` for the
+  60-minute ceiling D, so `E + J + 5T <= D - 60 s`. Phase cutoffs 15/30/37/38 minutes. Native cleanup caps
+  (120+30+30 s) leave 60 s inside one 240 s interval; poststop enforces ONE outer deadline (235 s, clipped to the
+  ceiling) over native children AND filesystem work (`bounded_rmtree`; no link following, no device crossing) and
+  reports `uncertain` rather than finishing late. Timer: no randomized delay, `AccuracySec=1us`, no persistence.
+* **Clock capsule.** The caller (`build/gcp/management_trial.py:guest_clock_capsule`) takes ONE fixed guest sample
+  (`SAMPLE_STUB`: boot id, one-shot nonce, wall, monotonic) through the original Master, reads its own
+  ONCE-retained wall/monotonic clock immediately before sending and at RESPONSE reception, and computes every
+  phase's remaining time at reception (`ManagementClock.left_at`), subtracts a 5 s safety allowance and maps it
+  onto the returned guest monotonic value. The round trip is never added back. Fail-closed policy limits (not
+  measured): round trip <= 10 s; guest wall within the caller's send/receive bracket +/- 5 s. The capsule binds
+  nonce, lease, epoch, run, attempt, body hash, VM, boot, source, admission/deadline, the sample, the caller
+  readings and all cutoffs; it is staged once as `capsule.json` in the manifest (never resampled or reissued,
+  including after an ambiguous bootstrap). Bootstrap re-validates it and refuses it if older than 300 s, from the
+  future, or if the guest wall clock moved relative to monotonic by more than 5 s since the sample. Later processes
+  re-validate bindings and ordering but cannot renew time: cutoffs are absolute boot-monotonic values, a guest
+  wall rollback cannot extend them and a forward jump only shortens them (the wall term is still evaluated).
+  `production_clock` never falls back to a per-process clock when the capsule is missing.
+* **Bootstrap order.** One-shot private reservation and files -> install the three units -> runtime timer drop-in
+  with the single boot-monotonic value -> `daemon-reload` -> start and confirm the timer (active, next elapse set;
+  the exact property format is a runtime gate) -> start the guardian and confirm its PID/binding -> only then open
+  the permanently closable release gate (`release.json`). No package, Docker or Secret effect exists before
+  that. A failure stops the guardian (its `ExecStopPost` owns cleanup) and preserves the reservation; nothing is
+  retried or rearmed.
+* **Expiry.** The timer starts the stop service, which writes the permanent `release-closed.json` marker (closure
+  always wins over the open marker) and runs `systemctl stop --no-block` on the guardian (also intended to
+  supersede a still-pending start job; unverified), bounded to 10 s. It never restarts or renews.
+* **Guardian and worker.** The guardian waits for the gate, spawns exactly one worker under the unchanged
+  `OwnedGroup` (sole reaper, non-reaping identity), supervises boot, heartbeat (30 s), cutoffs, gate and the
+  closed `cancel` marker, and after a clean worker exit holds the cluster up for the Viewer handoff until
+  cancel, expiry or loss. The worker runs all 18 original step functions with one `Context`. The guardian never
+  writes `steps.json`; its only record is `outcome.json` (native worker exit/signal, closure result). The native
+  exit stays primary and uncertainty is sticky.
+* **Poststop.** Single writer: poststop claims the state (exclusive `poststop.json`, under an `flock`) after which
+  worker writes are refused; a second poststop is a read-only duplicate. It never reconstructs an `OwnedGroup` from
+  a saved PID and never treats entering poststop as absence (v255 enters it even when `SIGKILL` survivors remain,
+  per the `service.c` v255 `Processes still around after SIGKILL. Ignoring.` path): it requires the guardian
+  cgroup to contain only itself (`CGROUP_PROCS`) and the guardian's recorded closure to be positive. Otherwise
+  protective native deletes and private-file removal still run, storage is NEVER removed, and the receipt is
+  `uncertain` with `worker_uncertain` recorded. No claim is made that a killed or uninterruptible task is gone.
+* **Host.** After the one-shot bootstrap the host only heartbeats, polls the read-only `result`, exports the
+  Viewer handoff, runs the unchanged loopback-forward browser session (still `owner-attested` at best,
+  `browser_verified=false`), then sends `cancel` and waits a bounded time for the guest's own receipt.
+
+Reading coverage and gaps for this slice: `service.c` v255 was read through a summarizing fetch (the relevant
+`service_enter_signal`, `service_enter_stop_post`, sigchld and timeout paths were returned, but not as exact line
+ranges 599-611/4075-4243); the `systemd.service`, `systemd.timer`, `systemd.unit` and `systemd.kill` documentation
+sections were NOT read, so `OnBootSec` semantics (assumed `CLOCK_MONOTONIC` since boot), `stop --no-block`
+superseding a pending start job, `NextElapseUSecMonotonic` output and cgroup membership of `ExecStopPost` are
+unverified assumptions for the runtime gate.
 
 **Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
 (2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,

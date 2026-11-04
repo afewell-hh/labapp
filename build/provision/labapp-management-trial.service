@@ -1,0 +1,25 @@
+[Unit]
+Description=Bounded disposable management trial guardian (source-inactive, issue #508)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/labapp-management-trial
+Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+UnsetEnvironment=SSH_AUTH_SOCK PYTHONPATH PYTHONHOME
+ExecStart=/usr/bin/python3 /var/lib/labapp-management-trial/management_trial.py guardian
+ExecStopPost=/usr/bin/python3 /var/lib/labapp-management-trial/management_trial.py poststop
+Restart=no
+TimeoutStartSec=15
+# T = 240s. The same value bounds ExecStopPost (the documented stop-post timeout). The source budget
+# E <= D - (5T + J + 60) assumes five such intervals; it is policy, not observed systemd behavior.
+TimeoutStopSec=240
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+StandardOutput=null
+StandardError=null

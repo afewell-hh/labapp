@@ -11,7 +11,12 @@ Activation is HELD. ``refuse_activation`` always raises while ``ACTIVATION_BLOCK
 non-empty; no flag, environment value or argument bypasses it, and source code does not record
 any approval. Importing this module performs no IO or privileged action.
 
-Supervision: this is not the VLAB guardian service and adds no unit or controller. Every step
+Lifetime ownership (issue #508, SOURCE-INACTIVE): three FIXED units (guardian service, boot-monotonic
+expiry timer, expiry stop service; see ``UNIT_NAMES``) own ONE worker that runs all 18 steps with one
+Context. The caller supplies an immutable authenticated clock capsule (``build_capsule`` /
+``validate_capsule``). Every number below is explicit source policy, not measured systemd behavior.
+
+Per-step supervision (unchanged from #506; no generic controller exists). Every step
 re-checks contract, boot, heartbeat freshness and the management clock before each child, and
 ``stdin_bounded`` re-runs that same gate on every <=0.1s tick while a child is live, so heartbeat
 loss, boot change, phase cutoff, deadline, interruption or cancel kill the child's exact process
@@ -24,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
+import math
 import os
 from pathlib import Path
 import re
@@ -64,9 +71,40 @@ BIND_ADDRESS = '127.0.0.1'  # guest loopback only; no host/switch/Alloy reachabi
 # provider lease (admission+7200s deadline, VLAB persistence cutoff). The provider envelope is
 # NOT changed here: ``base.contract`` still requires exactly 7200 seconds, and running a
 # 60-minute component inside it is an unresolved owner/runtime decision (ACTIVATION_BLOCKERS).
-MGMT_PHASES = {'access': 15, 'stage': 30, 'work': 50, 'persistence': 54}
+MGMT_PHASES = {'access': 15, 'stage': 30, 'work': 37, 'persistence': 38}
 CEILING_MINUTES = 60
 PROVIDER_ENVELOPE_SECONDS = 7200
+# #508 SOURCE budget (explicit policy, not measured runtime). Five systemd stop intervals of
+# TimeoutStopSec plus timer/dispatch allowance and slack must fit between the fixed expiry E and the
+# 60-minute ceiling D: E <= D - (5T + J + 60) = D - 1320s = admission + 38 minutes.
+STOP_TIMEOUT_SECONDS = 240      # T: TimeoutStopSec of the guardian unit
+STOP_JITTER_SECONDS = 60        # J: timer accuracy/dispatch/stop-request allowance
+EXTRA_SLACK_SECONDS = 60
+STOP_INTERVALS = 5
+EXPIRY_RESERVE_SECONDS = STOP_INTERVALS * STOP_TIMEOUT_SECONDS + STOP_JITTER_SECONDS + EXTRA_SLACK_SECONDS
+assert EXPIRY_RESERVE_SECONDS == 1320
+assert MGMT_PHASES['persistence'] * 60 == CEILING_MINUTES * 60 - EXPIRY_RESERVE_SECONDS
+POSTSTOP_OUTER_SECONDS = STOP_TIMEOUT_SECONDS - 5   # ONE outer deadline for ALL poststop work
+ABSENCE_SECONDS = 20
+# Initial guest clock correlation: FAIL-CLOSED policy limits, not NTP/performance measurements.
+CLOCK_ROUNDTRIP_MAX = 10
+CLOCK_SKEW_MAX = 5
+CLOCK_SAFETY_SECONDS = 5
+CAPSULE_MAX_AGE = 300
+PHASE_MINUTES = dict(MGMT_PHASES, ceiling=CEILING_MINUTES)
+
+GUARDIAN_UNIT = 'labapp-management-trial.service'
+TIMER_UNIT = 'labapp-management-expiry.timer'
+STOP_UNIT = 'labapp-management-expiry.service'
+UNIT_NAMES = (GUARDIAN_UNIT, TIMER_UNIT, STOP_UNIT)
+UNIT_DIR = Path('/etc/systemd/system')
+RUNTIME_DIR = Path('/run/systemd/system')
+CGROUP_PROCS = Path('/sys/fs/cgroup/system.slice') / GUARDIAN_UNIT / 'cgroup.procs'
+# Fixed guest clock sample program. Its digest is bound into the capsule; it is not a command loader.
+SAMPLE_STUB = (
+    "import json,sys,time\n"
+    "b=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
+    "print(json.dumps({'boot':b,'nonce':sys.argv[1],'wall':time.time(),'mono':time.monotonic()},sort_keys=True))\n")
 
 ACTIVATION_BLOCKERS = (
     'provider-envelope-7200s-versus-60-minute-component-decision',
@@ -74,7 +112,7 @@ ACTIVATION_BLOCKERS = (
     'viewer-dashboard-runtime-discovery-unobserved',
     'private-viewer-handoff-and-browser-forward-review',
     'no-authorized-verified-browser-observer',
-    'independent-lifetime-supervision-and-cross-step-monotonic-anchor-unimplemented',
+    'native-systemd-guardian-timer-and-clock-capsule-runtime-behavior-unobserved',
     'quota-shape-budget-unresolved',
     'reviewed-activation-and-separate-experiment-authorization',
 )
@@ -89,7 +127,8 @@ def refuse_activation():
 SOURCES = {name: 'build/provision/' + name for name in (
     'management_trial.py', 'vlab_trial.py', 'hhfab_release.py', 'owned_process.py',
     'install-docker.py', 'install-kubectl.py', 'install-helm.py', 'install-k3d.sh',
-    'management-cluster.yaml', 'management-observability-values.yaml', 'observability-values.yaml')}
+    'management-cluster.yaml', 'management-observability-values.yaml', 'observability-values.yaml',
+    *UNIT_NAMES)}
 # Binary acquisition table. kubectl reuses the VLAB pin object. Helm client archive and the
 # chart package repeat the accepted install-helm.py / observability-inputs.yaml pins (a test
 # guards drift; no second independent ledger). k3d is NOT a host payload: install-k3d.sh pins
@@ -100,7 +139,7 @@ PAYLOADS = {
     'helm.tar.gz': (18014603, '759c656fbd9c11e6a47784ecbeac6ad1eb16a9e76d202e51163ab78504848862'),
     'kube-prometheus-stack-65.2.0.tgz': (591234, 'fa80a64847ba4e59224554ef57a3d243088d43375a75caffbd4592e34f3923e7'),
 }
-FILES = {*SOURCES, *PAYLOADS, 'contract.json'}
+FILES = {*SOURCES, *PAYLOADS, 'contract.json', 'capsule.json'}
 ARTIFACT_INVENTORY = {
     'host-payloads': tuple(sorted(PAYLOADS)),
     'runtime-download-sha-only': ('k3d v5.7.4 binary via install-k3d.sh (size unpinned)',),
@@ -179,7 +218,17 @@ def manifest(value):
 
 
 class ManagementClock(base.Clock):
-    """Admission-anchored wall AND monotonic bounds; clips to the unchanged lease, never renews."""
+    """Admission-anchored wall AND monotonic bounds; clips to the unchanged lease, never renews.
+
+    With an immutable ``capsule`` (#508) every phase is additionally bounded by the capsule's absolute
+    guest CLOCK_MONOTONIC cutoff, so a fresh process, a guest wall rollback or a restart can never renew
+    time, and a guest forward wall jump can only shorten it (the wall term is still evaluated).
+    Without a capsule only the legacy per-process bounds apply (synthetic/internal use only).
+    """
+    def __init__(self, value, wall=time.time, mono=time.monotonic, capsule=None):
+        super().__init__(value, wall, mono)
+        self.capsule = capsule
+
     def _end(self, minutes):
         admitted = base.stamp(self.value['admitted_at'])
         return min(admitted + minutes * 60, base.phase_end(self.value, 'persistence'),
@@ -188,18 +237,115 @@ class ManagementClock(base.Clock):
     def _left(self, end):
         return min(end - self.wall(), end - self.started_wall - (self.mono() - self.started_mono))
 
+    def left_at(self, minutes, wall, mono):
+        """Remaining seconds to a cutoff at EXPLICIT original-clock readings (caller response time)."""
+        end = self._end(minutes)
+        return min(end - wall, end - self.started_wall - (mono - self.started_mono))
+
+    def _capsule_left(self, key):
+        return float('inf') if self.capsule is None else self.capsule['cutoffs'][key] - self.mono()
+
     def remaining(self, phase):
         base.require(phase in MGMT_PHASES, 'unknown management phase')
-        left = self._left(self._end(MGMT_PHASES[phase]))
+        left = min(self._left(self._end(MGMT_PHASES[phase])), self._capsule_left(phase))
         if left <= 0:
             raise base.Failure('absolute phase cutoff', 124, 'phase-cutoff')
         return left
 
     def cleanup_remaining(self):
-        left = self._left(self._end(CEILING_MINUTES))
+        left = min(self._left(self._end(CEILING_MINUTES)), self._capsule_left('ceiling'))
         if left <= 0:
             raise base.Failure('immutable cleanup cutoff', 124, 'phase-cutoff')
         return left
+
+
+# ---- Authenticated guest clock capsule (#508) -------------------------------------------------------
+CAPSULE_COPIED = ('nonce', 'lease', 'epoch', 'run_id', 'attempt', 'body_sha256', 'vm_id', 'boot_id',
+                  'source_sha', 'boot_uuid', 'admitted_at', 'deadline')
+CAPSULE_FIELDS = {'schema', 'stub_sha256', 'sample', 'caller', 'safety', 'left', 'cutoffs', *CAPSULE_COPIED}
+SAMPLE_FIELDS = {'boot', 'nonce', 'wall', 'mono'}
+CALLER_FIELDS = {'send_wall', 'recv_wall', 'roundtrip'}
+
+
+def _number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def sample_valid(sample, contract, sample_nonce):
+    """Strict guest sample: bound to boot and the one-shot sample nonce; finite non-negative clocks."""
+    base.require(type(sample) is dict and set(sample) == SAMPLE_FIELDS, 'clock sample refused')
+    base.require(sample['boot'] == contract['boot_uuid'] and type(sample_nonce) is str and sample['nonce'] == sample_nonce
+                 and re.fullmatch('[a-f0-9]{32}', sample_nonce) is not None, 'clock sample refused')
+    base.require(_number(sample['wall']) and _number(sample['mono']) and sample['wall'] > 0 and sample['mono'] > 0,
+                 'clock sample refused')
+    return sample
+
+
+def build_capsule(contract, clock, sample, sample_nonce, send, receive):
+    """Caller side: map each cutoff conservatively onto the returned guest monotonic sample.
+
+    ``send``/``receive`` are (wall, monotonic) readings of the caller's ONCE-retained original clock
+    taken immediately before the request and at RESPONSE reception. The remaining time of every
+    cutoff is computed at reception from that clock and subtracted from nothing else: the round trip
+    is never added back (the guest sample was taken earlier, so its true remaining time is at least
+    this) and a fixed safety allowance is subtracted. Limits are fail-closed policy, not measurements.
+    """
+    (send_wall, send_mono), (recv_wall, recv_mono) = send, receive
+    base.require(all(_number(x) for x in (send_wall, send_mono, recv_wall, recv_mono)), 'clock readings refused')
+    sample = sample_valid(sample, contract, sample_nonce)
+    roundtrip = recv_mono - send_mono
+    base.require(0 <= roundtrip <= CLOCK_ROUNDTRIP_MAX and recv_wall >= send_wall, 'clock round trip refused')
+    base.require(send_wall - CLOCK_SKEW_MAX <= sample['wall'] <= recv_wall + CLOCK_SKEW_MAX, 'guest clock skew refused')
+    left = {key: clock.left_at(minutes, recv_wall, recv_mono) for key, minutes in PHASE_MINUTES.items()}
+    cutoffs = {key: sample['mono'] + seconds - CLOCK_SAFETY_SECONDS for key, seconds in left.items()}
+    capsule = {'schema': 1, 'stub_sha256': base.sha(SAMPLE_STUB.encode()), 'sample': dict(sample),
+               'caller': {'send_wall': send_wall, 'recv_wall': recv_wall, 'roundtrip': roundtrip},
+               'safety': CLOCK_SAFETY_SECONDS, 'left': left, 'cutoffs': cutoffs,
+               **{key: contract[key] for key in CAPSULE_COPIED}}
+    return validate_capsule(capsule, contract)
+
+
+def validate_capsule(value, contract, now=None):
+    """Strict closed validator. ``now`` = (guest wall, guest monotonic) is given ONLY by the one-shot
+    bootstrap, which then also refuses late/skewed/stale samples; later loads re-validate bindings and
+    ordering but cannot renew anything because every cutoff is an absolute boot-monotonic value."""
+    base.require(type(value) is dict and set(value) == CAPSULE_FIELDS and value['schema'] == 1
+                 and type(value['schema']) is int, 'capsule refused')
+    for key in CAPSULE_COPIED:
+        base.require(type(value[key]) is type(contract[key]) and value[key] == contract[key], 'capsule binding differs')
+    base.require(value['stub_sha256'] == base.sha(SAMPLE_STUB.encode()) and value['safety'] == CLOCK_SAFETY_SECONDS
+                 and type(value['safety']) is int, 'capsule refused')
+    sample = sample_valid(value['sample'], contract, value['sample'].get('nonce') if type(value['sample']) is dict else None)
+    caller, left, cutoffs = value['caller'], value['left'], value['cutoffs']
+    base.require(type(caller) is dict and set(caller) == CALLER_FIELDS and all(_number(v) for v in caller.values())
+                 and 0 <= caller['roundtrip'] <= CLOCK_ROUNDTRIP_MAX and caller['recv_wall'] >= caller['send_wall']
+                 and caller['send_wall'] - CLOCK_SKEW_MAX <= sample['wall'] <= caller['recv_wall'] + CLOCK_SKEW_MAX,
+                 'capsule clock bracket refused')
+    base.require(type(left) is dict and type(cutoffs) is dict and set(left) == set(cutoffs) == set(PHASE_MINUTES)
+                 and all(_number(v) for v in (*left.values(), *cutoffs.values())), 'capsule cutoffs refused')
+    for key in PHASE_MINUTES:
+        base.require(abs(cutoffs[key] - (sample['mono'] + left[key] - CLOCK_SAFETY_SECONDS)) <= 1e-6,
+                     'capsule cutoff mapping differs')
+    order = [cutoffs[key] for key in ('access', 'stage', 'work', 'persistence', 'ceiling')]
+    base.require(sample['mono'] < order[0] and order == sorted(order), 'capsule cutoff order refused')
+    base.require(cutoffs['ceiling'] - cutoffs['persistence'] >= EXPIRY_RESERVE_SECONDS - 1e-3,
+                 'capsule expiry reserve refused')
+    if now is not None:
+        wall_now, mono_now = now
+        base.require(_number(wall_now) and _number(mono_now) and sample['mono'] <= mono_now
+                     <= sample['mono'] + CAPSULE_MAX_AGE, 'capsule sample stale or from the future')
+        base.require(abs((wall_now - sample['wall']) - (mono_now - sample['mono'])) <= CLOCK_SKEW_MAX,
+                     'guest wall clock moved since the sample')
+    return value
+
+
+def load_capsule(value):
+    """Immutable root-private capsule bound to this contract; a missing capsule NEVER falls back."""
+    return validate_capsule(base.data(base.regular(MROOT / 'capsule.json', base.MAX_SOURCE, 0, 0o600)), value)
+
+
+def production_clock(value):
+    return ManagementClock(value, capsule=load_capsule(value))
 
 
 # ---- Private state ------------------------------------------------------------------------------
@@ -207,6 +353,11 @@ def contract_value(nonce):
     value = base.contract(base.data(base.regular(MROOT / 'contract.json', base.MAX_SOURCE, 0)))
     base.require(type(nonce) is str and nonce == value['nonce'])
     return value
+
+
+def contract_any():
+    """Unit entrypoints carry no argument: the root-private contract is the sole nonce source."""
+    return base.contract(base.data(base.regular(MROOT / 'contract.json', base.MAX_SOURCE, 0)))
 
 
 def initial_state(nonce):
@@ -221,8 +372,42 @@ def load_state(nonce):
     return state
 
 
-def save_state(state):
-    base.atomic(MROOT / 'steps.json', state)
+POSTSTOP_CLAIM = 'poststop.json'
+RELEASE_OPEN, RELEASE_CLOSED, CANCEL_MARK = 'release.json', 'release-closed.json', 'cancel.json'
+
+
+class state_lock:
+    """Advisory flock serializing every steps.json writer (worker, poststop) for a bounded time."""
+    def __init__(self, seconds=5.0):
+        self.until, self.fd = time.monotonic() + seconds, None
+
+    def __enter__(self):
+        fd = os.open(base.no_links(MROOT / 'state.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    base.require(time.monotonic() < self.until, 'state lock unavailable', 'child-timeout')
+                    time.sleep(.01)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return self
+
+    def __exit__(self, *_exc):
+        os.close(self.fd)  # closing the descriptor releases the lock
+
+
+def save_state(state, *, poststop=False):
+    """Single-writer discipline: the worker writes until poststop CLAIMS the state under the same lock
+    (exclusive poststop.json); afterwards worker writes are refused and only poststop may write."""
+    with state_lock():
+        claimed = os.path.lexists(MROOT / POSTSTOP_CLAIM)
+        base.require(claimed == poststop, 'state writer superseded')
+        base.atomic(MROOT / 'steps.json', state)
 
 
 def public_record(state):
@@ -881,17 +1066,16 @@ def validate_handoff(value, nonce):
     return value
 
 
-def run_step(nonce, name):
+def execute_step(ctx, name):
+    """ONE step of the closed table under the caller's single Context (worker and ``run_step``)."""
+    state = ctx.state
     base.require(name in STEP_NAMES, 'unknown step')
-    value = contract_value(nonce)
-    state = load_state(nonce)
     base.require(state['failure'] is None and state['teardown'] == 'pending', 'sequence stopped')
     index = STEP_NAMES.index(name)
     base.require(all(state['steps'][n] == 'ok' for n in STEP_NAMES[:index]) and state['steps'][name] == 'not-run',
                  'step order refused')
-    ctx = Context(value, None, state)
     try:
-        ctx.clock = gate(value, ctx.clock)
+        ctx.clock = gate(ctx.value, ctx.clock)
         ctx.clock.remaining(STEP_PHASE[name])
         STEP_FUNCTIONS[name](ctx)
     except BaseException as error:
@@ -906,6 +1090,24 @@ def run_step(nonce, name):
         raise
     state['steps'][name] = 'ok'
     save_state(state)
+
+
+def run_step(nonce, name, clock=None):
+    """Internal single-step entry (no host command reaches it). ``clock`` defaults to the legacy
+    per-process clock for synthetic tests; the worker always passes the capsule clock."""
+    base.require(name in STEP_NAMES, 'unknown step')
+    value = contract_value(nonce)
+    state = load_state(nonce)
+    execute_step(Context(value, clock, state), name)
+
+
+def worker():
+    """The ONE worker process: all 18 closed steps, one Context, native failures stay primary."""
+    value = contract_any()
+    clock = production_clock(value)
+    ctx = Context(value, clock, load_state(value['nonce']))
+    for name in STEP_NAMES:
+        execute_step(ctx, name)
 
 
 # ---- Fixed export, result, heartbeat and teardown --------------------------------------------------
@@ -924,25 +1126,69 @@ def result(nonce):
     return base.encoded(validate_result(public_record(load_state(nonce)), nonce))
 
 
+def cancel(nonce):
+    """Closed host action: request the normal end of the trial. Idempotent; the guardian exits and the
+    fixed ExecStopPost performs the cleanup. Nothing here runs cleanup or selects anything."""
+    value = contract_value(nonce)
+    base.require(base.kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
+    try:
+        base.exclusive(MROOT / CANCEL_MARK, base.encoded({'nonce': nonce}))
+    except FileExistsError:
+        pass
+
+
 def heartbeat(nonce, sequence):
     value = contract_value(nonce)
     base.require(type(sequence) is int and sequence > 0)
-    ManagementClock(value).remaining('persistence')
+    production_clock(value).remaining('persistence')
     base.require(base.kernel_boot() == value['boot_uuid'])
     old = base.data(base.regular(MROOT / 'heartbeat.json', 4096, 0))
     base.require(sequence == old['sequence'] + 1)
     base.atomic(MROOT / 'heartbeat.json', {'sequence': sequence, 'received': time.monotonic()})
 
 
-def teardown(nonce):
-    """Positive, idempotent removal of exactly what this program created; uncertainty is reported."""
+def bounded_rmtree(path, deadline):
+    """Remove one directory tree without following links or crossing devices, checking ONE outer
+    deadline before every entry. Raises on any refusal; never reports success it did not observe."""
+    root_dev = os.lstat(path).st_dev
+
+    def walk(directory):
+        with os.scandir(directory) as scan:
+            entries = list(scan)
+        for entry in entries:
+            base.require(time.monotonic() < deadline, 'cleanup deadline elapsed', 'child-timeout')
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode) and info.st_dev == root_dev:
+                walk(entry.path)
+                os.rmdir(entry.path)
+            else:
+                os.unlink(entry.path)  # mount points and non-directories: unlink/rmdir refusal propagates
+    walk(path)
+    base.require(time.monotonic() < deadline, 'cleanup deadline elapsed', 'child-timeout')
+    os.rmdir(path)
+
+
+def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False, extra_private=None):
+    """Positive, idempotent removal of exactly what this program created; uncertainty is reported.
+
+    ``outer`` (monotonic) is ONE deadline for ALL work including filesystem work; ``storage_allowed``
+    is False when worker absence is unproven (storage is never removed then and the receipt cannot be
+    clean); ``final`` marks the poststop writer, which already holds the state claim.
+    """
     value = contract_value(nonce)
     state = load_state(nonce)
     if state['teardown'] == 'complete':
         return 0
-    ctx = Context(value, ManagementClock(value), state)
+    ctx = Context(value, clock if clock is not None else ManagementClock(value), state)
+    if outer is not None:
+        ctx.poll_deadlines.append(outer)
     private = state['private']
-    clean = not private.get('child_cleanup_uncertain', False)
+    if extra_private:
+        private.update(extra_private)
+    clean = not private.get('child_cleanup_uncertain', False) and storage_allowed
+
+    def in_time():
+        return outer is None or time.monotonic() < outer
 
     def attempt(argv, cap):
         try:
@@ -958,9 +1204,10 @@ def teardown(nonce):
     if private.get('docker_started') or private.get('docker_intent'):
         units = [SYSTEMCTL, 'stop', 'docker.socket', 'docker.service', 'containerd.service']
         clean = attempt(units, 30) is not None and clean
-    for name in PRIVATE_FILES:
+    for name in PRIVATE_FILES:  # protective: credentials are removed even when worker absence is unproven
         path = WORK / name
         try:
+            base.require(in_time(), 'cleanup deadline elapsed', 'child-timeout')
             info = path.lstat()
             if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1:
                 path.unlink()
@@ -971,19 +1218,191 @@ def teardown(nonce):
         except BaseException:
             clean = False
     recorded = private.get('storage_ino')
-    if recorded is not None:
+    if recorded is not None and storage_allowed:  # destructive: only after worker absence was shown
         try:
             info = os.lstat(STORAGE)
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and [info.st_dev, info.st_ino] == recorded:
-                shutil.rmtree(STORAGE)
+                bounded_rmtree(STORAGE, outer if outer is not None else time.monotonic() + 120)
             clean = clean and not os.path.lexists(STORAGE)
         except FileNotFoundError:
             pass
         except BaseException:
             clean = False
+    clean = clean and in_time()
     state['teardown'] = 'complete' if clean else 'uncertain'
-    save_state(state)
+    save_state(state, poststop=final)
     return 0 if clean else 1
+
+
+# ---- Guardian, expiry and poststop (fixed units; #508) -------------------------------------------------
+class Cancelled(Exception):
+    """The host requested the normal end of the trial (closed ``cancel`` action)."""
+
+
+def gate_state(value):
+    """'closed' once the expiry/poststop marker exists (permanent), 'open' once bootstrap released the
+    worker, else 'unopened'. Closure always wins; nothing ever reopens the gate."""
+    if os.path.lexists(MROOT / RELEASE_CLOSED):
+        return 'closed'
+    if os.path.lexists(MROOT / RELEASE_OPEN):
+        record = base.data(base.regular(MROOT / RELEASE_OPEN, 4096, 0, 0o600))
+        base.require(type(record) is dict and record.get('nonce') == value['nonce'], 'release binding differs')
+        return 'open'
+    return 'unopened'
+
+
+def close_release(value):
+    """Permanently close the worker-release gate. Idempotent (an existing marker is the closure)."""
+    try:
+        base.exclusive(MROOT / RELEASE_CLOSED, base.encoded({'nonce': value['nonce'], 'boot': value['boot_uuid']}))
+    except FileExistsError:
+        pass
+
+
+def fresh_heartbeat():
+    try:
+        heartbeat_fresh()
+    except base.Failure as error:
+        if error.category == 'heartbeat-loss':
+            raise
+        heartbeat_fresh()  # ONE retry for the atomic-replace read race; a second failure is the primary
+
+
+def supervise(value, clock):
+    """Boot, heartbeat freshness, persistence cutoff and permanent gate closure; raises the primary."""
+    base.require(base.kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
+    fresh_heartbeat()
+    clock.remaining('persistence')
+    base.require(gate_state(value) != 'closed', 'release closed', 'phase-cutoff')
+    if os.path.lexists(MROOT / CANCEL_MARK):
+        raise Cancelled()
+
+
+def wait_release(value, clock):
+    while True:
+        supervise(value, clock)
+        clock.remaining('stage')
+        if gate_state(value) == 'open':
+            return
+        time.sleep(.1)
+
+
+def guardian():
+    """Fixed owner of exactly ONE worker. It never writes steps.json (the worker, then poststop, do);
+    its only record is its own ``outcome.json``. The unchanged OwnedGroup is the sole reaper."""
+    value = contract_any()
+    clock = production_clock(value)
+    base.require(base.kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
+    base.exclusive(MROOT / 'guardian.json', base.encoded({'boot': value['boot_uuid'], 'lease': value['lease'],
+                   'nonce': value['nonce'], 'guardian_pid': os.getpid()}))
+    outcome = {'schema': 1, 'nonce': value['nonce'], 'worker': None, 'closed': None, 'guardian': None}
+    group, code = None, 1
+    try:
+        wait_release(value, clock)
+        proc = subprocess.Popen([PYTHON, str(MROOT / 'management_trial.py'), 'worker'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(base.ENV),
+                                start_new_session=True)
+        group = owned_process.OwnedGroup(proc)
+        while True:
+            supervise(value, clock)
+            status = group.status()
+            if status is not None:
+                outcome['worker'], code = status, (status if status >= 0 else 128 - status)
+                break
+            time.sleep(.2)
+        if status == 0:  # keep the cluster up for the private Viewer handoff until cancel/expiry/loss
+            while True:
+                supervise(value, clock)
+                time.sleep(.2)
+    except Cancelled:
+        code = code if outcome['worker'] is not None else 130
+        outcome['guardian'] = {'category': 'interrupted', 'child_status': None}
+    except BaseException as error:
+        record = failure_record('guardian', error)
+        outcome['guardian'] = {'category': record['category'], 'child_status': record['child_status']}
+        code = error.code if isinstance(error, base.Failure) and type(error.code) is int and 0 < error.code < 256 else 1
+    finally:
+        if group is None:
+            outcome['closed'] = True
+        else:
+            try:
+                outcome['closed'] = bool(group.close(owned_process.TERM_GRACE_SECONDS, until=time.monotonic() + 15))
+            except BaseException:
+                outcome['closed'] = False
+        try:
+            base.atomic(MROOT / 'outcome.json', outcome)
+        except BaseException:
+            pass
+    return code
+
+
+def expire():
+    """Fixed expiry stop service body: close the release gate, then ask systemd to stop the guardian
+    (a stop job also replaces a still-pending start job). Never blocks beyond its own 10s bound and
+    never restarts, rearms or renews anything."""
+    value = contract_any()
+    close_release(value)
+    code, _ = base.call_bounded([SYSTEMCTL, 'stop', '--no-block', GUARDIAN_UNIT], 10)
+    if code:
+        raise base.child_failure(code, 'fixed child failed')
+    return 0
+
+
+def unit_processes():
+    with CGROUP_PROCS.open('rb') as stream:
+        raw = stream.read(65537)  # cgroup pseudo-files report zero size: separate byte bound
+    base.require(len(raw) <= 65536 and all(re.fullmatch(rb'[1-9][0-9]{0,9}', p) for p in raw.split()))
+    return {int(p) for p in raw.split()}
+
+
+def workers_absent(outer):
+    """True only when the guardian cgroup holds nothing but this poststop process. Entering poststop
+    proves nothing (v255 enters it even when SIGKILL survivors remain); any read error is uncertainty."""
+    until = min(outer, time.monotonic() + ABSENCE_SECONDS)
+    me = os.getpid()
+    while True:
+        try:
+            if unit_processes() <= {me}:
+                return True
+        except BaseException:
+            return False
+        if time.monotonic() >= until:
+            return False
+        time.sleep(.2)
+
+
+def poststop():
+    """Fixed ExecStopPost body: ONE outer deadline, serialized single writer, absence before storage."""
+    value = contract_any()
+    nonce = value['nonce']
+    clock = production_clock(value)
+    try:
+        left = clock.cleanup_remaining()
+    except base.Failure:
+        left = 0
+    outer = time.monotonic() + max(0, min(POSTSTOP_OUTER_SECONDS, left))
+    close_release(value)
+    duplicate = False
+    with state_lock(max(1.0, outer - time.monotonic())):
+        try:
+            base.exclusive(MROOT / POSTSTOP_CLAIM, base.encoded({'nonce': nonce, 'pid': os.getpid()}))
+        except FileExistsError:
+            duplicate = True
+    if duplicate:  # read-only duplicate: never a second writer
+        return 0 if load_state(nonce)['teardown'] == 'complete' else 1
+    absent = workers_absent(outer)
+    try:
+        outcome = base.data(base.regular(MROOT / 'outcome.json', 4096, 0))
+        base.require(type(outcome) is dict and outcome.get('nonce') == nonce)
+    except Exception:
+        outcome = None  # a missing guardian record is not by itself uncertainty; the cgroup is the evidence
+    uncertain = not absent or (outcome is not None and outcome.get('closed') is not True)
+    extra = {}
+    if uncertain:
+        extra['worker_uncertain'] = True  # sticky: never cleared
+    if outcome is not None and type(outcome.get('worker')) is int:
+        extra['worker_exit'] = outcome['worker']  # the native primary exit/signal, preserved
+    return teardown(nonce, clock=clock, outer=outer, storage_allowed=not uncertain, final=True, extra_private=extra)
 
 
 # ---- Root bootstrap (executed by the host's hash-verifying stub) -----------------------------------
@@ -1010,8 +1429,16 @@ def _bootstrap(incoming, expected_manifest):
     value = base.contract(base.data(base.regular(incoming / 'contract.json', base.MAX_SOURCE, uid)))
     base.require(incoming.name == 'labapp-vlab-' + value['nonce'] and table['source_sha'] == value['source_sha'])
     base.require(base.kernel_boot() == value['boot_uuid'])
-    ManagementClock(value).remaining('stage')
+    # The capsule is authenticated by the manifest hash like every other byte, then re-validated
+    # against this contract and refused when late (age), from the future, or after a guest wall jump.
+    capsule = validate_capsule(base.data(base.regular(incoming / 'capsule.json', base.MAX_SOURCE, uid)), value,
+                               now=(time.time(), time.monotonic()))
+    clock = ManagementClock(value, capsule=capsule)
+    clock.remaining('stage')
     base.require(not MROOT.exists(), 'one-shot root reservation collision')
+    base.require(all(not (unit_base / name).exists() and not (unit_base / name).is_symlink()
+                     for unit_base in base.UNIT_BASES for unit in UNIT_NAMES for name in (unit, unit + '.d')),
+                 'management unit override refused')
     base.no_links(MROOT.parent)
     MROOT.mkdir(mode=0o700)
     for directory in (WORK, WORK / 'home', WORK / 'helm-cache', WORK / 'helm-config', WORK / 'helm-data'):
@@ -1023,6 +1450,45 @@ def _bootstrap(incoming, expected_manifest):
     base.exclusive(MROOT / 'manifest.json', base.encoded(table))
     base.exclusive(MROOT / 'steps.json', base.encoded(initial_state(value['nonce'])))
     base.exclusive(MROOT / 'heartbeat.json', base.encoded({'sequence': 0, 'received': time.monotonic()}))
+    # No package, Docker or Secret effect exists until every step below succeeded. Failure leaves the
+    # reservation: the guardian's fixed ExecStopPost owns cleanup; nothing is retried or rearmed.
+    try:
+        for name in UNIT_NAMES:
+            base.exclusive(UNIT_DIR / name, base.regular(MROOT / name, base.MAX_SOURCE, 0), 0o644)
+        dropin = RUNTIME_DIR / (TIMER_UNIT + '.d')
+        base.no_links(dropin.parent)
+        dropin.mkdir(mode=0o755)
+        expiry = int(capsule['cutoffs']['persistence'])  # floor: boot-monotonic seconds, never later
+        base.require(expiry > 0, 'expiry refused')
+        base.exclusive(dropin / '10-bound.conf', ('[Timer]\nOnBootSec=%ds\n' % expiry).encode(), 0o644)
+        sys.path.insert(0, str(MROOT))
+        base.run([SYSTEMCTL, 'daemon-reload'], clock, 'stage', 10)
+        base.run([SYSTEMCTL, 'start', TIMER_UNIT], clock, 'stage', 10)
+        shown = base.run([SYSTEMCTL, 'show', TIMER_UNIT, '-p', 'ActiveState', '-p', 'NextElapseUSecMonotonic'],
+                         clock, 'stage', 5)
+        fields = dict(line.split('=', 1) for line in shown.decode().splitlines())
+        base.require(set(fields) == {'ActiveState', 'NextElapseUSecMonotonic'} and fields['ActiveState'] == 'active'
+                     and fields['NextElapseUSecMonotonic'] not in ('', '0', 'infinity'), 'expiry timer unconfirmed')
+        base.run([SYSTEMCTL, 'start', GUARDIAN_UNIT], clock, 'stage', 15)
+        until = time.monotonic() + min(10, clock.remaining('stage'))
+        while not (MROOT / 'guardian.json').exists():
+            base.require(time.monotonic() < until, 'guardian readiness unconfirmed')
+            time.sleep(.1)
+        started = base.data(base.regular(MROOT / 'guardian.json', 4096, 0))
+        base.require(started['boot'] == value['boot_uuid'] and started['lease'] == value['lease']
+                     and started['nonce'] == value['nonce'], 'guardian binding differs')
+        observed = base.run([SYSTEMCTL, 'show', GUARDIAN_UNIT, '-p', 'MainPID', '-p', 'ActiveState'], clock, 'stage', 5)
+        fields = dict(line.split('=', 1) for line in observed.decode().splitlines())
+        base.require(fields == {'MainPID': str(started['guardian_pid']), 'ActiveState': 'active'},
+                     'original guardian process not active')
+        # Only now is the permanently closable worker-release gate opened.
+        base.exclusive(MROOT / RELEASE_OPEN, base.encoded({'nonce': value['nonce'], 'boot': value['boot_uuid']}))
+    except BaseException:
+        try:
+            base.run([SYSTEMCTL, 'stop', GUARDIAN_UNIT], clock, 'stage', 30)
+        except BaseException:
+            pass  # the primary failure below stays primary
+        raise
 
 
 def main(argv=None):
@@ -1030,27 +1496,32 @@ def main(argv=None):
     return dispatch(argv)
 
 
+HOST_ACTIONS = ('heartbeat', 'export-viewer', 'result', 'cancel')   # closed, over the original Master only
+UNIT_ACTIONS = ('guardian', 'worker', 'poststop', 'expire')         # only the three fixed units run these
+
+
 def dispatch(argv=None):
     """Internal fixed dispatcher; reachable only through ``main`` after a future reviewed activation."""
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument('action', choices=('step', 'heartbeat', 'export-viewer', 'result', 'teardown'))
-    parser.add_argument('--nonce', required=True)
-    parser.add_argument('--name', choices=STEP_NAMES)
+    parser.add_argument('action', choices=(*HOST_ACTIONS, *UNIT_ACTIONS))
+    parser.add_argument('--nonce')
     parser.add_argument('--sequence', type=int)
     args = parser.parse_args(argv)
     base.require(os.geteuid() == 0, 'root required')
     os.umask(0o077)
     sys.path.insert(0, str(MROOT))
-    if args.action == 'step':
-        base.require(args.name is not None and args.sequence is None)
-        run_step(args.nonce, args.name)
-    elif args.action == 'heartbeat':
-        base.require(args.name is None and args.sequence is not None)
+    if args.action in UNIT_ACTIONS:  # fixed systemd entrypoints carry no argument at all
+        base.require(args.nonce is None and args.sequence is None)
+        return {'guardian': guardian, 'worker': worker, 'poststop': poststop, 'expire': expire}[args.action]() or 0
+    base.require(args.nonce is not None)
+    if args.action == 'heartbeat':
+        base.require(args.sequence is not None)
         heartbeat(args.nonce, args.sequence)
     else:
-        base.require(args.name is None and args.sequence is None)
-        if args.action == 'teardown':
-            return teardown(args.nonce)
+        base.require(args.sequence is None)
+        if args.action == 'cancel':
+            cancel(args.nonce)
+            return 0
         try:
             out = export_viewer(args.nonce) if args.action == 'export-viewer' else result(args.nonce)
         except Exception:
