@@ -1713,23 +1713,26 @@ later, separately reviewed activation would expose; only offline synthetic tests
   goes through the ONE original ControlMaster and its deliberately failing fallback proxy, so there is no
   second master, reconnect or new authentication. The only differences are the fixed management tables and the
   management clock below.
-* **No selector.** The host can name only a step from `STEP_NAMES` (argparse `choices`, plus a host-side
-  enum check) or one of `heartbeat`, `export-viewer`, `result`, `teardown`. No path, argv, script or command
+* **No selector.** Since #508 the host names no step at all: it can send only `heartbeat`, `export-viewer`,
+  `result` or `cancel` (`HOST_ACTIONS`), and the three fixed units run `guardian`, `worker`, `poststop` and
+  `expire` (`UNIT_ACTIONS`, no arguments). No path, argv, script or command
   comes from the caller, guest output or a file. The root stub in `STUB` hash-verifies each of
   `vlab_trial.py`, `owned_process.py` and `management_trial.py` against its host-held digest before
   executing that module. The ownership helper is included in the fixed staged source table.
-* **Not a guardian.** Unlike the VLAB trial there is no autonomous in-guest supervisor. Each step re-checks
-  contract, boot id, a heartbeat at most 30 seconds old and the management clock before every child. An
-  orphaned guest child after host loss is contained only by those gates and by lease/VM expiry; `contained`
-  is never claimed.
+* **Guardian (#508, see the next section).** A fixed guardian service now owns ONE worker. Each step still
+  re-checks contract, boot id, a heartbeat at most 30 seconds old and the management clock before every
+  child. `contained` is never claimed.
 * **Time (unresolved decision).** `ManagementClock` anchors at durable ADMISSION, never at process start:
-  access 15, stage 30, work 50, persistence 54 minutes, and a 60-minute CEILING for work plus cleanup, so a
-  six-minute cleanup reserve survives failed work. Every bound is clipped to the unchanged provider lease. The
+  access 15, stage 30, work 37, persistence 38 minutes (#508; was 50/54), and a 60-minute CEILING for work plus
+  cleanup, so a 22-minute (1320 s) stop reserve survives failed work. Every bound is clipped to the unchanged provider lease. The
   provider envelope is NOT changed: `contract` still requires exactly 7200 seconds, and running this 60-minute
   component inside it (an exception) versus a separately reviewed provider change is an open owner/runtime
   decision. This work grants no 120-minute exception and does not classify the component as a full build.
-  Each in-process `Context` retains one monotonic anchor across native children, HTTP and polling;
-  there is still no independently surviving owner retaining that anchor across step processes.
+  The one worker's `Context` retains one monotonic anchor across all 18 steps, native children, HTTP and polling,
+  and the immutable capsule (next section) carries absolute guest-monotonic cutoffs across processes.
+  **Open budget concern for the lead:** the work window now spans minute 30 (stage end) to minute 37, i.e. seven
+  minutes for `storage`, `cluster` (cap 330 s), `helm` (requires >=120 s) and everything after it. The approved
+  cutoffs were applied exactly; whether they can fit real work is a runtime decision, not a source claim.
 * **Inputs.** Docker, kubectl 1.35.0, k3d 5.7.4, Helm 3.19.4 and chart 65.2.0 reuse the accepted installers and
   pins; Grafana 11.2.1, operator 0.77.1, hhfab 0.43.1, Fabric 0.96.2 and private SONiC 4.5 are unchanged. The only
   management image candidate is `docker.io/rancher/k3s@sha256:81fc7349…e4` (EXPERIMENTAL, not a maintained or
@@ -1783,15 +1786,131 @@ later, separately reviewed activation would expose; only offline synthetic tests
   requires positive group absence. Closure also follows clean exit and has reserved time within the
   command cap. Uncertainty survives a primary failure and prevents a complete teardown claim.
   An observed native exit or signal remains the primary failure if group closure is uncertain.
-  Teardown children honor only the immutable 60-minute ceiling. No new unit or controller; the VLAB
-  guardian and `vlab_trial.py` are unchanged. Loss of the step runner process itself is still bounded only by
-  lease/VM expiry.
+  Teardown children honor only the immutable 60-minute ceiling. The VLAB guardian and `vlab_trial.py` are
+  unchanged.
 * **Outcome.** A closed nonsecret typed result (`validate_result`: per-step ok/failed/not-run, one first failure
-  with category and child status, sixteen booleans, teardown pending/complete/uncertain) is read after the fixed
-  `teardown` through the same original master. No secret, argv or raw output enters it or the receipt.
+  with category and child status, sixteen booleans, teardown pending/complete/uncertain) is polled through the
+  same original master (`result`) and read again after `cancel` once the guest's own poststop has finalized it
+  (a still-`pending` receipt is reported unknown). No secret, argv or raw output enters it or the receipt.
   Teardown removes only what this program recorded (the exact cluster name, its Docker units, the private files,
   the recorded storage inode) and reports `uncertain` otherwise. VM/boot absence, census and own-key authority
   before slot release remain the existing independent cleanup path and are not weakened.
+
+### Fixed lifetime ownership and clock capsule (issue #508, SOURCE-INACTIVE)
+
+Three fixed units (`labapp-management-trial.service`, `labapp-management-expiry.timer`,
+`labapp-management-expiry.service`; hash-authenticated through the same manifest as every other staged byte)
+own ONE worker. Everything below is explicit source policy and offline stdlib tests; none of it is observed
+systemd v255, cgroup, timer or Docker behavior.
+
+* **Budget.** `TimeoutStopSec` T=240 s; J=60 s (timer accuracy, dispatch, stop-request policy); 60 s slack. The
+  fixed expiry E is the persistence cutoff, `E <= D - (5T + J + 60) = D - 1320 s = admission + 38 min` for the
+  60-minute ceiling D, so `E + J + 5T <= D - 60 s`. Phase cutoffs 15/30/37/38 minutes. Native cleanup caps
+  (120+30+30 s) leave 60 s inside one 240 s interval; poststop uses ONE outer deadline (235 s, clipped to the
+  ceiling) for native children, polling and directory enumeration (`bounded_rmtree`; no link following, no device
+  crossing). It is NOT a bound on every filesystem call or the final state write (see R4 below). Timer: no randomized delay, `AccuracySec=1us`, no persistence.
+* **Clock capsule.** The caller (`build/gcp/management_trial.py:guest_clock_capsule`) takes ONE fixed guest sample
+  (`SAMPLE_STUB`: boot id, one-shot nonce, wall, monotonic) through the original Master, reads its own
+  ONCE-retained wall/monotonic clock immediately before sending and at RESPONSE reception, and computes every
+  phase's remaining time at reception (`ManagementClock.left_at`), subtracts a 5 s safety allowance and maps it
+  onto the returned guest monotonic value. The round trip is never added back. Fail-closed policy limits (not
+  measured): round trip <= 10 s; guest wall within the caller's send/receive bracket +/- 5 s. The capsule binds
+  nonce, lease, epoch, run, attempt, body hash, VM, boot, source, admission/deadline, the sample, the caller
+  readings and all cutoffs; it is staged once as `capsule.json` in the manifest (never resampled or reissued,
+  including after an ambiguous bootstrap). Bootstrap re-validates it and refuses it if older than 300 s, from the
+  future, or if the guest wall clock moved relative to monotonic by more than 5 s since the sample. Later processes
+  re-validate bindings and ordering but cannot renew time: cutoffs are absolute boot-monotonic values, a guest
+  wall rollback cannot extend them and a forward jump only shortens them (the wall term is still evaluated).
+  `production_clock` never falls back to a per-process clock when the capsule is missing.
+* **Bootstrap order.** One-shot private reservation and files -> install the three units -> runtime timer drop-in
+  with the single boot-monotonic value -> `daemon-reload` -> start and confirm the timer (active, next elapse set;
+  the exact property format is a runtime gate) -> start the guardian and confirm its PID/binding -> only then open
+  the permanently closable release gate (`release.json`). No package, Docker or Secret effect exists before
+  that. A failure stops the guardian (its `ExecStopPost` owns cleanup) and preserves the reservation; nothing is
+  retried or rearmed.
+* **Expiry.** The timer starts the stop service, which writes the permanent `release-closed.json` marker (closure
+  always wins over the open marker) and runs `systemctl stop --no-block` on the guardian (also intended to
+  supersede a still-pending start job; unverified), bounded to 10 s. It never restarts or renews.
+* **Guardian and worker.** The guardian waits for the gate, spawns exactly one worker under the unchanged
+  `OwnedGroup` (sole reaper, non-reaping identity), supervises boot, heartbeat (30 s), cutoffs, gate and the
+  closed `cancel` marker, and after a clean worker exit holds the cluster up for the Viewer handoff until
+  cancel, expiry or loss. The worker runs all 18 original step functions with one `Context`. The guardian never
+  writes `steps.json`; its only record is `outcome.json` (native worker exit/signal, closure result). The native
+  exit stays primary and uncertainty is sticky.
+* **Poststop.** Single writer: poststop claims the state (exclusive `poststop.json`, under an `flock`) after which
+  worker writes are refused; a second poststop is a read-only duplicate. It never reconstructs an `OwnedGroup` from
+  a saved PID and never treats entering poststop as absence (v255 enters it even when `SIGKILL` survivors remain,
+  per the `service.c` v255 `Processes still around after SIGKILL. Ignoring.` path): it requires the guardian
+  cgroup (`CGROUP_DIR`) to be FLAT (any descendant cgroup makes quiescence unprovable: sequential recursive reads
+  are a survivor diagnostic, not migration-safe absence, and repeated snapshots are not proof) and to contain only
+  itself (read before and after the child check), the guardian's recorded closure to be positive, and a PRESENT
+  `outcome.json` (a missing or invalid one is an unknown terminal result: sticky uncertainty). Absence uses strict
+  `lstat` (`present`): only a genuine `FileNotFoundError` is absent, any other error (EACCES/EIO/...) is unknown and
+  never permits storage removal or a clean observation. Destructive storage removal additionally needs
+  positive cluster delete, an empty container listing and positive daemon-process absence
+  (`daemons_absent`: the docker/containerd unit cgroups and `docker-*`/`containerd-*` scopes hold no process; a
+  successful `systemctl stop` is not absence). Otherwise protective native deletes and private-file removal still
+  run, storage is NEVER removed, and the receipt is `uncertain` with `worker_uncertain` recorded. Storage creation
+  intent is persisted (file, rename AND parent-directory fsync, `durable_atomic`, management-local; the base atomic
+  helper is unchanged) before `mkdir`, and a failed durable publication refuses the `mkdir`; an existing but
+  unrecorded storage directory is never adopted or deleted and keeps the receipt `uncertain`. The terminal outcome
+  (native worker exit/signal, else the guardian's own category) is carried into the strict public record
+  (`apply_terminal`; a recorded worker failure stays primary). A nonzero NATIVE worker status that arrives after all
+  18 steps are ok is kept too: the strict result shape has no terminal field, so the last step (`viewer-ready`)
+  carries it as `failed` and `succeeded` is false. The guardian observes the non-reaping `OwnedGroup.status()` BEFORE
+  supervision and once more before closure signals anything, so an already exited native status is not obscured by
+  a concurrent cutoff; a status produced by its own closure is never recorded as native. No claim is made that a
+  killed or uninterruptible task is gone.
+* **Positive completion is refused (R4, NOT closed).** `save_state` never publishes `teardown=complete` (and
+  `teardown` always returns 1, including direct, poststop and duplicate paths, and never trusts a stored
+  `complete`), because the timeliness of the final fsync/rename publication cannot be proved in this process. The
+  receipt is `uncertain`; whether the observed cleanup was clean is recorded only privately
+  (`teardown_observed_clean`, diagnostic, not a completion). The 235 s deadline starts at poststop ENTRY; once the
+  original-clock remaining time is known the one-shot `ITIMER_REAL` is clipped to it (never extended or renewed by
+  later reads) and interrupts only INTERRUPTIBLE blocking calls. Preparation reads before that point, an
+  uninterruptible filesystem call and the final state write are NOT bounded in-process, and a poststop that does
+  not finish leaves whatever was last published (`pending` is not evidence of anything). This is NOT a real-time
+  bound and no "all work", "never late" or "killed leaves pending" guarantee is made. Explicit unimplemented
+  activation blocker `poststop-all-work-deadline-unenforceable-for-uninterruptible-filesystem-calls-in-process`;
+  the broader options (a second independently owned watchdog under `OwnedGroup`, a runtime-verified cgroup
+  `TimeoutStopSec`/`SIGKILL` contract, or a kernel-backed recursive emptiness/freeze mechanism for R2) need separate
+  design authority and are NOT implemented. Credentials and protective native deletes still run when uncertain.
+* **Expiry independence and timer proof.** `expire` requests the fixed `systemctl stop --no-block` FIRST, before and
+  independent of any contract or gate I/O, then still attempts the permanent gate closure and checks it is closed
+  (a gate/contract failure stays the primary failure; a blocked gate read can no longer delay the stop request).
+  Bootstrap parses the ACTUAL loaded
+  `NextElapseUSecMonotonic` and the timer's `Unit`, and requires the deadline to equal the capsule-derived
+  `OnBootSec` value (tolerance 2 s); an unknown rendering refuses (runtime format unobserved).
+* **Guardian phase cutoffs.** While the worker runs the guardian enforces the `work` cutoff and the cutoff of
+  the first unfinished step (read-only step record); the persistence cutoff governs only the completed worker's
+  Viewer hold, which is refused if the worker exited 0 before all 18 steps were ok.
+* **Clock correlation.** The sample is bracketed by the original effective (admission-anchored, monotonic-derived)
+  wall at send/receive; the raw caller wall must agree within the skew limit and cannot widen the bracket.
+* **Host.** After the one-shot bootstrap the host only heartbeats, polls the read-only `result`, exports the
+  Viewer handoff, runs the unchanged loopback-forward browser session (still `owner-attested` at best,
+  `browser_verified=false`), then sends `cancel` and waits a bounded time for the guest's own receipt.
+
+Reading coverage and gaps for this slice: `service.c` v255 was read through a summarizing fetch (the relevant
+`service_enter_signal`, `service_enter_stop_post`, sigchld and timeout paths were returned, but not as exact line
+ranges 599-611/4075-4243); the `systemd.service`, `systemd.timer`, `systemd.unit` and `systemd.kill` documentation
+sections were NOT read, so `OnBootSec` semantics (assumed `CLOCK_MONOTONIC` since boot), `stop --no-block`
+superseding a pending start job, `NextElapseUSecMonotonic` output and cgroup membership of `ExecStopPost` are
+unverified assumptions for the runtime gate.
+
+Revision round 1 late reading (honest, no retroactive claim): the independent exact-head report 509/6644075777 could
+not be fetched in full by the author worker (`gh api` denied); the R1-R9 summary in the trigger comment was used.
+The documents skipped in the first authoring (#145/#476, the #506/#507 design reports, the full shared workflow,
+`STUDENT_QUICK_START.md`, the systemd man pages, raw `service.c` ranges) were also NOT read in this revision round;
+only `AGENTS.md`, the affected modules/tests/units and the trigger comment were. No project code was executed.
+
+Revision round 2 (final) reading, stated exactly: `AGENTS.md`, the trigger comment, the full independent ed6 report
+509/6644742183 (read through `gh pr view 509 --json comments`), both management modules, the affected provision
+and caller test sections, the unchanged `owned_process.OwnedGroup` and `vlab_trial.atomic`, the three units and the
+nearest README sections were read. NOT read in this round either: #145/#476 bodies, the #506/#507 design and
+proposal reports, `docs/contributing/agent-workflow.md` in full, `STUDENT_QUICK_START.md`, the systemd man pages,
+raw `service.c` ranges and the kernel cgroup-v2 documents. That late reading does not erase the first-authoring
+gaps. Nothing was executed, imported, compiled or tested by the author; native systemd/cgroup/timer behavior stays
+unobserved.
 
 **Exact runtime blockers (activation stays refused):** (1) provider-envelope exception versus provider change;
 (2) actual artifact/egress and image-closure inventory (Docker installer sources, k3d download, helper, chart,

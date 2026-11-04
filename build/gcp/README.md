@@ -1880,5 +1880,25 @@ the same finalizer. A forwarding attempt is recorded before the request; even an
 then-command-error path attempts original-master cancellation and checks listener absence.
 Only definite connection refusal proves listener absence. Timeouts, descriptor exhaustion,
 permission errors or interruption leave forward cleanup uncertain without skipping private-file cleanup.
-No authorized verified-browser observer or independently surviving management guardian exists, so
-the whole-trial success contract remains incomplete and activation stays held.
+No authorized verified-browser observer exists, so the whole-trial success contract remains incomplete and
+activation stays held.
+
+#### Guest lifetime ownership and clock capsule (issue #508, source-inactive)
+
+The caller no longer executes steps: it takes ONE fixed guest clock sample through the original Master
+(`guest_clock_capsule`; round trip <= 10 s, guest wall within the ORIGINAL effective-clock bracket +/- 5 s with
+the raw caller wall only cross-checked, remaining time computed
+from the caller's retained clock at RESPONSE reception, safety allowance subtracted, round trip never added back),
+stages the resulting immutable `capsule.json` and the three fixed units in the manifest, bootstraps once, then
+only heartbeats, polls the read-only `result`, exports the Viewer handoff, runs the unchanged browser session and
+sends `cancel`. The guest's fixed guardian/timer/stop units and poststop own cleanup and write the typed receipt;
+a still-`pending` receipt after the bounded wait is reported unknown. A `cancel` acknowledgement is a request only,
+and a non-`pending` `teardown` is not by itself terminal proof of the contract. A public native failure keeps its
+exit (positive) or signal (negative status -> 128 + signal); only non-native categories collapse to 1. A native
+failure first discovered in the receipt read after `cancel` is reconciled into both the return code and the printed
+receipt, but never replaces an earlier primary failure. The guest never publishes `teardown=complete` (see the
+provision README), so the whole-trial success stays unattainable. There is no reconnect, resample after an
+ambiguous bootstrap, per-step command or host teardown command. Assumptions, the budget and unverified systemd
+behavior are listed in
+[build/provision/README.md](../provision/README.md#fixed-lifetime-ownership-and-clock-capsule-issue-508-source-inactive).
+Tests (fake masters, no ssh/gcloud/native tool) are in the existing `test_vlab_trial.py` home.

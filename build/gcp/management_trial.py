@@ -11,8 +11,11 @@ that protects the VLAB trial is reused unchanged from ``build.gcp.vlab_trial``: 
 binding, owner registration (CAS/lease), OS Login own-key import and cleanup, pinned host key, the
 ONE original ControlMaster with its failing fallback proxy (``Master.remote``/``transfer``/``check``),
 heartbeat, bounded private captures, creator cancellation and positive cleanup. The only differences
-are the fixed management tables (``build.provision.management_trial``) and the admission-anchored
-60-minute management clock. ``contained`` is never claimed: there is no in-guest guardian.
+are the fixed management tables (``build.provision.management_trial``), the admission-anchored
+management clock and (#508) ONE authenticated guest clock correlation staged as an immutable capsule.
+The guest owns the lifetime (fixed guardian, boot-monotonic expiry timer, stop service); the host only
+samples the clock once, bootstraps, heartbeats, reads the typed result, forwards the Viewer, and
+requests ``cancel``. It never executes, retries or reorders a step. ``contained`` is never claimed.
 """
 from __future__ import annotations
 
@@ -41,13 +44,13 @@ from .lifecycle.access_records import AccessError, canonical
 from .lifecycle.oslogin import OwnKeyImport, cleanup_own_key, profile_user
 from . import vlab_trial as owner
 
-STEP_CAPS = {
-    'install-docker': 260, 'install-kubectl': 60, 'install-helm': 150, 'install-k3d': 200, 'daemon-start': 60,
-    'storage': 30, 'cluster': 360, 'namespace': 40, 'secret': 60, 'helm': 640, 'health': 300,
-    'probe-push': 120, 'probe-read': 240, 'principal': 200, 'restart': 900, 'historical': 60,
-    'persisted-principal': 200, 'viewer-ready': 60}
-TEARDOWN_CAP = 240
+PROGRESS_CAP = 15              # one fixed read-only ``result`` poll over the original Master
+PROGRESS_INTERVAL = 5          # seconds between polls; no step is executed or retried by the host
+CANCEL_CAP = 15
+TEARDOWN_CAP = 240             # upper bound for waiting on the guest's own poststop receipt
 RESULT_CAP = 15
+CLOCK_SAMPLE_CAP = 15
+INVALID_POLLS = 3              # consecutive unreadable results tolerated (atomic-replace read race)
 EXPORT_CAP = 15
 BROWSER_MIN_SECONDS = 60       # less work time than this -> browser step skipped, never faked
 BROWSER_WAIT_SECONDS = 600     # upper bound; always clipped to the original remaining work time
@@ -87,13 +90,9 @@ MANAGEMENT_SCRIPT = str(program.MROOT / 'management_trial.py')
 SUDO = ['/usr/bin/sudo', '-n', '/usr/bin/python3']
 
 
-def step_command(nonce, name):
-    guest.require(name in program.STEP_NAMES and re.fullmatch('[a-f0-9]{32}', nonce))
-    return [*SUDO, MANAGEMENT_SCRIPT, 'step', '--nonce', nonce, '--name', name]
-
-
 def fixed_command(action, nonce, sequence=None):
-    guest.require(action in ('heartbeat', 'export-viewer', 'result', 'teardown') and re.fullmatch('[a-f0-9]{32}', nonce))
+    """Closed host actions only. No step, teardown or worker selector exists on the host (#508)."""
+    guest.require(action in program.HOST_ACTIONS and re.fullmatch('[a-f0-9]{32}', nonce))
     extra = [] if sequence is None else ['--sequence', str(sequence)]
     return [*SUDO, MANAGEMENT_SCRIPT, action, '--nonce', nonce, *extra]
 
@@ -112,14 +111,33 @@ def management_source_files(snapshot, output):
     return result
 
 
-def stage_program(snapshot, payloads, output, initial):
-    """Fixed source + hash/size-pinned payloads + contract -> verified manifest table."""
+def guest_clock_capsule(master, clock, initial):
+    """ONE bounded authenticated guest clock sample through the original Master (no reconnect).
+
+    The caller's ONCE-retained original clock supplies the send and RESPONSE readings; the guest
+    sample is bound to boot and a fresh one-shot nonce. Round trip <= 10s, wall within the caller
+    bracket +-5s, safety allowance subtracted, round trip never added back (all in
+    ``program.build_capsule``). Never resampled after an ambiguous bootstrap: the capsule is staged once.
+    """
+    sample_nonce = secrets.token_hex(16)
+    send = (clock.wall(), clock.mono())
+    raw = master.remote(['/usr/bin/python3', '-I', '-c', program.SAMPLE_STUB, sample_nonce], 'access',
+                        cap=CLOCK_SAMPLE_CAP, limit=1024)
+    receive = (clock.wall(), clock.mono())
+    return program.build_capsule(initial, clock, guest.data(raw), sample_nonce, send, receive)
+
+
+def stage_program(snapshot, payloads, output, initial, capsule=None):
+    """Fixed source + hash/size-pinned payloads + contract + clock capsule -> verified manifest table."""
+    guest.require(capsule is not None or 'capsule.json' not in program.FILES, 'clock capsule required')
     source = management_source_files(snapshot, output)
     for name, pin in program.PAYLOADS.items():
         raw = guest.regular(guest.no_links(payloads / name), pin[0], os.geteuid())
         guest.require((len(raw), guest.sha(raw)) == pin, 'payload bytes refused')
         guest.exclusive(output / name, raw)
     guest.exclusive(output / 'contract.json', canonical(initial))
+    if capsule is not None:
+        guest.exclusive(output / 'capsule.json', canonical(program.validate_capsule(capsule, initial)))
     for name in program.FILES - set(source):
         raw = guest.regular(output / name, program.PAYLOADS[name][0] if name in program.PAYLOADS else guest.MAX_SOURCE,
                             os.geteuid())
@@ -280,8 +298,8 @@ def browser_session(master, clock, nonce, lease, raw_handoff, private, failed, p
 HOST_OPERATIONS = frozenset({
     'preflight', 'source-check', 'registration-check', 'owner-check', 'key-generation', 'key-registration',
     'access-prepare', 'access-import', 'host-key', 'master-start', 'guest-boot', 'guest-probe', 'program-stage',
-    'source-transfer', 'bootstrap', 'heartbeat-start', 'management-step', 'viewer-export', 'browser',
-    'teardown', 'result-read'})
+    'source-transfer', 'bootstrap', 'heartbeat-start', 'management-progress', 'viewer-export', 'browser',
+    'clock-sample', 'cancel', 'result-read'})
 
 
 class Held:
@@ -343,6 +361,17 @@ def enroll(snapshot, output, registration, records, login, rec, clock, failed, i
     return rec
 
 
+def native_code(failure):
+    """Process code for a typed guest failure. Native precedence: a positive exit stays itself, a negative
+    raw signal maps to 128+signal exactly like ``child_failure``; only non-native categories collapse to 1."""
+    status = failure['child_status']
+    if type(status) is int and 0 < status < 256:
+        return status
+    if type(status) is int and -64 <= status < 0:
+        return 128 - status
+    return 1
+
+
 def sequence(snapshot, payloads, output, *, registration, records, login, private=None):
     """INTERNAL body; never reachable from ``main``/``trial`` while activation is held."""
     owner.expected_snapshot(snapshot)
@@ -370,8 +399,10 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
         master.transfer(incoming, ['marker'], 'access')
         guest.require(master.remote(['/usr/bin/cat', incoming + '/marker'], 'access') == nonce.encode())
         master.remote(['/usr/bin/rm', '--', incoming + '/marker'], 'access')
+        phase, held.operation = 'clock-sample', 'clock-sample'
+        capsule = guest_clock_capsule(master, clock, initial)
         phase, held.operation = 'program-stage', 'program-stage'
-        source, table = stage_program(snapshot, payloads, output, initial)
+        source, table = stage_program(snapshot, payloads, output, initial, capsule)
         registration.current()
         owner.trusted_source(snapshot)
         held.operation = 'source-transfer'
@@ -397,13 +428,27 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
         held.thread = threading.Thread(target=heartbeat, daemon=True)
         held.thread.start()
         phase = 'guest-work'
-        for name in program.STEP_NAMES:
-            held.operation = 'management-step'
+        invalid = 0
+        while True:  # observe the guest's ONE worker; the host never executes, retries or reorders a step
+            held.operation = 'management-progress'
             guest.require(not failed.is_set(), 'heartbeat failed')
             registration.current()
             owner.trusted_source(snapshot)
-            clock.remaining(program.STEP_PHASE[name])
-            master.remote(step_command(nonce, name), program.STEP_PHASE[name], cap=STEP_CAPS[name])
+            clock.remaining('work')
+            state, record = management_result(
+                master.remote(fixed_command('result', nonce), 'work', cap=PROGRESS_CAP, limit=4096 + 128), nonce)
+            if state != 'valid':
+                invalid += 1
+                guest.require(invalid < INVALID_POLLS, 'guest result unreadable')
+            else:
+                invalid = 0
+                failure = record['failure']
+                if failure is not None:
+                    raise guest.Failure('fixed child failed', native_code(failure))
+                guest.require(record['teardown'] == 'pending', 'guest ended before the steps finished')
+                if all(v == 'ok' for v in record['steps'].values()):
+                    break
+            stop.wait(PROGRESS_INTERVAL)
         phase = 'guest-browser'
         held.operation = 'viewer-export'
         raw = master.remote(fixed_command('export-viewer', nonce), 'work', cap=EXPORT_CAP, limit=2048)
@@ -439,20 +484,33 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
         process_absent = master is None and heartbeat_absent and not process_uncertain.is_set()
         if master is not None:
             if heartbeat_absent and held.attempted:
-                # Fixed positive teardown, then the fixed typed result, both through the SAME original master.
+                # Fixed cancel request, then the guest's OWN poststop receipt, through the SAME original
+                # master. The guest (not the host) performs the serialized cleanup; the host only waits
+                # a bounded time and reports a still-pending receipt as unknown.
                 try:
-                    master.remote(fixed_command('teardown', nonce), 'persistence', cap=TEARDOWN_CAP, cleanup=True)
+                    master.remote(fixed_command('cancel', nonce), 'persistence', cap=CANCEL_CAP, cleanup=True)
                 except BaseException as error:
                     if getattr(error, 'cleanup_uncertain', False):
                         process_uncertain.set()
-                try:
-                    typed_state, typed = management_result(
-                        master.remote(fixed_command('result', nonce), 'persistence', cap=RESULT_CAP, cleanup=True,
-                                      limit=4096 + 128), nonce)
-                except BaseException as error:
-                    typed_state = 'invalid'
-                    if getattr(error, 'cleanup_uncertain', False):
-                        process_uncertain.set()
+                receipt_until = owned_process.monotonic() + TEARDOWN_CAP
+                while True:
+                    try:
+                        typed_state, typed = management_result(
+                            master.remote(fixed_command('result', nonce), 'persistence', cap=RESULT_CAP, cleanup=True,
+                                          limit=4096 + 128), nonce)
+                    except BaseException as error:
+                        typed_state, typed = 'invalid', None
+                        if getattr(error, 'cleanup_uncertain', False):
+                            process_uncertain.set()
+                    if (typed_state == 'valid' and typed['teardown'] != 'pending') \
+                            or owned_process.monotonic() >= receipt_until:
+                        break
+                    time.sleep(PROGRESS_INTERVAL)
+                # A native failure first discovered during finalization is reconciled into BOTH the return
+                # code and the printed receipt, but never replaces an earlier primary failure. A cancel
+                # acknowledgement or a non-pending receipt is not terminal proof of anything.
+                if result == 0 and typed_state == 'valid' and typed['failure'] is not None:
+                    result, category, phase = native_code(typed['failure']), 'guest', 'guest-result'
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

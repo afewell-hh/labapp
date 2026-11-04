@@ -1,0 +1,12 @@
+[Unit]
+Description=Management trial boot-monotonic expiry (source-inactive, issue #508)
+
+[Timer]
+# The boot-relative trigger is NOT set here: bootstrap writes the single immutable value from the
+# authenticated clock capsule into a runtime drop-in. No randomized delay, minimal accuracy, no
+# persistence, no rearm.
+Unit=labapp-management-expiry.service
+AccuracySec=1us
+RandomizedDelaySec=0
+Persistent=no
+RemainAfterElapse=yes
