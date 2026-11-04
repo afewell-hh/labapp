@@ -5997,7 +5997,9 @@ class ManagementLifetime(unittest.TestCase):
             (docker / 'cgroup.procs').write_text('')
             (docker / 'sub').mkdir()
             (docker / 'sub' / 'cgroup.procs').write_text('4242\n')  # survivor in a SUBGROUP
-            self.assertFalse(m.daemon_cgroups_empty(time.monotonic() + 5))
+            with self.assertRaises(trial.Failure):
+                m.daemon_cgroups_empty(time.monotonic() + 5)
+            self.assertFalse(m.daemons_absent(time.monotonic() + 5))
             (docker / 'sub' / 'cgroup.procs').write_text('')
             with self.assertRaises(trial.Failure):  # an empty SUBGROUP: quiescence is unprovable, never absence
                 m.daemon_cgroups_empty(time.monotonic() + 5)
