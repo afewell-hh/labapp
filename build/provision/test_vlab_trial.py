@@ -4792,7 +4792,8 @@ class ManagementProgram(unittest.TestCase):
         self.assertEqual(self.m.load_state(NONCE)['failure']['category'], 'phase-cutoff')
         self.assertEqual(self.model.calls, [])  # no child started after the cutoff
         self.assertEqual(self.m.teardown(NONCE), 1)  # cleanup still runs inside the reserve; never 'complete'
-        self.assertTrue(self.m.load_state(NONCE)['private']['teardown_observed_clean'])
+        # outcome-less direct teardown is missing terminal evidence (#510 round 2): never privately clean
+        self.assertIs(self.m.load_state(NONCE)['private']['teardown_observed_clean'], False)
         self.reset(self.admitted_ago(61))
         with self.assertRaises(trial.Failure):
             self.m.ManagementClock(self.value).cleanup_remaining()
@@ -6134,7 +6135,44 @@ class ManagementLifetime(unittest.TestCase):
         shutil.rmtree(m.STORAGE)  # intent recorded but nothing created: nothing unresolved
         trial.atomic(self.root / 'steps.json', dict(m.load_state(NONCE), teardown='pending'))
         self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False), 1)
+        # outcome-less direct teardown is missing terminal evidence (#510 round 2): never privately clean
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], False)
+        self.assertTrue(m.load_state(NONCE)['private']['worker_uncertain'])
+        self.assertEqual(m.load_state(NONCE)['terminal']['group'], 'uncertain')
+
+    def test_s2_direct_teardown_normalizes_missing_or_non_dict_outcomes_before_any_clean_claim(self):
+        m = self.m
+        valid = {'nonce': NONCE, 'closed': True, 'worker': 0,
+                 'terminal': {'status': None, 'origin': 'unobserved', 'group': 'uncertain'}}
+        cases = {'omitted': {}, 'none': {'outcome': None}, 'list': {'outcome': []}, 'scalar': {'outcome': 7},
+                 'string': {'outcome': 'x'}, 'no terminal': {'outcome': {'nonce': NONCE, 'closed': True}},
+                 'bad terminal': {'outcome': dict(valid, terminal={'status': False, 'origin': 'pre-close',
+                                                                   'group': 'uncertain'})}}
+        for name, kw in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(m.STORAGE, True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                calls = []
+                with patch.object(m, 'stdin_bounded', side_effect=lambda *a, **k: calls.append(a) or (0, b'')), \
+                        patch.object(m, 'daemons_absent', return_value=True):
+                    self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False,
+                                                storage_allowed=True, **kw), 1)
+                private = m.load_state(NONCE)['private']
+                self.assertIs(private['teardown_observed_clean'], False)
+                self.assertTrue(private['worker_uncertain'])
+                self.assertEqual(m.load_state(NONCE)['terminal']['group'], 'uncertain')
+        # control: valid terminal evidence still reaches the positive-evidence path (storage absent => observed clean)
+        shutil.rmtree(m.STORAGE, True)
+        trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False, outcome=valid), 1)
         self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
+        # an earlier genuine pre-close status survives a missing later outcome
+        state = m.initial_state(NONCE)
+        state['terminal'] = {'status': 17, 'origin': 'pre-close', 'group': 'uncertain'}
+        trial.atomic(self.root / 'steps.json', state)
+        self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False, outcome=[]), 1)
+        kept = m.load_state(NONCE)['terminal']
+        self.assertEqual((kept['status'], kept['origin'], kept['group']), (17, 'pre-close', 'uncertain'))
 
     def test_r6_terminal_outcome_reaches_the_strict_public_receipt_with_native_precedence(self):
         m = self.m
@@ -6416,6 +6454,22 @@ class ManagementLifetime(unittest.TestCase):
                     with self.assertRaises(trial.Failure):
                         m.export_viewer(NONCE)
                 self.assertFalse([r for r in reads if 'viewer-handoff' in r])  # refused before any handoff read
+        # control: a legitimate pending record passes the SAME strict validator and reaches the handoff read
+        state = m.load_state(NONCE)
+        state['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+        state['failure'] = None
+        state['terminal'] = {'status': None, 'origin': 'unobserved', 'group': 'uncertain'}
+        trial.atomic(self.root / 'steps.json', state)
+        real, reads = m.base.regular, []
+
+        def spy_ok(path, *a, **k):
+            reads.append(str(path))
+            return b'{}' if 'viewer-handoff' in str(path) else real(path, *a, **k)
+        with patch.object(m.base, 'regular', spy_ok), patch.object(m, 'gate'), \
+                patch.object(m, 'validate_handoff') as handoff:
+            self.assertEqual(m.export_viewer(NONCE), b'{}')
+        handoff.assert_called_once()
+        self.assertTrue([r for r in reads if 'viewer-handoff' in r])
 
     def test_s2_a_genuine_earlier_preclose_observation_is_not_erased_by_a_later_unknown_origin(self):
         m = self.m

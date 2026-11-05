@@ -1269,20 +1269,23 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
     private = state['private']
     if extra_private:
         private.update(extra_private)
-    if outcome is not None:
-        if not terminal_ok(outcome.get('terminal')):  # malformed/missing evidence never authorizes a positive report
-            private['worker_uncertain'] = True  # sticky: never cleared
-            storage_allowed = False
-        apply_terminal(state, outcome)
-        record_terminal(state, outcome, storage_allowed)
-        try:
-            validate_result(public_record(state), nonce)
-        except BaseException:  # an inexpressible terminal outcome is never published as a half record
-            state['failure'] = None
-            state['terminal'] = initial_terminal()
-            state['steps'] = {n: ('not-run' if s == 'failed' else s) for n, s in state['steps'].items()}
-            private['terminal_unpublished'] = True
-            private['child_cleanup_uncertain'] = True  # receipt cannot be clean without its terminal outcome
+    # Normalize the evidence ONCE for every entry (omitted/None/non-dict/malformed): `.get` is only ever
+    # called on a dict, and missing or malformed terminal evidence never authorizes a positive report.
+    evidence = outcome if type(outcome) is dict else None
+    if evidence is None or not terminal_ok(evidence.get('terminal')):
+        private['worker_uncertain'] = True  # sticky: never cleared
+        storage_allowed = False
+    if evidence is not None:
+        apply_terminal(state, evidence)
+    record_terminal(state, evidence, storage_allowed)  # earlier genuine pre-close status is kept; group uncertain
+    try:
+        validate_result(public_record(state), nonce)
+    except BaseException:  # an inexpressible terminal outcome is never published as a half record
+        state['failure'] = None
+        state['terminal'] = initial_terminal()
+        state['steps'] = {n: ('not-run' if s == 'failed' else s) for n, s in state['steps'].items()}
+        private['terminal_unpublished'] = True
+        private['child_cleanup_uncertain'] = True  # receipt cannot be clean without its terminal outcome
     clean = not private.get('child_cleanup_uncertain', False) and storage_allowed
     # ``absent`` = POSITIVE evidence that nothing can still write the storage: the worker (storage_allowed),
     # the cluster/containers and the daemons. Any failed, unknown or unobserved proof withholds the
