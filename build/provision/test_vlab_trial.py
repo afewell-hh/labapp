@@ -6287,7 +6287,8 @@ class ManagementLifetime(unittest.TestCase):
         self.beat()
         self.worker_script(WORKER_EXITS)
         self.open_gate()
-        with patch.object(self.m.owned_process, 'OwnedGroup', Group):
+        with patch.object(self.m.subprocess, 'Popen', return_value=SimpleNamespace(returncode=None)), \
+            patch.object(self.m.owned_process, 'OwnedGroup', Group):
             return self.run_guardian()
 
     def test_s2_exit17_between_the_last_none_status_and_close_is_exposed_despite_close_false(self):
@@ -6494,21 +6495,24 @@ class ManagementLifetime(unittest.TestCase):
 
     def test_f2_native_failure_after_all_steps_ok_reaches_the_public_receipt_with_sticky_uncertainty(self):
         m = self.m
-        for status, expected in ((17, ('child-exit', 17)), (-15, ('child-signal', -15))):
+        for status in (17, -15):
             with self.subTest(status):
                 for stale in (self.root / m.POSTSTOP_CLAIM, self.root / m.RELEASE_CLOSED):
                     stale.unlink(missing_ok=True)
                 shutil.rmtree(m.STORAGE, True)
                 trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
-                self.poststop_fixture(worker=status, closed=True)
+                self.poststop_fixture(worker=status, closed=True,
+                                      terminal={'status': status, 'origin': 'pre-close', 'group': 'uncertain'})
                 done = m.load_state(NONCE)
                 done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
                 done['observed'] = {k: True for k in m.OBSERVED}
                 trial.atomic(self.root / 'steps.json', done)
                 self.assertEqual(m.poststop(), 1)
                 public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
-                self.assertEqual((public['failure']['category'], public['failure']['child_status']), expected)
-                self.assertEqual(public['failure']['step'], m.STEP_NAMES[-1])
+                self.assertIsNone(public['failure'])
+                self.assertEqual(set(public['steps'].values()), {'ok'})
+                self.assertEqual(public['terminal']['status'], status)
+                self.assertEqual(public['terminal']['origin'], 'pre-close')
                 self.assertFalse(m.succeeded(public))
                 self.assertEqual(m.load_state(NONCE)['private']['worker_exit'], status)
 
