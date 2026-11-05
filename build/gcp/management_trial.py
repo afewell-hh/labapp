@@ -372,6 +372,25 @@ def native_code(failure):
     return 1
 
 
+TERMINAL_AMBIGUOUS_CODE = 1  # fixed code for a closure-window negative status (see ``terminal_code``)
+
+
+def terminal_code(terminal):
+    """Process code for the guest's separate typed terminal evidence; 0 = nothing to reconcile.
+
+    Fixed honest policy: an observed positive exit keeps itself whichever window saw it (a closure-window 17
+    is an observed terminal 17, not proof it preceded cleanup signals). A ``pre-close`` raw negative signal
+    is native and maps to 128+signal. A ``closure-window`` negative status may be the signal OUR closure
+    delivered, so it is never claimed as a native pre-closure failure: it returns the fixed code 1. Status 0,
+    unknown or unobserved reconcile nothing, and are never verified success either."""
+    status, origin = terminal['status'], terminal['origin']
+    if origin == 'unobserved' or type(status) is not int or status == 0:
+        return 0
+    if status > 0:
+        return status
+    return 128 - status if origin == 'pre-close' else TERMINAL_AMBIGUOUS_CODE
+
+
 def sequence(snapshot, payloads, output, *, registration, records, login, private=None):
     """INTERNAL body; never reachable from ``main``/``trial`` while activation is held."""
     owner.expected_snapshot(snapshot)
@@ -511,6 +530,10 @@ def sequence(snapshot, payloads, output, *, registration, records, login, privat
                 # acknowledgement or a non-pending receipt is not terminal proof of anything.
                 if result == 0 and typed_state == 'valid' and typed['failure'] is not None:
                     result, category, phase = native_code(typed['failure']), 'guest', 'guest-result'
+                elif result == 0 and typed_state == 'valid' and terminal_code(typed['terminal']):
+                    # Finalization-only observation (no earlier primary): all 18 steps may be ok. The separate
+                    # typed ``terminal`` record stays visible in the receipt; an earlier primary always wins.
+                    result, category, phase = terminal_code(typed['terminal']), 'guest', 'guest-result'
             try:
                 process_absent = master.close() and heartbeat_absent and not process_uncertain.is_set()
             except BaseException:

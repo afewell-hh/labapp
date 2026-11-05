@@ -2667,10 +2667,9 @@ class FakeManagementMaster:
                                  'child_status': status}
         elif len(self.ran) == len(p.STEP_NAMES):
             record['observed'] = {k: True for k in p.OBSERVED}
-            final = getattr(self, 'final_failure', None)
-            if self.torn and final is not None:  # a native worker failure first discovered during finalization
-                record['steps'][p.STEP_NAMES[-1]] = 'failed'
-                record['failure'] = {'step': p.STEP_NAMES[-1], 'category': final[0], 'child_status': final[1]}
+        final = getattr(self, 'final_terminal', None)
+        if self.torn and final is not None:  # #510: the later status lives ONLY in the separate typed terminal
+            record['terminal'] = {'status': final[1], 'origin': final[0], 'group': 'uncertain'}
         record['teardown'] = 'complete' if self.torn else 'pending'
         return guest.encoded(record)
 
@@ -3072,20 +3071,38 @@ class ManagementCaller(unittest.TestCase):
                 self.assertEqual(code, expected)
 
     def test_f2_final_native_failure_is_reconciled_into_return_and_receipt_but_never_replaces_an_earlier_primary(self):
-        for category, status, expected in (('child-signal', -15, 143), ('child-exit', 17, 17)):
-            with self.subTest(category):
+        # (origin, status) -> code. A closure-window negative status may be our own closure's signal, so it
+        # gets the fixed code 1 rather than a claimed native 128+signal; a pre-close signal stays native.
+        for origin, status, expected in (('pre-close', -15, 143), ('pre-close', 17, 17), ('closure-window', 17, 17),
+                                         ('closure-window', -15, 1), ('closure-window', -9, 1)):
+            with self.subTest((origin, status)):
                 master = FakeManagementMaster(self.program)
-                master.final_failure = (category, status)
+                master.final_terminal = (origin, status)
                 code, receipt, spy = self.sequence(master, private=self.private)
                 self.assertEqual((code, receipt['code']), (expected, expected))
                 self.assertEqual(receipt['failure_category'], 'guest')
-                self.assertEqual(receipt['management']['failure']['child_status'], status)
+                self.assertIsNone(receipt['management']['failure'])  # no step is falsified
+                self.assertEqual(set(receipt['management']['steps'].values()), {'ok'})  # all 18 facts preserved
+                self.assertEqual(receipt['management']['terminal']['status'], status)
+                self.assertEqual(receipt['management']['terminal']['origin'], origin)
                 self.assertFalse(self.program.succeeded(receipt['management']))
+        master = FakeManagementMaster(self.program)  # observed exit 0 is not success either (browser unverified)
+        master.final_terminal = ('pre-close', 0)
+        code, receipt, spy = self.sequence(master, private=self.private, browser=('owner-attested', True))
+        self.assertNotEqual(code, 0)
+        self.assertFalse(receipt['browser_verified'])
+        master = FakeManagementMaster(self.program)  # earlier primary (17) wins; later terminal stays visible
+        master.failing_step, master.late_status, master.final_terminal = 'helm', 9, ('closure-window', 23)
+        code, receipt, spy = self.sequence(master, private=self.private)
+        self.assertEqual((code, receipt['code']), (17, 17))
+        self.assertEqual(receipt['management']['terminal']['status'], 23)
         master = FakeManagementMaster(self.program)  # an earlier primary (17) keeps its code and category
         master.failing_step, master.late_status = 'helm', 9
         code, receipt, spy = self.sequence(master, private=self.private)
         self.assertEqual((code, receipt['code']), (17, 17))
         self.assertEqual(receipt['management']['failure']['child_status'], 9)  # the receipt shows what the guest said
+        for bad in ({'status': None, 'origin': 'unobserved'}, {'status': 0, 'origin': 'closure-window'}):
+            self.assertEqual(self.caller.terminal_code(dict(bad, group='uncertain')), 0)  # nothing to reconcile
 
     def test_first_step_failure_stops_work_but_still_tears_down_and_reads_the_typed_result(self):
         master = FakeManagementMaster(self.program)

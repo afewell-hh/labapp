@@ -180,7 +180,36 @@ OBSERVED = {  # closed boolean observations -> the step that produces them
     'principal_persisted': 'persisted-principal', 'viewer_handoff_ready': 'viewer-ready'}
 STEP_STATES = ('ok', 'failed', 'not-run')
 TEARDOWN_STATES = ('pending', 'complete', 'uncertain')
-RESULT_FIELDS = {'schema', 'nonce', 'steps', 'failure', 'observed', 'teardown'}
+RESULT_SCHEMA = 2  # management result contract v2: adds the closed ``terminal`` evidence object (#510)
+RESULT_FIELDS = {'schema', 'nonce', 'steps', 'failure', 'observed', 'teardown', 'terminal'}
+# Closed, nonsecret terminal evidence of the ONE worker, independent of the ordered steps and of the
+# primary ``failure``. ``status`` is the worker's observed exit (0..255) or raw negative signal, else None.
+# ``origin``: 'pre-close' = a non-reaping look BEFORE the closure transition could signal anything;
+# 'closure-window' = read from the unchanged OwnedGroup after its sole close (a positive value is an
+# observed terminal status but NOT proof it preceded cleanup signals; a negative one may be our own
+# closure's signal); 'unobserved' = nothing known. ``group`` is 'closure-reported' only when the guardian
+# recorded a positive close AND worker absence held, else 'uncertain' (sticky). Neither is verified success.
+TERMINAL_FIELDS = {'status', 'origin', 'group'}
+TERMINAL_ORIGINS = ('pre-close', 'closure-window', 'unobserved')
+TERMINAL_GROUPS = ('closure-reported', 'uncertain')
+
+
+def terminal_status_ok(status):
+    return type(status) is int and (0 <= status <= 255 or -64 <= status <= -1)
+
+
+def initial_terminal():
+    return {'status': None, 'origin': 'unobserved', 'group': 'uncertain'}
+
+
+def terminal_ok(value):
+    if not (type(value) is dict and set(value) == TERMINAL_FIELDS
+            and type(value['origin']) is str and value['origin'] in TERMINAL_ORIGINS
+            and type(value['group']) is str and value['group'] in TERMINAL_GROUPS):
+        return False
+    if value['origin'] == 'unobserved':
+        return value['status'] is None
+    return terminal_status_ok(value['status'])
 PRIVATE_FILES = ('grafana-admin-user', 'grafana-admin-password', 'viewer.json', 'viewer-handoff.json', 'kubeconfig')
 
 # Synthetic-probe vocabulary: a TEST receiver sample, not Alloy, target-page or course proof.
@@ -376,8 +405,9 @@ def contract_any():
 
 
 def initial_state(nonce):
-    return {'schema': 1, 'nonce': nonce, 'steps': {n: 'not-run' for n in STEP_NAMES}, 'failure': None,
-            'observed': {k: False for k in OBSERVED}, 'teardown': 'pending', 'private': {}}
+    return {'schema': RESULT_SCHEMA, 'nonce': nonce, 'steps': {n: 'not-run' for n in STEP_NAMES}, 'failure': None,
+            'observed': {k: False for k in OBSERVED}, 'teardown': 'pending', 'terminal': initial_terminal(),
+            'private': {}}
 
 
 def load_state(nonce):
@@ -458,8 +488,9 @@ def public_record(state):
 def validate_result(value, nonce):
     """Closed strict validator for the nonsecret typed result (host and guest share it)."""
     base.require(type(value) is dict and set(value) == RESULT_FIELDS, 'result refused')
-    base.require(type(value['schema']) is int and value['schema'] == 1 and value['nonce'] == nonce
-                 and type(value['teardown']) is str and value['teardown'] in TEARDOWN_STATES, 'result refused')
+    base.require(type(value['schema']) is int and value['schema'] == RESULT_SCHEMA and value['nonce'] == nonce
+                 and type(value['teardown']) is str and value['teardown'] in TEARDOWN_STATES
+                 and terminal_ok(value['terminal']), 'result refused')
     steps, observed, failure = value['steps'], value['observed'], value['failure']
     base.require(type(steps) is dict and set(steps) == set(STEP_NAMES)
                  and all(type(v) is str and v in STEP_STATES for v in steps.values()), 'result refused')
@@ -487,7 +518,8 @@ def validate_result(value, nonce):
 
 def succeeded(record):
     return (all(v == 'ok' for v in record['steps'].values()) and record['failure'] is None
-            and record['teardown'] == 'complete' and all(record['observed'].values()))
+            and record['teardown'] == 'complete' and all(record['observed'].values())
+            and record['terminal']['status'] in (None, 0))  # an observed nonzero terminal status is never success
 
 
 def failure_record(step, error):
@@ -1158,7 +1190,9 @@ def worker():
 def export_viewer(nonce):
     value = contract_value(nonce)
     state = load_state(nonce)
-    base.require(state['steps']['viewer-ready'] == 'ok' and state['failure'] is None, 'handoff unavailable')
+    validate_result(public_record(state), nonce)  # same strict versioned validator as ``result``, before any effect
+    base.require(state['steps']['viewer-ready'] == 'ok' and state['failure'] is None
+                 and state['terminal']['status'] in (None, 0), 'handoff unavailable')  # observed nonzero terminal refuses
     gate(value)
     raw = base.regular(WORK / 'viewer-handoff.json', 1024, 0, 0o600)
     validate_handoff(base.data(raw), nonce)
@@ -1193,7 +1227,9 @@ def heartbeat(nonce, sequence):
 
 def bounded_rmtree(path, deadline):
     """Remove one directory tree without following links or crossing devices, checking ONE outer
-    deadline before every entry. Raises on any refusal; never reports success it did not observe."""
+    deadline before every entry. Raises on any refusal; never reports success it did not observe.
+    NOT called by any production path (#510: management storage is always retained); kept only as a
+    bounded filesystem utility exercised by its own tests. Do not wire it into cleanup."""
     root_dev = os.lstat(path).st_dev
 
     def walk(directory):
@@ -1233,15 +1269,23 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
     private = state['private']
     if extra_private:
         private.update(extra_private)
-    if outcome is not None:
-        apply_terminal(state, outcome)
-        try:
-            validate_result(public_record(state), nonce)
-        except BaseException:  # an inexpressible terminal outcome is never published as a half record
-            state['failure'] = None
-            state['steps'] = {n: ('not-run' if s == 'failed' else s) for n, s in state['steps'].items()}
-            private['terminal_unpublished'] = True
-            private['child_cleanup_uncertain'] = True  # receipt cannot be clean without its terminal outcome
+    # Normalize the evidence ONCE for every entry (omitted/None/non-dict/malformed): `.get` is only ever
+    # called on a dict, and missing or malformed terminal evidence never authorizes a positive report.
+    evidence = outcome if type(outcome) is dict else None
+    if evidence is None or not terminal_ok(evidence.get('terminal')):
+        private['worker_uncertain'] = True  # sticky: never cleared
+        storage_allowed = False
+    if evidence is not None:
+        apply_terminal(state, evidence)
+    record_terminal(state, evidence, storage_allowed)  # earlier genuine pre-close status is kept; group uncertain
+    try:
+        validate_result(public_record(state), nonce)
+    except BaseException:  # an inexpressible terminal outcome is never published as a half record
+        state['failure'] = None
+        state['terminal'] = initial_terminal()
+        state['steps'] = {n: ('not-run' if s == 'failed' else s) for n, s in state['steps'].items()}
+        private['terminal_unpublished'] = True
+        private['child_cleanup_uncertain'] = True  # receipt cannot be clean without its terminal outcome
     clean = not private.get('child_cleanup_uncertain', False) and storage_allowed
     # ``absent`` = POSITIVE evidence that nothing can still write the storage: the worker (storage_allowed),
     # the cluster/containers and the daemons. Any failed, unknown or unobserved proof withholds the
@@ -1286,21 +1330,15 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
         exists = present(STORAGE)  # None = unobservable (EACCES/EIO/...): unknown, never absent
     except BaseException:
         exists, clean, absent = None, False, False
-    if recorded is None and private.get('storage_intent') and exists is not False:
-        clean = False  # creation was attempted but never recorded (or is unobservable): never adopted or deleted
-    if recorded is not None and absent and exists:  # destructive: only after worker, container and daemon absence
-        try:
-            info = os.lstat(STORAGE)
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and [info.st_dev, info.st_ino] == recorded:
-                bounded_rmtree(STORAGE, deadline)
-        except FileNotFoundError:
-            pass
-        except BaseException:
-            clean = False
-        try:
-            clean = clean and not present(STORAGE)  # final deletion is observed, not assumed
-        except BaseException:
-            clean = False
+    # STORAGE RETENTION (#510): this program has NO migration-safe quiescence boundary (cgroup population
+    # reads are sequential and unproven against migration), so NO reachable path removes management
+    # storage, whatever ``storage_allowed``, the worker/daemon checks, the recorded inode or any private
+    # observation says. There is no flag or marker that re-enables it. The recorded inode and intent stay
+    # untouched, unknown or foreign paths are never adopted, and any existing (or unobservable) storage
+    # keeps the receipt uncertain. Credential removal and the native cluster/daemon cleanup above remain.
+    if exists is not False:  # present (ours, foreign or unrecorded) or unobservable: retained, never clean
+        clean = False
+        private['storage_retained'] = True
     clean = clean and in_time()
     # Diagnostic only (private): whether every observed absence held. It is NEVER published as ``complete``:
     # ``save_state`` refuses a positive complete while final-publication timeliness is unproved.
@@ -1383,7 +1421,8 @@ def guardian():
     base.require(base.kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
     base.exclusive(MROOT / 'guardian.json', base.encoded({'boot': value['boot_uuid'], 'lease': value['lease'],
                    'nonce': value['nonce'], 'guardian_pid': os.getpid()}))
-    outcome = {'schema': 1, 'nonce': value['nonce'], 'worker': None, 'closed': None, 'guardian': None}
+    outcome = {'schema': 1, 'nonce': value['nonce'], 'worker': None, 'closed': None, 'guardian': None,
+               'terminal': initial_terminal()}
     group, code = None, 1
     try:
         wait_release(value, clock)
@@ -1427,6 +1466,18 @@ def guardian():
                 outcome['closed'] = bool(group.close(owned_process.TERM_GRACE_SECONDS, until=time.monotonic() + 15))
             except BaseException:
                 outcome['closed'] = False
+            # Independent terminal evidence, whatever ``close`` returned: an earlier pre-close observation
+            # wins; otherwise the unchanged OwnedGroup's already-settled returncode (read ONCE, never a
+            # second wait/poll/PID reconstruction) is a closure-window observation, not a causal claim.
+            try:
+                if terminal_status_ok(outcome['worker']):
+                    outcome['terminal'] = {'status': outcome['worker'], 'origin': 'pre-close', 'group': 'uncertain'}
+                else:
+                    settled = group.proc.returncode
+                    if terminal_status_ok(settled):
+                        outcome['terminal'] = {'status': settled, 'origin': 'closure-window', 'group': 'uncertain'}
+            except BaseException:
+                pass  # stays unobserved
         try:
             base.atomic(MROOT / 'outcome.json', outcome)
         except BaseException:
@@ -1578,23 +1629,19 @@ def poststop():
 def apply_terminal(state, outcome):
     """Carry the authoritative terminal outcome into the strict public record when the worker could not
     (SIGKILL, guardian-side loss, cancel): native exit/signal first, else the guardian's own category.
-    An already recorded failure stays primary. A nonzero NATIVE worker status is kept even after all 18
-    steps are ok: the strict result shape has no separate terminal field, so the last step carries it as
-    ``failed`` (``succeeded`` is then false and the Viewer export is refused). Nothing else is invented
-    once every step is ok, and a missing outcome adds nothing (the caller records it as unknown)."""
+    An already recorded failure stays primary. Once all 18 steps are ok nothing is rewritten: a later
+    nonzero worker status lives ONLY in the separate ``terminal`` evidence (``record_terminal``), never as
+    a falsified failed last step. A missing outcome adds nothing (the caller records it as unknown)."""
     if state['failure'] is not None or outcome is None:
         return
     worker, guardian = outcome.get('worker'), outcome.get('guardian')
     native = type(worker) is int and worker != 0
     pending = [n for n in STEP_NAMES if state['steps'][n] != 'ok']
-    if pending:
-        if any(state['steps'][n] != 'not-run' for n in pending):
-            return
-        carrier = pending[0]
-    elif native:
-        carrier = STEP_NAMES[-1]
-    else:
+    if not pending:
         return
+    if any(state['steps'][n] != 'not-run' for n in pending):
+        return
+    carrier = pending[0]
     if native:
         category, status = ('child-signal', worker) if worker < 0 else ('child-exit', worker)
     elif type(guardian) is dict:
@@ -1606,6 +1653,21 @@ def apply_terminal(state, outcome):
         category, status = 'exception', None
     state['steps'][carrier] = 'failed'
     state['failure'] = {'step': carrier, 'category': category, 'child_status': status}
+
+
+def record_terminal(state, outcome, storage_allowed):
+    """Carry the guardian's independent terminal observation into ``state['terminal']``. Never touches
+    steps or the primary failure. A genuine earlier ``pre-close`` observation is kept; a missing or
+    malformed observation stays unobserved; ``group`` uncertainty is sticky and is 'closure-reported'
+    only for a positive recorded close with worker absence proven."""
+    current = state['terminal']
+    seen = outcome.get('terminal') if type(outcome) is dict else None
+    if terminal_ok(seen) and seen['origin'] != 'unobserved' and current['origin'] != 'pre-close':
+        current = {'status': seen['status'], 'origin': seen['origin'], 'group': 'uncertain'}
+    reported = (type(outcome) is dict and terminal_ok(seen) and outcome.get('closed') is True and storage_allowed
+                and not state['private'].get('worker_uncertain') and not state['private'].get('child_cleanup_uncertain'))
+    state['terminal'] = {'status': current['status'], 'origin': current['origin'],
+                         'group': 'closure-reported' if reported else 'uncertain'}
 
 
 def _poststop(entry, clip=None):
@@ -1634,7 +1696,8 @@ def _poststop(entry, clip=None):
         base.require(type(outcome) is dict and outcome.get('nonce') == nonce)
     except Exception:
         outcome = None  # missing/invalid guardian record: the terminal result is UNKNOWN (sticky uncertainty)
-    uncertain = not absent or outcome is None or outcome.get('closed') is not True
+    uncertain = (not absent or outcome is None or outcome.get('closed') is not True
+                 or not terminal_ok(outcome.get('terminal')))  # invalid terminal evidence is sticky uncertainty
     extra = {}
     if uncertain:
         extra['worker_uncertain'] = True  # sticky: never cleared
