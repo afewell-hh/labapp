@@ -1866,6 +1866,17 @@ The caller's tests are in the two existing `test_vlab_trial.py` homes and use fa
 processes only; they do not need or authorize live admission. Source/CI acceptance of this surface is not
 activation.
 
+Management result contract v2 (#510): the caller parses the guest's separate closed `terminal` object
+(`status`, `origin`, `group`; see the provision README). A native failure first discovered during
+finalization is reconciled into the printed receipt and the return code through `terminal_code` and never
+replaces an earlier primary failure, which keeps its code and category while the later terminal stays visible in
+`management.terminal`. With no earlier primary, an observed positive status (also from the closure window) returns
+itself even if all 18 steps are ok; a `pre-close` raw signal returns 128+signal; a `closure-window` negative status
+may be our own closure's signal, so it is NOT claimed as a native pre-closure failure and returns the fixed code 1.
+Status 0, `unobserved`, a cancel acknowledgement or a non-pending receipt is never verified success, and
+`browser_verified` stays false. The guest retains management storage in every cleanup path (no quiescence proof
+exists); that gap and the unchanged runtime, absence and hard-deadline holds are listed in the provision README.
+
 Enrollment checks the canonical caller's pinned Google Cloud SDK 575.0.0 before key generation.
 Before staging appliance source, it revalidates registration/source and round-trips a harmless nonce
 marker through the original master and its transfer path. A mismatched marker refuses staging.

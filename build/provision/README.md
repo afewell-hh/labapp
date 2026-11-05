@@ -1846,18 +1846,31 @@ systemd v255, cgroup, timer or Docker behavior.
   itself (read before and after the child check), the guardian's recorded closure to be positive, and a PRESENT
   `outcome.json` (a missing or invalid one is an unknown terminal result: sticky uncertainty). Absence uses strict
   `lstat` (`present`): only a genuine `FileNotFoundError` is absent, any other error (EACCES/EIO/...) is unknown and
-  never permits storage removal or a clean observation. Destructive storage removal additionally needs
-  positive cluster delete, an empty container listing and positive daemon-process absence
-  (`daemons_absent`: the docker/containerd unit cgroups and `docker-*`/`containerd-*` scopes hold no process; a
-  successful `systemctl stop` is not absence). Otherwise protective native deletes and private-file removal still
-  run, storage is NEVER removed, and the receipt is `uncertain` with `worker_uncertain` recorded. Storage creation
+  never permits a clean observation. **Storage retention (#510):** there is NO migration-safe quiescence boundary, so
+  NO reachable cleanup path removes `/var/lib/labapp/management-storage`, whatever `storage_allowed`, the worker or
+  daemon checks (`daemons_absent`: the docker/containerd unit cgroups and `docker-*`/`containerd-*` scopes hold no
+  process; a successful `systemctl stop` is not absence), a matching recorded inode, direct/poststop/duplicate entry
+  or any private clean observation says. There is no flag, environment value or marker that re-enables removal;
+  `bounded_rmtree` remains only as an uncalled bounded utility. Existing (or unobservable) storage keeps the receipt
+  `uncertain` with `storage_retained` recorded privately; the recorded inode and intent are kept and unknown or
+  foreign paths are never adopted. Protective native cluster/daemon cleanup and private-credential removal still run.
+  The storage directory therefore persists (a known gap: no removal until a reviewed quiescence proof exists). Storage creation
   intent is persisted (file, rename AND parent-directory fsync, `durable_atomic`, management-local; the base atomic
   helper is unchanged) before `mkdir`, and a failed durable publication refuses the `mkdir`; an existing but
   unrecorded storage directory is never adopted or deleted and keeps the receipt `uncertain`. The terminal outcome
   (native worker exit/signal, else the guardian's own category) is carried into the strict public record
-  (`apply_terminal`; a recorded worker failure stays primary). A nonzero NATIVE worker status that arrives after all
-  18 steps are ok is kept too: the strict result shape has no terminal field, so the last step (`viewer-ready`)
-  carries it as `failed` and `succeeded` is false. The guardian observes the non-reaping `OwnedGroup.status()` BEFORE
+  (`apply_terminal`; a recorded worker failure stays primary). **Terminal evidence (#510, result schema 2):** after
+  all 18 steps are ok nothing is rewritten; the observed worker status lives in ONE separate closed
+  `terminal` object `{status, origin, group}` (exact keys/types; `status` is an exit 0..255, a raw negative signal
+  -64..-1, or `null`; `origin` is `pre-close`, `closure-window` or `unobserved`; `group` is `closure-reported` or
+  `uncertain`; no path, token, output or guessed timestamp). The guardian records it independently of `close()`'s
+  boolean by reading the unchanged `OwnedGroup.proc.returncode` once after its sole close (no second wait, poll or
+  PID reconstruction); an earlier non-reaping observation is `pre-close` and is kept. A closure-window positive status
+  (for example 17) is an observed terminal status, not proof it preceded cleanup signals, and a closure-window
+  negative status may be our own closure's signal. `group` is `closure-reported` only for a positive recorded close
+  with worker absence proven and is sticky `uncertain` otherwise; a missing or malformed outcome stays
+  `unobserved`/`uncertain`. A nonzero terminal status makes `succeeded` false and refuses the Viewer export; a
+  missing record is neither success nor absence. Legacy schema 1 records are refused. The guardian observes the non-reaping `OwnedGroup.status()` BEFORE
   supervision and once more before closure signals anything, so an already exited native status is not obscured by
   a concurrent cutoff; a status produced by its own closure is never recorded as native. No claim is made that a
   killed or uninterruptible task is gone.

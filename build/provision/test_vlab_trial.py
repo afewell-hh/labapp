@@ -5159,7 +5159,20 @@ class ManagementProgram(unittest.TestCase):
         failed['failure'] = {'step': 'install-kubectl', 'category': 'child-exit', 'child_status': 7}
         m.validate_result(failed, NONCE)
         mutations = [
-            lambda v: v.update(extra=1), lambda v: v.update(nonce='b' * 32), lambda v: v.update(schema=2),
+            lambda v: v.update(extra=1), lambda v: v.update(nonce='b' * 32), lambda v: v.update(schema=1),  # no legacy fallback
+            lambda v: v.pop('terminal'), lambda v: v.update(terminal=None),
+            lambda v: v['terminal'].update(extra=1), lambda v: v['terminal'].pop('group'),
+            lambda v: v['terminal'].update(status=17),                       # status without an observation origin
+            lambda v: v['terminal'].update(origin='pre-close'),              # origin without a status
+            lambda v: v['terminal'].update(status=17, origin='guessed'),
+            lambda v: v['terminal'].update(group='absent'),
+            lambda v: v['terminal'].update(status=True, origin='closure-window'),
+            lambda v: v['terminal'].update(status='17', origin='closure-window'),
+            lambda v: v['terminal'].update(status=17.0, origin='closure-window'),
+            lambda v: v['terminal'].update(status=float('nan'), origin='closure-window'),
+            lambda v: v['terminal'].update(status=256, origin='pre-close'),
+            lambda v: v['terminal'].update(status=-65, origin='pre-close'),
+            lambda v: v['terminal'].update(status=17, origin=['pre-close']),
             lambda v: v['steps'].update({'storage': 'ok'}),               # ok without earlier steps
             lambda v: v['steps'].update({'install-docker': 'maybe'}),
             lambda v: v['observed'].update({'probe_fresh': True}),        # observed without its step
@@ -5193,15 +5206,16 @@ class ManagementProgram(unittest.TestCase):
         with patch.object(m, 'daemons_absent', return_value=True):  # positive proof is tested in ManagementLifetime
             self.assertEqual(m.teardown(NONCE), 1)  # publication timeliness is unproved: never positive
         self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
-        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
-        self.assertFalse(m.STORAGE.exists())
-        self.assertFalse(any((m.WORK / name).exists() for name in m.PRIVATE_FILES))
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], False)  # storage retained (#510)
+        self.assertIs(m.load_state(NONCE)['private']['storage_retained'], True)
+        self.assertTrue(m.STORAGE.exists())  # all cleanup-success inputs true: still never deleted
+        self.assertFalse(any((m.WORK / name).exists() for name in m.PRIVATE_FILES))  # credentials still removed
         deletes = [c for c in self.model.calls if c[:3] == [m.K3D, 'cluster', 'delete']]
         self.assertEqual(deletes, [[m.K3D, 'cluster', 'delete', m.CLUSTER]])
         with patch.object(m, 'daemons_absent', return_value=True):
             self.assertEqual(m.teardown(NONCE), 1)  # a stored non-complete receipt is simply re-observed
         self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
-        self.assertFalse(m.STORAGE.exists())
+        self.assertTrue(m.STORAGE.exists())
 
     def test_teardown_never_removes_foreign_storage_and_cluster_failure_is_uncertain(self):
         m = self.m
@@ -5878,8 +5892,8 @@ class ManagementLifetime(unittest.TestCase):
         self.assertEqual(m.poststop(), 1)  # never a positive completion
         state = m.load_state(NONCE)
         self.assertEqual((state['teardown'], state['private']['worker_exit']), ('uncertain', -9))
-        self.assertIs(state['private']['teardown_observed_clean'], True)
-        self.assertFalse(m.STORAGE.exists())
+        self.assertIs(state['private']['teardown_observed_clean'], False)  # storage retained (#510)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())  # absence proofs held, storage still kept
         self.assertTrue((self.root / m.RELEASE_CLOSED).exists())
         with self.assertRaises(trial.Failure):  # the worker/any other writer is refused after the claim
             m.save_state(state)
@@ -5981,8 +5995,8 @@ class ManagementLifetime(unittest.TestCase):
         code, calls = self.run_teardown(ok, True)
         self.assertEqual(code, 1)  # observed clean, but a positive 'complete' is never published
         self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
-        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], True)
-        self.assertFalse(m.STORAGE.exists())
+        self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], False)  # storage retained (#510)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
         self.assertIn([m.SYSTEMCTL, 'stop', *m.DAEMON_UNITS], calls)
 
     def test_r1_daemon_absence_needs_an_observed_hierarchy_and_empty_daemon_cgroups(self):
@@ -6150,14 +6164,18 @@ class ManagementLifetime(unittest.TestCase):
         done['steps'] = {n: 'ok' for n in m.STEP_NAMES}
         m.apply_terminal(done, {'worker': 0, 'guardian': {'category': 'interrupted', 'child_status': None}})
         self.assertIsNone(done['failure'])  # nothing is invented once every step finished and the worker exited 0
-        for status, expected in ((17, ('child-exit', 17)), (-15, ('child-signal', -15)), (-9, ('child-signal', -9))):
+        for status in (17, -15, -9):
             late = m.initial_state(NONCE)
             late['steps'] = {n: 'ok' for n in m.STEP_NAMES}
             late['observed'] = {k: True for k in m.OBSERVED}
-            m.apply_terminal(late, {'worker': status, 'guardian': None})  # native status AFTER all 18 ok is kept
-            self.assertEqual(late['failure'], {'step': m.STEP_NAMES[-1], 'category': expected[0],
-                                               'child_status': expected[1]})
-            self.assertFalse(m.succeeded(m.validate_result(m.public_record(late), NONCE)))
+            m.apply_terminal(late, {'worker': status, 'guardian': None})
+            self.assertIsNone(late['failure'])  # all 18 successful step facts are NOT rewritten (#510)
+            self.assertEqual(set(late['steps'].values()), {'ok'})
+            m.record_terminal(late, {'worker': status, 'closed': True,
+                                     'terminal': {'status': status, 'origin': 'pre-close', 'group': 'uncertain'}}, True)
+            self.assertEqual(late['terminal'], {'status': status, 'origin': 'pre-close', 'group': 'closure-reported'})
+            late['teardown'] = 'complete'
+            self.assertFalse(m.succeeded(m.validate_result(m.public_record(late), NONCE)))  # nonzero terminal
         earlier = m.initial_state(NONCE)
         earlier['steps'] = {n: 'ok' for n in m.STEP_NAMES}
         earlier['steps'][m.STEP_NAMES[-1]] = 'failed'
@@ -6172,6 +6190,211 @@ class ManagementLifetime(unittest.TestCase):
         public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
         self.assertEqual((public['failure']['category'], public['failure']['child_status'], public['teardown']),
                          ('child-signal', -9, 'uncertain'))
+
+    # -- #510: storage retention and independent closed terminal evidence ------------------------------------
+    def test_s1_no_production_call_site_can_destroy_storage(self):
+        source = Path(self.m.__file__).read_text()
+        self.assertEqual(source.count('bounded_rmtree('), 1)  # the definition only: no production call
+        for forbidden in ('shutil.rmtree', 'rmtree(STORAGE', 'os.removedirs'):
+            self.assertNotIn(forbidden, source)
+
+    def test_s1_storage_is_retained_with_every_cleanup_success_input_true_and_in_every_path(self):
+        m = self.m
+        self.write_outcome(worker=0)
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.with_storage()
+        self.assertEqual(m.poststop(), 1)  # absence proofs true, matching inode, direct poststop entry
+        state = m.load_state(NONCE)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        self.assertEqual((state['teardown'], state['private']['storage_ino'] is not None), ('uncertain', True))
+        self.assertIs(state['private']['teardown_observed_clean'], False)
+        self.assertIs(state['private']['storage_retained'], True)
+        for storage_allowed in (True, False):  # direct teardown and a duplicate entry: same retention
+            with patch.object(m, 'daemons_absent', return_value=True):
+                self.assertEqual(m.teardown(NONCE, storage_allowed=storage_allowed, final=True,
+                                            outer=time.monotonic() + 30), 1)
+            self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+            self.assertEqual(m.load_state(NONCE)['teardown'], 'uncertain')
+        self.assertEqual(m.poststop(), 1)  # read-only duplicate
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+
+    def test_s1_missing_foreign_unreadable_and_transient_cases_retain_storage_credentials_still_go(self):
+        m = self.m
+        cases = {'foreign inode': lambda s: s['private'].update(storage_ino=[0, 0]),
+                 'missing inode record': lambda s: s['private'].pop('storage_ino'),
+                 'intent only': lambda s: s['private'].update(storage_intent=True, storage_ino=None)}
+        for name, change in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(m.STORAGE, True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                self.with_storage()
+                state = m.load_state(NONCE)
+                change(state)
+                trial.atomic(self.root / 'steps.json', state)
+                trial.exclusive(m.WORK / 'viewer.json', b'secret') if not (m.WORK / 'viewer.json').exists() else None
+                with patch.object(m, 'daemons_absent', return_value=True):
+                    self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30), 1)
+                self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+                self.assertFalse((m.WORK / 'viewer.json').exists())  # protective credential removal remains
+                self.assertIs(m.load_state(NONCE)['private']['teardown_observed_clean'], False)
+        shutil.rmtree(m.STORAGE, True)
+        trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+        self.with_storage()
+        real_present = m.present
+
+        def unreadable(path):
+            if path == m.STORAGE:
+                raise OSError('EIO')
+            return real_present(path)
+        with patch.object(m, 'present', side_effect=unreadable), \
+                patch.object(m, 'daemons_absent', return_value=True):  # unknown read error is never absence
+            self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30), 1)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        (self.cg / 'sub').mkdir()  # a transient subgroup: quiescence unprovable, storage still retained
+        (self.cg / 'sub' / 'cgroup.procs').write_text('')
+        self.write_outcome(worker=0)
+        with patch.object(m, 'ABSENCE_SECONDS', .3):
+            self.assertEqual(m.poststop(), 1)
+        self.assertTrue((m.STORAGE / 'nested' / 'file').exists())
+        self.assertIs(m.load_state(NONCE)['private']['worker_uncertain'], True)
+
+    def fake_group(self, statuses, settled, closed=True, raises=False):
+        """OwnedGroup stand-in with the real surface the guardian uses: ``status()`` (non-reaping), ``close()``
+        and the settled ``proc.returncode``. ``close`` is the SOLE closure; nothing waits or polls again."""
+        test = self
+
+        class Group:
+            def __init__(self, proc):
+                self.proc, self.calls, self.closes = SimpleNamespace(returncode=None), 0, 0
+
+            def status(self):
+                self.calls += 1
+                if self.calls == 1 and len(statuses) == 1:
+                    test.beat(age=60)  # heartbeat loss after the first look: the guardian must close the group
+                return statuses[self.calls - 1] if self.calls <= len(statuses) else None
+
+            def close(self, *args, **kw):
+                self.closes += 1
+                self.proc.returncode = settled
+                if raises:
+                    raise RuntimeError('close failed')
+                return closed
+        return Group
+
+    def run_fake_guardian(self, Group):
+        for stale in ('guardian.json', 'outcome.json', self.m.RELEASE_OPEN, self.m.RELEASE_CLOSED):
+            (self.root / stale).unlink(missing_ok=True)  # each run is a fresh one-shot guardian
+        self.beat()
+        self.worker_script(WORKER_EXITS)
+        self.open_gate()
+        with patch.object(self.m.owned_process, 'OwnedGroup', Group):
+            return self.run_guardian()
+
+    def test_s2_exit17_between_the_last_none_status_and_close_is_exposed_despite_close_false(self):
+        for closed, raises in ((False, False), (True, False), (False, True)):
+            with self.subTest((closed, raises)):
+                self.beat()
+                (self.root / 'outcome.json').unlink(missing_ok=True)
+                self.run_fake_guardian(self.fake_group([None], 17, closed=closed, raises=raises))
+                out = self.outcome()
+                self.assertIsNone(out['worker'])
+                self.assertEqual(out['terminal'], {'status': 17, 'origin': 'closure-window', 'group': 'uncertain'})
+
+    def test_s2_preclose_status_wins_and_closure_window_is_never_promoted_to_preclose(self):
+        self.run_fake_guardian(self.fake_group([None, -15], -9))  # a status seen before closure beats the settled one
+        self.assertEqual(self.outcome()['terminal']['origin'], 'pre-close')
+        for settled, expected in ((-15, ('closure-window', -15)), (-9, ('closure-window', -9)), (0, ('closure-window', 0))):
+            with self.subTest(settled):
+                self.beat()
+                (self.root / 'outcome.json').unlink(missing_ok=True)
+                self.run_fake_guardian(self.fake_group([None], settled))
+                self.assertEqual((self.outcome()['terminal']['origin'], self.outcome()['terminal']['status']), expected)
+        for settled in (None, True, 256, -65, '17', 17.0):  # unavailable or invalid status stays unobserved
+            with self.subTest(settled):
+                self.beat()
+                (self.root / 'outcome.json').unlink(missing_ok=True)
+                self.run_fake_guardian(self.fake_group([None], settled))
+                self.assertEqual(self.outcome()['terminal'], {'status': None, 'origin': 'unobserved', 'group': 'uncertain'})
+
+    def all_ok_state(self):
+        state = self.m.load_state(NONCE)
+        state['steps'] = {n: 'ok' for n in self.m.STEP_NAMES}
+        state['observed'] = {k: True for k in self.m.OBSERVED}
+        trial.atomic(self.root / 'steps.json', state)
+
+    def test_s2_all18_ok_with_a_later_terminal_17_keeps_every_step_fact_and_exposes_the_terminal(self):
+        m = self.m
+        self.all_ok_state()
+        self.with_storage()
+        self.write_outcome(worker=None, closed=False,
+                           terminal={'status': 17, 'origin': 'closure-window', 'group': 'uncertain'})
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.assertEqual(m.poststop(), 1)
+        public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
+        self.assertEqual(set(public['steps'].values()), {'ok'})
+        self.assertIsNone(public['failure'])
+        self.assertEqual(public['terminal'], {'status': 17, 'origin': 'closure-window', 'group': 'uncertain'})
+        self.assertFalse(m.succeeded(public))
+        self.assertEqual(json.loads(m.result(NONCE))['terminal']['status'], 17)  # guest export carries it too
+        with self.assertRaises(trial.Failure):
+            m.export_viewer(NONCE)  # an observed nonzero terminal status refuses the Viewer export
+
+    def test_s2_earlier_primary_stays_primary_with_a_separate_secondary_terminal(self):
+        m = self.m
+        state = m.load_state(NONCE)
+        state['steps'][m.STEP_NAMES[0]] = 'failed'
+        state['failure'] = {'step': m.STEP_NAMES[0], 'category': 'phase-cutoff', 'child_status': None}
+        trial.atomic(self.root / 'steps.json', state)
+        self.write_outcome(worker=17, terminal={'status': 17, 'origin': 'pre-close', 'group': 'uncertain'})
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.assertEqual(m.poststop(), 1)
+        public = m.validate_result(m.public_record(m.load_state(NONCE)), NONCE)
+        self.assertEqual(public['failure'], {'step': m.STEP_NAMES[0], 'category': 'phase-cutoff', 'child_status': None})
+        self.assertEqual(public['terminal'], {'status': 17, 'origin': 'pre-close', 'group': 'closure-reported'})
+
+    def test_s2_group_uncertainty_is_independent_and_sticky_and_missing_or_invalid_outcomes_stay_unobserved(self):
+        m = self.m
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.write_outcome(worker=0, terminal={'status': 0, 'origin': 'pre-close', 'group': 'uncertain'})
+        self.assertEqual(m.poststop(), 1)
+        self.assertEqual(m.load_state(NONCE)['terminal'], {'status': 0, 'origin': 'pre-close', 'group': 'closure-reported'})
+        # missing outcome: unknown, sticky uncertain, never absence or success
+        for stale in (self.root / m.POSTSTOP_CLAIM, self.root / 'outcome.json'):
+            stale.unlink(missing_ok=True)
+        trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+        self.assertEqual(m.poststop(), 1)
+        state = m.load_state(NONCE)
+        self.assertEqual(state['terminal'], {'status': None, 'origin': 'unobserved', 'group': 'uncertain'})
+        self.assertIs(state['private']['worker_uncertain'], True)
+        for bad in ({'status': '17', 'origin': 'pre-close', 'group': 'uncertain'},
+                    {'status': True, 'origin': 'closure-window', 'group': 'uncertain'},
+                    {'status': 17, 'origin': 'unobserved', 'group': 'uncertain'},
+                    {'status': 999, 'origin': 'pre-close', 'group': 'uncertain'},
+                    {'status': 17, 'origin': 'pre-close', 'group': 'uncertain', 'path': '/x'}, None, 'x'):
+            with self.subTest(bad):
+                (self.root / m.POSTSTOP_CLAIM).unlink(missing_ok=True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                self.write_outcome(worker=None, terminal=bad)
+                self.assertEqual(m.poststop(), 1)
+                self.assertEqual(m.load_state(NONCE)['terminal']['origin'], 'unobserved')
+
+    def test_s2_a_genuine_earlier_preclose_observation_is_not_erased_by_a_later_unknown_origin(self):
+        m = self.m
+        state = m.load_state(NONCE)
+        state['terminal'] = {'status': 17, 'origin': 'pre-close', 'group': 'uncertain'}
+        trial.atomic(self.root / 'steps.json', state)
+        self.write_outcome(worker=None, closed=False)  # this outcome observed nothing
+        (self.cg / 'cgroup.procs').write_text('%d\n' % os.getpid())
+        self.assertEqual(m.poststop(), 1)
+        self.assertEqual(m.load_state(NONCE)['terminal']['status'], 17)
+
+    def test_s2_signal_handler_exit17_is_an_observed_closure_window_17_not_a_causal_claim(self):
+        m = self.m
+        self.run_fake_guardian(self.fake_group([None], 17))  # a handler that answers our SIGTERM with 17
+        terminal = self.outcome()['terminal']
+        self.assertEqual((terminal['status'], terminal['origin']), (17, 'closure-window'))
+        self.assertNotEqual(terminal['origin'], 'pre-close')
+        self.assertTrue(m.terminal_ok(terminal))
 
     def test_r7_guardian_enforces_the_current_phase_cutoff_independently_of_worker_progress(self):
         m = self.m
