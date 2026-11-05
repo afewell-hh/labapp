@@ -5880,7 +5880,8 @@ class ManagementLifetime(unittest.TestCase):
         trial.atomic(self.root / 'steps.json', state)
 
     def write_outcome(self, **change):
-        record = {'schema': 1, 'nonce': NONCE, 'worker': -9, 'closed': True, 'guardian': None}
+        record = {'schema': 1, 'nonce': NONCE, 'worker': -9, 'closed': True, 'guardian': None,
+                  'terminal': {'status': None, 'origin': 'unobserved', 'group': 'uncertain'}}
         record.update(change)
         trial.atomic(self.root / 'outcome.json', record)
 
@@ -6377,7 +6378,44 @@ class ManagementLifetime(unittest.TestCase):
                 trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
                 self.write_outcome(worker=None, terminal=bad)
                 self.assertEqual(m.poststop(), 1)
-                self.assertEqual(m.load_state(NONCE)['terminal']['origin'], 'unobserved')
+                state = m.load_state(NONCE)
+                self.assertEqual(state['terminal'], {'status': None, 'origin': 'unobserved', 'group': 'uncertain'})
+                self.assertIs(state['private']['worker_uncertain'], True)  # closed True + absence must not report closure
+                self.assertIsNot(state['private'].get('teardown_observed_clean'), True)
+        for missing in (True,):  # a missing terminal key under closed True and worker absence
+            with self.subTest('missing'):
+                (self.root / m.POSTSTOP_CLAIM).unlink(missing_ok=True)
+                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                trial.atomic(self.root / 'outcome.json', {'schema': 1, 'nonce': NONCE, 'worker': None,
+                                                         'closed': True, 'guardian': None})
+                self.assertEqual(m.poststop(), 1)
+                state = m.load_state(NONCE)
+                self.assertEqual(state['terminal'], {'status': None, 'origin': 'unobserved', 'group': 'uncertain'})
+                self.assertIs(state['private']['worker_uncertain'], True)
+
+    def test_s2_f2_export_viewer_refuses_invalid_terminal_before_reading_the_handoff(self):
+        m = self.m
+        for bad in ({'status': False, 'origin': 'pre-close', 'group': 'uncertain'},
+                    {'status': 0.0, 'origin': 'pre-close', 'group': 'uncertain'},
+                    {'status': 0, 'origin': 'bogus', 'group': 'uncertain'},
+                    {'status': 0, 'origin': 'pre-close'},
+                    {'status': 0, 'origin': 'pre-close', 'group': 'uncertain', 'x': 1}):
+            with self.subTest(bad):
+                state = m.load_state(NONCE)
+                state['steps'] = {n: 'ok' for n in m.STEP_NAMES}
+                state['terminal'] = bad
+                trial.atomic(self.root / 'steps.json', state)
+                with self.assertRaises(trial.Failure):
+                    m.result(NONCE)
+                real, reads = m.base.regular, []
+
+                def spy(path, *a, **k):
+                    reads.append(str(path))
+                    return real(path, *a, **k)
+                with patch.object(m.base, 'regular', spy):
+                    with self.assertRaises(trial.Failure):
+                        m.export_viewer(NONCE)
+                self.assertFalse([r for r in reads if 'viewer-handoff' in r])  # refused before any handoff read
 
     def test_s2_a_genuine_earlier_preclose_observation_is_not_erased_by_a_later_unknown_origin(self):
         m = self.m

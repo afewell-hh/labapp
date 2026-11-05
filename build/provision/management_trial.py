@@ -1190,6 +1190,7 @@ def worker():
 def export_viewer(nonce):
     value = contract_value(nonce)
     state = load_state(nonce)
+    validate_result(public_record(state), nonce)  # same strict versioned validator as ``result``, before any effect
     base.require(state['steps']['viewer-ready'] == 'ok' and state['failure'] is None
                  and state['terminal']['status'] in (None, 0), 'handoff unavailable')  # observed nonzero terminal refuses
     gate(value)
@@ -1269,6 +1270,9 @@ def teardown(nonce, *, clock=None, outer=None, storage_allowed=True, final=False
     if extra_private:
         private.update(extra_private)
     if outcome is not None:
+        if not terminal_ok(outcome.get('terminal')):  # malformed/missing evidence never authorizes a positive report
+            private['worker_uncertain'] = True  # sticky: never cleared
+            storage_allowed = False
         apply_terminal(state, outcome)
         record_terminal(state, outcome, storage_allowed)
         try:
@@ -1657,7 +1661,7 @@ def record_terminal(state, outcome, storage_allowed):
     seen = outcome.get('terminal') if type(outcome) is dict else None
     if terminal_ok(seen) and seen['origin'] != 'unobserved' and current['origin'] != 'pre-close':
         current = {'status': seen['status'], 'origin': seen['origin'], 'group': 'uncertain'}
-    reported = (type(outcome) is dict and outcome.get('closed') is True and storage_allowed
+    reported = (type(outcome) is dict and terminal_ok(seen) and outcome.get('closed') is True and storage_allowed
                 and not state['private'].get('worker_uncertain') and not state['private'].get('child_cleanup_uncertain'))
     state['terminal'] = {'status': current['status'], 'origin': current['origin'],
                          'group': 'closure-reported' if reported else 'uncertain'}
@@ -1689,7 +1693,8 @@ def _poststop(entry, clip=None):
         base.require(type(outcome) is dict and outcome.get('nonce') == nonce)
     except Exception:
         outcome = None  # missing/invalid guardian record: the terminal result is UNKNOWN (sticky uncertainty)
-    uncertain = not absent or outcome is None or outcome.get('closed') is not True
+    uncertain = (not absent or outcome is None or outcome.get('closed') is not True
+                 or not terminal_ok(outcome.get('terminal')))  # invalid terminal evidence is sticky uncertainty
     extra = {}
     if uncertain:
         extra['worker_uncertain'] = True  # sticky: never cleared
