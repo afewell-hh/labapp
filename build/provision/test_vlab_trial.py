@@ -6151,16 +6151,29 @@ class ManagementLifetime(unittest.TestCase):
         for name, kw in cases.items():
             with self.subTest(name):
                 shutil.rmtree(m.STORAGE, True)
-                trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
+                state = m.initial_state(NONCE)
+                state['steps'] = {step: 'ok' for step in m.STEP_NAMES}
+                state['observed'] = {key: True for key in m.OBSERVED}
+                state['private'].update(cluster_attempted=True, docker_started=True)
+                trial.atomic(self.root / 'steps.json', state)
+                trial.exclusive(m.WORK / 'viewer.json', b'secret')
                 calls = []
-                with patch.object(m, 'stdin_bounded', side_effect=lambda *a, **k: calls.append(a) or (0, b'')), \
+                with patch.object(m, 'run_tool', side_effect=lambda ctx, argv, cwd, cap, **kw: calls.append((argv, cap)) or b''), \
                         patch.object(m, 'daemons_absent', return_value=True):
                     self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False,
                                                 storage_allowed=True, **kw), 1)
-                private = m.load_state(NONCE)['private']
+                kept = m.load_state(NONCE)
+                private = kept['private']
                 self.assertIs(private['teardown_observed_clean'], False)
                 self.assertTrue(private['worker_uncertain'])
-                self.assertEqual(m.load_state(NONCE)['terminal']['group'], 'uncertain')
+                self.assertEqual(kept['terminal']['group'], 'uncertain')
+                self.assertEqual(kept['steps'], state['steps'])
+                self.assertEqual(kept['observed'], state['observed'])
+                self.assertIsNone(kept['failure'])
+                self.assertFalse((m.WORK / 'viewer.json').exists())
+                self.assertEqual(calls, [([m.K3D, 'cluster', 'delete', m.CLUSTER], 120),
+                                         ([m.DOCKER, 'ps', '--all', '--quiet', '--filter', 'name=k3d-' + m.CLUSTER], 30),
+                                         ([m.SYSTEMCTL, 'stop', *m.DAEMON_UNITS], 30)])
         # control: valid terminal evidence still reaches the positive-evidence path (storage absent => observed clean)
         shutil.rmtree(m.STORAGE, True)
         trial.atomic(self.root / 'steps.json', m.initial_state(NONCE))
@@ -6169,9 +6182,14 @@ class ManagementLifetime(unittest.TestCase):
         # an earlier genuine pre-close status survives a missing later outcome
         state = m.initial_state(NONCE)
         state['terminal'] = {'status': 17, 'origin': 'pre-close', 'group': 'uncertain'}
+        state['steps'][m.STEP_NAMES[0]] = 'failed'
+        state['failure'] = {'step': m.STEP_NAMES[0], 'category': 'phase-cutoff', 'child_status': None}
         trial.atomic(self.root / 'steps.json', state)
         self.assertEqual(m.teardown(NONCE, outer=time.monotonic() + 30, final=False, outcome=[]), 1)
-        kept = m.load_state(NONCE)['terminal']
+        preserved = m.load_state(NONCE)
+        self.assertEqual(preserved['steps'], state['steps'])
+        self.assertEqual(preserved['failure'], state['failure'])
+        kept = preserved['terminal']
         self.assertEqual((kept['status'], kept['origin'], kept['group']), (17, 'pre-close', 'uncertain'))
 
     def test_r6_terminal_outcome_reaches_the_strict_public_receipt_with_native_precedence(self):
