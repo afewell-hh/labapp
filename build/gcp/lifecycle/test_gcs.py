@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from .auth_http import (HttpResponse, HttpTransport, TransportError,
+from .auth_http import (HttpResponse, HttpTransport, NetworkUnavailable, TransportError,
                         _NoRedirect, bearer_headers, gcloud_token)
 from .gcs import GcsSlotStore, MAX_RECORD_BYTES, ReadUnavailable, StoreError
 from .store import PreconditionFailed
@@ -145,12 +145,13 @@ class GcsTests(unittest.TestCase):
                 with self.assertRaises(StoreError) as caught:
                     self.store(HttpResponse(status, b"{}")).read(KEY)
                 self.assertNotIsInstance(caught.exception, ReadUnavailable)
+                self.assertEqual(caught.exception.status, status)
         with self.assertRaises(StoreError) as caught:  # media 401/403 after metadata is hard too
             self.store(metadata(), HttpResponse(403, b"{}")).read(KEY)
         self.assertNotIsInstance(caught.exception, ReadUnavailable)
 
     def test_get_transport_loss_is_typed_but_token_and_bad_responses_are_not(self):
-        for error in (TransportError("x"), OSError("secret-diagnostic"), TimeoutError()):
+        for error in (NetworkUnavailable("secret-diagnostic"),):
             with self.assertRaises(ReadUnavailable) as caught:
                 self.store(error).read(KEY)
             self.assertIsNone(caught.exception.status)
@@ -276,6 +277,48 @@ class Opener:
 
 
 class AuthHttpTests(unittest.TestCase):
+    def test_actual_transport_types_only_known_network_exchanges(self):
+        import socket
+        from urllib.error import URLError
+        for error in (TimeoutError(), ConnectionResetError(), URLError(TimeoutError()),
+                      socket.gaierror(socket.EAI_AGAIN, 'temporary')):
+            with self.subTest(kind=type(error).__name__):
+                class Failed:
+                    def open(self, *args, **kwargs): raise error
+                http = HttpTransport(opener=Failed())
+                with self.assertRaises(NetworkUnavailable):
+                    http.request('GET', 'https://storage.googleapis.com/x', headers={})
+                store = GcsSlotStore(BUCKET, transport=http, token_provider=lambda:'public-test-token')
+                with self.assertRaises(ReadUnavailable): store.read(KEY)
+                with self.assertRaises(StoreError) as caught:
+                    store.write(KEY, FREE, if_generation_match=0)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_actual_transport_unknown_certificate_and_truncation_stay_hard(self):
+        import socket, ssl
+        from urllib.error import URLError
+        from http.client import IncompleteRead
+        errors = (ValueError('unknown'), RuntimeError('unknown'), OSError('unknown'),
+                  URLError('unknown'), ssl.SSLCertVerificationError(),
+                  socket.gaierror(socket.EAI_NONAME, 'permanent'), IncompleteRead(b'partial', 99))
+        for error in errors:
+            with self.subTest(kind=type(error).__name__):
+                class Failed:
+                    def open(self, *args, **kwargs): raise error
+                http = HttpTransport(opener=Failed())
+                with self.assertRaises(TransportError) as caught:
+                    http.request('GET', 'https://storage.googleapis.com/x', headers={})
+                self.assertNotIsInstance(caught.exception, NetworkUnavailable)
+                store = GcsSlotStore(BUCKET, transport=http, token_provider=lambda:'public-test-token')
+                with self.assertRaises(StoreError) as caught: store.read(KEY)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_actual_oversize_and_malformed_get_responses_are_not_network_loss(self):
+        for raw in (b'x'*8193, b'not-json'):
+            store = GcsSlotStore(BUCKET, transport=HttpTransport(opener=Opener(raw)), token_provider=lambda:'public-test-token')
+            with self.assertRaises(StoreError) as caught: store.read(KEY)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
     def test_transport_reads_at_most_bound_plus_one(self):
         opener = Opener(b"1234")
         http = HttpTransport(opener=opener)

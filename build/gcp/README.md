@@ -1692,17 +1692,21 @@ shown to be a 503, authorization, lease drift, operation retention or a guest ti
 every 5-second poll, and any single adapter exception disposed the build.
 
 * Recovery covers only the poll-loop recheck (`recheck_registration`), after the original
-  admission, registration and import. The first attempt is a bare `current()`. After a
-  typed transient failure at most THREE complete attempts run in total, each a full fresh
+  admission, registration and import. At most THREE complete attempts run in total, each a full fresh
   `current()` (lease/source/IDs/status/deadline, insert operation, VM, boot, disk
   provenance, 15-minute margin); nothing from a failed attempt is reused. Pauses are 2 s
-  and 4 s. One aggregate monotonic allowance of 30 s starts at the FIRST transient failure
-  and is not reset per attempt. Before every further attempt AND after a recovered one the
+  and 4 s. One aggregate monotonic allowance of 30 s starts at ENTRY
+  and is not reset per attempt. Before AND after EVERY attempt (including the first) the
   ORIGINAL `persistence` window (`Clock.remaining`), that allowance and the heartbeat flag
   are re-checked; a positive read landing late grants nothing and fails with code 124.
   When retrying stops, the last typed error is re-raised (category `unknown`, code 1
   unchanged) with its attempt count. Pauses end at once on heartbeat failure; signals and
-  `KeyboardInterrupt` are never caught. No deadline, lease or key is renewed.
+  `KeyboardInterrupt` cannot become read retries. `HostCancelled` crosses auth/HTTP adapters
+  as BaseException control flow and preserves actual SIGTERM143/SIGINT130 when cancellation
+  initiates a host work failure or happens in the initial main path. After a guest result is
+  already frozen, the existing primary-result/cleanup/handoff rules remain unchanged.
+  The30s allowance is a pre/post acceptance boundary, NOT a physical
+  interrupt of underlying20sHTTP/30stoken acquisition. No deadline, lease or key is renewed.
 * Retryable means ONLY a typed GET read failure: Cloud Storage `ReadUnavailable` (a
   `StoreError` subclass; transport loss, or HTTP 408/429/5xx on the metadata or pinned
   media GET) or Compute `TransientRead` (an `Uncertain` subclass). Compute collapses
@@ -1715,17 +1719,18 @@ every 5-second poll, and any single adapter exception disposed the build.
   ownership, a ready result or a handoff. Writes, CAS, key and import calls are never
   retried and the Cloud Storage write path never raises the typed read error.
 * Not covered, deliberately: the earlier one-off rechecks (before the master/bootstrap and
-  in image preparation) stay strict. `auth_http` reports an over-limit response and a
-  network failure alike as `TransportError`, so an oversize GET reply is retryable like
-  transport loss (bounded by the same three attempts). A later operation-retention limit
+  in image preparation) stay strict. `auth_http.NetworkUnavailable` types only known
+  connection/timeout and temporary DNS exchange failures; malformed, oversized, truncated,
+  unknown and certificate-verification failures stay hard TransportError. No helper retries.
+  A later operation-retention limit
   (completed operations are kept at least one hour, at most fourteen days) is not
   established as the native cause and no operation-proof caching or relaxation is added.
 * With the explicit `--private-diagnostics DIR`, a terminal host exception also writes ONE
-  closed `host-failure-<lease>.json` there (`O_EXCL`, `O_NOFOLLOW`, 0600, directory re-checked
-  as owner 0700; never overwritten, adopted or followed). Fields: schema, `kind`
+  closed `host-failure-<lease>.json` there (`O_EXCL`, `O_NOFOLLOW`, 0600, ancestor links rejected and write anchored by directory fd
+  re-checked as owner0700; never overwritten, adopted or followed). Fields: schema, `kind`
   `host-failure`, source SHA, nonce, lease, epoch, run, attempt, `phase`, `host_operation`,
   `failure_category`, `code`, a whitelisted `exception` token (`isinstance`, else `other`),
-  `http_status` (100-599, only from typed read errors or `ApiError`, else null) and
+  `http_status` (100-599, only from closed GCS/read metadata or `ApiError`, else null) and
   `recheck_attempts` (1-3 or null). Never argv, environment, paths, URLs, exception
   text, traceback, token or HTTP body. It is written only on a terminal failure, so a
   recovered poll leaves nothing and cannot block the success handoff, and it is HOST

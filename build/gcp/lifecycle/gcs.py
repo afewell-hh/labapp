@@ -28,12 +28,17 @@ import re
 from typing import Callable
 from urllib.parse import quote, urlencode
 
-from .auth_http import HttpTransport, bearer_headers, gcloud_token
+from .auth_http import HttpTransport, NetworkUnavailable, bearer_headers, gcloud_token
 from .store import PreconditionFailed
 
 
 class StoreError(Exception):
     """Uncertain or invalid ledger access: callers must fail closed."""
+    def __init__(self, message, *, status=None):
+        if status is not None and (type(status) is not int or not 100 <= status <= 599):
+            raise ValueError("invalid ledger HTTP status")
+        super().__init__(message)
+        self.status = status
 
 
 def transient_status(status) -> bool:
@@ -49,8 +54,10 @@ class ReadUnavailable(StoreError):
     Raised for GET requests only, never for a write. It proves nothing about ownership or absence.
     """
     def __init__(self, status=None):
+        if status is not None and not transient_status(status):
+            raise ValueError("invalid transient read status")
         super().__init__("ledger read unavailable; no ledger state was observed")
-        self.status = status if transient_status(status) else None
+        self.status = status
 
 
 MAX_RECORD_BYTES = 65_536
@@ -165,9 +172,11 @@ class GcsSlotStore:
         try:
             response = self.http.request(method, url, headers=headers, body=body,
                                          timeout=20, max_bytes=limit)
-        except Exception:
+        except NetworkUnavailable:
             if method == "GET":
                 raise ReadUnavailable(None) from None
+            raise StoreError("ledger HTTP request failed; outcome may be uncertain") from None
+        except Exception:
             raise StoreError("ledger HTTP request failed; outcome may be uncertain") from None
         try:
             if (type(response.status) is not int or not isinstance(response.body, bytes) or
@@ -182,7 +191,7 @@ class GcsSlotStore:
         # GET only: a documented transient status is typed; every other status stays a hard StoreError.
         if transient_status(response.status):
             raise ReadUnavailable(response.status)
-        raise StoreError(message)
+        raise StoreError(message, status=response.status)
 
     def _metadata(self, response, key):
         meta = _decode(response.body, MAX_METADATA_BYTES)

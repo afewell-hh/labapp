@@ -35,7 +35,7 @@ from . import owned_process
 from .inspection.hostkey import extract_ed25519
 from .lifecycle import spec
 from .lifecycle.access_records import AccessError, GcsAccessRecords, canonical
-from .lifecycle.auth_http import HttpTransport, TransportError, gcloud_token
+from .lifecycle.auth_http import HttpTransport, NetworkUnavailable, TransportError, gcloud_token
 from .lifecycle.cli import BUCKET, CREATOR_PATH, REPOSITORY, verify_disk_provenance
 from .lifecycle.cloud import ApiError, ForbiddenOperation, NotFound, PolicyCloud, Uncertain
 from .lifecycle.compute import ComputeRestTransport
@@ -69,6 +69,18 @@ IMAGE_COUNT_LIMIT = 10**6
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
+class HostCancelled(BaseException):
+    """Control flow that auth/HTTP adapters' Exception handlers cannot turn into a read retry."""
+    def __init__(self, signum):
+        if signum not in (signal.SIGTERM, signal.SIGINT):
+            raise ValueError('unsupported owner signal')
+        self.code = 143 if signum == signal.SIGTERM else 130
+
+
+def interrupted(signum, _frame):
+    raise HostCancelled(signum)
+
+
 class TransientRead(Uncertain):
     """A Compute identity READ whose HTTP exchange provably failed or returned 408/429/5xx.
 
@@ -76,8 +88,10 @@ class TransientRead(Uncertain):
     fail closed. Proves nothing about the VM, disk or operation; never an ownership observation.
     """
     def __init__(self, status=None):
+        if status is not None and not transient_status(status):
+            raise ValueError('invalid transient read status')
         super().__init__('Compute read unavailable; no resource state was observed')
-        self.status = status if transient_status(status) else None
+        self.status = status
 
 
 class ReadOutcome:
@@ -94,7 +108,7 @@ class ReadOutcome:
         self.last = None
         try:
             response = self.http.request(method, url, **kwargs)
-        except Exception:
+        except NetworkUnavailable:
             self.last = ('transport', None)
             raise
         status = getattr(response, 'status', None)
@@ -342,8 +356,7 @@ class OwnerRegistration:
 
 # Finite recovery of PERIODIC registration rechecks only (poll loop, after original admission and
 # registration). Every attempt is a COMPLETE fresh ``current()``; a failed read is never ownership.
-# One original work-phase allowance and one aggregate monotonic allowance that starts at the FIRST
-# transient failure and is never reset per attempt. Mutations (register, import, CAS, key) never retry.
+# One original work-phase allowance and one aggregate monotonic allowance from ENTRY and is never reset per attempt. Mutations (register, import, CAS, key) never retry.
 RECHECK_ATTEMPTS = 3
 RECHECK_ALLOWANCE_SECONDS = 30.0
 RECHECK_PAUSES = (2.0, 4.0)
@@ -354,9 +367,8 @@ TRANSIENT_READS = (ReadUnavailable, TransientRead)
 def recheck_registration(registration, clock, failed, *, monotonic=None, wait=None):
     """-> ``registration.current()`` result; retries ONLY the two typed transient READ errors.
 
-    The first attempt behaves exactly like a bare ``current()``. After a typed transient failure,
-    at most RECHECK_ATTEMPTS complete attempts run in total. Before each further attempt and after
-    any recovered one the ORIGINAL ``persistence`` window and the aggregate allowance are enforced, so
+    At most RECHECK_ATTEMPTS complete attempts run in total. Before and after EVERY attempt the
+    ORIGINAL ``persistence`` window, heartbeat and one allowance from entry are enforced, so
     a late positive read is refused (never authority). Everything else (foreign/changed lease, identity,
     deadline, 401/403/404, malformed, accounting, refusal, Failure/signal) propagates untouched. When
     retrying stops, the last typed error is re-raised with ``recheck_attempts`` for the closed record.
@@ -364,35 +376,35 @@ def recheck_registration(registration, clock, failed, *, monotonic=None, wait=No
     """
     monotonic = owned_process.monotonic if monotonic is None else monotonic
     wait = failed.wait if wait is None else wait
-    attempts, started = 0, None
+    attempts, started = 0, monotonic()
 
     def left():
-        try:
-            original = clock.remaining('persistence')
-        except guest.Failure:
-            return 0.0
-        return min(original, started + RECHECK_ALLOWANCE_SECONDS - monotonic())
+        original = clock.remaining('persistence')
+        guest.require(not failed.is_set(), 'heartbeat failed')
+        result = min(original, started + RECHECK_ALLOWANCE_SECONDS - monotonic())
+        if result <= 0:
+            raise guest.Failure('registration recheck exceeded its allowance', 124)
+        return result
 
     while True:
+        left()
         attempts += 1
         try:
             current = registration.current()
         except TRANSIENT_READS as error:
             error.recheck_attempts = attempts
-            if started is None:
-                started = monotonic()
+            available = left()
             if attempts >= RECHECK_ATTEMPTS:
                 raise
             pause = RECHECK_PAUSES[attempts - 1]
-            if left() < pause + RECHECK_MIN_SECONDS:
+            if available < pause + RECHECK_MIN_SECONDS:
                 raise
             if wait(pause) or failed.is_set():
                 raise guest.Failure('heartbeat failed') from None
             if left() < RECHECK_MIN_SECONDS:
                 raise
             continue
-        if attempts > 1 and (left() <= 0 or failed.is_set()):
-            raise guest.Failure('registration recheck exceeded its allowance', 124)
+        left()
         return current
 
 
@@ -1139,7 +1151,7 @@ HOST_OPERATIONS = frozenset({
 HOST_PHASES = frozenset({'preflight', 'access-prepare', 'access-import', 'guest-access', 'guest-work', 'guest-result'})
 HOST_CATEGORIES = frozenset({'guest', 'interrupted', 'access', 'unknown'})
 # Closed exception vocabulary; most specific first. Selected by isinstance, never by class name or text.
-HOST_EXCEPTIONS = ((guest.Failure, 'failure'), (KeyboardInterrupt, 'interrupted'), (AccessError, 'access-error'),
+HOST_EXCEPTIONS = ((HostCancelled, 'interrupted'), (guest.Failure, 'failure'), (KeyboardInterrupt, 'interrupted'), (AccessError, 'access-error'),
                    (ReadUnavailable, 'store-read-unavailable'), (StoreError, 'store-error'),
                    (TransientRead, 'cloud-read-unavailable'), (NotFound, 'cloud-not-found'),
                    (ApiError, 'cloud-api-error'), (Uncertain, 'cloud-uncertain'),
@@ -1157,7 +1169,7 @@ def host_failure_record(initial, phase, operation, category, code, error):
     guest.require(phase in HOST_PHASES and operation in HOST_OPERATIONS and category in HOST_CATEGORIES
                   and type(code) is int and 0 < code < 256)
     name = next((token for kind, token in HOST_EXCEPTIONS if isinstance(error, kind)), 'other')
-    status = getattr(error, 'status', None) if isinstance(error, (ReadUnavailable, TransientRead, ApiError)) else None
+    status = getattr(error, 'status', None) if isinstance(error, (StoreError, TransientRead, ApiError)) else None
     attempts = getattr(error, 'recheck_attempts', None) if isinstance(error, TRANSIENT_READS) else None
     return {'schema': 1, 'kind': 'host-failure', 'source_sha': initial['source_sha'], 'nonce': initial['nonce'],
             'lease': initial['lease'], 'epoch': initial['epoch'], 'run_id': initial['run_id'],
@@ -1173,10 +1185,34 @@ def retain_host_failure(directory, record):
     Distinct name and ``kind`` from the guest bundles: this is HOST evidence, not a guest bundle.
     """
     guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', record['lease']))
-    info = Path(directory).lstat()
+    directory = guest.no_links(Path(directory))
+    info = directory.lstat()
     guest.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
                   'private diagnostic directory required')
-    guest.exclusive(Path(directory) / ('host-failure-' + record['lease'] + '.json'), guest.encoded(record))
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        def identity(value):
+            return value.st_dev, value.st_ino, value.st_uid, value.st_mode
+        guest.require(identity(os.fstat(parent)) == identity(info))
+        guest.no_links(directory)
+        guest.require(identity(directory.lstat()) == identity(info))
+        raw = guest.encoded(record)
+        guest.require(len(raw) <= 4096)
+        fd = os.open('host-failure-' + record['lease'] + '.json',
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        try:
+            created = os.fstat(fd)
+            guest.require(stat.S_ISREG(created.st_mode) and created.st_nlink == 1
+                          and created.st_uid == os.geteuid() and stat.S_IMODE(created.st_mode) == 0o600)
+            with os.fdopen(fd, 'wb', closefd=False) as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None,
@@ -1382,6 +1418,12 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             phase = 'guest-result'
             failure_category = 'guest' if result else 'none'
             break
+    except HostCancelled as error:
+        result = error.code
+        failure_category = 'interrupted'
+        host_error = error
+        if getattr(error, 'cleanup_uncertain', False):
+            process_uncertain.set()
     except guest.Failure as error:
         result = error.code
         failure_category = 'guest'
@@ -1612,12 +1654,13 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    def interrupted(signum, _frame):
-        raise guest.Failure('signal', 143 if signum == signal.SIGTERM else 130)
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     try:
         exit_code = main()
+    except HostCancelled as error:
+        print('Owner trial cancelled; inspect private cleanup evidence.', file=sys.stderr)
+        exit_code = error.code
     except guest.Failure as error:
         print('Owner trial refused; inspect private cleanup evidence.', file=sys.stderr)
         exit_code = error.code
