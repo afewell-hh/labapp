@@ -2800,3 +2800,182 @@ Primary text read2026-10-31: [Docker group and fresh credentials](https://docs.d
 [v0.43.1 public CLI](https://github.com/githedgehog/fabricator/blob/v0.43.1/cmd/hhfab/main.go),
 [selected Fabric0.96.2 attachment schema](https://github.com/githedgehog/fabric/blob/v0.96.2/api/vpc/v1beta1/vpcattachment_types.go),
 and [kubectl1.35 raw DeleteOptions path](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/delete/delete.go).
+
+## Private candidate image preparation and clone-boot start (issue #526, source only)
+
+`vlab_image.py` + `labapp-vlab-clone.service` + `test_vlab_image.py`. **Nothing here has been run
+or clone-tested**; it needs lead native evidence. It is not production, not Marketplace and not a
+replacement lifecycle. GCP stop / `images create` / clone creation stay lead-owned (manual path in
+AGENTS.md). Google recommends imaging a *stopped* VM
+([create-custom](https://docs.cloud.google.com/compute/docs/images/create-custom)).
+
+**Design judgment.** The core already ends a successful trial in `phase=resumable` with a verified
+owned stop and the resume unit enabled, and its `unit-gate`/`start-resume` mint a fresh operation,
+deadline and `boot` on every start. So the minimum is not a new framework: (1) remove the trial's
+lease/nonce/boot-bound state, (2) make the core the only starter on a clone, (3) report what cannot
+be proven.
+
+### `prepare` (root, in the finished build guest, same boot)
+
+```
+python3 vlab_image.py prepare --private-candidate --source-sha <40hex> --nonce <32hex> \
+  --lease <uuid> --build-boot <uuid> --tool-sha256 <sha256 of vlab_image.py> \
+  --unit-sha256 <sha256 of labapp-vlab-clone.service>
+```
+
+The tool and its sibling clone unit are both pinned by operator-provided SHA-256 and read
+root-owned, no-follow, bounded, single-link and not group/world-writable (no credential file is
+read or hashed). The imported `owned_process.py` must be byte-identical to the core's installed copy.
+
+Refuses, before any mutation, unless: opt-in and all bindings equal `contract.json`/`manifest.json`/
+`started.json`; the current boot is the build boot and the original deadline has not passed (no
+renewal); `result.json` is exactly schema 2, code 0, contained, success diagnostic;
+`worker-status.json` is `succeeded persistence/complete`; `success.json` matches; no QEMU/hhfab
+process (`/proc/*/exe`; uncertainty refuses); fresh/resume/trial units inactive with unpopulated
+cgroups; core state is `resumable`, `stop_verified` matches, and the core's own `verify_contract` +
+`critical_snapshot` pass (the checks its resume gate makes); no `/run/labapp-vlab-docker` and no
+fallback registry stores; the trial root holds only the fixed `OWNED_NAMES` table (regular, root,
+single-link; `__pycache__` of `*.pyc`); the installed trial unit equals its root copy; any runtime
+drop-in is the exact bootstrap one; no installation conflict.
+
+Then it writes `/var/lib/labapp-vlab-image/seal.json` (`sealing`: the sealing **intent** with names,
+ids, the hash of every terminal record and the ORIGINAL contract deadline; no content), installs
+itself and the clone unit (no overwrite), unlinks the table through a pinned directory fd (terminal
+records last), removes the trial unit and exact runtime drop-in, runs `daemon-reload`,
+`disable hhfab-vlab-resume.service`, `enable labapp-vlab-clone.service`, checks postconditions and
+marks `sealed`. `/home/ubuntu/hhfab` and its cache (the preserved lab state) are never touched.
+
+**Interruption.** A rerun with the same bindings continues only that intent: every remaining name
+must be in the retained intent, every remaining terminal record must still equal its retained hash
+(all six are re-validated together while all are present), unknown files are preserved and refuse,
+and the ORIGINAL build deadline is rechecked before every unlink and every later mutation (no
+renewal, no new authority). The drop-in is removed even if the unit file is already gone.
+
+**Exit status is always 3** on a completed `prepare`/`verify`: the trial-owned portion is sealed but
+access-material provenance is unmet (below). `verify` re-checks the postconditions read-only.
+
+### Clone boot
+
+`labapp-vlab-clone.service` (oneshot, `RemainAfterExit`, `KillMode=mixed`, `TimeoutStopSec=240`,
+`PropagatesStopTo=hhfab-vlab-resume.service`; QEMU/hhfab stay in `hhfab-vlab-resume.service`'s own
+cgroup) runs `clone-start`. `mixed` sends systemd's SIGTERM only to the helper, so its cancel cleanup
+can run the core's serialized `stop` without the core CLI itself being terminated; the final SIGKILL
+still reaches helper/core descendants of this unit's cgroup. Every command is run in its own owned process group through `owned_process`
+(#365): output is capped while it is read, a timeout or uncertain group cleanup is a refusal even if
+the child exited 0, and a core command that times out gets SIGTERM first so its own cleanup runs.
+
+`clone-start` needs a `sealed` receipt and a boot different from the build boot, re-runs the
+offline checks, then runs the unchanged `vlab_core.py start-resume` (fresh operation, deadline and
+boot binding) and requires `phase=ready`, `boot=<this boot>` and a new operation and invocation
+before writing the checkpoint `clone-start.json` (boot, operation, invocation). **Readiness signal
+= core `state.json` `phase=ready` for this boot** (the unit-ready API/bridge/strict-switch checks).
+
+*First clone boot:* the core state must be exactly the sealed one (the receipt's operation and
+invocation). *Later boots:* the state must be exactly the one tied to the strict, owned checkpoint
+of an earlier verified clone start on a different boot; a `stop-observed` state is committed only
+through the core's own public `vlab_core.py stop` (it re-checks the inactive unit and empty cgroup)
+and only if its owned-stop intent, service result, boot and ids match. Failed, foreign or stale state
+is never adopted. A checkpoint from the SAME boot is accepted only as a restart after a stop of our
+own activation (state `stop-observed` or its verified `resumable` commit); every other gate is
+unchanged, so a restart while the backend still runs fails the offline gate.
+
+**Activation failure and cancel (whole activation).** From the moment `start-resume` is launched, any
+failure (core refusal, late checkpoint write, final validation) or handled SIGTERM/SIGINT (a startup
+cancel or a late interrupt; the handler raises `Cancelled`, a `BaseException`) runs
+`cleanup_activation`: the core's own public `vlab_core.py stop` (operation, invocation and
+stop-controller ownership stay in the core), then a positive offline proof (resume unit inactive,
+`MainPID=0`, empty cgroup, no QEMU/hhfab process). A verified stop commits `resumable`, and only that
+exact pair is then recorded in the checkpoint so the next start does not refuse a state it can
+prove. Further signals are ignored during cleanup. The PRIMARY failure is re-raised unchanged;
+unverified cleanup is reported on stderr (`activation cleanup unverified`) and never claimed as a
+stop. Not handled: SIGKILL of the helper or a power loss between readiness and cleanup (the state
+then stays for the lead; a hard-killed helper is only covered by the unit's propagated stop). If a
+cancel is itself a `systemctl stop` of the clone unit, the propagated stop of the resume unit is
+queued behind this unit's stop job, so the core `stop` inside the cleanup can wait for its own 30 s
+manager-call cap; the cleanup then reports uncertain and the propagated stop still completes it.
+That interplay is **unproven**.
+
+**Stop (standalone and OS shutdown).** `ExecStop` runs `clone-stop`, which only writes the core's own
+`stopping` marker and returns (non-blocking, no `systemctl`), and only when the sealed receipt, the
+installed unit/tool pins, the core `stop-controller` AND state locks, the sealed nonce, this boot
+and exactly the checkpointed operation/invocation of the running resume unit all agree. The unit's
+`PropagatesStopTo=` stops the resume unit in the SAME transaction after `ExecStop`, so a standalone
+`systemctl stop` schedules backend termination. It can return before that backend job completes;
+use `sudo /usr/bin/python3 /usr/local/lib/labapp/vlab_image.py stop-verified` outside the unit for
+a completed stop. This command first validates the current sealed checkpoint, waits for the clone
+stop, invokes the public core stop, and verifies the backend offline and resumable. It returns
+nonzero on uncertainty. Restart transactions can also process propagated dependencies.
+The post-stop verification (inactive unit, empty cgroup) cannot happen inside the transaction; it is
+the core's public `stop` at the next `clone-start`, never fabricated. Reason for no synchronous stop:
+the clone unit is `After=` the resume unit, so systemd stops it first; a synchronous stop of the
+resume unit from its `ExecStop` would wait on this unit's own stop job and deadlock
+([job.c](https://github.com/systemd/systemd/blob/v255/src/core/job.c#L1667-L1706);
+[systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html);
+[systemd.unit ordering](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)).
+The core's `ExecStopPost` then records `stop-observed`. This writes a core-owned field from outside
+the core (the exact value the core's own stop writes); the lead should judge that coupling, now
+validated against the sealed/checkpointed context and the core locks. The ordering, the stop job
+interplay, `PropagatesStopTo=` semantics on systemd 255 and
+the shutdown path are **not proven**; only text-level and fake-graph tests exist.
+
+### Original clock, interruption windows and installed pins
+
+- One cutoff on BOTH clocks, clipped to the ORIGINAL contract deadline: the wall cutoff is the
+  contract deadline and the monotonic cutoff is fixed once at the first `prepare` and retained in the
+  receipt (`monotonic_deadline`) for same-boot recovery; it is never rebased or renewed. It is checked
+  before every continued mutation (each unlink, `rmdir`, install, enablement) and again before the
+  sealed receipt is published, so a late expiry or a backward wall clock cannot extend it. An expiry
+  at the last step leaves a `sealing` receipt (no renewal, no new authority).
+- Final files (`vlab_image.py`, the clone unit) are written to the fixed `<name>.installing`, fsynced
+  and renamed, with the same original cutoff rechecked after fsync before publication.
+  A preexisting `.installing` or `.next` file and an empty runtime drop-in directory are
+  preserved and refused because ownership is unproven. Some interrupted preparations therefore
+  require disposal instead of an automatic retry. Partial final bytes are never published.
+- `prepare` postconditions, `verify`, `clone-start` and `clone-stop` check the ACTUAL installed unit
+  and tool bytes against the receipt hashes (owner, exact `0644`, single link, no-follow), not only
+  systemd's loaded path, so an edited-and-reloaded unit fails.
+
+### Metadata that remains, and old authority
+
+A clone never reads `contract.json`, the trial root, a lease, deadline or heartbeat as authority.
+What remains: `seal.json` (nonce, lease, source SHA, build boot, tool/unit hashes, terminal-record
+hashes, original deadline, removed names, counts) as sealing evidence only; `clone-start.json`;
+and the core's own `state.json`. The receipt/core `nonce` is read as the preserved LOGICAL lab
+identity (to compare with the core state), not as fresh build authority.
+
+### Gates: satisfied and unmet
+
+- Satisfied for the **trial-owned portion only**: an installed, narrowly scoped cleanup manifest
+  with metadata-only postconditions. `lifecycle/controller.py::_access_capture_gate` is unchanged;
+  that hold stays. No seal record or hash is produced for the controller.
+- **Unmet: trusted pre-login ownership.** `prelogin/hook.py` is inventory-only
+  (`SUPPORTED_MANIFESTS = {}`), so ownership of the owner login account's home, OS Login caches
+  (`/etc/oslogin_*.cache`), guest-agent state, `google_authorized_keys` and any
+  `authorized_keys`/`id_*`/`.google_authenticator` was never established. Fixed, non-exhaustive
+  counts (key files, other and symlinked homes, caches, a short agent path set) are reported and
+  **never** mean "absent": status is always `unproven` and `access-material-provenance` is always
+  unmet. Nothing is deleted.
+- The lab identity (random per-build password/key/join token in `fab.yaml`, `vlab/sshkey`) is
+  preserved by design and is not an owner or registry credential, but **every clone shares it**.
+
+### Limitations / lead decisions
+
+- Not done: machine-id reset, SSH host-key regeneration, `cloud-init clean`
+  ([`--machine-id`/`--logs`/`--seed`](https://docs.cloud-init.io/en/latest/reference/cli.html));
+  these are broad and outside trial-owned state.
+- Unlink does not scrub blocks, so a disk image can contain freed trial data. Registry credentials
+  lived on `/run` tmpfs only (#378).
+- Core `critical_snapshot` records `st_dev`/`st_ino`; a clone with a different root device number
+  fails closed.
+- A crash, SIGKILL or hard power-off of a running clone leaves core `failed`; the next `clone-start`
+  refuses until the lead decides on recovery. A handled failure or signal between core readiness
+  and the checkpoint write is cleaned up and reconciled (above); an unhandled one leaves a stale
+  checkpoint and also refuses.
+- The fake core in the tests mirrors, but is not, the real core; a drift test only pins a few
+  literals. Real `systemctl` output, `/proc` scanning and core loading need native evidence.
+
+Lead correction after the two author correction rounds: success reporting and return are inside
+the activation cleanup guard; retained preparation deadlines are checked after blocking writes
+and before publication. Ambiguous leftovers are preserved. The added `stop-verified` command is
+an operator completion boundary outside the unit ordering cycle. Native ordering and clone
+behavior still require measurement; these source changes do not clear access provenance.
