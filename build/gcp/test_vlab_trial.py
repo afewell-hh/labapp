@@ -1670,11 +1670,11 @@ class ImageBootstrap(unittest.TestCase):
         Authored UNRUN. The fixture performs that same read+hash and records the result for the assertion.
         """
         out = self.base / 'filecheck'
-        self.stage(("import hashlib, os, sys, owned_process\n"
+        self.stage((("import hashlib, os, sys, owned_process\n"
                     "p = getattr(owned_process, '__file__', None)\n"
                     "ok = p == %r and hashlib.sha256(open(p, 'rb').read()).hexdigest() == %r\n"
                     "open(%r, 'w').write('ok' if ok else 'bad:%%r' %% (p,))\n"
-                    "sys.exit(3)\n") % (str(self.trusted), hashlib_sha(self.trusted), str(out)))
+                    "sys.exit(3)\n") % (str(self.trusted), hashlib_sha(self.trusted), str(out))).encode('ascii'))
         done = self.run_bootstrap()
         self.assertEqual(done.returncode, 0)
         self.assertEqual(guest.data(done.stdout)['code'], 3)
