@@ -680,7 +680,7 @@ class Controller:
             return False
         try:
             if (rec.get("schema") != 2 or rec.get("state") != ACTIVE or
-                    rec.get("profile") != spec.UBUNTU_VLAB_CORE or rec.get("capture")):
+                    rec.get("profile") != spec.UBUNTU_VLAB_CORE or "capture" in rec):
                 return False
             window = inline_history.capture_window(rec)
             ends = _parse(window["ends_at"])
@@ -765,7 +765,7 @@ class Controller:
         if (rec is None or rec.get("schema") != 2 or rec.get("state") != ACTIVE or
                 rec.get("request_id") != request_id or
                 rec.get("profile") != spec.UBUNTU_VLAB_CORE or
-                "private_capture_window" in rec or rec.get("capture")):
+                "private_capture_window" in rec or "capture" in rec):
             raise Refused("window requires the current ACTIVE unarmed schema-2 VLAB lease")
         self._lease_kinds(rec)
         self._accounting(rec, reserve=True, adding=True)

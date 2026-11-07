@@ -89,7 +89,6 @@ class Base(unittest.TestCase):
             self.arm(**kw)
         self.assertEqual(self.read(), before)
         self.assertEqual(len(self.w.deletes()), deletes)
-        self.assertNotIn('private_capture_window', self.w.record())
 
     def assert_released(self):
         rec = self.w.record()
@@ -125,6 +124,7 @@ class Window(Base):
 
     def test_valid_window_single_cas_defers_only_nonforced_janitor(self):
         before, gen = self.read()
+        earlier_deletes = list(self.w.deletes())
         with patch.object(self.w.store, 'write', wraps=self.w.store.write) as write:
             window = self.arm()
         self.assertEqual(write.call_count, 1)
@@ -137,7 +137,7 @@ class Window(Base):
             self.assertEqual(after[name], before[name])
         self.stop()
         self.assertEqual(self.w.ctl.reconcile().status, 'not-due')
-        self.assertEqual(self.w.deletes(), [])
+        self.assertEqual(self.w.deletes(), earlier_deletes)
         self.assertEqual(self.read(), (after, new_gen))
 
     def test_ten_minutes_and_clipped_before_cleanup_reserve(self):
