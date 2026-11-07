@@ -99,6 +99,9 @@ OPERATIONS = {
     'persistence': ('strict-inspect', 'strict-ssh', 'api-ready', 'nonce-verify', 'nonce-remove',
                     'core-final-stop', 'complete')}
 GUARDIAN_OPERATIONS = ('guardian-init', 'worker-spawn', 'worker-supervision')
+# Fixed read-site labels (issue #527): a failure of the guardian's own read of phase.json or
+# heartbeat.json (not of parsing, freshness or any later check). Valid in every phase.
+GUARDIAN_READ_OPERATIONS = ('phase-state-read', 'heartbeat-state-read')
 ORIGINS = ('worker', 'guardian', 'unknown')
 CATEGORIES = ('none', 'policy', 'capability', 'child-exit', 'child-signal', 'child-timeout',
               'output-overflow', 'phase-cutoff', 'heartbeat-loss', 'oom-event', 'resource-floor',
@@ -135,7 +138,8 @@ def operation_ok(origin, phase, operation):
     if origin == 'worker':
         return operation in OPERATIONS[phase]
     if origin == 'guardian':
-        return operation == 'worker-supervision' or (phase == 'startup' and operation in GUARDIAN_OPERATIONS)
+        return (operation == 'worker-supervision' or operation in GUARDIAN_READ_OPERATIONS
+                or (phase == 'startup' and operation in GUARDIAN_OPERATIONS))
     return operation == 'worker-supervision' or operation in OPERATIONS[phase]
 
 
@@ -306,10 +310,15 @@ def regular(path, limit, uid=None, mode=None):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-                and info.st_size <= limit and (uid is None or info.st_uid == uid)
-                and (mode is None or stat.S_IMODE(info.st_mode) == mode),
-                'file type/owner/size refused')
+        usable = (stat.S_ISREG(info.st_mode) and info.st_size <= limit
+                  and (uid is None or info.st_uid == uid)
+                  and (mode is None or stat.S_IMODE(info.st_mode) == mode))
+        if usable and info.st_nlink == 0 and _fresh_name(path, info):
+            # Issue #527: the path was atomically replaced after open() but before this first
+            # fstat, so the opened inode is already unlinked. Same refusal as before; the
+            # subtype only lets the guardian facade discard this read (no byte was read).
+            raise _ReplacedState('file type/owner/size refused', 1, 'policy')
+        require(usable and info.st_nlink == 1, 'file type/owner/size refused')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             raw = stream.read(limit + 1)
         after = os.fstat(fd)
@@ -329,10 +338,21 @@ def regular(path, limit, uid=None, mode=None):
         os.close(fd)
 
 
+def _fresh_name(path, opened):
+    """True only if ``path`` now names a regular file that is a different inode than ``opened``."""
+    try:
+        now = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino)
+
+
 class _ReplacedState(Failure):
-    """regular()'s 'file changed' refusal with the closed eligible signature: the opened
-    inode was unlinked (link count exactly 1 -> 0, ctime changed) while every other observed
-    attribute and the byte count stayed unchanged. Internal flag only; message, code and
+    """regular()'s refusal with a closed eligible signature, either (a) after the read: the
+    opened inode was unlinked (link count exactly 1 -> 0, ctime changed) while every other
+    observed attribute and the byte count stayed unchanged; or (b) at the first fstat: an
+    otherwise valid owned bounded regular file already has link count 0 while the path names
+    a different regular inode (#527), with no byte read. Internal flag only; message, code and
     category are the ordinary refusal, so strict callers behave identically. It does NOT prove
     who replaced the file or that the replacement is legitimate."""
     eligible = True
@@ -349,14 +369,28 @@ def guardian_state(path, recover):
     """
     require(path in (ROOT / 'phase.json', ROOT / 'heartbeat.json'))
     try:
-        return regular(path, 4096, 0)
+        return _state_read(path)
     except _ReplacedState as error:
         if error.eligible is not True:
             raise
     recover()
-    raw = regular(path, 4096, 0)
+    raw = _state_read(path)
     recover()
     return raw
+
+
+def _state_read(path):
+    """One complete regular() read; a failure of it is tagged as a read-site failure (#527).
+
+    The tag only selects a fixed diagnostic operation in guardian(); the exception, message,
+    code and category are untouched. Signals (category interrupted) are not tagged.
+    """
+    try:
+        return regular(path, 4096, 0)
+    except Exception as error:
+        if not (isinstance(error, Failure) and error.category == 'interrupted'):
+            error.guardian_read_site = True
+        raise
 
 
 def exclusive(path, raw, mode=0o600):
@@ -1514,11 +1548,21 @@ def guardian():
     phase_seen, operation, last = 'startup', 'guardian-init', None
     detail = {'origin': 'guardian', 'phase': 'startup', 'operation': 'guardian-init',
               'category': 'exception', 'child_status': None}
+    def state(name, recover):
+        # Fixed read-site label only for a failure of the read itself (not parsing/freshness).
+        nonlocal operation
+        try:
+            return guardian_state(ROOT / name, recover)
+        except Exception as error:
+            if getattr(error, 'guardian_read_site', False) is True:
+                operation = 'phase-state-read' if name == 'phase.json' else 'heartbeat-state-read'
+            raise
+
     try:
         original_oom = oom_count()
         # Initial heartbeat grace is bounded by the same thirty-second loss
         # window; no provisioning starts before the guardian checks it.
-        beat = data(guardian_state(ROOT / 'heartbeat.json', lambda: clock.remaining('stage')))
+        beat = data(state('heartbeat.json', lambda: clock.remaining('stage')))
         require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
         # Armed credential gate: no worker/provisioning until bootstrap published the
         # verified credential, within a bounded wait. Expiry fails closed into cleanup.
@@ -1526,7 +1570,7 @@ def guardian():
         if auth_armed():
             require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
             clock.remaining('stage')
-            beat = data(guardian_state(ROOT / 'heartbeat.json', lambda: clock.remaining('stage')))
+            beat = data(state('heartbeat.json', lambda: clock.remaining('stage')))
             require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
         operation = 'worker-spawn'
         child = subprocess.Popen([PYTHON, str(ROOT / 'vlab_trial.py'), 'worker'],
@@ -1537,12 +1581,12 @@ def guardian():
         while True:
             # Recovery of a replaced phase.json is bounded by the persistence cutoff (never the
             # previous phase's); the consumed phase's own cutoff is checked just below as before.
-            phase = data(guardian_state(ROOT / 'phase.json', lambda: clock.remaining('persistence')))['phase']
+            phase = data(state('phase.json', lambda: clock.remaining('persistence')))['phase']
             if phase in PHASE_NAMES:
                 phase_seen = phase
             clock.remaining(phase)
             require(kernel_boot() == value['boot_uuid'], 'boot changed', 'boot-change')
-            beat = data(guardian_state(ROOT / 'heartbeat.json', lambda phase=phase: clock.remaining(phase)))
+            beat = data(state('heartbeat.json', lambda phase=phase: clock.remaining(phase)))
             require(0 <= time.monotonic() - beat['received'] <= 30, 'heartbeat lost', 'heartbeat-loss')
             clock.remaining(phase)
             require(oom_count() == original_oom, 'OOM event', 'oom-event')

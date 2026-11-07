@@ -241,6 +241,33 @@ class ReplaceTap(DescriptorTap):
         return self.stack.__exit__(*exc)
 
 
+class OpenTap:
+    """Issue #527: runs one REAL action right after the REAL os.open of the target and BEFORE
+    regular()'s first fstat. Always calls the original open; never fakes a stat or a read.
+    ``actions`` maps zero-based open numbers of the target to actions."""
+    def __init__(self, target, actions):
+        self.target, self.actions, self.opens, self.fds = Path(target), actions, 0, []
+        self.real_open = os.open
+
+    def __enter__(self):
+        self.stack = ExitStack()
+        self.stack.enter_context(patch.object(os, 'open', self.open))
+        return self
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+    def open(self, path, *args, **kwargs):
+        fd = self.real_open(path, *args, **kwargs)
+        if Path(path) == self.target:
+            number, self.opens = self.opens, self.opens + 1
+            self.fds.append(fd)
+            action = self.actions.get(number)
+            if action is not None:
+                action()
+        return fd
+
+
 class SharedTrial(unittest.TestCase):
     def nonce_fixture(self, nonce_value='a' * 32):
         # Fresh private root and work directory per fixture: exclusive creates never reuse a path.
@@ -1187,7 +1214,7 @@ class SharedTrial(unittest.TestCase):
                 tap = ReplaceTap(self.root / 'phase.json', {0: self.publish('phase.json', [], raw)})
                 code, result, _ = self.guardian_fault(spawn=self.popen_child(), around=tap)
                 self.assertEqual((code, result['diagnostic']['category'], result['diagnostic']['operation']),
-                                 (1, category, 'worker-supervision'))
+                                 (1, category, 'phase-state-read' if name == 'oversize phase' else 'worker-supervision'))
 
     def test_replacement_with_other_mode_is_accepted_because_these_sites_require_no_mode(self):
         # Documents unchanged behavior: guardian heartbeat/phase reads require uid 0 but NO mode.
@@ -1392,6 +1419,198 @@ class SharedTrial(unittest.TestCase):
                 trial.guardian_state(path, lambda: self.fail('no recovery for an ineligible flag'))
         self.assertEqual(reader.call_count, 1)
 
+    # ---- issue #527: replacement between open() and the FIRST fstat, plus read-site labels ----
+    # The race is reproduced on the actual filesystem. It matches the native diagnostic class
+    # only; the native initiating predicate of the failed corrected-core run stays UNKNOWN.
+    def open_race_publish(self, path, raw):
+        """Real atomic publication of ``raw`` at ``path`` (exclusive temp + os.replace)."""
+        return lambda: self.publish_raw(path, raw)
+
+    def publish_raw(self, path, raw):
+        trial.exclusive(Path(str(path) + '.next'), raw)
+        os.replace(Path(str(path) + '.next'), path)
+
+    def private_state(self, name='heartbeat.json', raw=b'{"old":1}'):
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        path = self.root / name
+        path.write_bytes(raw)
+        return path
+
+    def test_strict_regular_still_refuses_open_race_and_stable_replacement_passes(self):
+        path = self.private_state()
+        tap = OpenTap(path, {0: self.open_race_publish(path, b'{"new":1}')})
+        with tap, self.assertRaises(trial.Failure) as caught:
+            REAL_REGULAR(path, 4096, os.getuid())
+        error = caught.exception
+        self.assertEqual((str(error), error.code, error.category, error.child_status),
+                         ('file type/owner/size refused', 1, 'policy', None))
+        self.assertEqual(tap.opens, 1)  # strict: no reread
+        self.assertEqual(path.read_bytes(), b'{"new":1}')  # the replacement really happened
+        self.assertEqual(REAL_REGULAR(path, 4096, os.getuid()), b'{"new":1}')  # stable control
+
+    def test_open_race_is_marked_eligible_only_for_the_exact_signature(self):
+        # Opened inode unlinked before the first fstat, path names a different regular inode,
+        # otherwise valid: the only eligible case. Everything else is the plain refusal.
+        def run(limit=4096, uid=None, mode=None, action=None):
+            path = self.private_state(raw=b'{"old":1}')
+            os.chmod(path, 0o600)
+            publish = self.open_race_publish(path, b'{"new":1}')
+            with OpenTap(path, {0: action(path) if action else publish}):
+                try:
+                    return REAL_REGULAR(path, limit, uid, mode)
+                except trial.Failure as error:
+                    return error
+        eligible = run(uid=os.getuid(), mode=0o600)
+        self.assertIs(type(eligible), trial._ReplacedState)
+        self.assertEqual((str(eligible), eligible.code, eligible.category), ('file type/owner/size refused', 1, 'policy'))
+        def remove(path):
+            return lambda: os.unlink(path)
+        def to_symlink(path):
+            def action():
+                os.symlink(self.root / 'elsewhere', Path(str(path) + '.next'))
+                os.replace(Path(str(path) + '.next'), path)
+            return action
+        def to_directory(path):
+            def action():
+                os.unlink(path)
+                os.mkdir(path)
+            return action
+        cases = {'wrong owner': dict(uid=os.getuid() + 1), 'wrong mode': dict(mode=0o640),
+                 'oversize': dict(limit=3), 'path removed, no replacement': dict(action=remove),
+                 'replaced by symlink': dict(action=to_symlink), 'replaced by directory': dict(action=to_directory)}
+        for name, change in cases.items():
+            with self.subTest(name):
+                error = run(**change)
+                self.assertIs(type(error), trial.Failure)  # never the eligible subtype
+                self.assertEqual((str(error), error.code, error.category), ('file type/owner/size refused', 1, 'policy'))
+                shutil.rmtree(self.root)
+
+    def test_guardian_state_open_race_discards_failed_read_and_rereads_once(self):
+        for name in ('phase.json', 'heartbeat.json'):
+            with self.subTest(name):
+                path = self.private_state(name, b'{"old":"OLD-BYTES"}')
+                checks, tap = [], OpenTap(path, {0: self.open_race_publish(path, b'{"new":1}')})
+                with tap, patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)):
+                    self.assertEqual(trial.guardian_state(path, lambda: checks.append(1)), b'{"new":1}')
+                self.assertEqual((tap.opens, len(checks)), (2, 2))  # one discarded + one complete read; checks around
+                shutil.rmtree(self.root)
+
+    def test_guardian_state_second_open_race_is_terminal_with_no_third_read(self):
+        for name in ('phase.json', 'heartbeat.json'):
+            with self.subTest(name):
+                path = self.private_state(name, b'{"old":1}')
+                checks = []
+                tap = OpenTap(path, {0: self.open_race_publish(path, b'{"n":1}'), 1: self.open_race_publish(path, b'{"n":2}')})
+                with tap, patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)):
+                    with self.assertRaises(trial._ReplacedState) as caught:
+                        trial.guardian_state(path, lambda: checks.append(1))
+                self.assertEqual((tap.opens, len(checks)), (2, 1))
+                self.assertTrue(caught.exception.guardian_read_site)
+                shutil.rmtree(self.root)
+
+    def test_guardian_open_race_consumes_only_the_new_bytes_for_both_fixed_files(self):
+        old_beat = self.old_beat()
+        phase_body = trial.encoded({'phase': 'fresh'})
+        for name, old, expected_opens in (('heartbeat.json', old_beat, 3), ('phase.json', b'{"phase":"stage"}', 2)):
+            with self.subTest(name):
+                published, seen = [], []
+                body = self.fresh_beat() if name == 'heartbeat.json' else phase_body
+                tap = OpenTap(self.root / name, {0: self.publish(name, published, body)})
+                code, result, mocks = self.guardian_fault(spawn=self.popen_child(), files={name: old},
+                                                          overrides=self.recorded_state_bytes(seen), around=tap)
+                self.assertEqual((code, tap.opens), (17, expected_opens))
+                self.assertNotIn(old, seen)  # no byte of the failed read was parsed
+                self.assertIn(published[0], seen)
+                self.assertEqual(result['diagnostic']['origin'], 'unknown')  # worker exit 17 without status
+                mocks['containment'].assert_called_once_with()
+                self.host_accepts(result, 17)
+
+    def test_guardian_open_race_second_publication_is_fatal_with_fixed_read_site_diagnostic(self):
+        for name, label in (('heartbeat.json', 'heartbeat-state-read'), ('phase.json', 'phase-state-read')):
+            with self.subTest(name):
+                published, seen = [], []
+                old = self.old_beat() if name == 'heartbeat.json' else b'{"phase":"stage"}'
+                first = self.fresh_beat(2) if name == 'heartbeat.json' else trial.encoded({'phase': 'fresh'})
+                later = self.fresh_beat(3) if name == 'heartbeat.json' else trial.encoded({'phase': 'strict'})
+                tap = OpenTap(self.root / name, {0: self.publish(name, published, first), 1: self.publish(name, published, later)})
+                code, result, mocks = self.guardian_fault(spawn=self.popen_child(), files={name: old},
+                                                          overrides=self.recorded_state_bytes(seen), around=tap)
+                self.assertEqual((code, tap.opens, len(published)), (1, 2, 2))  # never a third read
+                for raw in (old, *published):
+                    self.assertNotIn(raw, seen)
+                self.assertEqual(result['diagnostic']['operation'], label)
+                self.assertEqual((result['diagnostic']['origin'], result['diagnostic']['category'],
+                                  result['diagnostic']['child_status'], result['code']), ('guardian', 'policy', None, 1))
+                self.host_accepts(result, 1)
+
+    def test_open_race_recovery_keeps_original_clock_checks_and_signal_primary(self):
+        for fail_at, opens in ((2, 1), (3, 2)):  # expiry before / after the one complete reread
+            with self.subTest(('expiry', fail_at)):
+                published, seen, calls = [], [], []
+                def clock(phase):
+                    calls.append(phase)
+                    if len(calls) == fail_at:
+                        raise trial.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+                    return 100
+                tap = OpenTap(self.root / 'heartbeat.json', {0: self.publish('heartbeat.json', published, self.fresh_beat())})
+                code, result, mocks = self.guardian_fault(spawn=self.popen_child(), files={'heartbeat.json': self.old_beat()},
+                                                          overrides=self.recorded_state_bytes(seen), clock_effects=clock, around=tap)
+                self.assertEqual((code, tap.opens, calls), (124, opens, ['stage'] * fail_at))
+                self.assertNotIn(published[0], seen)
+                self.assertEqual((result['diagnostic']['category'], result['diagnostic']['operation']),
+                                 ('phase-cutoff', 'guardian-init'))  # clock expiry is not a read-site failure
+                mocks['Popen'].assert_not_called()
+                self.host_accepts(result, 124)
+        for name, exception, expected in (('SIGINT', KeyboardInterrupt(), 130),
+                                          ('SIGTERM handler', trial.Failure('signal', 143, 'interrupted'), 143)):
+            with self.subTest(name):
+                calls = []
+                def clock(phase):
+                    calls.append(phase)
+                    if len(calls) == 2:
+                        raise exception
+                    return 100
+                tap = OpenTap(self.root / 'heartbeat.json', {0: self.publish('heartbeat.json', [], self.fresh_beat())})
+                code, result, mocks = self.guardian_fault(spawn=self.popen_child(), files={'heartbeat.json': self.old_beat()},
+                                                          clock_effects=clock, around=tap)
+                self.assertEqual((code, result['diagnostic']['category'], result['diagnostic']['operation']),
+                                 (expected, 'interrupted', 'guardian-init'))
+                mocks['containment'].assert_called_once_with()
+
+    def test_signal_during_a_state_read_keeps_its_code_and_operation(self):
+        path = self.private_state('heartbeat.json')
+        error = trial.Failure('signal', 143, 'interrupted')
+        with patch.object(trial, 'regular', side_effect=error), self.assertRaises(trial.Failure) as caught:
+            trial.guardian_state(path, lambda: None)
+        self.assertIs(caught.exception, error)
+        self.assertFalse(hasattr(error, 'guardian_read_site'))
+
+    def test_read_site_operations_are_closed_guardian_only_and_host_compatible(self):
+        from build.gcp.vlab_trial import guest_result
+        def detail(origin='guardian', phase='fresh', operation='heartbeat-state-read', category='policy', status=None):
+            return {'origin': origin, 'phase': phase, 'operation': operation, 'category': category, 'child_status': status}
+        for operation in trial.GUARDIAN_READ_OPERATIONS:
+            for phase in trial.PHASE_NAMES:
+                with self.subTest((operation, phase)):
+                    value = detail(phase=phase, operation=operation)
+                    self.assertEqual(trial.diagnostic(value), value)
+                    record = trial.result_record({'schema': 2, 'code': 1, 'contained': True, 'nonce': NONCE,
+                                                  'diagnostic': value}, NONCE)
+                    self.assertEqual(guest_result(trial.encoded(record), NONCE), ('valid', record))
+        self.assertEqual(trial.GUARDIAN_READ_OPERATIONS, ('phase-state-read', 'heartbeat-state-read'))
+        bad = {'worker origin': detail(origin='worker'), 'unknown origin': detail(origin='unknown', category='status-invalid'),
+               'arbitrary selector': detail(operation='contract-state-read'),
+               'path-like': detail(operation='/run/labapp/heartbeat.json'),
+               'extra field': dict(detail(), path='/x'), 'unhashable': detail(operation=['heartbeat-state-read'])}
+        for name, value in bad.items():
+            with self.subTest(name):
+                with self.assertRaises((trial.Failure, TypeError)):
+                    trial.diagnostic(value)
+        # Read-site labels never replace the success shape or child provenance rules.
+        self.assertEqual(trial.diagnostic(dict(trial.SUCCESS)), trial.SUCCESS)
+        with self.assertRaises(trial.Failure):
+            trial.diagnostic(detail(category='child-signal', status=None))
+
     def test_guardian_reservation_collision_and_bad_contract_publish_no_result(self):
         self.guardian_fixture()
         incumbent = trial.encoded({'schema': 2, 'incumbent': True})
@@ -1522,11 +1741,11 @@ class SharedTrial(unittest.TestCase):
         with patch.object(trial.time, 'sleep', side_effect=sleeper):
             return self.guardian_fault(spawn={'return_value': child}, prepare=fixture, overrides=overrides, around=around)
 
-    def assert_supervision_failure(self, outcome, phase, category, code=1):
+    def assert_supervision_failure(self, outcome, phase, category, code=1, operation='worker-supervision'):
         exit_code, result, mocks = outcome
         self.assertEqual(exit_code, code)
         self.assertEqual((result['schema'], result['code'], result['contained'], result['nonce']), (2, code, True, NONCE))
-        self.assertEqual(result['diagnostic'], {'origin': 'guardian', 'phase': phase, 'operation': 'worker-supervision',
+        self.assertEqual(result['diagnostic'], {'origin': 'guardian', 'phase': phase, 'operation': operation,
                                                 'category': category, 'child_status': None})
         self.assertEqual(trial.result_record(result, NONCE), result)  # actual final record validates
         mocks['containment'].assert_called_once_with()
@@ -1542,17 +1761,18 @@ class SharedTrial(unittest.TestCase):
                 action(root / name)
             return run
         heartbeat, phase = 'heartbeat.json', 'phase.json'
+        HB_READ, PH_READ = 'heartbeat-state-read', 'phase-state-read'  # read-site failures only (#527)
         cases = (
             ('heartbeat duplicate key', write(heartbeat, b'{"received":1,"received":2,"sequence":1}'), 'fresh', 'policy'),
             ('heartbeat NaN', write(heartbeat, b'{"received":NaN,"sequence":1}'), 'fresh', 'policy'),
             ('heartbeat Infinity', write(heartbeat, b'{"received":Infinity,"sequence":1}'), 'fresh', 'policy'),
-            ('heartbeat oversized', write(heartbeat, b' ' * 4097), 'fresh', 'policy'),
-            ('heartbeat hardlink', lambda root: os.link(root / heartbeat, root / 'heartbeat.alias'), 'fresh', 'policy'),
-            ('heartbeat symlink', replace_with(heartbeat, lambda p: os.symlink(p.parent / 'contract.json', p)), 'fresh', 'policy'),
-            ('heartbeat fifo', replace_with(heartbeat, os.mkfifo), 'fresh', 'policy'),
+            ('heartbeat oversized', write(heartbeat, b' ' * 4097), 'fresh', 'policy', HB_READ),
+            ('heartbeat hardlink', lambda root: os.link(root / heartbeat, root / 'heartbeat.alias'), 'fresh', 'policy', HB_READ),
+            ('heartbeat symlink', replace_with(heartbeat, lambda p: os.symlink(p.parent / 'contract.json', p)), 'fresh', 'policy', HB_READ),
+            ('heartbeat fifo', replace_with(heartbeat, os.mkfifo), 'fresh', 'policy', HB_READ),
             ('heartbeat malformed JSON is an ordinary exception', write(heartbeat, b'{'), 'fresh', 'exception'),
             ('heartbeat missing field is an ordinary exception', write(heartbeat, b'{"sequence":1}'), 'fresh', 'exception'),
-            ('heartbeat missing is an ordinary exception', lambda root: (root / heartbeat).unlink(), 'fresh', 'exception'),
+            ('heartbeat missing is an ordinary exception', lambda root: (root / heartbeat).unlink(), 'fresh', 'exception', HB_READ),
             ('stale heartbeat is the explicit watchdog category',
              lambda root: (root / heartbeat).write_bytes(trial.encoded({'sequence': 1, 'received': time.monotonic() - 31})),
              'fresh', 'heartbeat-loss'),
@@ -1560,14 +1780,15 @@ class SharedTrial(unittest.TestCase):
             ('phase NaN', write(phase, b'{"phase":NaN}'), 'fresh', 'policy'),
             ('phase unknown name', write(phase, b'{"phase":"bogus"}'), 'fresh', 'policy'),
             ('phase startup has no cutoff', write(phase, b'{"phase":"startup"}'), 'startup', 'policy'),
-            ('phase hardlink', lambda root: os.link(root / phase, root / 'phase.alias'), 'fresh', 'policy'),
+            ('phase hardlink', lambda root: os.link(root / phase, root / 'phase.alias'), 'fresh', 'policy', PH_READ),
             ('phase unhashable value is an ordinary exception', write(phase, b'{"phase":["fresh"]}'), 'fresh', 'exception'),
             ('phase missing key is an ordinary exception', write(phase, b'{}'), 'fresh', 'exception'),
-            ('phase missing is an ordinary exception', lambda root: (root / phase).unlink(), 'fresh', 'exception'),
+            ('phase missing is an ordinary exception', lambda root: (root / phase).unlink(), 'fresh', 'exception', PH_READ),
         )
-        for label, mutate, expected_phase, category in cases:
+        for label, mutate, expected_phase, category, *read_site in cases:
             with self.subTest(label):
-                self.assert_supervision_failure(self.supervised_loop_fault(mutate), expected_phase, category)
+                self.assert_supervision_failure(self.supervised_loop_fault(mutate), expected_phase, category,
+                                                operation=read_site[0] if read_site else 'worker-supervision')
 
     def test_guardian_measurements_path_refusals_and_symlink_replacement(self):
         def link_next(root):
@@ -1611,7 +1832,7 @@ class SharedTrial(unittest.TestCase):
                 self.assertIn((name + '.next', name), tap.replaced)
                 sys.stderr.write('\nOBSERVED #418 guardian %s %s\n' % (name, tap.observation()))
                 if tap.changed() and not tap.eligible():
-                    self.assert_supervision_failure(outcome, 'fresh', 'policy')
+                    self.assert_supervision_failure(outcome, 'fresh', 'policy', operation=name[:-5] + '-state-read')
                 else:  # eligible replacement recovers; unchanged observations retain the negative control
                     self.assertEqual((exit_code, result['code'], result['contained']), (17, 17, True))
                     self.assertEqual(result['diagnostic'], {'origin': 'unknown', 'phase': 'fresh',
