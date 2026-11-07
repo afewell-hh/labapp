@@ -1679,8 +1679,60 @@ service observation. It is set before work and frozen during supplemental
 diagnostics and cleanup, preserving the primary code/category even when cleanup
 fails. It supplies context for an unexpected host failure, not its cause or the
 guest's progress. No exception text, exception-type label, argv, path or secret
-enters it; no calls, retries or deadline allowance are added. A successful result
-ends at `result-validate`; the existing success/containment checks still apply.
+enters the receipt value; `host_operation` itself adds no calls or retries (the
+separate periodic-read recovery and private host record below are distinct). A
+successful result ends at `result-validate`; the existing success/containment
+checks still apply.
+
+**Periodic registration READ recovery and closed host failure record (issue #537).**
+Native run 42422397379 failed at `registration-check`/`guest-work`/`unknown`; the
+initiating exception type and status were discarded, so its cause is UNKNOWN (not
+shown to be a 503, authorization, lease drift, operation retention or a guest timeout).
+`OwnerRegistration.current()` makes several fresh Cloud Storage and Compute GETs in
+every 5-second poll, and any single adapter exception disposed the build.
+
+* Recovery covers only the poll-loop recheck (`recheck_registration`), after the original
+  admission, registration and import. The first attempt is a bare `current()`. After a
+  typed transient failure at most THREE complete attempts run in total, each a full fresh
+  `current()` (lease/source/IDs/status/deadline, insert operation, VM, boot, disk
+  provenance, 15-minute margin); nothing from a failed attempt is reused. Pauses are 2 s
+  and 4 s. One aggregate monotonic allowance of 30 s starts at the FIRST transient failure
+  and is not reset per attempt. Before every further attempt AND after a recovered one the
+  ORIGINAL `persistence` window (`Clock.remaining`), that allowance and the heartbeat flag
+  are re-checked; a positive read landing late grants nothing and fails with code 124.
+  When retrying stops, the last typed error is re-raised (category `unknown`, code 1
+  unchanged) with its attempt count. Pauses end at once on heartbeat failure; signals and
+  `KeyboardInterrupt` are never caught. No deadline, lease or key is renewed.
+* Retryable means ONLY a typed GET read failure: Cloud Storage `ReadUnavailable` (a
+  `StoreError` subclass; transport loss, or HTTP 408/429/5xx on the metadata or pinned
+  media GET) or Compute `TransientRead` (an `Uncertain` subclass). Compute collapses
+  transport loss, 408/429/5xx, token failure and bad 2xx bodies into one type, so the host
+  records the closed HTTP outcome of the latest request in a wrapper (`ReadOutcome`) and
+  never classifies by message. Hard failures, never retried: changed or foreign
+  lease/source/IDs/VM/boot/deadline, missing or NotFound ownership evidence, 400/401/403,
+  malformed or unknown responses, token acquisition failure, accounting/schema/`Refused`,
+  `ForbiddenOperation`, and any other exception. A failed read never constitutes
+  ownership, a ready result or a handoff. Writes, CAS, key and import calls are never
+  retried and the Cloud Storage write path never raises the typed read error.
+* Not covered, deliberately: the earlier one-off rechecks (before the master/bootstrap and
+  in image preparation) stay strict. `auth_http` reports an over-limit response and a
+  network failure alike as `TransportError`, so an oversize GET reply is retryable like
+  transport loss (bounded by the same three attempts). A later operation-retention limit
+  (completed operations are kept at least one hour, at most fourteen days) is not
+  established as the native cause and no operation-proof caching or relaxation is added.
+* With the explicit `--private-diagnostics DIR`, a terminal host exception also writes ONE
+  closed `host-failure-<lease>.json` there (`O_EXCL`, `O_NOFOLLOW`, 0600, directory re-checked
+  as owner 0700; never overwritten, adopted or followed). Fields: schema, `kind`
+  `host-failure`, source SHA, nonce, lease, epoch, run, attempt, `phase`, `host_operation`,
+  `failure_category`, `code`, a whitelisted `exception` token (`isinstance`, else `other`),
+  `http_status` (100-599, only from typed read errors or `ApiError`, else null) and
+  `recheck_attempts` (1-3 or null). Never argv, environment, paths, URLs, exception
+  text, traceback, token or HTTP body. It is written only on a terminal failure, so a
+  recovered poll leaves nothing and cannot block the success handoff, and it is HOST
+  evidence, never a guest bundle: `first-failure-*`/`installer-failure-*`,
+  `private_diagnostic` and `guest_diagnostic*` keep their meaning. Any failure to
+  write it is swallowed and cannot change the primary result, cleanup or the receipt,
+  whose shape is unchanged. A guest-reported failure with no host exception writes none.
 
 The owner Cloud SDK pin is575.0.0; workflow SDK remains540.0.0. The fixed IAP
 proxy uses `compute start-iap-tunnel ... 22 --listen-on-stdin`. Local installed

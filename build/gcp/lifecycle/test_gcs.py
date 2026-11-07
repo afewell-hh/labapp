@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .auth_http import (HttpResponse, HttpTransport, TransportError,
                         _NoRedirect, bearer_headers, gcloud_token)
-from .gcs import GcsSlotStore, MAX_RECORD_BYTES, StoreError
+from .gcs import GcsSlotStore, MAX_RECORD_BYTES, ReadUnavailable, StoreError
 from .store import PreconditionFailed
 
 KEY = "slots/slot-1.json"
@@ -127,6 +127,58 @@ class GcsTests(unittest.TestCase):
     def test_network_read_failure_is_not_absence(self):
         with self.assertRaises(StoreError):
             self.store(OSError("untrusted diagnostic")).read(KEY)
+
+    def test_only_documented_transient_get_failures_are_typed_closed_metadata(self):
+        for status in (408, 429, 500, 502, 503, 504, 599):
+            for position in ("metadata", "media"):
+                with self.subTest(status=status, position=position):
+                    responses = ([HttpResponse(status, b"secret-body")] if position == "metadata"
+                                 else [metadata(), HttpResponse(status, b"secret-body")])
+                    with self.assertRaises(ReadUnavailable) as caught:
+                        self.store(*responses).read(KEY)
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertNotIn("secret", str(caught.exception))
+                    self.assertIsInstance(caught.exception, StoreError)
+                    self.assertEqual(len(self.http.calls), 1 if position == "metadata" else 2)
+        for status in (301, 400, 401, 403, 409, 412):
+            with self.subTest(hard=status):
+                with self.assertRaises(StoreError) as caught:
+                    self.store(HttpResponse(status, b"{}")).read(KEY)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+        with self.assertRaises(StoreError) as caught:  # media 401/403 after metadata is hard too
+            self.store(metadata(), HttpResponse(403, b"{}")).read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_get_transport_loss_is_typed_but_token_and_bad_responses_are_not(self):
+        for error in (TransportError("x"), OSError("secret-diagnostic"), TimeoutError()):
+            with self.assertRaises(ReadUnavailable) as caught:
+                self.store(error).read(KEY)
+            self.assertIsNone(caught.exception.status)
+            self.assertNotIn("secret", str(caught.exception))
+        def no_token():
+            raise TransportError("credential")
+        store = GcsSlotStore(BUCKET, token_provider=no_token, transport=HTTP())
+        with self.assertRaises(StoreError) as caught:
+            store.read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+        for response in (HttpResponse("200", b"{}"), HttpResponse(200, "text")):
+            with self.assertRaises(StoreError) as caught:
+                self.store(response).read(KEY)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_writes_are_never_typed_read_unavailable_and_never_retried(self):
+        for response in (HttpResponse(503, b"{}"), HttpResponse(429, b"{}"), OSError("x")):
+            with self.assertRaises(StoreError) as caught:
+                self.store(response).write(KEY, FREE, if_generation_match=0)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+            self.assertEqual(len(self.http.calls), 1)
+
+    def test_not_found_after_observation_and_absence_semantics_are_unchanged(self):
+        self.assertEqual(self.store(HttpResponse(404, b"{}")).read(KEY), (None, 0))
+        with self.assertRaises(StoreError) as caught:
+            self.store(metadata(), HttpResponse(404, b"{}"), HttpResponse(404, b"{}"),
+                       HttpResponse(404, b"{}")).read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
 
     def test_metadata_identity_generation_and_size_validation(self):
         for changes in ({"bucket": "other"}, {"name": "other"}, {"generation": 101},

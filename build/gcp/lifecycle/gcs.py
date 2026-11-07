@@ -10,6 +10,9 @@ bounded fresh read. Once a revision was observed, a 404 never becomes absence
 within that call. Writes submit once with ifGenerationMatch; 412 is a CAS
 conflict, while timeout/HTTP/schema failures propagate as StoreError. A caller
 must re-read after an uncertain write; the adapter never blindly retries it.
+A GET whose HTTP exchange failed, or that returned 408/429/5xx, raises the StoreError
+subclass ReadUnavailable (closed status only); it never retries by itself and is never raised
+for writes. 401/403/404-after-observation/malformed/mismatched replies stay plain StoreError.
 
 Current envelope schema follows PR158; domain invariants remain the controller's
 responsibility. This adapter plus mocked tests is not live-cloud readiness.
@@ -31,6 +34,23 @@ from .store import PreconditionFailed
 
 class StoreError(Exception):
     """Uncertain or invalid ledger access: callers must fail closed."""
+
+
+def transient_status(status) -> bool:
+    """Closed predicate: documented retryable HTTP statuses (408, 429, 5xx) only."""
+    return type(status) is int and (status in (408, 429) or 500 <= status <= 599)
+
+
+class ReadUnavailable(StoreError):
+    """A GET that provably did not complete: transport loss (``status`` None) or a transient HTTP status.
+
+    Closed metadata only, never server text. It is a StoreError subclass, so every existing caller
+    still fails closed; only a caller that explicitly names this type may treat it as retryable.
+    Raised for GET requests only, never for a write. It proves nothing about ownership or absence.
+    """
+    def __init__(self, status=None):
+        super().__init__("ledger read unavailable; no ledger state was observed")
+        self.status = status if transient_status(status) else None
 
 
 MAX_RECORD_BYTES = 65_536
@@ -133,19 +153,36 @@ class GcsSlotStore:
             raise ValueError("slot key is not allowlisted")
 
     def _request(self, method, url, *, body=None, limit=MAX_METADATA_BYTES):
+        # Credential acquisition and response validation failures stay plain StoreError. Only a
+        # failure of the HTTP exchange itself on a GET is typed ReadUnavailable (no state observed).
         try:
             headers = bearer_headers(self.token_provider)
             headers["Accept-Encoding"] = "identity"
             if body is not None:
                 headers["Content-Type"] = "application/json; charset=utf-8"
+        except Exception:
+            raise StoreError("ledger HTTP request failed; outcome may be uncertain") from None
+        try:
             response = self.http.request(method, url, headers=headers, body=body,
                                          timeout=20, max_bytes=limit)
+        except Exception:
+            if method == "GET":
+                raise ReadUnavailable(None) from None
+            raise StoreError("ledger HTTP request failed; outcome may be uncertain") from None
+        try:
             if (type(response.status) is not int or not isinstance(response.body, bytes) or
                     len(response.body) > limit):
                 raise ValueError("invalid transport response")
             return response
         except Exception:
             raise StoreError("ledger HTTP request failed; outcome may be uncertain") from None
+
+    @staticmethod
+    def _read_failed(response, message):
+        # GET only: a documented transient status is typed; every other status stays a hard StoreError.
+        if transient_status(response.status):
+            raise ReadUnavailable(response.status)
+        raise StoreError(message)
 
     def _metadata(self, response, key):
         meta = _decode(response.body, MAX_METADATA_BYTES)
@@ -169,14 +206,16 @@ class GcsSlotStore:
                     return None, 0
                 continue
             if meta.status != 200:
-                raise StoreError("ledger metadata read failed")
+                self._read_failed(meta, "ledger metadata read failed")
             seen = True
             generation, size = self._metadata(meta, key)
             media = self._request("GET", base + "?" + urlencode({
                 "alt": "media", "generation": str(generation)}), limit=MAX_RECORD_BYTES)
             if media.status in (404, 412):
                 continue
-            if media.status != 200 or len(media.body) != size:
+            if media.status != 200:
+                self._read_failed(media, "ledger generation data read failed")
+            if len(media.body) != size:
                 raise StoreError("ledger generation data read failed")
             record = _decode(media.body, MAX_RECORD_BYTES)
             _record(record, key)

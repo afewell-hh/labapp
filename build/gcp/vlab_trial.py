@@ -35,12 +35,12 @@ from . import owned_process
 from .inspection.hostkey import extract_ed25519
 from .lifecycle import spec
 from .lifecycle.access_records import AccessError, GcsAccessRecords, canonical
-from .lifecycle.auth_http import gcloud_token
+from .lifecycle.auth_http import HttpTransport, TransportError, gcloud_token
 from .lifecycle.cli import BUCKET, CREATOR_PATH, REPOSITORY, verify_disk_provenance
-from .lifecycle.cloud import PolicyCloud, ForbiddenOperation
+from .lifecycle.cloud import ApiError, ForbiddenOperation, NotFound, PolicyCloud, Uncertain
 from .lifecycle.compute import ComputeRestTransport
 from .lifecycle.controller import Config, Controller, Refused
-from .lifecycle.gcs import GcsSlotStore
+from .lifecycle.gcs import GcsSlotStore, ReadUnavailable, StoreError, transient_status
 from .lifecycle.oslogin import OwnKeyImport, SelfLogin, cleanup_own_key, profile_user
 
 OWNER = 'art@githedgehog.com'
@@ -69,15 +69,62 @@ IMAGE_COUNT_LIMIT = 10**6
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
+class TransientRead(Uncertain):
+    """A Compute identity READ whose HTTP exchange provably failed or returned 408/429/5xx.
+
+    Closed status only (None = transport loss). Subclasses Uncertain, so existing handlers still
+    fail closed. Proves nothing about the VM, disk or operation; never an ownership observation.
+    """
+    def __init__(self, status=None):
+        super().__init__('Compute read unavailable; no resource state was observed')
+        self.status = status if transient_status(status) else None
+
+
+class ReadOutcome:
+    """HTTP wrapper recording ONLY the closed outcome of the latest request: a status or transport loss.
+
+    ComputeRestTransport collapses transport loss, 408/429/5xx and bad bodies into one Uncertain type
+    and its message must not be classified. This keeps the actual fact (never URL, header, body or text).
+    """
+    def __init__(self, http=None):
+        self.http = http if http is not None else HttpTransport()
+        self.last = None  # None | ('transport', None) | ('status', int)
+
+    def request(self, method, url, **kwargs):
+        self.last = None
+        try:
+            response = self.http.request(method, url, **kwargs)
+        except Exception:
+            self.last = ('transport', None)
+            raise
+        status = getattr(response, 'status', None)
+        self.last = ('status', status) if type(status) is int else None
+        return response
+
+
 class ReadCloud:
     """Owner operation cannot reach creator/delete/capture verbs."""
-    def __init__(self, cloud):
+    def __init__(self, cloud, outcome=None):
         self.__cloud = cloud
+        self.__outcome = outcome
 
     def call(self, resource, verb, **kwargs):
         if (resource, verb) not in {('instances', 'get'), ('disks', 'get'), ('zoneOperations', 'get')}:
             raise ForbiddenOperation('owner trial allows fixed identity reads only')
-        return self.__cloud.call(resource, verb, **kwargs)
+        if self.__outcome is not None:
+            self.__outcome.last = None
+        try:
+            return self.__cloud.call(resource, verb, **kwargs)
+        except Uncertain as error:
+            # Typed from the recorded HTTP fact only. Token failure, a 2xx with a bad body and every
+            # other Uncertain (no recorded transient fact) stay hard.
+            last = None if self.__outcome is None else self.__outcome.last
+            if type(error) is Uncertain and last is not None:
+                if last == ('transport', None):
+                    raise TransientRead(None) from None
+                if last[0] == 'status' and transient_status(last[1]):
+                    raise TransientRead(last[1]) from None
+            raise
 
 
 def expected_snapshot(value):
@@ -234,9 +281,9 @@ def trusted_source(snapshot, *, initial=False):
 
 class OwnerRegistration:
     """One explicit registration operation; no controller method selector."""
-    def __init__(self, store, cloud, records, snapshot):
+    def __init__(self, store, cloud, records, snapshot, outcome=None):
         self.expected = expected_snapshot(snapshot)
-        self.snapshot, self.store, self.cloud, self.records = snapshot, store, ReadCloud(cloud), records
+        self.snapshot, self.store, self.cloud, self.records = snapshot, store, ReadCloud(cloud, outcome), records
         self.__controller = Controller(store, self.cloud,
                                        Config(boot_image=spec.COMPONENT_IMAGE, profile=spec.UBUNTU_VLAB_CORE),
                                        access_records=records)
@@ -291,6 +338,62 @@ class OwnerRegistration:
         return self.__controller.register_access(self.expected['request_id'],
                  producer_run_id=self.expected['run_id'], producer_attempt=self.expected['attempt'],
                  self_user=self.snapshot['self_user'], public_key_text=public_key, expected_trial=self.expected)
+
+
+# Finite recovery of PERIODIC registration rechecks only (poll loop, after original admission and
+# registration). Every attempt is a COMPLETE fresh ``current()``; a failed read is never ownership.
+# One original work-phase allowance and one aggregate monotonic allowance that starts at the FIRST
+# transient failure and is never reset per attempt. Mutations (register, import, CAS, key) never retry.
+RECHECK_ATTEMPTS = 3
+RECHECK_ALLOWANCE_SECONDS = 30.0
+RECHECK_PAUSES = (2.0, 4.0)
+RECHECK_MIN_SECONDS = 5.0          # least budget worth starting another complete attempt
+TRANSIENT_READS = (ReadUnavailable, TransientRead)
+
+
+def recheck_registration(registration, clock, failed, *, monotonic=None, wait=None):
+    """-> ``registration.current()`` result; retries ONLY the two typed transient READ errors.
+
+    The first attempt behaves exactly like a bare ``current()``. After a typed transient failure,
+    at most RECHECK_ATTEMPTS complete attempts run in total. Before each further attempt and after
+    any recovered one the ORIGINAL ``persistence`` window and the aggregate allowance are enforced, so
+    a late positive read is refused (never authority). Everything else (foreign/changed lease, identity,
+    deadline, 401/403/404, malformed, accounting, refusal, Failure/signal) propagates untouched. When
+    retrying stops, the last typed error is re-raised with ``recheck_attempts`` for the closed record.
+    ``wait`` returns True if the heartbeat failed, which ends the pause and refuses.
+    """
+    monotonic = owned_process.monotonic if monotonic is None else monotonic
+    wait = failed.wait if wait is None else wait
+    attempts, started = 0, None
+
+    def left():
+        try:
+            original = clock.remaining('persistence')
+        except guest.Failure:
+            return 0.0
+        return min(original, started + RECHECK_ALLOWANCE_SECONDS - monotonic())
+
+    while True:
+        attempts += 1
+        try:
+            current = registration.current()
+        except TRANSIENT_READS as error:
+            error.recheck_attempts = attempts
+            if started is None:
+                started = monotonic()
+            if attempts >= RECHECK_ATTEMPTS:
+                raise
+            pause = RECHECK_PAUSES[attempts - 1]
+            if left() < pause + RECHECK_MIN_SECONDS:
+                raise
+            if wait(pause) or failed.is_set():
+                raise guest.Failure('heartbeat failed') from None
+            if left() < RECHECK_MIN_SECONDS:
+                raise
+            continue
+        if attempts > 1 and (left() <= 0 or failed.is_set()):
+            raise guest.Failure('registration recheck exceeded its allowance', 124)
+        return current
 
 
 def public_source(snapshot, path, *, blob=False):
@@ -1033,6 +1136,49 @@ HOST_OPERATIONS = frozenset({
 })
 
 
+HOST_PHASES = frozenset({'preflight', 'access-prepare', 'access-import', 'guest-access', 'guest-work', 'guest-result'})
+HOST_CATEGORIES = frozenset({'guest', 'interrupted', 'access', 'unknown'})
+# Closed exception vocabulary; most specific first. Selected by isinstance, never by class name or text.
+HOST_EXCEPTIONS = ((guest.Failure, 'failure'), (KeyboardInterrupt, 'interrupted'), (AccessError, 'access-error'),
+                   (ReadUnavailable, 'store-read-unavailable'), (StoreError, 'store-error'),
+                   (TransientRead, 'cloud-read-unavailable'), (NotFound, 'cloud-not-found'),
+                   (ApiError, 'cloud-api-error'), (Uncertain, 'cloud-uncertain'),
+                   (ForbiddenOperation, 'cloud-forbidden'), (Refused, 'controller-refused'),
+                   (TransportError, 'transport-error'), (OSError, 'os-error'))
+
+
+def host_failure_record(initial, phase, operation, category, code, error):
+    """Closed host-side terminal failure record. Never argv/env/path/URL/message/traceback/body/token.
+
+    Correlation comes from the captured trial values; phase/operation/category are source literals
+    checked against closed sets; the exception is a whitelist token and the HTTP status is only the
+    typed metadata of a genuine read failure. Unknown stays None / 'other'.
+    """
+    guest.require(phase in HOST_PHASES and operation in HOST_OPERATIONS and category in HOST_CATEGORIES
+                  and type(code) is int and 0 < code < 256)
+    name = next((token for kind, token in HOST_EXCEPTIONS if isinstance(error, kind)), 'other')
+    status = getattr(error, 'status', None) if isinstance(error, (ReadUnavailable, TransientRead, ApiError)) else None
+    attempts = getattr(error, 'recheck_attempts', None) if isinstance(error, TRANSIENT_READS) else None
+    return {'schema': 1, 'kind': 'host-failure', 'source_sha': initial['source_sha'], 'nonce': initial['nonce'],
+            'lease': initial['lease'], 'epoch': initial['epoch'], 'run_id': initial['run_id'],
+            'attempt': initial['attempt'], 'phase': phase, 'host_operation': operation,
+            'failure_category': category, 'code': code, 'exception': name,
+            'http_status': status if type(status) is int and 100 <= status <= 599 else None,
+            'recheck_attempts': attempts if type(attempts) is int and 1 <= attempts <= RECHECK_ATTEMPTS else None}
+
+
+def retain_host_failure(directory, record):
+    """Exclusive owner-only file in the explicit private diagnostics directory; never overwrites/adopts.
+
+    Distinct name and ``kind`` from the guest bundles: this is HOST evidence, not a guest bundle.
+    """
+    guest.require(re.fullmatch('[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}', record['lease']))
+    info = Path(directory).lstat()
+    guest.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                  'private diagnostic directory required')
+    guest.exclusive(Path(directory) / ('host-failure-' + record['lease'] + '.json'), guest.encoded(record))
+
+
 def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None,
           handoff_on_success=False, prepare_private_image=False):
     expected_snapshot(snapshot)
@@ -1060,6 +1206,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     # Closed, requested-only: 'skipped' (no validated success to prepare), 'refused', 'partial-owned'.
     image_preparation = 'skipped' if prepare_private_image else None
     clock = None
+    host_error = None  # the FIRST host terminal exception, kept only for the closed private record
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -1186,7 +1333,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             host_operation = 'poll-check'
             guest.require(not failed.is_set(), 'heartbeat failed')
             host_operation = 'registration-check'
-            registration.current()
+            recheck_registration(registration, clock, failed)
             host_operation = 'source-check'
             trusted_source(snapshot)
             host_operation = 'poll-check'
@@ -1238,21 +1385,34 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     except guest.Failure as error:
         result = error.code
         failure_category = 'guest'
+        host_error = error
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     except KeyboardInterrupt as error:
         result = 130
         failure_category = 'interrupted'
+        host_error = error
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     except Exception as error:
         result = 1
         failure_category = 'access' if isinstance(error, AccessError) else 'unknown'
+        host_error = error
         if getattr(error, 'cleanup_uncertain', False):
             process_uncertain.set()
     finally:
         # Keep primary callsite context frozen throughout supplemental diagnostics/cleanup.
         stop.set()
+        if host_error is not None and private is not None:
+            # Closed host-side first-failure record, only in the explicit private directory and only
+            # for a terminal failure (a recovered periodic read leaves nothing). Best effort: any
+            # error here is swallowed and cannot replace the primary failure, skip cleanup or
+            # claim success. It is not a guest bundle and leaves `private_diagnostic` untouched.
+            try:
+                retain_host_failure(private, host_failure_record(initial, phase, host_operation,
+                                                                 failure_category, result, host_error))
+            except BaseException:
+                pass
         heartbeat_absent = True
         if heartbeat_thread:
             try:
@@ -1440,8 +1600,11 @@ def main(argv=None):
     ghcr = None if args.ghcr_credentials is None else ghcr_credentials(args.ghcr_credentials, output)
     token = gcloud_token  # existing owner identity only; never impersonates
     records = GcsAccessRecords(BUCKET, token_provider=token)
+    # The recording wrapper keeps only the closed HTTP outcome of the latest Compute READ (see ReadCloud).
+    outcome = ReadOutcome()
     registration = OwnerRegistration(GcsSlotStore(BUCKET, token_provider=token),
-                     PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
+                     PolicyCloud(ComputeRestTransport(outcome, token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot,
+                     outcome)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
                  private=private, ghcr=ghcr, handoff_on_success=args.handoff_on_success,
