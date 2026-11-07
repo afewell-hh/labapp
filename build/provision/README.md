@@ -777,6 +777,23 @@ does not expose the original status in these bytes. A different status deliberat
 health text cannot be distinguished by this classifier. Native proof verdicts separately require the
 fixed HTTP500/content-type/body and ordered delivery evidence; ordinary JSON500 remains fatal.
 
+**Initial readyz client-timeout headroom (#524).** The execute cap (10s) starts before the kubectl
+client starts and arms its own request timer, so a `--request-timeout=10s` client can be
+hard-killed (exit 124, fatal) before it returns its bounded timeout error. Only the exact
+`api-initial-readyz` route with `['get', '--raw=/readyz']` now passes `--request-timeout=5s`; the cap,
+all other routes (including `api-final-readyz`) and every other deadline, limit and kill/reap
+semantic are unchanged, with no renewal. Under the same conditions as the health policy above
+(executed child, exit1, `child command failed`, same route, no `cleanup_uncertain`), only the exact
+whole output `Unable to connect to the server: context deadline exceeded (Client.Timeout exceeded
+while awaiting headers)\n` becomes Pending. Generic timeout substrings, x509/authentication/other
+exit1, other args or routes, 124 and 130/143 stay fatal with the original exception.
+A lead-run credential-free, network-none check with the pinned kubectl 1.35 and a synthetic TLS
+loopback endpoint showed 10s client/10s cap killed at ~10.02s with no output, while a 5s client
+exited 1 at ~5.08s with that exact text and a next request succeeded. This shows the timeout race
+only; it does not establish the underlying Kubernetes or network cause, and no successful resume or
+production readiness is claimed until actual native proof. Native validation remains pending. The
+#452 proof harness still labels and checks the `10s` binding; it is not updated here.
+
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
 introduced. Only the initial production loop catches this new Pending, under the original fresh2700s

@@ -3438,6 +3438,96 @@ class FormatAndSourceTests(unittest.TestCase):
             self.assertIs(raised.exception, error)
             self.assertNotIsInstance(raised.exception, core.Pending)
 
+    def captured_timeout(self, args, route):
+        seen = []
+
+        def fake(argv, deadline, cap=30, user=False, **kwargs):
+            seen.append((argv, cap, user))
+            return b'ok'
+        with patch.object(core, 'execute', side_effect=fake):
+            core.kubectl(args, 1000, route)
+        argv, cap, user = seen[0]
+        return [a for a in argv if a.startswith('--request-timeout=')], cap, user
+
+    def test_initial_readyz_alone_uses_5s_client_timeout_under_unchanged_10s_cap(self):
+        self.assertEqual(self.captured_timeout(['get', '--raw=/readyz'], 'api-initial-readyz'),
+                         (['--request-timeout=5s'], 10, True))
+        for args, route in ((['get', '--raw=/readyz'], 'api-final-readyz'),
+                            (['get', '--raw=/readyz'], None),
+                            (['get', '--raw=/readyz'], 'api-initial-nodes'),
+                            (['get', '--raw=/readyz?verbose'], 'api-initial-readyz'),
+                            (['get', '--raw=/readyz', '--v=8'], 'api-initial-readyz'),
+                            (['get', 'nodes', '-o', 'json'], 'api-initial-nodes'),
+                            (['get', 'nodes', '-o', 'json'], 'api-final-nodes')):
+            with self.subTest(args=args, route=route):
+                self.assertEqual(self.captured_timeout(args, route),
+                                 (['--request-timeout=10s'], 10, True))
+
+    def test_initial_client_timeout_is_pending_only_for_exact_executed_matching_context(self):
+        raw = core.INITIAL_READYZ_CLIENT_TIMEOUT
+        self.assertEqual(raw, b'Unable to connect to the server: context deadline exceeded '
+                              b'(Client.Timeout exceeded while awaiting headers)\n')
+        error = executed_failure('child command failed', 1, raw)
+        with patch.object(core, 'execute', side_effect=error):
+            with self.assertRaises(core.Pending) as raised:
+                core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+        self.assertEqual((str(raised.exception), raised.exception.code,
+                          raised.exception.private_output, raised.exception.route),
+                         ('API discovery pending', 1, b'', None))
+        self.assertIs(raised.exception.__context__, error)
+
+    def test_client_timeout_stays_fatal_outside_exact_initial_context_or_with_other_bytes(self):
+        raw = core.INITIAL_READYZ_CLIENT_TIMEOUT
+        for route, args in (
+                (None, ['get', '--raw=/readyz']),
+                ('api-final-readyz', ['get', '--raw=/readyz']),
+                ('api-initial-nodes', ['get', '--raw=/readyz']),
+                ('api-initial-nodes', ['get', 'nodes', '-o', 'json']),
+                ('api-initial-readyz', ['get', 'nodes', '-o', 'json']),
+                ('api-initial-readyz', ['get', '--raw=/readyz?verbose']),
+                ('api-initial-readyz', ['get', '--raw=/readyz', '--v=8'])):
+            error = executed_failure('child command failed', 1, raw)
+            with self.subTest(route=route, args=args), patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(args, 1000, route)
+            self.assertIs(raised.exception, error)
+            self.assertNotIsInstance(raised.exception, core.Pending)
+        for other in (raw.rstrip(b'\n'), raw + b'\n', raw + b'x', b'x' + raw, raw.lower(),
+                      b'Unable to connect to the server: context deadline exceeded\n',
+                      b'Unable to connect to the server: net/http: TLS handshake timeout\n',
+                      b'Unable to connect to the server: x509: certificate signed by unknown authority\n',
+                      b'error: You must be logged in to the server (Unauthorized)\n',
+                      b'Error from server (Timeout): request did not complete within requested timeout\n',
+                      b'Client.Timeout exceeded while awaiting headers\n', b'other', b''):
+            error = executed_failure('child command failed', 1, other)
+            with self.subTest(other=other), patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+            self.assertIs(raised.exception, error)
+            self.assertNotIsInstance(raised.exception, core.Pending)
+
+    def test_client_timeout_cannot_override_status_provenance_message_or_cleanup(self):
+        raw = core.INITIAL_READYZ_CLIENT_TIMEOUT
+        for message, code, executed, prior_route, uncertain in (
+                ('child command failed', 124, True, None, False),
+                ('child deadline exceeded', 124, True, None, False),
+                ('child command failed', 130, True, None, False),
+                ('child command failed', 143, True, None, False),
+                ('child command failed', 2, True, None, False),
+                ('private child output overflow', 1, True, None, False),
+                ('child containment unverified', 1, True, None, False),
+                ('child command failed', 1, False, None, False),
+                ('child command failed', 1, True, 'api-final-readyz', False),
+                ('child command failed', 1, True, None, True)):
+            error = core.Failure(message, code, raw)
+            error._executed_child, error.route, error.cleanup_uncertain = executed, prior_route, uncertain
+            with self.subTest(message=message, code=code, executed=executed, uncertain=uncertain), \
+                 patch.object(core, 'execute', side_effect=error):
+                with self.assertRaises(core.Failure) as raised:
+                    core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+            self.assertIs(raised.exception, error)
+            self.assertNotIsInstance(raised.exception, core.Pending)
+
     def test_kubectl_cleanup_uncertain_transient_reraises_same_failure_not_pending(self):
         refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
                    b'did you specify the right host or port?\n')
