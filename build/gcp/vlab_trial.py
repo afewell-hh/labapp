@@ -1011,7 +1011,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 key_absent = True
             except BaseException:
                 pass
-        # One guarded window from the handoff decision through receipt publication. A 'ready' result
+        # One guarded window from the handoff decision through publication and return. A 'ready' result
         # is only complete once its receipt line was printed AND flushed; any exception escaping the
         # window while 'ready' (handled late interrupt, BrokenPipeError/OSError on write or flush)
         # downgrades to 'refused' and runs the existing captured-creator cancellation. Non-ready paths
@@ -1051,6 +1051,8 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             # Publicly safe fixed statuses only; cloud deletion/FREE still require
             # independent immutable404/terminal-operation/access-archive receipts.
             print(json.dumps(receipt, sort_keys=True), **({'flush': True} if handoff == 'ready' else {}))
+            if handoff == 'ready':
+                return 0
         except BaseException:
             if handoff != 'ready':
                 raise
@@ -1069,8 +1071,6 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                                   'independent_cleanup_dispatched': dispatched}, sort_keys=True))
             except BaseException:
                 pass
-    if handoff == 'ready':
-        return 0
     if handoff == 'refused':
         return result if result else 1
     return result if result else (0 if all((contained, process_absent, key_absent, local_absent, dispatched)) else 1)

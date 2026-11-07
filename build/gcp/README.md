@@ -1545,7 +1545,7 @@ expiry cleanup continue. The receipt then carries `success_handoff: "ready"`
 receipt line; a `ready` line with a nonzero exit is void. Once `ready` is
 decided, a handled late interruption (a signal surfacing as a Python exception)
 or a receipt write/flush failure (for example `BrokenPipeError`) before the
-handoff completes downgrades it to `refused`, runs the captured-creator
+guarded `trial()` return completes downgrades it to `refused`, runs the captured-creator
 cancellation, makes a best-effort minimal `refused` receipt line and exits 1.
 SIGKILL, host or interpreter death, an interruption inside that fallback and a
 caller ignoring the exit status are not covered; the original deadline and
