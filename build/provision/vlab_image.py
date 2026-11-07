@@ -2,7 +2,7 @@
 """Guest-side PRIVATE candidate image preparation and clone-boot VLAB start (issue #526).
 
 Ubuntu 24.04 / Python 3.12, stdlib only (plus the installed ``owned_process.py`` core
-dependency), root only. Four fixed actions:
+dependency), root only. Five fixed actions:
 
   prepare      explicit opt-in; validates the finished full-core trial, then removes ONLY the
                fixed table of trial-owned files and installs the clone unit.
@@ -13,6 +13,8 @@ dependency), root only. Four fixed actions:
                core's own owned-stop intent for the sealed, checkpointed activation and returns.
                It never waits on or stops the resume unit: the unit's PropagatesStopTo= stops it
                in the same transaction. Activation failure/cancel is cleaned up by clone-start.
+  stop-verified  operator completion boundary outside the unit: stop and positively verify the
+                 checkpointed backend before returning success.
 
 It never stops or captures a VM, never calls a cloud API, never runs ``init``, never touches
 /home/ubuntu/hhfab or its cache (the preserved lab state) and never deletes a file it cannot
