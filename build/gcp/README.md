@@ -1975,14 +1975,22 @@ lease/run/attempt/epoch, confirmed instance and boot IDs, `source_sha` and
 privately captured evidence; this is not sealing and does not authenticate the
 caller), `armed_at` and `ends_at`. The span is at most ten minutes, clipped to the
 original deadline minus the fifteen-minute cleanup reserve; under two minutes of
-room is refused. The lease, deadline, generation, body, profile, image and VM TTL
-are unchanged; the window cannot be re-armed, altered or removed before FREE.
+room is refused. The immutable epoch, lease, IDs, deadline, body, profile, image and
+VM TTL are unchanged; the successful CAS advances the storage generation exactly
+once. The window is open only for `armed_at <= now < ends_at`, and cannot be
+re-armed, altered or removed before FREE.
 
 Only the automatic non-forced janitor's NOT_RUNNING trigger is deferred, and only
 while the window is valid, unexpired and bound to the exact instance. Force
 cancellation, `CLEANUP_FAILED`, the original deadline and any invalid, foreign or
-expired window leave cleanup unchanged. The managed `_access_capture_gate` and
+expired window leave cleanup unchanged. A false window check does not by itself
+guarantee deletion or release: whole-record validation can still block malformed
+metadata under the existing fail-closed ownership, and no bypass exists. The managed `_access_capture_gate` and
 schema-2's ban on capture inventory stay held.
+
+The receipt must be the exact closed 17-field host receipt with
+`host_operation == 'result-validate'`; optional `guest_service` values are checked
+against the host's closed state/result domains and integer ranges (diagnostic only).
 
 Limits: the field cannot revoke a delete an older runner already issued. The lead
 must show no older queued/running cleanup job exists before arming and stopping,

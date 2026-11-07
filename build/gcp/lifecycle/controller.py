@@ -685,7 +685,8 @@ class Controller:
             window = inline_history.capture_window(rec)
             ends = _parse(window["ends_at"])
             now = self.cfg.now()
-            return (now < ends and now < _parse(rec["deadline"]) - timedelta(
+            return (_parse(window["armed_at"]) <= now < ends and
+                    now < _parse(rec["deadline"]) - timedelta(
                         seconds=inline_history.WINDOW_CLEANUP_RESERVE_SECONDS) and
                     inst.get("id") == window["vm_id"] == rec["ids"]["instance"] and
                     inst.get("name") == rec["names"]["instance"])
@@ -700,6 +701,12 @@ class Controller:
         "image_preparation"})
     _GUEST_SUCCESS = {"origin": "worker", "phase": "persistence", "operation": "complete",
                       "category": "none", "child_status": None}
+
+    # Copied from the CURRENT host build/gcp/vlab_trial.py closed service domains.
+    _SERVICE_ACTIVE = ('active', 'inactive', 'failed', 'activating', 'deactivating',
+                       'reloading', 'maintenance')
+    _SERVICE_RESULTS = ('success', 'resources', 'timeout', 'exit-code', 'signal', 'core-dump',
+                        'watchdog', 'start-limit-hit', 'oom-kill', 'protocol', 'exec-condition')
 
     def _check_host_receipt(self, receipt, rec) -> None:
         """Closed shape/values of the accepted host's completed ready receipt.
@@ -722,12 +729,19 @@ class Controller:
               and r["private_diagnostic"] == "skipped"
               and r["success_handoff"] == "ready"
               and r["image_preparation"] == "partial-owned"
-              and isinstance(r["host_operation"], str)
-              and 0 < len(r["host_operation"]) <= 32)
+              and r["host_operation"] == "result-validate")
         service = r.get("guest_service") if type(r) is dict else None
         if ok and service is not None:
+            # Observation is diagnostic: only its closed value domains are checked,
+            # never inactive/success as a new gate. bool is not an integer here.
             ok = (type(service) is dict and
-                  set(service) == {"active_state", "result", "exec_code", "exec_status"})
+                  set(service) == {"active_state", "result", "exec_code", "exec_status"} and
+                  type(service["active_state"]) is str and
+                  service["active_state"] in self._SERVICE_ACTIVE and
+                  type(service["result"]) is str and
+                  service["result"] in self._SERVICE_RESULTS and
+                  type(service["exec_code"]) is int and 0 <= service["exec_code"] <= 7 and
+                  type(service["exec_status"]) is int and 0 <= service["exec_status"] <= 255)
         if not ok:
             raise Refused("host receipt is not the exact completed ready/partial-owned success")
 
@@ -735,13 +749,17 @@ class Controller:
                                    vm_id, boot_id, expected_trial):
         """Owner-library-only, one-time bounded stop/imaging time for Root (#533).
 
-        Not a managed capture gate, seal or lease renewal; the lease, deadline,
-        generation, body, profile, image and VM TTL are unchanged. Persists at most
-        one ``private_capture_window`` with a single CAS (no retry): a lost CAS
-        raises and nothing is claimed armed. ``source_sha`` and ``receipt_sha256``
+        Not a managed capture gate, seal or lease renewal. The immutable epoch,
+        lease, IDs, deadline, body, profile, image and VM TTL are unchanged; the
+        successful CAS ADVANCES the storage generation exactly once. Persists at
+        most one ``private_capture_window`` with a single CAS (no retry): a lost
+        CAS raises and nothing is claimed armed. ``source_sha`` and ``receipt_sha256``
         are metadata bindings the trusted caller must have checked against its
         privately captured evidence. Cannot revoke an already-issued delete by an
         older janitor; the lead must establish none is queued/running first.
+        An invalid window (``_window_open`` false) does not itself guarantee
+        deletion or release: whole-record validation can still block malformed
+        metadata under the existing fail-closed ownership rules.
         """
         rec, gen = self.store.read(self.cfg.key)
         if (rec is None or rec.get("schema") != 2 or rec.get("state") != ACTIVE or
