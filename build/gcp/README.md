@@ -1532,6 +1532,22 @@ process ran inside GitHub. Component/inspector access remains refused. Cleanup
 composes `ReadOnlyAccessRecords(GcsAccessRecords(...))`: evidence reads only,
 no SELF import/removal or producer object writes.
 
+Private owner-only `--handoff-on-success` (default off; library `handoff_on_success=False`)
+withholds the creator cancellation only after a validated full-core success
+(result 0, contained), positive original-process/heartbeat/local-file/own-key
+cleanup and at least 15 minutes left on the ORIGINAL immutable cleanup deadline
+(`Clock.cleanup_remaining`). It adds no API mutation, session/key renewal or
+deadline extension: the fixed creator/cloud DELETE deadline and independent
+expiry cleanup continue. The receipt then carries `success_handoff: "ready"`
+(creator not cancelled, `independent_cleanup_dispatched: false`, exit 0). Any
+primary failure, interruption, cleanup uncertainty, short budget or error while
+deciding records `"refused"`, still runs the existing captured-creator
+cancellation, and exits nonzero (the primary guest code if any, else 1). Without
+the option behavior and receipt are unchanged. The lead still owns stop,
+sanitize, capture and disposal; `ready` is not capture, sealing, guest
+quiescence, image acceptance or production readiness, and does not bypass
+existing capture/seal gates. All failed paths remain disposable.
+
 The fixed owner SELF adapter addresses the existing authenticated email while
 binding records to its configured numeric user ID. Only POST response key names
 may use that exact fixed email prefix; profile identity, key-map fingerprints,

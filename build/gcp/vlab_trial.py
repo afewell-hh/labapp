@@ -50,6 +50,8 @@ MAX_JSON = 256 * 1024
 # transport (<=8s) and every nested cleanup; 5+8+5=18 <= 22 <= join 25 - 3s margin.
 HEARTBEAT_BUDGET_SECONDS = 22.0
 HEARTBEAT_JOIN_SECONDS = 25
+# Opt-in success handoff (#523): the ORIGINAL VM deadline must still be at least this far away.
+HANDOFF_RESERVE_SECONDS = 15 * 60
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
@@ -730,7 +732,8 @@ HOST_OPERATIONS = frozenset({
 })
 
 
-def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None):
+def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None,
+          handoff_on_success=False):
     expected_snapshot(snapshot)
     rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
     nonce = secrets.token_hex(16)
@@ -750,6 +753,8 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     private_diagnostic = 'skipped'
     export_mode = 'fresh'  # frozen from the primary validated terminal result only
     export_installer_terminal = None
+    handoff = None  # None unless requested; then only the fixed 'ready' or 'refused'
+    clock = None
     try:
         clock = guest.Clock(initial)
         clock.remaining('access')
@@ -1006,11 +1011,25 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 key_absent = True
             except BaseException:
                 pass
-        try:
-            cleanup_dispatch(snapshot)
-            dispatched = True
-        except BaseException:
-            pass
+        if handoff_on_success:
+            # Withhold creator cancellation ONLY after a validated contained full-core success,
+            # positive process/file/own-key cleanup and >=15 minutes before the ORIGINAL deadline
+            # (immutable cleanup clock; no renewal). Anything else, including any error here, refuses.
+            handoff = 'refused'
+            try:
+                if (result == 0 and contained and failure_category == 'none' and phase == 'guest-result'
+                        and guest_status == 'valid' and not failed.is_set()
+                        and process_absent and local_absent and key_absent and clock is not None
+                        and clock.cleanup_remaining() >= HANDOFF_RESERVE_SECONDS):
+                    handoff = 'ready'
+            except BaseException:
+                handoff = 'refused'
+        if handoff != 'ready':
+            try:
+                cleanup_dispatch(snapshot)
+                dispatched = True
+            except BaseException:
+                pass
         receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
                    'phase': phase, 'failure_category': failure_category, 'host_operation': host_operation,
                    'own_key_absent': key_absent, 'local_files_absent': local_absent,
@@ -1020,9 +1039,16 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                    'guest_service': guest_service,
                    # Closed status of the fixed owner-private first-failure capture; never a path or bytes.
                    'private_diagnostic': private_diagnostic}
+        if handoff is not None:
+            # Requested handoff only. Not capture, sealing, quiescence, image acceptance or readiness.
+            receipt['success_handoff'] = handoff
         # Publicly safe fixed statuses only; cloud deletion/FREE still require
         # independent immutable404/terminal-operation/access-archive receipts.
         print(json.dumps(receipt, sort_keys=True))
+    if handoff == 'ready':
+        return 0
+    if handoff == 'refused':
+        return result if result else 1
     return result if result else (0 if all((contained, process_absent, key_absent, local_absent, dispatched)) else 1)
 
 
@@ -1037,6 +1063,9 @@ def main(argv=None):
     # Optional owner-protected GHCR record {"schema":1,"registry":"ghcr.io","username":..,"token":..};
     # prepared by the lead outside repository code. Never sourced, discovered or echoed.
     parser.add_argument('--ghcr-credentials', type=Path)
+    # Owner-only, default off: on validated success plus positive cleanup and >=15 minutes left before
+    # the ORIGINAL deadline, skip creator cancellation. The lead owns stop/sanitize/capture/disposal.
+    parser.add_argument('--handoff-on-success', action='store_true')
     args = parser.parse_args(argv)
     os.umask(0o077)
     snapshot = guest.data(guest.regular(args.snapshot, MAX_JSON, os.geteuid()))
@@ -1058,7 +1087,7 @@ def main(argv=None):
                      PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
-                 private=private, ghcr=ghcr)
+                 private=private, ghcr=ghcr, handoff_on_success=args.handoff_on_success)
 
 
 if __name__ == '__main__':
