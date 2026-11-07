@@ -45,6 +45,17 @@ def result_value(nonce, code, contained, detail=None):
     return {'schema': 2, 'code': code, 'contained': contained, 'nonce': nonce, 'diagnostic': detail}
 
 
+PARTIAL_INNER = {'owned_sealed': True, 'access': {'metadata': 2}, 'unmet': ['access-material-provenance'],
+                 'removed_count': 3}
+
+
+def prep_report(code=3, inner=None, **outer):
+    """Wrapper record exactly as the root bootstrap prints it (canonical JSON + newline)."""
+    inner = PARTIAL_INNER if inner is None else inner
+    text = inner if isinstance(inner, str) else json.dumps(inner)
+    return guest.encoded({'schema': 1, 'code': code, 'stdout': text + '\n', **outer}) + b'\n'
+
+
 def run_record(value):
     return {'id': value['run_id'], 'run_attempt': value['attempt'], 'path': host.CREATOR_PATH,
             'event': 'workflow_dispatch', 'head_branch': 'main', 'head_sha': value['source_sha'],
@@ -363,7 +374,9 @@ class OwnerTrial(unittest.TestCase):
     def owner_pipeline(self, *, heartbeat_alive=None, containment_error=None, start_error=None,
                        observed_code=0, observed_contained=True, ghcr=None,
                        handoff=None, remaining=None, cancel_error=None, key_error=None, leftover=None,
-                       print_failure=None, print_failures=1):
+                       print_failure=None, print_failures=1, prepare=False, prep=None):
+        prep = prep or {}
+        results_read = []
         self.remote_inputs = []
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
@@ -408,13 +421,28 @@ class OwnerTrial(unittest.TestCase):
                 guest.exclusive(directory / name, raw)
                 table[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
             return table
+        def image_sources(snap, directory):
+            trace.append(('image-sources', snap['source_sha']))
+            if prep.get('fetch_error') is not None:
+                raise prep['fetch_error']
+            table = {}
+            for name in host.IMAGE_SOURCES:
+                raw = ('PUBLIC-IMAGE-' + name).encode()
+                guest.exclusive(directory / name, raw)  # local staging that cleanup must remove
+                table[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
+            return table
         class Session:
             def start(self):
                 trace.append('master-start')
                 if start_error is not None:
                     raise start_error
-            def transfer(self, incoming, names, phase='stage'):
+            def transfer(self, incoming, names, phase='stage', until=None):
                 trace.append(('transfer', tuple(names), phase))
+                if sorted(names) == sorted(host.IMAGE_SOURCES):
+                    self_test.assertTrue(all((output / n).is_file() for n in names))
+                    self_test.assertIsNotNone(until)
+                    if prep.get('transfer_error') is not None:
+                        raise prep['transfer_error']
                 if 'manifest.json' in names:
                     table = guest.manifest(guest.data((output / 'manifest.json').read_bytes()))
                     self_test.assertEqual(set(table['files']), guest.FILES)
@@ -431,8 +459,18 @@ class OwnerTrial(unittest.TestCase):
                 if args == host.RESULT_COMMAND:
                     self_test.assertTrue(pulse.wait(2), 'separate heartbeat never started')
                     self_test.assertLessEqual(limit, 4096 + 128)
-                    return guest.encoded(result_value(nonce, observed_code, observed_contained,
+                    results_read.append(1)
+                    contained = observed_contained and not (prep.get('result_changed') and len(results_read) > 1)
+                    return guest.encoded(result_value(nonce, observed_code, contained,
                                                       worker_detail(status=observed_code) if observed_code else None))
+                if prepare and args == host.SERVICE_COMMAND:
+                    if prep.get('service_error') is not None:
+                        raise prep['service_error']
+                    return prep.get('service', b'ActiveState=inactive\nResult=success\nExecMainCode=1\nExecMainStatus=0\n')
+                if prepare and len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP:
+                    if prep.get('run_error') is not None:
+                        raise prep['run_error']
+                    return prep.get('report', prep_report())
                 return b''
             def close(self):
                 trace.append('master-close')
@@ -457,6 +495,7 @@ class OwnerTrial(unittest.TestCase):
         with patch.object(host, 'command', side_effect=command), patch.object(host, 'trusted_source') as trust, \
              patch.object(host, 'OwnKeyImport', return_value=importer), patch.object(host, 'Master', return_value=Session()), \
              patch.object(host, 'source_files', side_effect=sources), patch.object(guest, 'PAYLOADS', pins), \
+             patch.object(host, 'image_source_files', side_effect=image_sources), \
              patch.object(host, 'extract_ed25519', return_value='ssh-ed25519 UEVCTElDX0ZJWFRVUkU=\n'), \
              patch.object(host.secrets, 'token_hex', side_effect=lambda n: 'd'*(n*2)), \
              patch.object(host.secrets, 'token_urlsafe', return_value='PUBLIC-NONDEPLOYABLE-PASSWORD'), \
@@ -473,7 +512,8 @@ class OwnerTrial(unittest.TestCase):
             printed.side_effect = flaky_print
             code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
                               **({} if ghcr is None else {'ghcr': ghcr}),
-                              **({} if handoff is None else {'handoff_on_success': handoff}))
+                              **({} if handoff is None else {'handoff_on_success': handoff}),
+                              **({'prepare_private_image': True} if prepare else {}))
         self.printed_text = printed.call_args.args[0]
         return code, json.loads(printed.call_args.args[0]), trace, importer, trust, heartbeat, output
 
@@ -837,6 +877,569 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(sum(e[0] == 'remote' and '/usr/bin/systemctl' in e[1] for e in trace if isinstance(e, tuple)), 1)
         self.assertTrue(receipt['process_absent'])
         self.assertFalse(receipt['contained'])
+
+    # --- opt-in private image preparation bridge (#530); provisional guest dependency (#526) ---
+
+    @staticmethod
+    def image_remotes(trace):
+        return [e for e in trace if isinstance(e, tuple) and e[0] == 'remote' and len(e[1]) > 5
+                and e[1][5] == host.IMAGE_BOOTSTRAP]
+
+    def test_default_and_handoff_only_runs_never_touch_image_preparation(self):
+        for kwargs in ({}, {'handoff': True}):
+            with self.subTest(kwargs=kwargs):
+                code, receipt, trace, *_ = self.owner_pipeline(**kwargs)
+                self.assertNotIn('image_preparation', receipt)
+                self.assertFalse(self.image_remotes(trace))
+                self.assertFalse([e for e in trace if isinstance(e, tuple) and e[0] == 'image-sources'])
+                self.assertFalse([e for e in trace if e == ('remote', tuple(host.SERVICE_COMMAND), 'persistence')])
+
+    def test_preparation_requires_explicit_handoff_before_any_work(self):
+        value = snapshot()
+        registration = Mock()
+        for handoff in (False, None, 1):
+            with self.subTest(handoff=handoff), patch.object(host, 'trusted_source') as trust, \
+                 self.assertRaises(guest.Failure):
+                kwargs = {} if handoff is None else {'handoff_on_success': handoff}
+                host.trial(value, self.directory, self.directory, registration=registration, records=Mock(),
+                           login=Mock(), prepare_private_image=True, **kwargs)
+            trust.assert_not_called()
+            registration.current.assert_not_called()
+
+    def test_cli_preparation_option_is_explicit_default_off_and_requires_handoff(self):
+        value = snapshot()
+        def run(argv):
+            with patch.object(guest, 'regular', return_value=guest.encoded(value)), \
+                 patch.object(host, 'private_directory', return_value=self.directory), \
+                 patch.object(host, 'GcsAccessRecords', return_value=Mock()), \
+                 patch.object(host, 'OwnerRegistration', return_value=Mock()), \
+                 patch.object(host.SelfLogin, 'for_owner', return_value=Mock()), \
+                 patch.object(host, 'trial', return_value=0) as trial:
+                try:
+                    host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', 'output', *argv])
+                except SystemExit as exit_:
+                    return trial, exit_.code
+            return trial, None
+        trial, refused = run(['--prepare-private-image'])
+        trial.assert_not_called()
+        self.assertEqual(refused, 2)
+        trial, refused = run(['--handoff-on-success'])
+        self.assertNotIn('prepare_private_image', trial.call_args.kwargs)
+        trial, refused = run([])
+        self.assertNotIn('prepare_private_image', trial.call_args.kwargs)
+        trial, refused = run(['--handoff-on-success', '--prepare-private-image'])
+        self.assertIsNone(refused)
+        self.assertIs(trial.call_args.kwargs['prepare_private_image'], True)
+        self.assertIs(trial.call_args.kwargs['handoff_on_success'], True)
+
+    def test_exact_partial_preparation_is_reported_partial_owned_and_hands_off(self):
+        code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True)
+        self.assertEqual((code, receipt['code'], receipt['contained']), (0, 0, True))
+        self.assertEqual((receipt['image_preparation'], receipt['success_handoff']), ('partial-owned', 'ready'))
+        self.assertNotIn('captured-cancel', trace)
+        self.assertEqual(trace[-2:], ['master-close', 'removed'])
+        self.assertFalse(any(output.iterdir()), 'staged public files and all local extras must be removed')
+        self.assertTrue(receipt['local_files_absent'] and receipt['own_key_absent'])
+        # Public receipt carries the closed status only, never guest text or counts.
+        for text in ('owned_sealed', 'access-material-provenance', 'removed_count', 'metadata', 'PRIVATE'):
+            self.assertNotIn(text, self.printed_text)
+
+    def test_preparation_runs_only_after_heartbeat_join_on_the_original_master_in_fixed_order(self):
+        code, receipt, trace, _, _, _, _ = self.owner_pipeline(handoff=True, prepare=True)
+        tuples = [e for e in trace if isinstance(e, tuple)]
+        heartbeats = [i for i, e in enumerate(tuples) if e[0] == 'remote' and 'heartbeat' in e[1]]
+        service = tuples.index(('remote', tuple(host.SERVICE_COMMAND), 'persistence'))
+        self.assertTrue(heartbeats and max(heartbeats) < service, 'heartbeat must be stopped before preparation')
+        self.assertEqual(sum(e[0] == 'image-sources' for e in tuples), 1)
+        sources = [i for i, e in enumerate(tuples) if e[0] == 'image-sources']
+        transfer = [i for i, e in enumerate(tuples) if e[0] == 'transfer' and e[1] == tuple(sorted(host.IMAGE_SOURCES))]
+        run = [i for i, e in enumerate(tuples) if e[0] == 'remote' and len(e[1]) > 5 and e[1][5] == host.IMAGE_BOOTSTRAP]
+        self.assertEqual((len(transfer), len(run)), (1, 1))
+        self.assertTrue(service < sources[0] < transfer[0] < run[0])
+        self.assertEqual(tuples[transfer[0]][2], 'persistence')
+        self.assertEqual(tuples[run[0]][2], 'persistence')
+        self.assertEqual(tuples[sources[0]][1], snapshot()['source_sha'])  # captured SHA, not moving main
+        self.assertEqual(trace.count('master-start'), 1)  # no second master or reconnect
+        self.assertEqual(trace.index('master-close'), len(trace) - 2)
+
+    def test_guest_command_binds_lease_boot_source_nonce_and_exact_file_hashes_without_secrets(self):
+        self.owner_pipeline(handoff=True, prepare=True)
+        runs = [args for args, _ in self.remote_inputs if len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP]
+        self.assertEqual(len(runs), 1)
+        args = runs[0]
+        tool, unit = (guest.sha(('PUBLIC-IMAGE-' + n).encode()) for n in ('vlab_image.py', 'labapp-vlab-clone.service'))
+        self.assertEqual(args[:5], ('/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c'))
+        self.assertEqual(args[6:13], ('/tmp/labapp-vlab-image-' + 'd' * 32, 'a' * 40, 'd' * 32,
+                                      snapshot()['request_id'], '22222222-2222-4222-8222-222222222222', tool, unit))
+        self.assertTrue(args[13].isdigit() and 10 <= int(args[13]) <= host.IMAGE_CAP_SECONDS)
+        self.assertEqual(len(args), 14)
+        self.assertEqual([d for a, d in self.remote_inputs if a == args], [None])  # nothing on stdin
+        for text in ('ghp_', 'PUBLIC-NONDEPLOYABLE-PASSWORD', 'oslogin', 'candidate.password', 'known_hosts'):
+            self.assertFalse(any(text in part for part in args))
+
+    def test_ghcr_record_never_reaches_preparation_argv_stdin_or_receipt(self):
+        record = guest.encoded(self.GHCR)
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, ghcr=record)
+        self.assertEqual(receipt['image_preparation'], 'partial-owned')
+        carriers = [(a, d) for a, d in self.remote_inputs if d is not None]
+        self.assertEqual(len(carriers), 1)  # only the original bootstrap stdin carries it
+        self.assertIn(host.BOOTSTRAP, carriers[0][0])
+        canary = self.GHCR['token']
+        self.assertNotIn(canary, repr([a for a, _ in self.remote_inputs if len(a) > 5 and a[5] == host.IMAGE_BOOTSTRAP]))
+        self.assertNotIn(canary, self.printed_text)
+
+    def test_every_non_exact_guest_report_refuses_cancels_and_preserves_core_result(self):
+        inner = PARTIAL_INNER
+        cases = {
+            'code-0-complete': prep_report(code=0),
+            'code-1': prep_report(code=1),
+            'code-4': prep_report(code=4),
+            'code-3-not-sealed': prep_report(inner=dict(inner, owned_sealed=False)),
+            'sealed-string': prep_report(inner=dict(inner, owned_sealed='true')),
+            'sealed-int': prep_report(inner=dict(inner, owned_sealed=1)),
+            'unmet-empty': prep_report(inner=dict(inner, unmet=[])),
+            'unmet-other': prep_report(inner=dict(inner, unmet=['other'])),
+            'unmet-extra': prep_report(inner=dict(inner, unmet=['access-material-provenance', 'other'])),
+            'unmet-string': prep_report(inner=dict(inner, unmet='access-material-provenance')),
+            'inner-extra-field': prep_report(inner=dict(inner, note='free text')),
+            'inner-missing-field': prep_report(inner={k: v for k, v in inner.items() if k != 'removed_count'}),
+            'outer-extra-field': prep_report(extra=1),
+            'access-negative': prep_report(inner=dict(inner, access={'metadata': -1})),
+            'access-bool-count': prep_report(inner=dict(inner, access={'metadata': True})),
+            'access-bad-key': prep_report(inner=dict(inner, access={'Bad Key': 1})),
+            'access-nested': prep_report(inner=dict(inner, access={'metadata': {'x': 1}})),
+            'removed-bool': prep_report(inner=dict(inner, removed_count=True)),
+            'removed-huge': prep_report(inner=dict(inner, removed_count=10**9)),
+            'inner-not-json': prep_report(inner='PRIVATE not json'),
+            'inner-duplicate-key': prep_report(inner='{"owned_sealed":true,"owned_sealed":true,"access":{},'
+                                                      '"unmet":["access-material-provenance"],"removed_count":0}'),
+            'inner-nan': prep_report(inner='{"owned_sealed":true,"access":{},"unmet":["access-material-provenance"],'
+                                          '"removed_count":NaN}'),
+            'empty': b'',
+            'garbage': b'PRIVATE Traceback (most recent call last)\n',
+            'no-newline': prep_report().rstrip(b'\n'),
+            'not-canonical': json.dumps({'schema': 1, 'code': 3, 'stdout': json.dumps(inner) + '\n'}).encode() + b'\n',
+            'string-code': guest.encoded({'schema': 1, 'code': '3', 'stdout': json.dumps(inner)}) + b'\n',
+            'bool-code': guest.encoded({'schema': 1, 'code': True, 'stdout': json.dumps(inner)}) + b'\n',
+            'oversize': b'x' * (host.IMAGE_REPORT_LIMIT + 1),
+        }
+        for name, report in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True,
+                                                                           prep={'report': report})
+                self.assertEqual(receipt['image_preparation'], 'refused')
+                self.assertEqual((receipt['success_handoff'], code), ('refused', 1))
+                self.assertEqual((receipt['code'], receipt['contained']), (0, True))  # core result separate
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertTrue(receipt['independent_cleanup_dispatched'])
+                self.assertFalse(any(output.iterdir()))
+                self.assertNotIn('PRIVATE', self.printed_text)
+                self.assertNotIn('Traceback', self.printed_text)
+
+    def test_preparation_precondition_and_step_failures_refuse_cancel_and_clean_up(self):
+        cases = {
+            'service-active': dict(service=b'ActiveState=active\nResult=success\nExecMainCode=0\nExecMainStatus=0\n'),
+            'service-failed': dict(service=b'ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n'),
+            'service-unparsed': dict(service=b'garbage'),
+            'service-read-error': dict(service_error=RuntimeError('PRIVATE-SERVICE')),
+            'result-changed': dict(result_changed=True),
+            'fetch-error': dict(fetch_error=RuntimeError('PRIVATE-FETCH')),
+            'fetch-guest-failure': dict(fetch_error=guest.Failure('PRIVATE', 1)),
+            'transfer-error': dict(transfer_error=RuntimeError('PRIVATE-COPY')),
+            'run-timeout': dict(run_error=guest.Failure('bounded host child timeout', 124)),
+            'run-error': dict(run_error=RuntimeError('PRIVATE-RUN')),
+            'run-interrupt': dict(run_error=KeyboardInterrupt()),
+            'run-sigterm-failure': dict(run_error=guest.Failure('signal', 143)),
+        }
+        for name, prep in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True, prep=prep)
+                self.assertEqual(receipt['image_preparation'], 'refused')
+                self.assertEqual((receipt['success_handoff'], code), ('refused', 1))
+                self.assertEqual(receipt['code'], 0)
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertEqual(trace[-3:-1], ['master-close', 'removed'])  # normal ordered cleanup still ran
+                self.assertFalse(any(output.iterdir()))
+                self.assertTrue(receipt['local_files_absent'] and receipt['own_key_absent'])
+                self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_insufficient_original_budget_refuses_before_any_fetch_or_stage(self):
+        for remaining in (899.0, 900.0, 1000.0, 1019.0):  # reserve 900 + least usable 120
+            with self.subTest(remaining=remaining):
+                code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, remaining=remaining)
+                self.assertEqual(receipt['image_preparation'], 'refused')
+                self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+                self.assertFalse([e for e in trace if isinstance(e, tuple) and e[0] == 'image-sources'])
+                self.assertFalse(self.image_remotes(trace))
+                self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_exact_minimum_original_budget_still_prepares_and_keeps_the_reserve(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, remaining=1020.0)
+        self.assertEqual((code, receipt['image_preparation'], receipt['success_handoff']), (0, 'partial-owned', 'ready'))
+        seconds = [args for args, _ in self.remote_inputs if len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP][0][13]
+        self.assertLessEqual(int(seconds), 120)  # never reaches into the 15 minute handoff reserve
+
+    def test_preparation_skipped_when_core_result_is_not_a_validated_contained_success(self):
+        cases = {
+            'guest-failure': dict(observed_code=7, observed_contained=False),
+            'uncontained-success': dict(observed_contained=False),
+            'live-heartbeat': dict(heartbeat_alive=True),
+            'interrupted': dict(start_error=KeyboardInterrupt()),
+            'access-refusal': dict(start_error=host.AccessError('PRIVATE-ACCESS')),
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, **extra)
+                self.assertEqual(receipt['image_preparation'], 'skipped')
+                self.assertEqual(receipt['success_handoff'], 'refused')
+                self.assertNotEqual(code, 0)
+                self.assertFalse(self.image_remotes(trace))
+                self.assertFalse([e for e in trace if isinstance(e, tuple) and e[0] == 'image-sources'])
+                self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_primary_failure_code_is_preserved_when_preparation_is_requested(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, observed_code=7, observed_contained=False)
+        self.assertEqual((code, receipt['code']), (7, 7))
+
+    def test_cleanup_uncertainty_during_preparation_is_sticky_and_blocks_handoff_and_key_receipt(self):
+        failure = guest.Failure('PRIVATE-ORPHAN')
+        failure.cleanup_uncertain = True
+        for where in ('run_error', 'fetch_error', 'transfer_error', 'service_error'):
+            with self.subTest(where):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True,
+                                                                           prep={where: failure})
+                self.assertEqual(receipt['image_preparation'], 'refused')
+                self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+                self.assertFalse(receipt['process_absent'])
+                self.assertFalse(receipt['own_key_absent'])
+                self.assertFalse(receipt['local_files_absent'])
+                self.assertNotIn('removed', trace)
+                self.assertTrue(any(output.iterdir()), 'uncertain ownership must not claim files are gone')
+                self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_leftover_foreign_local_file_still_refuses_a_prepared_handoff(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, leftover='unexpected-private-file')
+        self.assertEqual(receipt['image_preparation'], 'partial-owned')
+        self.assertFalse(receipt['local_files_absent'])
+        self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_late_publication_failure_after_preparation_keeps_the_existing_guard(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, print_failure=BrokenPipeError())
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+        self.assertEqual(receipt['image_preparation'], 'partial-owned')  # truthful: guest state was changed
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_accept_preparation_unit_exactness(self):
+        self.assertTrue(host.accept_preparation(prep_report()))
+        self.assertTrue(host.accept_preparation(prep_report(inner={**PARTIAL_INNER, 'access': {}, 'removed_count': 0})))
+        self.assertFalse(host.accept_preparation(None))
+        self.assertFalse(host.accept_preparation('text'))
+        self.assertFalse(host.accept_preparation(prep_report(code=0)))
+
+    # --- public source acquisition: two fixed files at the captured SHA with complete verification ---
+
+    def contents(self, path, raw, **change):
+        import hashlib
+        value = {'type': 'file', 'path': path, 'encoding': 'base64', 'size': len(raw),
+                 'content': base64.encodebytes(raw).decode(),
+                 'sha': hashlib.sha1(b'blob %d\0' % len(raw) + raw).hexdigest()}
+        value.update(change)
+        return value
+
+    def test_image_sources_fetch_only_two_fixed_paths_at_the_captured_sha(self):
+        value = snapshot()
+        value['source_sha'] = 'f' * 40
+        served = {path: ('PUBLIC-' + name).encode() for name, path in host.IMAGE_SOURCES.items()}
+        paths = []
+        def fake(path, limit=host.MAX_JSON):
+            paths.append(path)
+            name, _, ref = path.removeprefix('contents/').partition('?ref=')
+            return self.contents(name, served[name])
+        output = self.directory / 'image-out'
+        output.mkdir(mode=0o700)
+        with patch.object(host, 'github', side_effect=fake):
+            table = host.image_source_files(value, output)
+        self.assertEqual(sorted(paths), sorted('contents/' + p + '?ref=' + 'f' * 40 for p in host.IMAGE_SOURCES.values()))
+        self.assertEqual(set(table), {'vlab_image.py', 'labapp-vlab-clone.service'})
+        for name, path in host.IMAGE_SOURCES.items():
+            self.assertEqual((output / name).read_bytes(), served[path])
+            self.assertEqual(table[name], {'bytes': len(served[path]), 'sha256': guest.sha(served[path])})
+            self.assertEqual(stat.S_IMODE((output / name).stat().st_mode), 0o600)
+        self.assertNotIn('main', ''.join(paths))
+
+    def test_image_source_refuses_wrong_path_type_encoding_size_blob_hash_and_oversize(self):
+        name, path = 'vlab_image.py', host.IMAGE_SOURCES['vlab_image.py']
+        raw = b'PUBLIC-MODULE'
+        bad = {
+            'wrong-path': self.contents('build/provision/other.py', raw),
+            'directory': self.contents(path, raw, type='dir'),
+            'encoding': self.contents(path, raw, encoding='utf-8'),
+            'size-mismatch': self.contents(path, raw, size=len(raw) + 1),
+            'zero-size': self.contents(path, b'', size=0),
+            'size-bool': self.contents(path, raw, size=True),
+            'oversize': self.contents(path, b'x' * (guest.MAX_SOURCE + 1)),
+            'blob-hash-wrong': self.contents(path, raw, sha='0' * 40),
+            'blob-hash-missing': {k: v for k, v in self.contents(path, raw).items() if k != 'sha'},
+            'blob-hash-short': self.contents(path, raw, sha='abc'),
+            'content-not-base64': self.contents(path, raw, content='!!!!'),
+        }
+        for label, value in bad.items():
+            with self.subTest(label), patch.object(host, 'github', return_value=value):
+                output = self.directory / ('o-' + label)
+                output.mkdir(mode=0o700)
+                with self.assertRaises((guest.Failure, ValueError)):
+                    host.image_source_files(snapshot(), output)
+                self.assertFalse((output / name).exists(), 'nothing is staged before full verification')
+
+    def test_image_source_files_are_refused_if_a_staging_name_already_exists(self):
+        output = self.directory / 'preexisting'
+        output.mkdir(mode=0o700)
+        (output / 'vlab_image.py').write_bytes(b'foreign')
+        with patch.object(host, 'github', side_effect=lambda path, limit=0: self.contents(
+                path.removeprefix('contents/').partition('?')[0], b'PUBLIC')):
+            with self.assertRaises(FileExistsError):
+                host.image_source_files(snapshot(), output)
+        self.assertEqual((output / 'vlab_image.py').read_bytes(), b'foreign')
+
+    def test_fixed_owned_cleanup_table_names_both_image_staging_files_and_source_fixes_the_names(self):
+        self.assertEqual(set(host.IMAGE_SOURCES), {'vlab_image.py', 'labapp-vlab-clone.service'})
+        self.assertEqual(set(host.IMAGE_SOURCES.values()),
+                         {'build/provision/vlab_image.py', 'build/provision/labapp-vlab-clone.service'})
+        self.assertFalse(set(host.IMAGE_SOURCES) & guest.FILES)  # never mixes into the core table
+
+    def test_actual_master_transfer_keeps_default_cap_and_only_shortens_with_until(self):
+        master = self.master()
+        with patch.object(host, 'command') as run:
+            master.transfer('/tmp/labapp-vlab-image-' + 'a' * 32, ['vlab_image.py'], 'access')
+            default_seconds = run.call_args.args[1]
+            self.assertLessEqual(default_seconds, 600)
+            master.transfer('/tmp/labapp-vlab-image-' + 'a' * 32, ['vlab_image.py'], 'access',
+                            until=host.owned_process.monotonic() + 30)
+            self.assertLessEqual(run.call_args.args[1], 30)
+        self.assertFalse((master.directory / 'sftp.batch').exists())
+
+
+@unittest.skipIf(os.geteuid() == 0, 'fixtures model the root-owned library as owned by the unprivileged test user')
+@unittest.skipUnless(os.path.exists('/usr/bin/python3'), 'bootstrap child uses the fixed /usr/bin/python3')
+class ImageBootstrap(unittest.TestCase):
+    """Runs the REAL guest bootstrap text against PUBLIC fake module/unit in safe temp fixtures.
+
+    Only the environment-specific trust anchors are rebound: the fixed library path and 'root' uid
+    become a temp directory and the test user; every verification step is the production code.
+    """
+    NONCE = 'c' * 32
+    SOURCE = 'a' * 40
+    LEASE = '11111111-1111-4111-8111-111111111111'
+    BOOT = '22222222-2222-4222-8222-222222222222'
+    MODULE = (b"import json, sys\nimport owned_process\n"
+              b"print(json.dumps({'owned_sealed': True, 'access': {'metadata': 1}, 'unmet': ['access-material-provenance'],"
+              b" 'removed_count': 2}))\nsys.exit(3)\n")
+    UNIT = b'[Unit]\nDescription=PUBLIC fixture\n'
+
+    def setUp(self):
+        import shutil
+        self.base = Path(tempfile.mkdtemp(prefix='image-bootstrap-'))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.base.chmod(0o755)
+        self.lib = self.base / 'lib'
+        self.lib.mkdir(mode=0o755)
+        self.lib.chmod(0o755)
+        self.trusted = self.lib / 'owned_process.py'
+        self.trusted.write_text('MARK = "trusted"\n')
+        self.trusted.chmod(0o644)
+        self.decoy = self.base / 'decoy'
+        self.decoy.mkdir()
+        (self.decoy / 'owned_process.py').write_text('MARK = "decoy"\n')
+        self.incoming = Path('/tmp/labapp-vlab-image-' + self.NONCE)
+        self.assertFalse(self.incoming.exists(), 'stale fixture directory')
+        self.incoming.mkdir(mode=0o700)
+        self.addCleanup(shutil.rmtree, self.incoming, True)
+        self.stage(self.MODULE)
+
+    def stage(self, module, unit=None):
+        for name, raw in (('vlab_image.py', module), ('labapp-vlab-clone.service', self.UNIT if unit is None else unit)):
+            path = self.incoming / name
+            if path.is_symlink() or path.exists():
+                path.unlink()
+            path.write_bytes(raw)
+            path.chmod(0o600)
+
+    def variant(self):
+        text = host.IMAGE_BOOTSTRAP
+        uid = os.geteuid()
+        for old, new in (
+                ("LIB='/usr/local/lib/labapp'", 'LIB=' + repr(str(self.lib))),
+                ("('/','/usr','/usr/local','/usr/local/lib',LIB)", '(LIB,)'),
+                ('s.st_uid==0', 's.st_uid==%d' % uid),
+                ("get(LIB+'/owned_process.py',0)", "get(LIB+'/owned_process.py',%d)" % uid),
+                ("get(LIB+'/'+n,0,0o644)", "get(LIB+'/'+n,%d,0o644)" % uid)):
+            self.assertIn(old, text, 'bootstrap changed shape; update the fixture rebinding')
+            text = text.replace(old, new)
+        return text
+
+    def run_bootstrap(self, *, tool=None, unit=None, nonce=None, incoming=None, seconds='20', code=None):
+        tool = tool or hashlib_sha(self.incoming / 'vlab_image.py')
+        unit = unit or hashlib_sha(self.incoming / 'labapp-vlab-clone.service')
+        argv = [str(incoming or self.incoming), self.SOURCE, nonce or self.NONCE, self.LEASE, self.BOOT, tool, unit, seconds]
+        import subprocess as sp
+        return sp.run([sys.executable, '-I', '-c', code or self.variant(), *argv], cwd=self.decoy, capture_output=True,
+                      env={'PATH': '/usr/bin:/bin', 'PYTHONPATH': str(self.decoy)}, timeout=60)
+
+    def installed(self):
+        return sorted(p.name for p in self.lib.iterdir() if p.name != 'owned_process.py')
+
+    def test_success_installs_exact_root_files_runs_trusted_module_and_reports_real_code(self):
+        done = self.run_bootstrap()
+        self.assertEqual((done.returncode, done.stderr), (0, b''))
+        outer = guest.data(done.stdout)
+        self.assertEqual((outer['schema'], outer['code']), (1, 3))  # real module code, never relabelled
+        self.assertEqual(done.stdout, guest.encoded(outer) + b'\n')
+        self.assertEqual(self.installed(), ['labapp-vlab-clone.service', 'vlab_image.py'])
+        for name, raw in (('vlab_image.py', self.MODULE), ('labapp-vlab-clone.service', self.UNIT)):
+            path = self.lib / name
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+            self.assertEqual(path.stat().st_nlink, 1)
+        self.assertTrue(host.accept_preparation(done.stdout))
+
+    def test_module_imports_owned_process_only_from_the_trusted_library(self):
+        self.stage(b"import sys, owned_process\nprint(owned_process.MARK)\nsys.exit(3)\n")
+        outer = guest.data(self.run_bootstrap().stdout)
+        self.assertEqual(outer['stdout'], 'trusted\n')
+
+    def test_arguments_reach_the_module_with_exact_binding_and_hashes(self):
+        self.stage(b"import json, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(3)\n")
+        done = self.run_bootstrap()
+        argv = json.loads(guest.data(done.stdout)['stdout'])
+        tool, unit = hashlib_sha(self.incoming / 'vlab_image.py'), hashlib_sha(self.incoming / 'labapp-vlab-clone.service')
+        self.assertEqual(argv, ['prepare', '--private-candidate', '--source-sha', self.SOURCE, '--nonce', self.NONCE,
+                                '--lease', self.LEASE, '--build-boot', self.BOOT, '--tool-sha256', tool,
+                                '--unit-sha256', unit])
+
+    def test_nonzero_and_signalled_module_codes_are_reported_not_relabelled(self):
+        for source, expected in ((b'import sys\nsys.exit(5)\n', 5), (b'import sys\nsys.exit(0)\n', 0),
+                                 (b'import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n', 137)):
+            with self.subTest(expected=expected):
+                for name in self.installed():
+                    (self.lib / name).unlink()
+                self.stage(source)
+                outer = guest.data(self.run_bootstrap().stdout)
+                self.assertEqual(outer['code'], expected)
+                self.assertFalse(host.accept_preparation(self.run_bootstrap_output_for(outer)))
+
+    @staticmethod
+    def run_bootstrap_output_for(outer):
+        return guest.encoded(outer) + b'\n'
+
+    def refused(self, done, ran=False):
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, b'')
+        self.assertEqual(done.stderr, b'')
+
+    def test_nothing_is_installed_or_executed_when_any_verification_fails(self):
+        marker = self.base / 'executed'
+        executing = ('open(%r, "w").write("x")\n' % str(marker)).encode()
+        self.stage(executing)
+        def mutate(label):
+            if label == 'hash':
+                return dict(tool='0' * 64)
+            if label == 'unit-hash':
+                return dict(unit='0' * 64)
+            if label == 'nonce-mismatch':
+                return dict(nonce='e' * 32)
+            if label == 'foreign-incoming-path':
+                return dict(incoming=self.base)
+            if label == 'bad-seconds':
+                return dict(seconds='9')
+            return {}
+        for label in ('hash', 'unit-hash', 'nonce-mismatch', 'foreign-incoming-path', 'bad-seconds'):
+            with self.subTest(label):
+                self.refused(self.run_bootstrap(**mutate(label)))
+                self.assertEqual(self.installed(), [])
+                self.assertFalse(marker.exists())
+
+    def test_symlink_hardlink_extra_mode_and_type_defects_in_incoming_are_refused_before_install(self):
+        marker = self.base / 'executed'
+        self.stage(('open(%r, "w").write("x")\n' % str(marker)).encode())
+        target = self.base / 'elsewhere'
+        target.write_bytes(self.UNIT)
+        def symlinked():
+            (self.incoming / 'labapp-vlab-clone.service').unlink()
+            (self.incoming / 'labapp-vlab-clone.service').symlink_to(target)
+        def hardlinked():
+            os.link(self.incoming / 'vlab_image.py', self.base / 'alias')
+        def extra():
+            (self.incoming / 'extra').write_bytes(b'x')
+        def loose_directory():
+            self.incoming.chmod(0o755)
+        def directory_instead():
+            (self.incoming / 'vlab_image.py').unlink()
+            (self.incoming / 'vlab_image.py').mkdir()
+        def oversize():
+            (self.incoming / 'vlab_image.py').write_bytes(b'x' * (262144 + 1))
+        for label, damage in (('symlink', symlinked), ('hardlink', hardlinked), ('extra-entry', extra),
+                              ('loose-mode', loose_directory), ('directory', directory_instead), ('oversize', oversize)):
+            with self.subTest(label):
+                import shutil
+                shutil.rmtree(self.incoming)
+                self.incoming.mkdir(mode=0o700)
+                (self.base / 'alias').unlink(missing_ok=True)
+                self.stage(('open(%r, "w").write("x")\n' % str(marker)).encode())
+                damage()
+                hashes = {}
+                for name in ('vlab_image.py', 'labapp-vlab-clone.service'):
+                    path = self.incoming / name
+                    hashes[name] = hashlib_sha(path) if path.is_file() else '0' * 64
+                self.refused(self.run_bootstrap(tool=hashes['vlab_image.py'], unit=hashes['labapp-vlab-clone.service']))
+                self.assertEqual(self.installed(), [])
+                self.assertFalse(marker.exists())
+
+    def test_foreign_or_preexisting_installation_and_untrusted_library_are_refused(self):
+        for label in ('preexisting-module', 'preexisting-unit', 'preexisting-dangling-symlink', 'no-owned-process',
+                      'group-writable-owned-process', 'owned-process-symlink', 'writable-library'):
+            with self.subTest(label):
+                for entry in list(self.lib.iterdir()):
+                    entry.unlink()
+                self.lib.chmod(0o755)
+                self.trusted.write_text('MARK = "trusted"\n')
+                self.trusted.chmod(0o644)
+                if label == 'preexisting-module':
+                    (self.lib / 'vlab_image.py').write_bytes(b'FOREIGN')
+                elif label == 'preexisting-unit':
+                    (self.lib / 'labapp-vlab-clone.service').write_bytes(b'FOREIGN')
+                elif label == 'preexisting-dangling-symlink':
+                    (self.lib / 'vlab_image.py').symlink_to(self.base / 'nowhere')
+                elif label == 'no-owned-process':
+                    self.trusted.unlink()
+                elif label == 'group-writable-owned-process':
+                    self.trusted.chmod(0o664)
+                elif label == 'owned-process-symlink':
+                    self.trusted.unlink()
+                    self.trusted.symlink_to(self.decoy / 'owned_process.py')
+                else:
+                    self.lib.chmod(0o775)
+                before = {p.name: p.read_bytes() if p.is_file() and not p.is_symlink() else None for p in self.lib.iterdir()}
+                self.refused(self.run_bootstrap())
+                after = {p.name: p.read_bytes() if p.is_file() and not p.is_symlink() else None for p in self.lib.iterdir()}
+                self.assertEqual(before, after)
+        self.lib.chmod(0o755)
+
+    def test_oversize_or_non_ascii_module_output_is_never_reported(self):
+        self.stage(b"import sys\nsys.stdout.write('x' * 5000)\nsys.stdout.flush()\nsys.exit(3)\n")
+        self.refused(self.run_bootstrap())
+        for name in self.installed():
+            (self.lib / name).unlink()
+        self.stage(b"import sys\nsys.stdout.buffer.write(b'\\xff')\nsys.exit(3)\n")
+        done = self.run_bootstrap()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn(b'\xff', done.stdout)
+
+
+def hashlib_sha(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 # --- Issue #365: owned original process-group closure (fake kernel, no native child) ---

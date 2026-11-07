@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -52,6 +53,19 @@ HEARTBEAT_BUDGET_SECONDS = 22.0
 HEARTBEAT_JOIN_SECONDS = 25
 # Opt-in success handoff (#523): the ORIGINAL VM deadline must still be at least this far away.
 HANDOFF_RESERVE_SECONDS = 15 * 60
+# Opt-in private image PREPARATION bridge (#530). Exactly two fixed PUBLIC files from the captured
+# source SHA; no selector, ref, path or name is ever caller/guest supplied. Provisional dependency
+# on the guest module of #526 (PR528); the feature fails closed on any mismatch.
+IMAGE_SOURCES = {'vlab_image.py': 'build/provision/vlab_image.py',
+                 'labapp-vlab-clone.service': 'build/provision/labapp-vlab-clone.service'}
+IMAGE_LIBRARY = '/usr/local/lib/labapp'
+IMAGE_PARTIAL_CODE = 3          # real guest code: owned_sealed with ONE unmet category (not a full seal)
+IMAGE_UNMET = ['access-material-provenance']
+IMAGE_MIN_SECONDS = 120         # least usable budget before the 15 minute handoff reserve
+IMAGE_CAP_SECONDS = 900         # total ceiling for source check, fetch, stage and guest run
+IMAGE_REPORT_LIMIT = 4096
+IMAGE_STDOUT_LIMIT = 2048
+IMAGE_COUNT_LIMIT = 10**6
 SAFE_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
@@ -279,14 +293,36 @@ class OwnerRegistration:
                  self_user=self.snapshot['self_user'], public_key_text=public_key, expected_trial=self.expected)
 
 
+def public_source(snapshot, path, *, blob=False):
+    """One fixed PUBLIC file at the captured source SHA (never moving main). Bounded, exact length.
+
+    ``blob`` additionally verifies the complete git blob SHA-1 reported by GitHub against the bytes.
+    """
+    value = github('contents/' + path + '?ref=' + snapshot['source_sha'], 512 * 1024)
+    guest.require(value.get('type') == 'file' and value.get('path') == path and value.get('encoding') == 'base64'
+                  and type(value.get('size')) is int and 0 < value['size'] <= guest.MAX_SOURCE)
+    raw = base64.b64decode(value['content'].replace('\n', ''), validate=True)
+    guest.require(len(raw) == value['size'])
+    if blob:
+        guest.require(type(value.get('sha')) is str and re.fullmatch('[a-f0-9]{40}', value['sha'])
+                      and hashlib.sha1(b'blob %d\0' % len(raw) + raw).hexdigest() == value['sha'])
+    return raw
+
+
 def source_files(snapshot, output):
     result = {}
     for name, path in guest.SOURCES.items():
-        value = github('contents/' + path + '?ref=' + snapshot['source_sha'], 512 * 1024)
-        guest.require(value.get('type') == 'file' and value.get('path') == path and value.get('encoding') == 'base64'
-                      and type(value.get('size')) is int and 0 < value['size'] <= guest.MAX_SOURCE)
-        raw = base64.b64decode(value['content'].replace('\n', ''), validate=True)
-        guest.require(len(raw) == value['size'])
+        raw = public_source(snapshot, path)
+        guest.exclusive(output / name, raw)
+        result[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
+    return result
+
+
+def image_source_files(snapshot, output):
+    """The TWO fixed public image-preparation files -> owner-private staging files + byte table."""
+    result = {}
+    for name, path in IMAGE_SOURCES.items():
+        raw = public_source(snapshot, path, blob=True)
         guest.exclusive(output / name, raw)
         result[name] = {'bytes': len(raw), 'sha256': guest.sha(raw)}
     return result
@@ -407,8 +443,12 @@ class Master:
         self.check(until)
         return raw
 
-    def transfer(self, incoming, names, phase='stage'):
-        until = owned_process.monotonic() + self.clock.remaining(phase)
+    def transfer(self, incoming, names, phase='stage', until=None):
+        # ``until`` (absolute monotonic) can only SHORTEN the phase window; it never renews it.
+        # Without it the original window and 600s cap are exactly as before.
+        phase_end = owned_process.monotonic() + self.clock.remaining(phase)
+        bounded = until is not None
+        until = phase_end if until is None else min(until, phase_end)
         self.check(until)
         batch = self.directory / 'sftp.batch'
         lines = [f'put {shlex.quote(str(self.directory / name))} {incoming}/{name}' for name in names]
@@ -416,7 +456,8 @@ class Master:
         try:
             command(['/usr/bin/sftp', '-b', str(batch), *self.options,
                      '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false', self.target],
-                     min(600, self.clock.remaining(phase)), failed=self.failed, until=until)
+                     self.slice(min(600, self.clock.remaining(phase)), until) if bounded
+                     else min(600, self.clock.remaining(phase)), failed=self.failed, until=until)
             self.check(until)
         finally:
             primary = sys.exc_info()[1]
@@ -705,6 +746,183 @@ def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, proc
         return 'unavailable'
 
 
+# Child (root) that runs the installed, hash-verified guest module as __main__. ``-I`` removes
+# script/cwd/user-site/PYTHONPATH; the trusted library directory is then put FIRST so the module's
+# top-level ``import owned_process`` can only resolve to the installed trusted copy.
+IMAGE_RUNNER = """import hashlib,os,stat,sys
+lib,tool=sys.argv[1],sys.argv[2]
+p=lib+'/vlab_image.py'
+f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+s=os.fstat(f)
+if not(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o644 and 0<s.st_size<=262144): sys.exit(2)
+b=os.read(f,262145); os.close(f)
+if len(b)!=s.st_size or hashlib.sha256(b).hexdigest()!=tool: sys.exit(2)
+sys.path.insert(0,lib)
+sys.argv=[p]+sys.argv[3:]
+exec(compile(b,p,'exec'),{'__name__':'__main__','__file__':p})
+"""
+
+# Root bootstrap for the two fixed public files. Everything is verified BEFORE any byte is executed:
+# trusted root ancestry, exact incoming set, regular/single-link/owner/size/SHA-256 of both files, the
+# trusted installed owned_process, and the absence of any preexisting target. Then exclusive 0644
+# root files, re-verification, and one bounded run. The wrapper exits 0 whenever the module ran, and
+# reports the REAL module exit code in a closed record; it never relabels a code. Any pre-run refusal
+# exits 2 with no report. argv: incoming source nonce lease boot tool-sha unit-sha seconds.
+IMAGE_BOOTSTRAP = """import hashlib,json,os,re,select,signal,stat,subprocess,sys,time
+LIB=%(lib)r
+NAMES=('vlab_image.py','labapp-vlab-clone.service')
+RUNNER=%(runner)r
+sys.excepthook=lambda *a: os._exit(2)
+def need(c):
+    if not c: sys.exit(2)
+def tdir(q):
+    s=os.lstat(q)
+    need(stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022)
+def get(path,uid,mode=None):
+    f=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        s=os.fstat(f)
+        need(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==uid and 0<s.st_size<=262144)
+        need(not s.st_mode&0o022 if mode is None else stat.S_IMODE(s.st_mode)==mode)
+        b=b''
+        while len(b)<=s.st_size:
+            c=os.read(f,65536)
+            if not c: break
+            b+=c
+    finally:
+        os.close(f)
+    need(len(b)==s.st_size)
+    return b
+a=sys.argv[1:]
+need(len(a)==8)
+inc,src,nonce,lease,boot,tool,unit,secs=a
+H=lambda v,n: re.fullmatch('[0-9a-f]{%%d}'%%n,v) is not None
+U=lambda v: re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}',v) is not None
+need(H(src,40) and H(nonce,32) and U(lease) and U(boot) and H(tool,64) and H(unit,64) and re.fullmatch('[0-9]{2,3}',secs))
+secs=int(secs); need(10<=secs<=900)
+need(inc=='/tmp/labapp-vlab-image-'+nonce)
+for q in ('/','/usr','/usr/local','/usr/local/lib',LIB): tdir(q)
+s=os.lstat(inc)
+need(stat.S_ISDIR(s.st_mode) and stat.S_IMODE(s.st_mode)==0o700 and s.st_uid!=0)
+need(sorted(os.listdir(inc))==sorted(NAMES))
+want={'vlab_image.py':tool,'labapp-vlab-clone.service':unit}
+body={n:get(inc+'/'+n,s.st_uid,None) for n in NAMES}
+need(all(hashlib.sha256(body[n]).hexdigest()==want[n] for n in NAMES))
+get(LIB+'/owned_process.py',0)
+for n in NAMES: need(not os.path.lexists(LIB+'/'+n))
+for n in NAMES:
+    fd=os.open(LIB+'/'+n,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644)
+    try:
+        os.fchmod(fd,0o644)
+        need(os.write(fd,body[n])==len(body[n]))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+for n in NAMES: need(get(LIB+'/'+n,0,0o644)==body[n])
+cmd=['/usr/bin/python3','-I','-c',RUNNER,LIB,tool,'prepare','--private-candidate','--source-sha',src,'--nonce',nonce,
+     '--lease',lease,'--build-boot',boot,'--tool-sha256',tool,'--unit-sha256',unit]
+env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','HOME':'/root'}
+p=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+                   start_new_session=True,env=env,cwd='/')
+end=time.monotonic()+secs; out=b''
+def kill():
+    os.killpg(p.pid,signal.SIGKILL); p.wait(); sys.exit(2)
+while True:
+    left=end-time.monotonic()
+    if left<=0 or len(out)>%(limit)d: kill()
+    r=select.select([p.stdout],[],[],min(left,1))[0]
+    if r:
+        c=os.read(p.stdout.fileno(),4096)
+        if not c: break
+        out+=c
+try:
+    rc=p.wait(timeout=max(1,end-time.monotonic()))
+except subprocess.TimeoutExpired:
+    kill()
+code=rc if rc>=0 else 128-rc
+if len(out)>%(limit)d: sys.exit(2)
+print(json.dumps({'schema':1,'code':code,'stdout':out.decode('ascii')},sort_keys=True,separators=(',',':')),flush=True)
+sys.exit(0)
+""" % {'lib': IMAGE_LIBRARY, 'runner': IMAGE_RUNNER, 'limit': IMAGE_STDOUT_LIMIT}
+
+
+def image_command(incoming, source_sha, nonce, lease, boot, tool, unit, seconds):
+    return ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', IMAGE_BOOTSTRAP, incoming, source_sha,
+            nonce, lease, boot, tool, unit, str(seconds)]
+
+
+def accept_preparation(raw):
+    """True ONLY for the exact partial-preparation report; nothing from it is ever relayed.
+
+    Wrapper record is canonical ``{"code","schema","stdout"}`` with the REAL module code 3; the inner
+    module report must be exactly ``owned_sealed`` true, ``unmet`` exactly the one expected category,
+    a closed metadata-count map and a bounded removed count. Every other shape, code or extra field is
+    refused (so a full seal, a different gap, or an evolved report is NOT accepted by this bridge).
+    """
+    try:
+        guest.require(type(raw) is bytes and 0 < len(raw) <= IMAGE_REPORT_LIMIT and raw.endswith(b'\n'))
+        body = raw[:-1]
+        outer = guest.data(body)
+        guest.require(type(outer) is dict and body == guest.encoded(outer)
+                      and set(outer) == {'schema', 'code', 'stdout'})
+        guest.require(type(outer['schema']) is int and outer['schema'] == 1
+                      and type(outer['code']) is int and outer['code'] == IMAGE_PARTIAL_CODE
+                      and type(outer['stdout']) is str and 0 < len(outer['stdout']) <= IMAGE_STDOUT_LIMIT)
+        inner = guest.data(outer['stdout'].encode('ascii'))
+        guest.require(type(inner) is dict and set(inner) == {'owned_sealed', 'access', 'unmet', 'removed_count'}
+                      and inner['owned_sealed'] is True and inner['unmet'] == IMAGE_UNMET
+                      and type(inner['unmet']) is list)
+        access = inner['access']
+        guest.require(type(access) is dict and len(access) <= 16
+                      and all(type(k) is str and re.fullmatch('[a-z][a-z0-9_-]{0,47}', k)
+                              and type(v) is int and 0 <= v <= IMAGE_COUNT_LIMIT for k, v in access.items()))
+        guest.require(type(inner['removed_count']) is int and 0 <= inner['removed_count'] <= IMAGE_COUNT_LIMIT)
+        return True
+    except BaseException:
+        return False
+
+
+def prepare_image(master, clock, snapshot, nonce, boot, registration, output, process_uncertain):
+    """Opt-in guest PRIVATE image preparation on the ORIGINAL master -> closed status.
+
+    Caller guarantees: validated full-core terminal success, heartbeat joined, no stop issued.
+    The ORIGINAL cutoffs apply: work window ``persistence`` and a retained 15 minute handoff reserve
+    on the immutable cleanup deadline. No reconnect, key, renewal or additional permission.
+    """
+    left = min(clock.remaining('persistence'), clock.cleanup_remaining() - HANDOFF_RESERVE_SECONDS)
+    guest.require(left >= IMAGE_MIN_SECONDS, 'image preparation budget insufficient')
+    until = owned_process.monotonic() + min(left, IMAGE_CAP_SECONDS)
+
+    def room(minimum):
+        guest.require(until - owned_process.monotonic() >= minimum, 'image preparation budget insufficient')
+
+    # Positive inactive/successful ORIGINAL guardian and the unchanged genuine result, both read again
+    # after the heartbeat was joined. Deleting trial state before this would be a false failure.
+    service = service_observation(master.remote(SERVICE_COMMAND, 'persistence', cap=8, limit=1024, until=until))
+    guest.require(service is not None and service['active_state'] == 'inactive' and service['result'] == 'success',
+                  'guest guardian not positively inactive')
+    state, record = guest_result(master.remote(RESULT_COMMAND, 'persistence', cap=8, limit=RESULT_READ_LIMIT, until=until),
+                                 nonce)
+    guest.require(state == 'valid' and record['code'] == 0 and record['contained'] is True
+                  and record['diagnostic'] == guest.SUCCESS, 'guest result changed')
+    room(IMAGE_MIN_SECONDS // 2)
+    registration.current()
+    trusted_source(snapshot)
+    table = image_source_files(snapshot, output)
+    room(IMAGE_MIN_SECONDS // 2)
+    incoming = '/tmp/labapp-vlab-image-' + nonce
+    master.remote(['/usr/bin/mkdir', '-m', '0700', incoming], 'persistence', cap=8, until=until)
+    master.transfer(incoming, sorted(IMAGE_SOURCES), 'persistence', until=until)
+    room(60)
+    seconds = int(min(900, max(10, until - owned_process.monotonic() - 10)))
+    raw = master.remote(image_command(incoming, snapshot['source_sha'], nonce, snapshot['request_id'], boot,
+                                      table['vlab_image.py']['sha256'], table['labapp-vlab-clone.service']['sha256'],
+                                      seconds),
+                        'persistence', cap=seconds + 10, until=until, limit=IMAGE_REPORT_LIMIT + 1)
+    guest.require(owned_process.monotonic() <= until and accept_preparation(raw), 'image preparation refused')
+    return 'partial-owned'
+
+
 def cleanup_dispatch(snapshot):
     # Cancel ONLY this captured trusted creator. Its completed workflow_run is
     # checked against the lease by the independent cleanup workflow. The API
@@ -733,8 +951,10 @@ HOST_OPERATIONS = frozenset({
 
 
 def trial(snapshot, payloads, output, *, registration, records, login, private=None, ghcr=None,
-          handoff_on_success=False):
+          handoff_on_success=False, prepare_private_image=False):
     expected_snapshot(snapshot)
+    # Opt-in guest preparation only exists as part of an explicit success handoff; refuse BEFORE any work.
+    guest.require(not prepare_private_image or handoff_on_success is True, 'image preparation requires handoff')
     rec = dict(snapshot, names=spec.names(snapshot['run_id'], snapshot['attempt'], spec.UBUNTU_VLAB_CORE))
     nonce = secrets.token_hex(16)
     initial = {'schema': 1, 'nonce': nonce, 'lease': rec['request_id'], 'epoch': rec['epoch'],
@@ -754,6 +974,8 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
     export_mode = 'fresh'  # frozen from the primary validated terminal result only
     export_installer_terminal = None
     handoff = None  # None unless requested; then only the fixed 'ready' or 'refused'
+    # Closed, requested-only: 'skipped' (no validated success to prepare), 'refused', 'partial-owned'.
+    image_preparation = 'skipped' if prepare_private_image else None
     clock = None
     try:
         clock = guest.Clock(initial)
@@ -970,6 +1192,22 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 except BaseException as error:
                     if getattr(error, 'cleanup_uncertain', False):
                         process_uncertain.set()
+            if (prepare_private_image and heartbeat_absent and not failed.is_set() and not process_uncertain.is_set()
+                    and result == 0 and contained and failure_category == 'none' and phase == 'guest-result'
+                    and guest_status == 'valid' and guest_detail == guest.SUCCESS
+                    and clock is not None and initial['boot_uuid'] != ZERO_BOOT):
+                # Only after the heartbeat was joined (above) and before the original master closes; the
+                # primary core result/contained stay as validated. Any failure, interruption or
+                # uncertainty refuses (the swallowed exception is never relayed) and the handoff below
+                # then cancels the captured creator and exits nonzero.
+                image_preparation = 'refused'
+                try:
+                    image_preparation = prepare_image(master, clock, snapshot, nonce, initial['boot_uuid'],
+                                                      registration, output, process_uncertain)
+                except BaseException as error:
+                    image_preparation = 'refused'
+                    if getattr(error, 'cleanup_uncertain', False):
+                        process_uncertain.set()
             if private is not None and result != 0 and heartbeat_absent and initial['boot_uuid'] != ZERO_BOOT:
                 # After the joined heartbeat and the fixed stop, before the original master
                 # closes: no reconnect, reauthentication or retry. Diagnostic only; it
@@ -986,7 +1224,8 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         # Fixed owned table only. Verify no unexpected local file before delete;
         # socket may survive master exit but its original inode is bound above.
         owned = {*guest.FILES, 'manifest.json', 'oslogin', 'oslogin.pub', 'candidate', 'candidate.pub',
-                 'candidate.password', 'known_hosts', 'marker', 'sftp.batch', 'master.sock'}
+                 'candidate.password', 'known_hosts', 'marker', 'sftp.batch', 'master.sock',
+                 *IMAGE_SOURCES}
         local_absent = process_absent
         for name in (owned if process_absent else ()):
             path = output / name
@@ -1026,6 +1265,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                     if (result == 0 and contained and failure_category == 'none' and phase == 'guest-result'
                             and guest_status == 'valid' and not failed.is_set()
                             and process_absent and local_absent and key_absent and clock is not None
+                            and (not prepare_private_image or image_preparation == 'partial-owned')
                             and clock.cleanup_remaining() >= HANDOFF_RESERVE_SECONDS):
                         handoff = 'ready'
                 except BaseException:
@@ -1048,6 +1288,9 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
             if handoff is not None:
                 # Requested handoff only. Not capture, sealing, quiescence, image acceptance or readiness.
                 receipt['success_handoff'] = handoff
+            if image_preparation is not None:
+                # Requested only. Partial owned preparation: NOT a full seal, capture clearance or readiness.
+                receipt['image_preparation'] = image_preparation
             # Publicly safe fixed statuses only; cloud deletion/FREE still require
             # independent immutable404/terminal-operation/access-archive receipts.
             print(json.dumps(receipt, sort_keys=True), **({'flush': True} if handoff == 'ready' else {}))
@@ -1068,7 +1311,9 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 # Best-effort minimal closed receipt; failure here is swallowed (exit stays nonzero).
                 print(json.dumps({'schema': 1, 'code': result, 'lease': rec['request_id'],
                                   'success_handoff': 'refused',
-                                  'independent_cleanup_dispatched': dispatched}, sort_keys=True))
+                                  'independent_cleanup_dispatched': dispatched,
+                                  **({} if image_preparation is None else {'image_preparation': image_preparation})},
+                                 sort_keys=True))
             except BaseException:
                 pass
     if handoff == 'refused':
@@ -1090,7 +1335,12 @@ def main(argv=None):
     # Owner-only, default off: on validated success plus positive cleanup and >=15 minutes left before
     # the ORIGINAL deadline, skip creator cancellation. The lead owns stop/sanitize/capture/disposal.
     parser.add_argument('--handoff-on-success', action='store_true')
+    # Owner-only, default off, REQUIRES --handoff-on-success (#530): after a validated full-core success
+    # prepare PRIVATE image state on the original SSH master. Partial only; never a seal or capture.
+    parser.add_argument('--prepare-private-image', action='store_true')
     args = parser.parse_args(argv)
+    if args.prepare_private_image and not args.handoff_on_success:
+        parser.error('--prepare-private-image requires --handoff-on-success')
     os.umask(0o077)
     snapshot = guest.data(guest.regular(args.snapshot, MAX_JSON, os.geteuid()))
     output = private_directory(args.output)
@@ -1111,7 +1361,8 @@ def main(argv=None):
                      PolicyCloud(ComputeRestTransport(token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
-                 private=private, ghcr=ghcr, handoff_on_success=args.handoff_on_success)
+                 private=private, ghcr=ghcr, handoff_on_success=args.handoff_on_success,
+                 **({'prepare_private_image': True} if args.prepare_private_image else {}))
 
 
 if __name__ == '__main__':
