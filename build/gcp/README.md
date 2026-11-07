@@ -1605,7 +1605,16 @@ Order, all through the original master:
    cancel the group gets TERM, a bounded grace, then KILL. There is ONE wrapper budget (`secs`, at most
    900 s) that includes an 8 s closure reserve; nothing is renewed or extended. Wrapper exit codes:
    `0` record printed after positive group absence; `2` refused before the module started; `3` started,
-   group positively closed, no record; `4` started but closure not positively established.
+   group positively closed, no record; `4` started but closure not positively established. Both the
+   wrapper's and the child's `owned_process` module objects get `__file__` set to the validated installed
+   absolute path before their bytes execute, because the real guest module reads and hashes
+   `owned_process.__file__` against the installed core copy (never imported from incoming/cwd/PYTHONPATH;
+   byte/owner/hash checks unchanged). A stop flag or the original TOTAL cutoff observed after closure
+   yields exit `3` (no record); nothing is claimed after the wrapper returns, for escaped sessions or
+   hard kill. Positive group absence (ESRCH) is deliberately not weakened: a zombie is not absence, so
+   a venue without an orphan reaper (a bare container PID 1) can report exit `4` for a lingering
+   descendant. A real VM's init reaps orphans; host tests that exercise the lingering-descendant
+   control must run the container with `--init`. That is a venue qualification, not a source change.
 
 Only exact code `3` with `owned_sealed: true`, `unmet` exactly `["access-material-provenance"]`,
 `access` EXACTLY `{status: "unproven", key_files, other_home_dirs, symlinked_homes, oslogin_caches,

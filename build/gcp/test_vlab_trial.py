@@ -887,7 +887,7 @@ class OwnerTrial(unittest.TestCase):
 
     @staticmethod
     def image_remotes(trace):
-        return [e for e in trace if isinstance(e, tuple) and e[0] == 'remote' and len(e[1]) > 5
+        return [e for e in trace if isinstance(e, tuple) and e[0] == 'remote' and len(e[1]) > 6
                 and e[1][6] == host.IMAGE_BOOTSTRAP]
 
     def test_default_and_handoff_only_runs_never_touch_image_preparation(self):
@@ -1663,6 +1663,38 @@ class ImageBootstrap(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.lib.iterdir()),
                          ['labapp-vlab-clone.service', 'owned_process.py', 'vlab_image.py'])
         self.assertFalse(list(self.base.rglob('__pycache__')))
+
+    def test_imported_closure_module_has_the_validated_installed_file_and_matching_bytes(self):
+        """Actual #526 prepare reads ``owned_process.__file__`` and hashes it against the installed core copy.
+
+        Authored UNRUN. The fixture performs that same read+hash and records the result for the assertion.
+        """
+        out = self.base / 'filecheck'
+        self.stage(("import hashlib, os, sys, owned_process\n"
+                    "p = getattr(owned_process, '__file__', None)\n"
+                    "ok = p == %r and hashlib.sha256(open(p, 'rb').read()).hexdigest() == %r\n"
+                    "open(%r, 'w').write('ok' if ok else 'bad:%%r' %% (p,))\n"
+                    "sys.exit(3)\n") % (str(self.trusted), hashlib_sha(self.trusted), str(out)))
+        done = self.run_bootstrap()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(guest.data(done.stdout)['code'], 3)
+        self.assertEqual(out.read_text(), 'ok')
+
+    def test_stop_arriving_during_closure_is_not_reported_as_an_accepted_preparation(self):
+        """A cancellation that lands while the group is being closed must publish no record (exit 3)."""
+        trusted = self.TRUSTED_SOURCE + (
+            "\n_close = OwnedGroup.close\n"
+            "def _late(self, *a, **k):\n"
+            "    import os, signal\n"
+            "    r = _close(self, *a, **k)\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    return r\n"
+            "OwnedGroup.close = _late\n")
+        self.trusted.write_text(trusted)
+        # The child runner verifies the closure hash it was given, so it sees the same patched bytes.
+        done = self.run_bootstrap()
+        self.assertEqual((done.returncode, done.stdout), (3, b''))
+        self.assertFalse(host.accept_preparation(done.stdout))
 
     def test_child_runner_requires_the_exact_trusted_closure_bytes(self):
         """The child exits 2 before executing anything if owned_process differs from the hash the parent saw."""

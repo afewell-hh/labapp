@@ -767,6 +767,7 @@ ob=rd(lib+'/owned_process.py',osha,0)
 p=lib+'/vlab_image.py'
 b=rd(p,tool,0o644)
 m=types.ModuleType('owned_process')
+m.__file__=lib+'/owned_process.py'
 exec(compile(ob,lib+'/owned_process.py','exec',dont_inherit=True),m.__dict__)
 sys.modules['owned_process']=m
 sys.path.insert(0,lib)
@@ -836,6 +837,7 @@ need(all(hashlib.sha256(body[n]).hexdigest()==want[n] for n in NAMES))
 ob=get(LIB+'/owned_process.py',0)
 osha=hashlib.sha256(ob).hexdigest()
 op=types.ModuleType('owned_process')
+op.__file__=LIB+'/owned_process.py'
 exec(compile(ob,LIB+'/owned_process.py','exec',dont_inherit=True),op.__dict__)
 for n in NAMES: need(not os.path.lexists(LIB+'/'+n))
 for n in NAMES:
@@ -887,7 +889,7 @@ try:
 except BaseException:
     closed=False
 if not closed or time.monotonic()>TOTAL: sys.exit(4)
-if why is not None or rc is None: sys.exit(3)
+if why is not None or rc is None or STOP: sys.exit(3)
 try:
     text=out.decode('ascii')
 except BaseException:
