@@ -6,6 +6,10 @@ Wants=network-online.target
 # or stops the resume unit (that would wait on this unit's own stop job: deadlock). No dependency
 # pulls the resume unit in: start is delegated to the core, the only starter of that unit.
 After=network-online.target hhfab-vlab-resume.service
+# A standalone stop request for this unit (not only OS shutdown) stops the resume unit in the
+# SAME stop transaction, after ExecStop, instead of leaving the backend running. Stop only: this
+# is not a start or restart dependency, so nothing here can start the backend.
+PropagatesStopTo=hhfab-vlab-resume.service
 
 [Service]
 Type=oneshot
@@ -18,10 +22,14 @@ UnsetEnvironment=SSH_AUTH_SOCK PYTHONPATH PYTHONHOME HHFAB_LOG_LEVEL
 ExecStart=/usr/bin/python3 /usr/local/lib/labapp/vlab_image.py clone-start
 ExecStop=/usr/bin/python3 /usr/local/lib/labapp/vlab_image.py clone-stop
 TimeoutStartSec=1200
-TimeoutStopSec=60
-# Helper and core CLI descendants belong to this unit's cgroup and are killed with it.
+# Covers a cancelled start's cleanup (core SIGTERM grace, then the core's own bounded stop and the
+# offline proof) before systemd escalates to SIGKILL.
+TimeoutStopSec=240
+# mixed: systemd's SIGTERM reaches ONLY the helper (so its cancel cleanup can run the core's
+# serialized stop without the core CLI itself being terminated); the final SIGKILL still removes
+# any remaining helper/core descendants of this unit's cgroup.
 # QEMU/hhfab run in hhfab-vlab-resume.service's own cgroup, never in this unit's.
-KillMode=control-group
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

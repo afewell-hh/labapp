@@ -9,8 +9,10 @@ dependency), root only. Four fixed actions:
   verify       read-only report of the sealed postconditions.
   clone-start  run by labapp-vlab-clone.service on a NEW boot; delegates to the unchanged
                ``vlab_core.py start-resume`` (fresh operation, deadline and boot binding).
-  clone-stop   run by the clone unit's ExecStop at shutdown; records the core's own owned-stop
-               intent and returns. It never waits on or stops the resume unit.
+  clone-stop   run by the clone unit's ExecStop (standalone stop and OS shutdown); records the
+               core's own owned-stop intent for the sealed, checkpointed activation and returns.
+               It never waits on or stops the resume unit: the unit's PropagatesStopTo= stops it
+               in the same transaction. Activation failure/cancel is cleaned up by clone-start.
 
 It never stops or captures a VM, never calls a cloud API, never runs ``init``, never touches
 /home/ubuntu/hhfab or its cache (the preserved lab state) and never deletes a file it cannot
@@ -35,6 +37,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -124,13 +127,18 @@ UNMET_ACCESS = 'access-material-provenance'
 
 RECEIPT_FIELDS = {'schema', 'state', 'nonce', 'lease', 'source_sha', 'tool_sha256', 'unit_sha256',
                   'build_boot', 'sealed_at', 'core_operation', 'core_invocation',
-                  'trial_unit_sha256', 'evidence', 'removed', 'access', 'unmet', 'owned_sealed'}
+                  'trial_unit_sha256', 'evidence', 'removed', 'access', 'unmet', 'owned_sealed',
+                  'monotonic_deadline'}
 HEX32, HEX40, HEX64 = '[0-9a-f]{32}', '[0-9a-f]{40}', '[0-9a-f]{64}'
 UUID = '[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}'
 
 
 class Refused(Exception):
     """Fixed nonsecret refusal."""
+
+
+class Cancelled(BaseException):
+    """A handled SIGTERM/SIGINT during clone-start. BaseException so no ``except Exception`` hides it."""
 
 
 def require(ok, message='image preparation refused'):
@@ -492,26 +500,44 @@ def remove_trial(files, cache, alive):
     os.rmdir(TRIAL)  # fails if anything foreign appeared meanwhile; nothing else is touched
 
 
-def remove_trial_unit(expected_sha):
-    """Remove the installed trial unit and, independently, the exact volatile drop-in."""
+def remove_trial_unit(expected_sha, alive):
+    """Remove the installed trial unit and, independently, the exact volatile drop-in.
+
+    ``alive`` (the ORIGINAL deadline, wall AND monotonic) is checked before every single mutation.
+    """
     path = UNITS / TRIAL_UNIT
     if os.path.lexists(path):
         no_links(path)
         require(sha(private_file(path, MAX_FILE, 0o644)) == expected_sha,
                 'trial unit is not the installed copy')
+        alive()
         path.unlink()
     bound = dropin_file()  # checked even when the unit is already gone (interrupted earlier run)
     if bound is not None:
+        alive()
         bound.unlink()
+    if os.path.lexists(RUNTIME_DROPIN):  # incl. the empty directory left by an interruption after the unlink
+        alive()
         RUNTIME_DROPIN.rmdir()
 
 
 def dropin_file():
-    """The bootstrap's exact volatile RuntimeMaxSec drop-in, or None; anything else refuses."""
+    """The bootstrap's exact volatile RuntimeMaxSec drop-in, or None; anything else refuses.
+
+    An EMPTY directory is the positively attributable remainder of an interrupted removal of that
+    exact file (fixed name, root-owned, not world writable; the mode itself is systemd's): it is accepted so a retry can
+    finish with ``rmdir``. Any other content refuses and is preserved.
+    """
     if not os.path.lexists(RUNTIME_DROPIN):
         return None
     no_links(RUNTIME_DROPIN)
-    require(sorted(p.name for p in RUNTIME_DROPIN.iterdir()) == ['10-bound.conf'], 'foreign runtime drop-in')
+    info = RUNTIME_DROPIN.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == OWNER and not info.st_mode & 0o002,
+            'foreign runtime drop-in')
+    names = sorted(p.name for p in RUNTIME_DROPIN.iterdir())
+    if not names:
+        return None
+    require(names == ['10-bound.conf'], 'foreign runtime drop-in')
     bound = RUNTIME_DROPIN / '10-bound.conf'
     require(owned_regular(bound.lstat()) and DROPIN_BODY.fullmatch(bound.read_bytes()),
             'foreign runtime drop-in')
@@ -528,19 +554,44 @@ def install_conflict(target, raw):
 
 
 def install_exact(target, raw, mode):
-    """Create exactly these bytes or accept identical existing bytes; never overwrite."""
+    """Publish exactly these bytes atomically or accept identical existing bytes; never overwrite.
+
+    The bytes go to the fixed sibling ``<target>.installing`` (O_EXCL, final mode, fsynced) and only
+    a complete file is renamed onto the final path, so an interruption can leave a partial
+    TEMPORARY (our fixed name, owned single-link regular file, removed on retry) but never partial
+    final bytes. The final path was just proven absent and its parent is root-only.
+    """
     if install_conflict(target, raw):
         return
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
-    os.fchmod(fd, mode)
+    temporary = Path(str(target) + '.installing')
+    no_links(temporary)
+    if os.path.lexists(temporary):  # an interrupted earlier write of OURS; anything else refuses
+        require(owned_regular(temporary.lstat()), 'foreign temporary file')
+        temporary.unlink()
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     with os.fdopen(fd, 'wb') as stream:
+        os.fchmod(stream.fileno(), mode)
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
+    require(not os.path.lexists(target), 'installation conflict')
+    os.rename(temporary, target)
 
 
-def owned_absent():
-    """Checkable postconditions for the trial-owned portion."""
+def unit_pin(receipt):
+    """The ACTUAL installed clone unit and tool bytes (not systemd's loaded view) equal the seal.
+
+    Owner, exact 0644 mode, single link and no-follow parents are enforced by ``private_file``,
+    so an edited-and-daemon-reloaded unit, a relinked file or a changed tool all refuse.
+    """
+    require(sha(private_file(UNITS / CLONE_UNIT, 4096, 0o644)) == receipt['unit_sha256'],
+            'installed clone unit differs from the sealed pin')
+    require(sha(private_file(LIB / 'vlab_image.py', MAX_FILE, 0o644)) == receipt['tool_sha256'],
+            'installed tool differs from the sealed pin')
+
+
+def owned_absent(receipt):
+    """Checkable postconditions for the trial-owned portion, bound to the sealed unit/tool pins."""
     require(not os.path.lexists(TRIAL) and not os.path.lexists(UNITS / TRIAL_UNIT)
             and not os.path.lexists(RUNTIME_DROPIN), 'trial state remains')
     credentials_absent()
@@ -552,6 +603,7 @@ def owned_absent():
     fields = unit_fields(CLONE_UNIT, 'FragmentPath', 'NeedDaemonReload', 'DropInPaths')
     require(fields == {'FragmentPath': str(UNITS / CLONE_UNIT), 'NeedDaemonReload': 'no', 'DropInPaths': ''},
             'clone unit not loaded as installed')
+    unit_pin(receipt)  # the installed BYTES, not just the loaded path, equal the receipt pins
 
 
 # -------------------------------------------------------------------------- receipt ---------
@@ -565,7 +617,9 @@ def load_receipt():
             and re.fullmatch(HEX64, value['unit_sha256'])
             and re.fullmatch(HEX64, value['trial_unit_sha256']) and re.fullmatch(UUID, value['build_boot'])
             and re.fullmatch(HEX32, value['core_operation']) and re.fullmatch(HEX32, value['core_invocation'])
-            and value['owned_sealed'] == (value['state'] == 'sealed'), 'seal receipt refused')
+            and value['owned_sealed'] == (value['state'] == 'sealed')
+            and type(value['monotonic_deadline']) in (int, float) and value['monotonic_deadline'] > 0,
+            'seal receipt refused')
     evidence = value['evidence']
     require(type(evidence) is dict and set(evidence) == EVIDENCE_KEYS
             and type(evidence['deadline']) is int and not isinstance(evidence['deadline'], bool)
@@ -635,9 +689,17 @@ def prepare(args):
             if TRIAL_UNIT in files:
                 require(sha(private_file(TRIAL / TRIAL_UNIT)) == trial_sha, 'trial unit differs from the intent')
     deadline = evidence['deadline']
+    # ONE cutoff on BOTH clocks, clipped to the ORIGINAL contract deadline and never rebased or
+    # renewed: the wall cutoff is the contract deadline; the monotonic cutoff is fixed once at the
+    # first prepare and retained in the receipt for same-boot recovery (the build boot is required
+    # above). Either clock passing the cutoff refuses, so a backward wall clock cannot extend it.
+    if existing is None:
+        stop_at = time.monotonic() + max(0, deadline - time.time())
+    else:
+        stop_at = existing['monotonic_deadline']
 
-    def alive():  # the ORIGINAL clock; never renewed, checked before every continued mutation
-        require(time.time() < deadline, 'original build deadline passed')
+    def alive():  # checked before the final commit and before EVERY continued mutation
+        require(time.time() < deadline and time.monotonic() < stop_at, 'original build deadline passed')
 
     alive()
     installed = UNITS / TRIAL_UNIT
@@ -663,7 +725,7 @@ def prepare(args):
                'sealed_at': int(time.time()), 'core_operation': state['operation'],
                'core_invocation': state['invocation'], 'trial_unit_sha256': trial_sha,
                'evidence': evidence, 'removed': sorted(files + cache), 'access': access,
-               'unmet': [UNMET_ACCESS], 'owned_sealed': False}
+               'unmet': [UNMET_ACCESS], 'owned_sealed': False, 'monotonic_deadline': stop_at}
     if existing:
         receipt['sealed_at'], receipt['removed'] = existing['sealed_at'], existing['removed']
     alive()
@@ -676,14 +738,15 @@ def prepare(args):
     install_exact(UNITS / CLONE_UNIT, unit_raw, 0o644)
     if present:
         remove_trial(files, cache, alive)
-    alive()
-    remove_trial_unit(trial_sha)
+    remove_trial_unit(trial_sha, alive)
     for argv in ([SYSTEMCTL, 'daemon-reload'], [SYSTEMCTL, 'disable', RESUME_UNIT],
                  [SYSTEMCTL, 'enable', CLONE_UNIT]):
         alive()
         require(run(argv, 30)[0] == 0, 'service enablement refused')
-    owned_absent()
+    alive()
+    owned_absent(receipt)  # includes the installed unit/tool byte pins
     receipt.update(state='sealed', owned_sealed=True, access=access_inventory())
+    alive()  # the sealed publication is itself a continued mutation under the ORIGINAL clock
     atomic(SEAL / RECEIPT, receipt)
     report(receipt)
     return 3  # the trial-owned portion is sealed; access-material provenance is ALWAYS unmet
@@ -698,7 +761,7 @@ def verify(_args):
     require(os.geteuid() == OWNER, 'root required')
     receipt = load_receipt()
     require(receipt['state'] == 'sealed', 'not sealed')
-    owned_absent()
+    owned_absent(receipt)
     receipt['access'] = access_inventory()
     receipt['unmet'] = [UNMET_ACCESS]
     report(receipt)
@@ -720,33 +783,89 @@ def load_checkpoint():
     return value
 
 
+def _cancel(_signum, _frame):
+    raise Cancelled()
+
+
+def reconcile_checkpoint(core, receipt, boot, previous):
+    """After a VERIFIED activation cleanup the core committed a new operation/invocation pair.
+
+    Record exactly that pair (this boot, this nonce, ``stop_verified`` equal to it) so the next
+    start does not refuse a state it can prove; nothing else is ever adopted.
+    """
+    with core.locked():
+        value = core.state()
+    pair = {'operation': value.get('operation'), 'invocation': value.get('invocation')}
+    if (value['phase'] == 'resumable' and value['nonce'] == receipt['nonce'] and value['boot'] == boot
+            and value.get('stop_verified') == pair and (pair['operation'], pair['invocation']) != previous):
+        atomic(SEAL / CLONE_START, {'schema': 1, 'boot': boot, **pair})
+
+
+def cleanup_activation(core, receipt, boot, previous):
+    """Ownership-bound cleanup of the ENTIRE activation after ``start-resume`` was launched.
+
+    Runs for any failure after the core CLI started the resume unit: a refusal, the late
+    checkpoint write failing, a handled SIGTERM/SIGINT or a startup cancel. It uses ONLY the core's
+    public serialized ``stop`` (operation/invocation/stop-controller ownership live in the core),
+    then proves the resume unit offline (inactive, MainPID 0, empty cgroup, no QEMU/hhfab image).
+    Further SIGTERM/SIGINT are ignored so a second signal cannot cut the cleanup short. Returns
+    True only when the stop is positively verified; it never fabricates a receipt.
+    """
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, signal.SIG_IGN)
+    try:
+        code, _ = run([PYTHON, str(LIB / 'vlab_core.py'), 'stop'], 70, CORE_TERM_GRACE)
+        require(code == 0, 'core stop refused')
+        units_offline()
+    except BaseException:
+        print('vlab-image: activation cleanup unverified; the resume unit may still be running',
+              file=sys.stderr)
+        return False
+    try:
+        reconcile_checkpoint(core, receipt, boot, previous)
+    except BaseException:
+        print('vlab-image: checkpoint reconciliation failed after a verified stop', file=sys.stderr)
+    return True
+
+
 def clone_start(_args):
     """New-boot start. Receives no build lease, deadline or boot authority.
 
     First clone boot: the preserved core state must be EXACTLY the sealed one (receipt operation
-    and invocation). Later boots: the state must be exactly the one tied to the strict checkpoint
-    of an earlier verified clone start on a different boot. The core mints its own fresh
-    operation, deadline and boot binding on every start.
+    and invocation). Later boots (and a same-boot restart after a stop of OUR activation): the
+    state must be exactly the one tied to the strict checkpoint of an earlier verified clone
+    start. The core mints its own fresh operation, deadline and boot binding on every start.
+
+    From the moment ``start-resume`` is launched, ANY failure or handled signal runs
+    ``cleanup_activation`` and then re-raises the PRIMARY failure unchanged. The unit uses
+    ``KillMode=mixed`` so systemd's SIGTERM reaches only this helper, whose cleanup is the only
+    thing that stops the independent resume unit (ExecStop is skipped for a never-active oneshot).
     """
     require(os.geteuid() == OWNER, 'root required')
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, _cancel)
     receipt = load_receipt()
     require(receipt['state'] == 'sealed' and receipt['owned_sealed'] is True, 'image is not sealed')
     boot = kernel_boot()
     require(boot != receipt['build_boot'], 'not a new boot')
     core = load_core()
     require(core.boot() == boot, 'boot identity differs')
-    owned_absent()
+    owned_absent(receipt)
     units_offline()
     checkpoint = load_checkpoint()
+    with core.locked():
+        value = core.state()
     if checkpoint is None:
         operation, invocation, prior_boot = receipt['core_operation'], receipt['core_invocation'], None
     else:
-        require(checkpoint['boot'] not in (boot, receipt['build_boot']), 'checkpoint is not from an earlier clone boot')
+        require(checkpoint['boot'] != receipt['build_boot'], 'checkpoint is not from an earlier clone boot')
+        # The same boot is accepted ONLY as a restart after a stop of OUR activation: the state must
+        # already be the observed stop (or its verified commit); every later gate re-checks it fully.
+        require(checkpoint['boot'] != boot or value['phase'] in ('stop-observed', 'resumable'),
+                'checkpoint is not from an earlier clone boot')
         operation, invocation, prior_boot = checkpoint['operation'], checkpoint['invocation'], checkpoint['boot']
-    with core.locked():
-        value = core.state()
     if value['phase'] == 'stop-observed':
-        # A clean shutdown of the previous clone boot: clone-stop recorded the core's owned-stop
+        # A clean stop of the previous activation: clone-stop recorded the core's owned-stop
         # intent and the core's own ExecStopPost observed the manager stop. Commit it only through
         # the core's public verified ``stop`` (it re-checks the inactive unit and empty cgroup).
         require(checkpoint is not None and value['nonce'] == receipt['nonce']
@@ -757,43 +876,63 @@ def clone_start(_args):
         code, _ = run([PYTHON, str(LIB / 'vlab_core.py'), 'stop'], 70, CORE_TERM_GRACE)
         require(code == 0, 'core stop refused')
     value = core_offline(core, receipt['nonce'])
-    require(value['boot'] != boot and (value['operation'], value['invocation']) == (operation, invocation)
+    require((value['boot'] != boot or prior_boot == boot)
+            and (value['operation'], value['invocation']) == (operation, invocation)
             and (prior_boot is None or value['boot'] == prior_boot),
             'preserved core state is not the sealed or last verified one')
-    # The core's own start-resume cleans up after its own failure; a timeout here SIGTERMs it first.
-    code, _ = run([PYTHON, str(LIB / 'vlab_core.py'), 'start-resume'], CORE_WAIT, CORE_TERM_GRACE)
-    require(code == 0, 'core resume refused')
-    with core.locked():
-        after = core.state()
-    require(after['nonce'] == receipt['nonce'] and after['phase'] == 'ready' and after['mode'] == 'resume'
-            and after['boot'] == boot and after['operation'] != operation
-            and after.get('invocation') not in (None, invocation),
-            'resume did not reach readiness on this boot')
-    atomic(SEAL / CLONE_START, {'schema': 1, 'boot': boot, 'operation': after['operation'],
-                                'invocation': after['invocation']})
+    try:
+        # The core's own start-resume cleans up after its own failure; a timeout or a handled
+        # signal here SIGTERMs it first (run() closes the owned group before re-raising).
+        code, _ = run([PYTHON, str(LIB / 'vlab_core.py'), 'start-resume'], CORE_WAIT, CORE_TERM_GRACE)
+        require(code == 0, 'core resume refused')
+        with core.locked():
+            after = core.state()
+        require(after['nonce'] == receipt['nonce'] and after['phase'] == 'ready' and after['mode'] == 'resume'
+                and after['boot'] == boot and after['operation'] != operation
+                and after.get('invocation') not in (None, invocation),
+                'resume did not reach readiness on this boot')
+        atomic(SEAL / CLONE_START, {'schema': 1, 'boot': boot, 'operation': after['operation'],
+                                    'invocation': after['invocation']})
+    except BaseException:
+        cleanup_activation(core, receipt, boot, (operation, invocation))
+        raise  # the PRIMARY failure, unchanged; cleanup uncertainty is reported on stderr only
     print('vlab-image: ready on a new boot')
     return 0
 
 
 def clone_stop(_args):
-    """ExecStop: record the core's own owned-stop intent for the running resume invocation.
+    """ExecStop: record the core's owned-stop intent for THIS sealed, checkpointed activation.
 
-    Deliberately NON-BLOCKING and never stops the resume unit. The clone unit is ordered After
-    the resume unit, so systemd runs this before it stops the resume unit; a synchronous
-    ``systemctl stop`` of the resume unit from here would wait on this unit's own stop job
-    (deadlock). The core's ExecStopPost then sees the intent and records ``stop-observed``;
-    the next clone boot commits it through the core's public ``stop``.
+    Deliberately NON-BLOCKING and never stops the resume unit from here. The clone unit is ordered
+    After the resume unit and carries ``PropagatesStopTo=`` it, so ONE systemd stop transaction
+    (standalone ``systemctl stop`` and OS shutdown alike) runs this ExecStop first and then stops
+    the resume unit; a synchronous ``systemctl stop`` of the resume unit from here would wait on
+    this unit's own stop job (deadlock). The core's ExecStopPost then records ``stop-observed``
+    from the intent; the positive post-stop verification happens in the core's public ``stop`` at
+    the next clone-start, never here and never fabricated.
+
+    The intent is written only under the core's stop-controller AND state locks (so it serializes
+    with a core ``stop``), only for the sealed nonce, this boot and exactly the checkpointed
+    operation/invocation that is running.
     """
     require(os.geteuid() == OWNER, 'root required')
+    receipt = load_receipt()
+    require(receipt['state'] == 'sealed' and receipt['owned_sealed'] is True, 'image is not sealed')
+    unit_pin(receipt)
     core = load_core()
-    require(core.boot() == kernel_boot(), 'boot identity differs')
-    with core.locked():
+    boot = kernel_boot()
+    require(core.boot() == boot, 'boot identity differs')
+    checkpoint = load_checkpoint()
+    with core.stop_controller(), core.locked():
         value = core.state()
         if value['phase'] != 'ready':
             print('vlab-image: nothing to mark')
             return 0
-        require(value['mode'] == 'resume' and value.get('invocation') and value['boot'] == kernel_boot(),
-                'ready state is not this boot resume')
+        require(checkpoint is not None and checkpoint['boot'] == boot and value['nonce'] == receipt['nonce']
+                and value['mode'] == 'resume' and value['boot'] == boot
+                and (value.get('operation'), value.get('invocation')) ==
+                (checkpoint['operation'], checkpoint['invocation']),
+                'ready state is not the checkpointed clone activation')
         fields = unit_fields(RESUME_UNIT, 'ActiveState', 'InvocationID')
         require(fields['ActiveState'] == 'active' and fields['InvocationID'] == value['invocation'],
                 'resume invocation differs')
@@ -829,6 +968,9 @@ if __name__ == '__main__':
     except Refused as error:
         print('vlab-image: refused: ' + str(error), file=sys.stderr)
         sys.exit(1)
+    except Cancelled:
+        print('vlab-image: cancelled', file=sys.stderr)
+        sys.exit(143)
     except Exception:
         print('vlab-image: operational failure', file=sys.stderr)
         sys.exit(1)

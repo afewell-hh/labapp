@@ -2837,9 +2837,11 @@ access-material provenance is unmet (below). `verify` re-checks the postconditio
 
 ### Clone boot
 
-`labapp-vlab-clone.service` (oneshot, `RemainAfterExit`, `KillMode=control-group`, so the helper and
-core CLI descendants stay in this unit's cgroup; QEMU/hhfab stay in `hhfab-vlab-resume.service`)
-runs `clone-start`. Every command is run in its own owned process group through `owned_process`
+`labapp-vlab-clone.service` (oneshot, `RemainAfterExit`, `KillMode=mixed`, `TimeoutStopSec=240`,
+`PropagatesStopTo=hhfab-vlab-resume.service`; QEMU/hhfab stay in `hhfab-vlab-resume.service`'s own
+cgroup) runs `clone-start`. `mixed` sends systemd's SIGTERM only to the helper, so its cancel cleanup
+can run the core's serialized `stop` without the core CLI itself being terminated; the final SIGKILL
+still reaches helper/core descendants of this unit's cgroup. Every command is run in its own owned process group through `owned_process`
 (#365): output is capped while it is read, a timeout or uncertain group cleanup is a refusal even if
 the child exited 0, and a core command that times out gets SIGTERM first so its own cleanup runs.
 
@@ -2853,20 +2855,62 @@ before writing the checkpoint `clone-start.json` (boot, operation, invocation). 
 invocation). *Later boots:* the state must be exactly the one tied to the strict, owned checkpoint
 of an earlier verified clone start on a different boot; a `stop-observed` state is committed only
 through the core's own public `vlab_core.py stop` (it re-checks the inactive unit and empty cgroup)
-and only if its owned-stop intent, service result, boot and ids match. Failed, foreign, stale or
-same-boot state is never adopted.
+and only if its owned-stop intent, service result, boot and ids match. Failed, foreign or stale state
+is never adopted. A checkpoint from the SAME boot is accepted only as a restart after a stop of our
+own activation (state `stop-observed` or its verified `resumable` commit); every other gate is
+unchanged, so a restart while the backend still runs fails the offline gate.
 
-**Shutdown.** `ExecStop` runs `clone-stop`, which only writes the core's own `stopping` marker for
-the running resume invocation and returns (non-blocking, no `systemctl`). Reason: the clone unit is
-`After=` the resume unit, so systemd stops it first; a synchronous stop of the resume unit from its
-`ExecStop` would wait on this unit's own stop job and deadlock
+**Activation failure and cancel (whole activation).** From the moment `start-resume` is launched, any
+failure (core refusal, late checkpoint write, final validation) or handled SIGTERM/SIGINT (a startup
+cancel or a late interrupt; the handler raises `Cancelled`, a `BaseException`) runs
+`cleanup_activation`: the core's own public `vlab_core.py stop` (operation, invocation and
+stop-controller ownership stay in the core), then a positive offline proof (resume unit inactive,
+`MainPID=0`, empty cgroup, no QEMU/hhfab process). A verified stop commits `resumable`, and only that
+exact pair is then recorded in the checkpoint so the next start does not refuse a state it can
+prove. Further signals are ignored during cleanup. The PRIMARY failure is re-raised unchanged;
+unverified cleanup is reported on stderr (`activation cleanup unverified`) and never claimed as a
+stop. Not handled: SIGKILL of the helper or a power loss between readiness and cleanup (the state
+then stays for the lead; a hard-killed helper is only covered by the unit's propagated stop). If a
+cancel is itself a `systemctl stop` of the clone unit, the propagated stop of the resume unit is
+queued behind this unit's stop job, so the core `stop` inside the cleanup can wait for its own 30 s
+manager-call cap; the cleanup then reports uncertain and the propagated stop still completes it.
+That interplay is **unproven**.
+
+**Stop (standalone and OS shutdown).** `ExecStop` runs `clone-stop`, which only writes the core's own
+`stopping` marker and returns (non-blocking, no `systemctl`), and only when the sealed receipt, the
+installed unit/tool pins, the core `stop-controller` AND state locks, the sealed nonce, this boot
+and exactly the checkpointed operation/invocation of the running resume unit all agree. The unit's
+`PropagatesStopTo=` stops the resume unit in the SAME transaction after `ExecStop`, so a standalone
+`systemctl stop` no longer leaves the backend running (it does not propagate restarts or starts).
+The post-stop verification (inactive unit, empty cgroup) cannot happen inside the transaction; it is
+the core's public `stop` at the next `clone-start`, never fabricated. Reason for no synchronous stop:
+the clone unit is `After=` the resume unit, so systemd stops it first; a synchronous stop of the
+resume unit from its `ExecStop` would wait on this unit's own stop job and deadlock
 ([job.c](https://github.com/systemd/systemd/blob/v255/src/core/job.c#L1667-L1706);
 [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html);
 [systemd.unit ordering](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)).
 The core's `ExecStopPost` then records `stop-observed`. This writes a core-owned field from outside
-the core (the exact value the core's own stop writes); the lead should judge that coupling. The
-ordering, the stop job interplay and the shutdown path are **not proven**; only text-level and
-fake-graph tests exist.
+the core (the exact value the core's own stop writes); the lead should judge that coupling, now
+validated against the sealed/checkpointed context and the core locks. The ordering, the stop job
+interplay, `PropagatesStopTo=` semantics on systemd 255 (stop only, no restart propagation) and
+the shutdown path are **not proven**; only text-level and fake-graph tests exist.
+
+### Original clock, interruption windows and installed pins
+
+- One cutoff on BOTH clocks, clipped to the ORIGINAL contract deadline: the wall cutoff is the
+  contract deadline and the monotonic cutoff is fixed once at the first `prepare` and retained in the
+  receipt (`monotonic_deadline`) for same-boot recovery; it is never rebased or renewed. It is checked
+  before every continued mutation (each unlink, `rmdir`, install, enablement) and again before the
+  sealed receipt is published, so a late expiry or a backward wall clock cannot extend it. An expiry
+  at the last step leaves a `sealing` receipt (no renewal, no new authority).
+- Final files (`vlab_image.py`, the clone unit) are written to the fixed `<name>.installing`, fsynced
+  and renamed, so an interruption leaves at most our own partial temporary (removed on retry), never
+  partial final bytes. A leftover empty runtime drop-in directory (interrupted after the
+  `10-bound.conf` unlink) is accepted and removed; foreign content, links or a world-writable
+  directory are preserved and refused.
+- `prepare` postconditions, `verify`, `clone-start` and `clone-stop` check the ACTUAL installed unit
+  and tool bytes against the receipt hashes (owner, exact `0644`, single link, no-follow), not only
+  systemd's loaded path, so an edited-and-reloaded unit fails.
 
 ### Metadata that remains, and old authority
 
@@ -2900,8 +2944,9 @@ identity (to compare with the core state), not as fresh build authority.
   lived on `/run` tmpfs only (#378).
 - Core `critical_snapshot` records `st_dev`/`st_ino`; a clone with a different root device number
   fails closed.
-- A crash or hard power-off of a running clone leaves core `failed`; the next `clone-start`
-  refuses until the lead decides on recovery. A crash between core readiness and the checkpoint
-  write leaves a stale checkpoint and also refuses.
+- A crash, SIGKILL or hard power-off of a running clone leaves core `failed`; the next `clone-start`
+  refuses until the lead decides on recovery. A handled failure or signal between core readiness
+  and the checkpoint write is cleaned up and reconciled (above); an unhandled one leaves a stale
+  checkpoint and also refuses.
 - The fake core in the tests mirrors, but is not, the real core; a drift test only pins a few
   literals. Real `systemctl` output, `/proc` scanning and core loading need native evidence.

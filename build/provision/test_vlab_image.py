@@ -8,11 +8,12 @@ and a drift test pins the literals it relies on). ``RunTests`` runs the real ``r
 reach any output or receipt. AUTHOR TESTS: NOT RUN by the author; no systemd shutdown behavior
 is proven here.
 """
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import time
@@ -53,6 +54,9 @@ class World:
         self.resume_active = False
         self.unit_invocation = ''
         self.counter = 0
+        self.core_stops = 0
+        self.stop_fails = False
+        self.controller_busy = False
         self.trial = self.tmp / 'trial'
         self.units, self.lib, self.seal = self.tmp / 'units', self.tmp / 'lib', self.tmp / 'seal'
         self.src = self.tmp / 'src'
@@ -128,10 +132,25 @@ class World:
             self.resume_active = True
             self.unit_invocation = self.state['invocation']  # what systemd reports for the running unit
             return 0, b''
-        if argv[-1] == 'stop':  # mirrors vlab_core._stop_owned_locked for an observed stop
-            binding = {'operation': self.state['operation'], 'invocation': self.state['invocation']}
-            if self.state['phase'] == 'stop-observed' and self.state.get('stopping') == binding:
-                self.state.update(phase='resumable', stop_verified=binding)
+        if argv[-1] == 'stop':  # mirrors vlab_core._stop_owned_locked (serialized public stop)
+            self.core_stops += 1
+            state = self.state
+            binding = {'operation': state['operation'], 'invocation': state['invocation']}
+            if self.stop_fails:
+                return 1, b''
+            if state['phase'] == 'ready' and self.resume_active:  # owned intent, manager stop, commit
+                state['stopping'] = binding
+                self.shutdown()
+            if state['phase'] == 'stop-observed' and state.get('stopping') == binding:
+                state.update(phase='resumable', stop_verified=binding)
+                return 0, b''
+            if state['phase'] == 'starting':
+                state['phase'] = 'failed'
+                self.resume_active = False
+                return 0, b''
+            if state['phase'] == 'failed' or (state['phase'] == 'resumable'
+                                              and state.get('stop_verified') == binding):
+                self.resume_active = False
                 return 0, b''
             return 1, b''
         return 0, b''
@@ -163,9 +182,16 @@ class World:
         def locked(*_a, **_k):
             yield
 
+        @contextmanager
+        def stop_controller():  # vlab_core.stop_controller: never waits, a second owner is refused
+            if self.controller_busy:
+                raise image.Refused('another stop controller is active')
+            yield
+
         def save(value):
             self.state = dict(value)
         return SimpleNamespace(boot=lambda: self.boot, locked=locked, state=lambda: dict(self.state),
+                               stop_controller=stop_controller,
                                save=save, verify_contract=lambda v, d: None,
                                critical_snapshot=lambda d: self.critical)
 
@@ -198,6 +224,8 @@ class Base(unittest.TestCase):
         self.stack.enter_context(patch.object(image, 'live_vlab_processes', lambda: w.live))
         self.stack.enter_context(patch.object(image, 'kernel_boot', lambda: w.boot))
         self.stack.enter_context(patch.object(image, 'load_core', lambda: w.core))
+        for number in (signal.SIGTERM, signal.SIGINT):  # clone_start installs/ignores these handlers
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
 
     def prepare(self, **changes):
         out = io.StringIO()
@@ -753,6 +781,424 @@ class CloneStopTests(Base):
             self.stop()
 
 
+class Activated(Base):
+    """Helpers for a sealed image on a new boot (fake core mirrors vlab_core.py transitions)."""
+
+    def sealed(self):
+        self.assertEqual(3, self.prepare()[0])
+        self.w.boot = CLONE
+
+    def start(self):
+        with redirect_stdout(io.StringIO()):
+            return image.clone_start(SimpleNamespace())
+
+    def stop(self):
+        with redirect_stdout(io.StringIO()):
+            return image.clone_stop(SimpleNamespace())
+
+    def checkpoint(self):
+        return json.loads((self.w.seal / image.CLONE_START).read_bytes())
+
+    def fail_checkpoint_once(self, error):
+        real, calls = image.atomic, []
+
+        def flaky(path, value):
+            if Path(path).name == image.CLONE_START and not calls:
+                calls.append(path)
+                raise error
+            return real(path, value)
+        return patch.object(image, 'atomic', flaky)
+
+    def stopped_cleanly(self):
+        state = self.w.state
+        return (not self.w.resume_active and state['phase'] == 'resumable'
+                and state.get('stop_verified') == {'operation': state['operation'],
+                                                   'invocation': state['invocation']})
+
+
+class ActivationCleanupTests(Activated):
+    """Failure/cancel AFTER the core CLI reported success must stop the independent resume unit."""
+
+    def test_checkpoint_publication_failure_after_ready_stops_the_backend(self):
+        self.sealed()
+        with self.fail_checkpoint_once(OSError('injected checkpoint failure')):
+            with self.assertRaises(OSError):  # the PRIMARY failure is preserved, not replaced
+                self.start()
+        self.assertTrue(self.stopped_cleanly())
+        self.assertEqual(1, self.w.core_stops)
+        self.assertEqual(1, [c[-1] for c in self.w.commands if c[0] == image.PYTHON].count('start-resume'))
+        # the verified stop committed a new pair, so it is recorded (and only that exact pair)
+        self.assertEqual((self.w.state['operation'], self.w.state['invocation']),
+                         (self.checkpoint()['operation'], self.checkpoint()['invocation']))
+        self.assertEqual(CLONE, self.checkpoint()['boot'])
+
+    def test_late_interrupt_after_the_checkpoint_stops_the_backend_and_stays_cancelled(self):
+        self.sealed()
+        real = image.atomic
+
+        def late(path, value):
+            real(path, value)
+            raise image.Cancelled()  # handled SIGTERM arriving after the last write
+        with patch.object(image, 'atomic', late):
+            with self.assertRaises(image.Cancelled):
+                self.start()
+        self.assertTrue(self.stopped_cleanly())
+        self.assertEqual(1, [c[-1] for c in self.w.commands if c[0] == image.PYTHON].count('start-resume'))
+
+    def test_startup_cancel_while_the_core_cli_runs_stops_without_restart(self):
+        self.sealed()
+        real = self.w.run
+
+        def cancelled(argv, seconds, term_grace=0):
+            if argv[-1] == 'start-resume':
+                real(argv, seconds, term_grace)  # the core already made the unit ready ...
+                raise image.Cancelled()          # ... when the handled signal arrived
+            return real(argv, seconds, term_grace)
+        with patch.object(image, 'run', cancelled):
+            with self.assertRaises(image.Cancelled):
+                self.start()
+        self.assertTrue(self.stopped_cleanly())
+        self.assertEqual(1, [c[-1] for c in self.w.commands if c[0] == image.PYTHON].count('start-resume'))
+        # a second signal cannot cut the cleanup short
+        self.assertEqual(signal.SIG_IGN, signal.getsignal(signal.SIGTERM))
+        self.assertEqual(signal.SIG_IGN, signal.getsignal(signal.SIGINT))
+
+    def test_cleanup_failure_is_reported_honestly_and_the_primary_failure_wins(self):
+        self.sealed()
+        self.w.stop_fails = True
+        err = io.StringIO()
+        with self.fail_checkpoint_once(OSError('injected checkpoint failure')), redirect_stderr(err):
+            with self.assertRaises(OSError):
+                self.start()
+        self.assertIn('activation cleanup unverified', err.getvalue())
+        self.assertTrue(self.w.resume_active)  # not claimed stopped
+        self.assertFalse((self.w.seal / image.CLONE_START).exists())
+
+    def test_backend_still_running_after_a_zero_core_stop_is_not_verified(self):
+        self.sealed()
+        real = self.w.run
+
+        def liar(argv, seconds, term_grace=0):
+            if argv[-1] == 'stop':
+                return 0, b''  # core claims success but the unit stays up
+            return real(argv, seconds, term_grace)
+        err = io.StringIO()
+        with self.fail_checkpoint_once(OSError('x')), patch.object(image, 'run', liar), redirect_stderr(err):
+            with self.assertRaises(OSError):
+                self.start()
+        self.assertIn('activation cleanup unverified', err.getvalue())
+
+    def test_failure_before_the_core_is_launched_stops_nothing(self):
+        self.sealed()
+        self.w.trial.mkdir(mode=0o700)
+        with self.assertRaises(image.Refused):
+            self.start()
+        self.assertEqual(0, self.w.core_stops)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), image._cancel)  # handler installed, not ignored
+
+    def test_core_refusal_runs_the_serialized_stop_and_keeps_the_refusal(self):
+        self.sealed()
+        real = self.w.run
+        with patch.object(image, 'run', lambda argv, seconds, term_grace=0: (1, b'')
+                          if argv[-1] == 'start-resume' else real(argv, seconds, term_grace)):
+            with self.assertRaises(image.Refused):
+                self.start()
+        self.assertEqual(1, self.w.core_stops)
+        self.assertFalse(self.w.resume_active)
+
+    def test_signal_handler_raises_the_non_exception_cancel(self):
+        with self.assertRaises(image.Cancelled):
+            image._cancel(signal.SIGTERM, None)
+        self.assertFalse(issubclass(image.Cancelled, Exception))
+
+
+class StandaloneStopTests(Activated):
+    def ready(self):
+        self.sealed()
+        self.assertEqual(0, self.start())
+
+    def test_intent_is_bound_to_the_seal_boot_and_checkpointed_activation(self):
+        self.ready()
+        before = len(self.w.commands)
+        self.assertEqual(0, self.stop())
+        self.assertEqual([], self.w.commands[before:])  # never a systemctl/core stop from ExecStop
+        self.assertEqual({'operation': self.w.state['operation'], 'invocation': self.w.state['invocation']},
+                         self.w.state['stopping'])
+
+    def test_missing_wrong_or_foreign_context_refuses_and_writes_nothing(self):
+        self.ready()
+        good_state, path = dict(self.w.state), self.w.seal / image.CLONE_START
+        value = self.checkpoint()
+        for label, mutate in (
+                ('no checkpoint', lambda: path.unlink()),
+                ('other operation', lambda: (path.unlink(), write(path, image.encoded({**value, 'operation': 'e' * 32})))),
+                ('other invocation', lambda: (path.unlink(), write(path, image.encoded({**value, 'invocation': 'e' * 32})))),
+                ('other boot', lambda: (path.unlink(), write(path, image.encoded({**value, 'boot': CLONE2})))),
+                ('other nonce', lambda: self.w.state.update(nonce='f' * 32)),
+                ('other mode', lambda: self.w.state.update(mode='fresh'))):
+            with self.subTest(label):
+                self.w.state = dict(good_state)
+                if not path.exists():
+                    write(path, image.encoded(value))
+                mutate()
+                with self.assertRaises(image.Refused):
+                    self.stop()
+                self.assertNotIn('stopping', self.w.state)
+
+    def test_unsealed_receipt_refuses(self):
+        self.ready()
+        receipt = image.load_receipt()
+        receipt.update(state='sealing', owned_sealed=False)
+        image.atomic(self.w.seal / image.RECEIPT, receipt)
+        with self.assertRaises(image.Refused):
+            self.stop()
+
+    def test_stop_serializes_with_an_active_core_stop_controller(self):
+        self.ready()
+        self.w.controller_busy = True
+        with self.assertRaises(image.Refused):
+            self.stop()
+        self.assertNotIn('stopping', self.w.state)
+
+    def test_standalone_stop_then_same_boot_restart_commits_only_through_the_core_stop(self):
+        self.ready()
+        first = self.checkpoint()
+        self.assertEqual(0, self.stop())
+        self.w.shutdown()  # the propagated stop job: ExecStopPost sees the intent
+        self.assertEqual('stop-observed', self.w.state['phase'])
+        self.assertFalse(self.w.resume_active)
+        self.assertEqual(0, self.start())  # same boot: allowed only from OUR observed stop
+        cores = [c[-1] for c in self.w.commands if c[0] == image.PYTHON]
+        self.assertEqual(['start-resume', 'stop', 'start-resume'], cores)
+        self.assertNotEqual(first['operation'], self.checkpoint()['operation'])
+        self.assertTrue(self.w.resume_active)
+
+    def test_same_boot_restart_is_refused_while_the_backend_still_runs(self):
+        self.ready()
+        with self.assertRaises(image.Refused):
+            self.start()  # not stopped: offline gate fails, no second start-resume
+        self.assertEqual(1, [c[-1] for c in self.w.commands if c[0] == image.PYTHON].count('start-resume'))
+
+    def test_same_boot_restart_is_refused_after_an_unowned_failure(self):
+        self.ready()
+        self.w.shutdown()  # stop WITHOUT clone-stop intent: the core marks it failed
+        self.assertEqual('failed', self.w.state['phase'])
+        with self.assertRaises(image.Refused):
+            self.start()
+        self.assertEqual(1, [c[-1] for c in self.w.commands if c[0] == image.PYTHON].count('start-resume'))
+
+
+class InstalledPinTests(Activated):
+    """The ACTUAL installed unit/tool bytes and metadata are checked, not systemd's loaded view."""
+
+    def edit_unit(self, raw=None, mode=0o644):
+        path = self.w.units / image.CLONE_UNIT
+        path.unlink()
+        write(path, raw if raw is not None else CLONE_BYTES + b'ExecStartPre=/bin/sh\n', mode)
+
+    def test_edited_and_reloaded_unit_fails_verify_clone_start_and_clone_stop(self):
+        self.sealed()
+        self.assertEqual(0, self.start())
+        self.edit_unit()  # fake systemd reports NeedDaemonReload=no, i.e. the edit was reloaded
+        with self.assertRaises(image.Refused):
+            image.verify(SimpleNamespace())
+        with self.assertRaises(image.Refused):
+            self.stop()
+        self.assertNotIn('stopping', self.w.state)
+        self.w.shutdown()
+        self.w.boot = CLONE2
+        before = len(self.w.commands)
+        with self.assertRaises(image.Refused):
+            self.start()
+        self.assertEqual([], [c for c in self.w.commands[before:] if c[0] == image.PYTHON])
+
+    def test_unsafe_unit_or_tool_metadata_fails(self):
+        self.sealed()
+        for label, damage in (
+                ('mode', lambda: (self.w.units / image.CLONE_UNIT).chmod(0o664)),
+                ('hardlink', lambda: os.link(self.w.units / image.CLONE_UNIT, self.w.tmp / 'extra-link')),
+                ('symlink', lambda: (self.edit_unit(), (self.w.units / image.CLONE_UNIT).unlink(),
+                                     (self.w.units / image.CLONE_UNIT).symlink_to(self.w.src / image.CLONE_UNIT))),
+                ('tool bytes', lambda: (self.w.lib / 'vlab_image.py').write_bytes(b'# other\n')),
+                ('tool mode', lambda: (self.w.lib / 'vlab_image.py').chmod(0o666))):
+            with self.subTest(label):
+                receipt = image.load_receipt()
+                self.edit_unit(CLONE_BYTES)
+                write(self.w.lib / 'vlab_image.py', (HERE / 'vlab_image.py').read_bytes(), 0o644)
+                image.unit_pin(receipt)  # pristine again
+                damage()
+                with self.assertRaises(image.Refused):
+                    image.unit_pin(receipt)
+
+    def test_unit_changed_between_install_and_postconditions_blocks_the_seal(self):
+        real = self.w.run
+
+        def edit_on_reload(argv, seconds, term_grace=0):
+            if argv[:2] == [image.SYSTEMCTL, 'daemon-reload']:
+                self.edit_unit()
+            return real(argv, seconds, term_grace)
+        with patch.object(image, 'run', edit_on_reload):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertEqual('sealing', image.load_receipt()['state'])
+
+
+class OriginalClockTests(Activated):
+    """One wall AND monotonic cutoff, clipped to the original deadline, checked at every mutation."""
+
+    def test_receipt_retains_a_monotonic_cutoff_clipped_to_the_original_deadline(self):
+        before = time.monotonic()
+        with patch.object(time, 'time', lambda: EXPIRED - 100):  # 99 s of the original window left
+            self.prepare()
+        cutoff = image.load_receipt()['monotonic_deadline']
+        self.assertLess(cutoff - before, 105)
+        self.assertGreater(cutoff - before, 90)
+
+    def test_expiry_after_the_postconditions_blocks_the_sealed_publication(self):
+        late, real = [], image.owned_absent
+
+        def then_expire(receipt):
+            real(receipt)
+            late.append(True)
+        with patch.object(image, 'owned_absent', then_expire), \
+                patch.object(time, 'time', lambda: EXPIRED if late else REAL_TIME()):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertEqual('sealing', image.load_receipt()['state'])  # never published as sealed
+
+    def test_monotonic_expiry_holds_even_if_the_wall_clock_goes_backwards(self):
+        late, real = [], os.unlink
+        real_mono = time.monotonic
+
+        def unlink_then_jump(*args, **kwargs):
+            real(*args, **kwargs)
+            late.append(True)
+        with patch.object(os, 'unlink', unlink_then_jump), \
+                patch.object(time, 'time', lambda: REAL_TIME() - (1000 if late else 0)), \
+                patch.object(time, 'monotonic', lambda: real_mono() + (1e12 if late else 0)):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertEqual('sealing', image.load_receipt()['state'])
+        self.assertTrue(self.w.trial.exists())
+
+    def test_retry_keeps_the_original_cutoff_without_rebasing(self):
+        self.interrupted_unlink(8)
+        cutoff = image.load_receipt()['monotonic_deadline']
+        real_mono = time.monotonic
+        with patch.object(time, 'monotonic', lambda: real_mono() + 1e12):  # past the retained cutoff
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertEqual(cutoff, image.load_receipt()['monotonic_deadline'])
+        self.assertEqual(3, self.prepare()[0])
+        self.assertEqual(cutoff, image.load_receipt()['monotonic_deadline'])
+
+    def test_expiry_between_the_trial_unit_unlink_and_the_dropin_unlink(self):
+        self.w.dropin.mkdir()
+        write(self.w.dropin / '10-bound.conf', b'[Service]\nRuntimeMaxSec=6000\n')
+        late, real = [], os.unlink
+
+        def fake(*args, **kwargs):
+            real(*args, **kwargs)
+            if Path(str(args[0])) == self.w.units / image.TRIAL_UNIT:
+                late.append(True)
+        with patch.object(os, 'unlink', fake), \
+                patch.object(time, 'time', lambda: EXPIRED if late else REAL_TIME()):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertTrue((self.w.dropin / '10-bound.conf').exists())
+        self.assertFalse((self.w.units / image.TRIAL_UNIT).exists())
+
+    def test_expiry_between_dropin_unlink_and_rmdir_keeps_the_empty_directory(self):
+        self.w.dropin.mkdir()
+        write(self.w.dropin / '10-bound.conf', b'[Service]\nRuntimeMaxSec=6000\n')
+        late, real = [], os.unlink
+
+        def fake(*args, **kwargs):
+            real(*args, **kwargs)
+            if Path(str(args[0])) == self.w.dropin / '10-bound.conf':
+                late.append(True)
+        with patch.object(os, 'unlink', fake), \
+                patch.object(time, 'time', lambda: EXPIRED if late else REAL_TIME()):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertTrue(self.w.dropin.is_dir())
+        self.assertEqual([], list(self.w.dropin.iterdir()))
+
+
+class PublicationInterruptionTests(Activated):
+    """Interruption at the precise windows inside multi-step mutators."""
+
+    def test_interrupted_after_the_dropin_unlink_before_the_directory_rmdir(self):
+        self.w.dropin.mkdir()
+        write(self.w.dropin / '10-bound.conf', b'[Service]\nRuntimeMaxSec=6000\n')
+        real = os.rmdir
+
+        def fake(path, *args, **kwargs):
+            if str(path) == str(self.w.dropin):
+                raise RuntimeError('injected interruption')
+            return real(path, *args, **kwargs)
+        with patch.object(os, 'rmdir', fake):
+            with self.assertRaises(RuntimeError):
+                self.prepare()
+        self.assertEqual([], list(self.w.dropin.iterdir()))  # exactly the attributable remainder
+        self.assertEqual(3, self.prepare()[0])  # retry accepts it and finishes
+        self.assertFalse(self.w.dropin.exists())
+
+    def test_empty_or_unsafe_dropin_directory_is_accepted_only_when_attributable(self):
+        self.w.dropin.mkdir()
+        self.w.dropin.chmod(0o777)
+        self.refused()  # group/world writable: foreign, preserved
+        self.assertTrue(self.w.dropin.is_dir())
+        self.w.dropin.chmod(0o755)
+        write(self.w.dropin / 'other.conf', b'x')
+        self.refused()
+        self.assertTrue((self.w.dropin / 'other.conf').exists())
+
+    def test_interrupted_final_file_write_leaves_no_partial_final_bytes(self):
+        real, calls = os.fsync, []
+
+        def fake(fd):
+            calls.append(fd)
+            if len(calls) == 2:  # 1 = receipt, 2 = the tool temporary
+                raise RuntimeError('injected interruption')
+            return real(fd)
+        with patch.object(os, 'fsync', fake):
+            with self.assertRaises(RuntimeError):
+                self.prepare()
+        self.assertFalse((self.w.lib / 'vlab_image.py').exists())  # never partial FINAL bytes
+        self.assertTrue((self.w.lib / 'vlab_image.py.installing').exists())
+        self.assertEqual(3, self.prepare()[0])
+        self.assertEqual((HERE / 'vlab_image.py').read_bytes(), (self.w.lib / 'vlab_image.py').read_bytes())
+        self.assertFalse((self.w.lib / 'vlab_image.py.installing').exists())
+
+    def test_interrupted_rename_of_the_unit_is_retried_from_the_complete_temporary(self):
+        real, calls = os.rename, []
+
+        def fake(source, target, *args, **kwargs):
+            calls.append(str(target))
+            if str(target).endswith(image.CLONE_UNIT):
+                raise RuntimeError('injected interruption')
+            return real(source, target, *args, **kwargs)
+        with patch.object(os, 'rename', fake):
+            with self.assertRaises(RuntimeError):
+                self.prepare()
+        self.assertFalse((self.w.units / image.CLONE_UNIT).exists())
+        self.assertEqual(CLONE_BYTES, (self.w.units / (image.CLONE_UNIT + '.installing')).read_bytes())
+        self.assertEqual(3, self.prepare()[0])
+        self.assertEqual(CLONE_BYTES, (self.w.units / image.CLONE_UNIT).read_bytes())
+        self.assertEqual(0o644, (self.w.units / image.CLONE_UNIT).stat().st_mode & 0o7777)
+
+    def test_a_foreign_temporary_is_preserved_and_refused(self):
+        other = self.w.tmp / 'elsewhere'
+        write(other, b'x')
+        (self.w.lib / 'vlab_image.py.installing').symlink_to(other)
+        with self.assertRaises(image.Refused):
+            self.prepare()
+        self.assertTrue((self.w.lib / 'vlab_image.py.installing').is_symlink())
+        self.assertEqual(b'x', other.read_bytes())
+        self.assertFalse((self.w.lib / 'vlab_image.py').exists())
+
+
 class RunTests(unittest.TestCase):
     """The real ``run`` on tiny interpreter children (no systemd, no project code)."""
 
@@ -800,10 +1246,17 @@ class ScopeTests(unittest.TestCase):
                           'vlab_trial', 'init', 'ghcr', 'systemctl', 'vlab_core.py stop', 'Before='):
             self.assertNotIn(forbidden, text)
 
-    def test_helper_tree_is_controlled_by_the_unit_cgroup_and_shutdown_ordering_is_one_way(self):
+    def test_signals_reach_only_the_helper_and_stop_is_propagated_one_way(self):
         text = self.unit()
-        self.assertIn('KillMode=control-group', text)
+        # mixed: SIGTERM only to the helper (its cancel cleanup runs the core stop); SIGKILL to the rest
+        self.assertIn('KillMode=mixed', text)
+        self.assertNotIn('KillMode=control-group', text)
         self.assertNotIn('KillMode=process', text)
+        self.assertIn('PropagatesStopTo=hhfab-vlab-resume.service', text)
+        self.assertNotIn('PartOf=', text)  # no restart propagation: nothing here may start the backend
+        self.assertNotIn('BindsTo=', text)
+        timeout = int(next(l for l in text.splitlines() if l.startswith('TimeoutStopSec=')).split('=')[1])
+        self.assertGreaterEqual(timeout, image.CORE_TERM_GRACE + 70 + 45)  # grace + core stop + proof
         self.assertIn('After=network-online.target hhfab-vlab-resume.service', text)
         for line in text.splitlines():
             if line.startswith('Exec'):
