@@ -1539,10 +1539,20 @@ cleanup and at least 15 minutes left on the ORIGINAL immutable cleanup deadline
 (`Clock.cleanup_remaining`). It adds no API mutation, session/key renewal or
 deadline extension: the fixed creator/cloud DELETE deadline and independent
 expiry cleanup continue. The receipt then carries `success_handoff: "ready"`
-(creator not cancelled, `independent_cleanup_dispatched: false`, exit 0). Any
-primary failure, interruption, cleanup uncertainty, short budget or error while
-deciding records `"refused"`, still runs the existing captured-creator
-cancellation, and exits nonzero (the primary guest code if any, else 1). Without
+(creator not cancelled, `independent_cleanup_dispatched: false`, exit 0). A
+`ready` receipt is usable only from a completed invocation: the process exited
+0 after the receipt line was written and flushed, and `ready` is the last
+receipt line; a `ready` line with a nonzero exit is void. Once `ready` is
+decided, a handled late interruption (a signal surfacing as a Python exception)
+or a receipt write/flush failure (for example `BrokenPipeError`) before the
+handoff completes downgrades it to `refused`, runs the captured-creator
+cancellation, makes a best-effort minimal `refused` receipt line and exits 1.
+SIGKILL, host or interpreter death, an interruption inside that fallback and a
+caller ignoring the exit status are not covered; the original deadline and
+independent expiry cleanup remain the backstop. Any primary failure,
+interruption, cleanup uncertainty, short budget or error while deciding records
+`"refused"`, still runs the existing captured-creator cancellation, and exits
+nonzero (the primary guest code if any, else 1). Without
 the option behavior and receipt are unchanged. The lead still owns stop,
 sanitize, capture and disposal; `ready` is not capture, sealing, guest
 quiescence, image acceptance or production readiness, and does not bypass

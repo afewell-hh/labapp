@@ -1011,40 +1011,64 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
                 key_absent = True
             except BaseException:
                 pass
-        if handoff_on_success:
-            # Withhold creator cancellation ONLY after a validated contained full-core success,
-            # positive process/file/own-key cleanup and >=15 minutes before the ORIGINAL deadline
-            # (immutable cleanup clock; no renewal). Anything else, including any error here, refuses.
-            handoff = 'refused'
-            try:
-                if (result == 0 and contained and failure_category == 'none' and phase == 'guest-result'
-                        and guest_status == 'valid' and not failed.is_set()
-                        and process_absent and local_absent and key_absent and clock is not None
-                        and clock.cleanup_remaining() >= HANDOFF_RESERVE_SECONDS):
-                    handoff = 'ready'
-            except BaseException:
+        # One guarded window from the handoff decision through receipt publication. A 'ready' result
+        # is only complete once its receipt line was printed AND flushed; any exception escaping the
+        # window while 'ready' (handled late interrupt, BrokenPipeError/OSError on write or flush)
+        # downgrades to 'refused' and runs the existing captured-creator cancellation. Non-ready paths
+        # re-raise exactly as before. SIGKILL/host death/atomic exit are not covered.
+        try:
+            if handoff_on_success:
+                # Withhold creator cancellation ONLY after a validated contained full-core success,
+                # positive process/file/own-key cleanup and >=15 minutes before the ORIGINAL deadline
+                # (immutable cleanup clock; no renewal). Anything else, including any error here, refuses.
                 handoff = 'refused'
-        if handoff != 'ready':
+                try:
+                    if (result == 0 and contained and failure_category == 'none' and phase == 'guest-result'
+                            and guest_status == 'valid' and not failed.is_set()
+                            and process_absent and local_absent and key_absent and clock is not None
+                            and clock.cleanup_remaining() >= HANDOFF_RESERVE_SECONDS):
+                        handoff = 'ready'
+                except BaseException:
+                    handoff = 'refused'
+            if handoff != 'ready':
+                try:
+                    cleanup_dispatch(snapshot)
+                    dispatched = True
+                except BaseException:
+                    pass
+            receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
+                       'phase': phase, 'failure_category': failure_category, 'host_operation': host_operation,
+                       'own_key_absent': key_absent, 'local_files_absent': local_absent,
+                       'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id'],
+                       # Closed values only; never text, argv, paths or raw manager output.
+                       'guest_diagnostic_status': guest_status, 'guest_diagnostic': guest_detail,
+                       'guest_service': guest_service,
+                       # Closed status of the fixed owner-private first-failure capture; never a path or bytes.
+                       'private_diagnostic': private_diagnostic}
+            if handoff is not None:
+                # Requested handoff only. Not capture, sealing, quiescence, image acceptance or readiness.
+                receipt['success_handoff'] = handoff
+            # Publicly safe fixed statuses only; cloud deletion/FREE still require
+            # independent immutable404/terminal-operation/access-archive receipts.
+            print(json.dumps(receipt, sort_keys=True), **({'flush': True} if handoff == 'ready' else {}))
+        except BaseException:
+            if handoff != 'ready':
+                raise
+            # Late interruption or receipt write/flush failure before a completed handoff: the ready
+            # claim is void. Fall back to the exact captured-creator cancellation and a nonzero exit.
+            handoff = 'refused'
             try:
                 cleanup_dispatch(snapshot)
                 dispatched = True
             except BaseException:
                 pass
-        receipt = {'schema': 1, 'code': result, 'contained': contained, 'process_absent': process_absent,
-                   'phase': phase, 'failure_category': failure_category, 'host_operation': host_operation,
-                   'own_key_absent': key_absent, 'local_files_absent': local_absent,
-                   'independent_cleanup_dispatched': dispatched, 'lease': rec['request_id'],
-                   # Closed values only; never text, argv, paths or raw manager output.
-                   'guest_diagnostic_status': guest_status, 'guest_diagnostic': guest_detail,
-                   'guest_service': guest_service,
-                   # Closed status of the fixed owner-private first-failure capture; never a path or bytes.
-                   'private_diagnostic': private_diagnostic}
-        if handoff is not None:
-            # Requested handoff only. Not capture, sealing, quiescence, image acceptance or readiness.
-            receipt['success_handoff'] = handoff
-        # Publicly safe fixed statuses only; cloud deletion/FREE still require
-        # independent immutable404/terminal-operation/access-archive receipts.
-        print(json.dumps(receipt, sort_keys=True))
+            try:
+                # Best-effort minimal closed receipt; failure here is swallowed (exit stays nonzero).
+                print(json.dumps({'schema': 1, 'code': result, 'lease': rec['request_id'],
+                                  'success_handoff': 'refused',
+                                  'independent_cleanup_dispatched': dispatched}, sort_keys=True))
+            except BaseException:
+                pass
     if handoff == 'ready':
         return 0
     if handoff == 'refused':
