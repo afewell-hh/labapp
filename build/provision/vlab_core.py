@@ -1533,10 +1533,20 @@ def initial_readyz_failed(raw):
     return failed
 
 
+# Pinned kubectl v0.35.0 client-side request timeout text (exact bytes, README).
+INITIAL_READYZ_CLIENT_TIMEOUT = (b'Unable to connect to the server: context deadline exceeded '
+                                 b'(Client.Timeout exceeded while awaiting headers)\n')
+
+
 def kubectl(args, deadline, route=None):
+    # Only the exact initial readyz context gets a client timeout BELOW the unchanged
+    # 10s process cap, so the client can return its own bounded error before the cap
+    # (which starts before client startup) hard-kills it. Everything else stays 10s.
+    initial = route == 'api-initial-readyz' and args == ['get', '--raw=/readyz']
+    request_timeout = '--request-timeout=5s' if initial else '--request-timeout=10s'
     try:
         return routed(route, [KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
-                              '--request-timeout=10s', *args], deadline, 10, user=True)
+                              request_timeout, *args], deadline, 10, user=True)
     except Failure as error:
         # v1.35.0 kubectl cmd/util/helpers.go formats these known cases. Never
         # treat arbitrary exit1/authentication/x509 failures as startup pending.
@@ -1544,9 +1554,9 @@ def kubectl(args, deadline, route=None):
         refused = (b'The connection to the server 127.0.0.1:6443 was refused - '
                    b'did you specify the right host or port?\n')
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
-        health_failed = (route == 'api-initial-readyz' and args == ['get', '--raw=/readyz']
-                         and error.route == route and getattr(error, '_executed_child', False) is True
-                         and initial_readyz_failed(raw))
+        matched = (initial and error.route == route
+                   and getattr(error, '_executed_child', False) is True)
+        health_failed = matched and (initial_readyz_failed(raw) or raw == INITIAL_READYZ_CLIENT_TIMEOUT)
         # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
         # original Failure propagates and can never lead to another readiness poll.
         if (error.code == 1 and str(error) == 'child command failed'
