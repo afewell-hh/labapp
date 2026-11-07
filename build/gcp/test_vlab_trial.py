@@ -362,7 +362,8 @@ class OwnerTrial(unittest.TestCase):
 
     def owner_pipeline(self, *, heartbeat_alive=None, containment_error=None, start_error=None,
                        observed_code=0, observed_contained=True, ghcr=None,
-                       handoff=None, remaining=None, cancel_error=None, key_error=None, leftover=None):
+                       handoff=None, remaining=None, cancel_error=None, key_error=None, leftover=None,
+                       print_failure=None, print_failures=1):
         self.remote_inputs = []
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
@@ -464,6 +465,12 @@ class OwnerTrial(unittest.TestCase):
              (patch.object(guest.Clock, 'cleanup_remaining', return_value=remaining) if remaining is not None
               else nullcontext()), \
              patch('builtins.print') as printed:
+            print_calls = self.print_calls = []
+            def flaky_print(*args, **kwargs):
+                print_calls.append(kwargs)
+                if print_failure is not None and len(print_calls) <= print_failures:
+                    raise print_failure
+            printed.side_effect = flaky_print
             code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
                               **({} if ghcr is None else {'ghcr': ghcr}),
                               **({} if handoff is None else {'handoff_on_success': handoff}))
@@ -709,6 +716,53 @@ class OwnerTrial(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(code, receipt['code'] or 1)
                 self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_ready_receipt_is_printed_flushed_and_default_print_is_unchanged(self):
+        self.owner_pipeline(handoff=True)
+        self.assertEqual(self.print_calls, [{'flush': True}])
+        self.owner_pipeline()
+        self.assertEqual(self.print_calls, [{}])
+        self.owner_pipeline(handoff=True, remaining=10.0)
+        self.assertEqual(self.print_calls, [{}])
+
+    def test_late_publication_failure_after_eligibility_refuses_cancels_and_exits_nonzero(self):
+        cases = {
+            'broken-pipe': BrokenPipeError(),
+            'flush-os-error': OSError('PRIVATE-FLUSH'),
+            'late-sigint': KeyboardInterrupt(),
+            'late-sigterm-as-exit': SystemExit(143),
+        }
+        for name, error in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=error)
+                self.assertEqual(code, 1)
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertEqual(receipt['success_handoff'], 'refused')
+                self.assertEqual(receipt['code'], 0)
+                self.assertTrue(receipt['independent_cleanup_dispatched'])
+                self.assertEqual(self.print_calls[0], {'flush': True})
+                self.assertEqual(len(self.print_calls), 2)
+                self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_failed_ready_publication_with_failing_fallback_print_still_cancels_and_exits_nonzero(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=BrokenPipeError(), print_failures=2)
+        self.assertEqual(code, 1)
+        self.assertEqual(trace[-1], 'captured-cancel')
+        self.assertEqual(len(self.print_calls), 2)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+
+    def test_failed_ready_publication_with_cancellation_failure_never_reports_dispatch_or_success(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=BrokenPipeError(),
+                                                       cancel_error=RuntimeError('PRIVATE-CANCEL'))
+        self.assertEqual(code, 1)
+        self.assertIn('captured-cancel', trace)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+        self.assertFalse(receipt['independent_cleanup_dispatched'])
+        self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_default_mode_publication_failure_still_propagates_after_cancellation(self):
+        with self.assertRaises(BrokenPipeError):
+            self.owner_pipeline(print_failure=BrokenPipeError())
 
     def test_local_file_uncertainty_withholds_key_receipt_and_never_hands_off(self):
         code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, leftover='unexpected-private-file')
