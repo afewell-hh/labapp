@@ -211,17 +211,17 @@ def private_file(path, limit=MAX_FILE, mode=0o600):
         os.close(fd)
 
 
-def atomic(path, value):
+def atomic(path, value, alive=lambda: None):
     temporary = Path(str(path) + '.next')
     no_links(temporary)
-    if os.path.lexists(temporary):  # fixed name of OUR interrupted write; anything else refuses
-        require(owned_regular(temporary.lstat()), 'foreign temporary file')
-        temporary.unlink()
+    require(not os.path.lexists(temporary), 'unproven temporary file; preserved')
+    alive()
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     with os.fdopen(fd, 'wb') as stream:
         stream.write(encoded(value))
         stream.flush()
         os.fsync(stream.fileno())
+    alive()  # write/fsync may have consumed the original preparation budget
     os.replace(temporary, path)
 
 
@@ -524,9 +524,8 @@ def remove_trial_unit(expected_sha, alive):
 def dropin_file():
     """The bootstrap's exact volatile RuntimeMaxSec drop-in, or None; anything else refuses.
 
-    An EMPTY directory is the positively attributable remainder of an interrupted removal of that
-    exact file (fixed name, root-owned, not world writable; the mode itself is systemd's): it is accepted so a retry can
-    finish with ``rmdir``. Any other content refuses and is preserved.
+    An empty directory has no retained ownership proof and is preserved and refused.
+    The preparation cannot distinguish that object from an interrupted removal remainder.
     """
     if not os.path.lexists(RUNTIME_DROPIN):
         return None
@@ -535,8 +534,7 @@ def dropin_file():
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == OWNER and not info.st_mode & 0o002,
             'foreign runtime drop-in')
     names = sorted(p.name for p in RUNTIME_DROPIN.iterdir())
-    if not names:
-        return None
+    require(names, 'unproven empty runtime drop-in; preserved')
     require(names == ['10-bound.conf'], 'foreign runtime drop-in')
     bound = RUNTIME_DROPIN / '10-bound.conf'
     require(owned_regular(bound.lstat()) and DROPIN_BODY.fullmatch(bound.read_bytes()),
@@ -553,21 +551,20 @@ def install_conflict(target, raw):
     return False
 
 
-def install_exact(target, raw, mode):
+def install_exact(target, raw, mode, alive=lambda: None):
     """Publish exactly these bytes atomically or accept identical existing bytes; never overwrite.
 
     The bytes go to the fixed sibling ``<target>.installing`` (O_EXCL, final mode, fsynced) and only
     a complete file is renamed onto the final path, so an interruption can leave a partial
-    TEMPORARY (our fixed name, owned single-link regular file, removed on retry) but never partial
+    TEMPORARY (preserved and refused on retry without ownership proof) but never partial
     final bytes. The final path was just proven absent and its parent is root-only.
     """
     if install_conflict(target, raw):
         return
     temporary = Path(str(target) + '.installing')
     no_links(temporary)
-    if os.path.lexists(temporary):  # an interrupted earlier write of OURS; anything else refuses
-        require(owned_regular(temporary.lstat()), 'foreign temporary file')
-        temporary.unlink()
+    require(not os.path.lexists(temporary), 'unproven temporary file; preserved')
+    alive()
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     with os.fdopen(fd, 'wb') as stream:
         os.fchmod(stream.fileno(), mode)
@@ -575,6 +572,7 @@ def install_exact(target, raw, mode):
         stream.flush()
         os.fsync(stream.fileno())
     require(not os.path.lexists(target), 'installation conflict')
+    alive()
     os.rename(temporary, target)
 
 
@@ -730,12 +728,12 @@ def prepare(args):
         receipt['sealed_at'], receipt['removed'] = existing['sealed_at'], existing['removed']
     alive()
     seal_directory()
-    atomic(SEAL / RECEIPT, receipt)
+    atomic(SEAL / RECEIPT, receipt, alive)
     alive()
     LIB.mkdir(mode=0o755, exist_ok=True)
-    install_exact(LIB / 'vlab_image.py', tool, 0o644)
+    install_exact(LIB / 'vlab_image.py', tool, 0o644, alive)
     alive()
-    install_exact(UNITS / CLONE_UNIT, unit_raw, 0o644)
+    install_exact(UNITS / CLONE_UNIT, unit_raw, 0o644, alive)
     if present:
         remove_trial(files, cache, alive)
     remove_trial_unit(trial_sha, alive)
@@ -747,7 +745,7 @@ def prepare(args):
     owned_absent(receipt)  # includes the installed unit/tool byte pins
     receipt.update(state='sealed', owned_sealed=True, access=access_inventory())
     alive()  # the sealed publication is itself a continued mutation under the ORIGINAL clock
-    atomic(SEAL / RECEIPT, receipt)
+    atomic(SEAL / RECEIPT, receipt, alive)
     report(receipt)
     return 3  # the trial-owned portion is sealed; access-material provenance is ALWAYS unmet
 
@@ -893,10 +891,41 @@ def clone_start(_args):
                 'resume did not reach readiness on this boot')
         atomic(SEAL / CLONE_START, {'schema': 1, 'boot': boot, 'operation': after['operation'],
                                     'invocation': after['invocation']})
+        print('vlab-image: ready on a new boot', flush=True)
+        return 0
     except BaseException:
         cleanup_activation(core, receipt, boot, (operation, invocation))
         raise  # the PRIMARY failure, unchanged; cleanup uncertainty is reported on stderr only
-    print('vlab-image: ready on a new boot')
+
+
+def stop_verified(_args):
+    """Operator completion boundary, invoked OUTSIDE the clone unit's ordered ExecStop.
+
+    A systemctl stop of the clone unit alone only schedules backend termination. This command
+    binds the checkpoint first, waits for the clone stop, then uses the core's serialized public
+    stop and proves the backend offline and resumable before returning success.
+    """
+    require(os.geteuid() == OWNER, 'root required')
+    receipt = load_receipt()
+    require(receipt['state'] == 'sealed' and receipt['owned_sealed'], 'image is not sealed')
+    unit_pin(receipt)
+    core, boot, checkpoint = load_core(), kernel_boot(), load_checkpoint()
+    require(core.boot() == boot and checkpoint is not None and checkpoint['boot'] == boot
+            and boot != receipt['build_boot'], 'not a checkpointed clone boot')
+    with core.locked():
+        state = core.state()
+    require(state['nonce'] == receipt['nonce'] and state['boot'] == boot
+            and state['mode'] == 'resume' and state['phase'] in ('ready', 'stop-observed', 'resumable')
+            and (state['operation'], state.get('invocation')) ==
+            (checkpoint['operation'], checkpoint['invocation']), 'not the checkpointed activation')
+    require(run([SYSTEMCTL, 'stop', CLONE_UNIT], 250)[0] == 0, 'clone stop refused')
+    require(run([PYTHON, str(LIB / 'vlab_core.py'), 'stop'], 70, CORE_TERM_GRACE)[0] == 0,
+            'core stop refused')
+    units_offline()
+    state = core_offline(core, receipt['nonce'])
+    require(state['boot'] == boot and (state['operation'], state['invocation']) ==
+            (checkpoint['operation'], checkpoint['invocation']), 'stopped activation changed')
+    print('vlab-image: checkpointed backend stop verified', flush=True)
     return 0
 
 
@@ -944,7 +973,7 @@ def clone_stop(_args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument('action', choices=('prepare', 'verify', 'clone-start', 'clone-stop'))
+    parser.add_argument('action', choices=('prepare', 'verify', 'clone-start', 'clone-stop', 'stop-verified'))
     parser.add_argument('--private-candidate', action='store_true')
     parser.add_argument('--source-sha')
     parser.add_argument('--nonce')
@@ -959,7 +988,7 @@ def main(argv=None):
             and (args.action == 'prepare' or all(v is None for v in bindings)), 'invalid arguments')
     os.umask(0o077)
     return {'prepare': prepare, 'verify': verify, 'clone-start': clone_start,
-            'clone-stop': clone_stop}[args.action](args)
+            'clone-stop': clone_stop, 'stop-verified': stop_verified}[args.action](args)
 
 
 if __name__ == '__main__':

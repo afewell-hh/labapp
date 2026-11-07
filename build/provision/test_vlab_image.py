@@ -1141,8 +1141,9 @@ class PublicationInterruptionTests(Activated):
             with self.assertRaises(RuntimeError):
                 self.prepare()
         self.assertEqual([], list(self.w.dropin.iterdir()))  # exactly the attributable remainder
-        self.assertEqual(3, self.prepare()[0])  # retry accepts it and finishes
-        self.assertFalse(self.w.dropin.exists())
+        with self.assertRaises(image.Refused):
+            self.prepare()  # no retained inode proof: preserve the ambiguous remainder
+        self.assertTrue(self.w.dropin.is_dir())
 
     def test_empty_or_unsafe_dropin_directory_is_accepted_only_when_attributable(self):
         self.w.dropin.mkdir()
@@ -1167,9 +1168,10 @@ class PublicationInterruptionTests(Activated):
                 self.prepare()
         self.assertFalse((self.w.lib / 'vlab_image.py').exists())  # never partial FINAL bytes
         self.assertTrue((self.w.lib / 'vlab_image.py.installing').exists())
-        self.assertEqual(3, self.prepare()[0])
-        self.assertEqual((HERE / 'vlab_image.py').read_bytes(), (self.w.lib / 'vlab_image.py').read_bytes())
-        self.assertFalse((self.w.lib / 'vlab_image.py.installing').exists())
+        with self.assertRaises(image.Refused):
+            self.prepare()
+        self.assertFalse((self.w.lib / 'vlab_image.py').exists())
+        self.assertTrue((self.w.lib / 'vlab_image.py.installing').exists())
 
     def test_interrupted_rename_of_the_unit_is_retried_from_the_complete_temporary(self):
         real, calls = os.rename, []
@@ -1184,9 +1186,10 @@ class PublicationInterruptionTests(Activated):
                 self.prepare()
         self.assertFalse((self.w.units / image.CLONE_UNIT).exists())
         self.assertEqual(CLONE_BYTES, (self.w.units / (image.CLONE_UNIT + '.installing')).read_bytes())
-        self.assertEqual(3, self.prepare()[0])
-        self.assertEqual(CLONE_BYTES, (self.w.units / image.CLONE_UNIT).read_bytes())
-        self.assertEqual(0o644, (self.w.units / image.CLONE_UNIT).stat().st_mode & 0o7777)
+        with self.assertRaises(image.Refused):
+            self.prepare()
+        self.assertFalse((self.w.units / image.CLONE_UNIT).exists())
+        self.assertEqual(CLONE_BYTES, (self.w.units / (image.CLONE_UNIT + '.installing')).read_bytes())
 
     def test_a_foreign_temporary_is_preserved_and_refused(self):
         other = self.w.tmp / 'elsewhere'
@@ -1197,6 +1200,100 @@ class PublicationInterruptionTests(Activated):
         self.assertTrue((self.w.lib / 'vlab_image.py.installing').is_symlink())
         self.assertEqual(b'x', other.read_bytes())
         self.assertFalse((self.w.lib / 'vlab_image.py').exists())
+
+
+
+class LeadCompletionTests(Activated):
+    """Lead correction after the two author repair rounds: observable failure boundaries."""
+
+    def test_success_publication_failure_and_interrupt_stop_the_ready_backend(self):
+        for error in (BrokenPipeError('closed output'), image.Cancelled()):
+            with self.subTest(error=type(error).__name__):
+                # Separate tests use a fresh world; this test also proves a same-boot restart.
+                if not (self.w.seal / image.RECEIPT).exists():
+                    self.sealed()
+                with patch('builtins.print', side_effect=error):
+                    with self.assertRaises(type(error)):
+                        image.clone_start(SimpleNamespace())
+                self.assertTrue(self.stopped_cleanly())
+
+    def test_verified_stop_waits_for_the_public_core_and_checks_actual_offline_state(self):
+        self.sealed()
+        self.start()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(0, image.stop_verified(SimpleNamespace()))
+        self.assertTrue(self.stopped_cleanly())
+        actions = [c[-1] for c in self.w.commands if c[0] == image.PYTHON]
+        self.assertEqual(['start-resume', 'stop'], actions)
+        self.assertIn([image.SYSTEMCTL, 'stop', image.CLONE_UNIT], self.w.commands)
+
+    def test_verified_stop_does_not_accept_a_false_zero_with_backend_still_live(self):
+        self.sealed()
+        self.start()
+        real = self.w.run
+        with patch.object(image, 'run', lambda a, s, term_grace=0: (0, b'')
+                          if a[0] == image.PYTHON and a[-1] == 'stop' else real(a, s, term_grace)):
+            with self.assertRaises(image.Refused):
+                image.stop_verified(SimpleNamespace())
+        self.assertTrue(self.w.resume_active)
+
+    def test_verified_stop_refuses_a_foreign_operation_before_any_stop(self):
+        self.sealed()
+        self.start()
+        self.w.state['operation'] = 'f' * 32
+        before = len(self.w.commands)
+        with self.assertRaises(image.Refused):
+            image.stop_verified(SimpleNamespace())
+        self.assertEqual(before, len(self.w.commands))
+
+    def test_final_receipt_fsync_crossing_original_cutoff_never_publishes_sealed(self):
+        late, calls, real = [], [], os.fsync
+        def fsync(fd):
+            real(fd)
+            calls.append(fd)
+            if len(calls) == 4:  # intent, tool, unit, final receipt
+                late.append(True)
+        with patch.object(os, 'fsync', fsync), \
+                patch.object(time, 'time', lambda: EXPIRED if late else REAL_TIME()):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertEqual(4, len(calls))
+        self.assertEqual('sealing', image.load_receipt()['state'])
+        self.assertTrue(Path(str(self.w.seal / image.RECEIPT) + '.next').exists())
+
+    def test_install_fsync_crossing_original_cutoff_preserves_unpublished_temporary(self):
+        late, calls, real = [], [], os.fsync
+        def fsync(fd):
+            real(fd)
+            calls.append(fd)
+            if len(calls) == 2:
+                late.append(True)
+        with patch.object(os, 'fsync', fsync), \
+                patch.object(time, 'time', lambda: EXPIRED if late else REAL_TIME()):
+            with self.assertRaises(image.Refused):
+                self.prepare()
+        self.assertFalse((self.w.lib / 'vlab_image.py').exists())
+        self.assertTrue((self.w.lib / 'vlab_image.py.installing').exists())
+
+    def test_preexisting_regular_installing_and_next_files_are_preserved(self):
+        for name in ('vlab_image.py.installing',):
+            path = self.w.lib / name
+            write(path, b'foreign regular file', 0o666)
+            with self.assertRaises(image.Refused):
+                self.prepare()
+            self.assertEqual(b'foreign regular file', path.read_bytes())
+        path = self.w.tmp / 'record.next'
+        write(path, b'foreign atomic temporary')
+        with self.assertRaises(image.Refused):
+            image.atomic(self.w.tmp / 'record', {'a': 1})
+        self.assertEqual(b'foreign atomic temporary', path.read_bytes())
+
+    def test_initially_empty_dropin_is_preserved(self):
+        self.w.dropin.mkdir()
+        with self.assertRaises(image.Refused):
+            self.prepare()
+        self.assertTrue(self.w.dropin.is_dir())
+        self.assertEqual([], list(self.w.dropin.iterdir()))
 
 
 class RunTests(unittest.TestCase):

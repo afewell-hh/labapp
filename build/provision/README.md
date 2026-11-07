@@ -2881,7 +2881,11 @@ That interplay is **unproven**.
 installed unit/tool pins, the core `stop-controller` AND state locks, the sealed nonce, this boot
 and exactly the checkpointed operation/invocation of the running resume unit all agree. The unit's
 `PropagatesStopTo=` stops the resume unit in the SAME transaction after `ExecStop`, so a standalone
-`systemctl stop` no longer leaves the backend running (it does not propagate restarts or starts).
+`systemctl stop` schedules backend termination. It can return before that backend job completes;
+use `sudo /usr/bin/python3 /usr/local/lib/labapp/vlab_image.py stop-verified` outside the unit for
+a completed stop. This command first validates the current sealed checkpoint, waits for the clone
+stop, invokes the public core stop, and verifies the backend offline and resumable. It returns
+nonzero on uncertainty. Restart transactions can also process propagated dependencies.
 The post-stop verification (inactive unit, empty cgroup) cannot happen inside the transaction; it is
 the core's public `stop` at the next `clone-start`, never fabricated. Reason for no synchronous stop:
 the clone unit is `After=` the resume unit, so systemd stops it first; a synchronous stop of the
@@ -2892,7 +2896,7 @@ resume unit from its `ExecStop` would wait on this unit's own stop job and deadl
 The core's `ExecStopPost` then records `stop-observed`. This writes a core-owned field from outside
 the core (the exact value the core's own stop writes); the lead should judge that coupling, now
 validated against the sealed/checkpointed context and the core locks. The ordering, the stop job
-interplay, `PropagatesStopTo=` semantics on systemd 255 (stop only, no restart propagation) and
+interplay, `PropagatesStopTo=` semantics on systemd 255 and
 the shutdown path are **not proven**; only text-level and fake-graph tests exist.
 
 ### Original clock, interruption windows and installed pins
@@ -2904,10 +2908,10 @@ the shutdown path are **not proven**; only text-level and fake-graph tests exist
   sealed receipt is published, so a late expiry or a backward wall clock cannot extend it. An expiry
   at the last step leaves a `sealing` receipt (no renewal, no new authority).
 - Final files (`vlab_image.py`, the clone unit) are written to the fixed `<name>.installing`, fsynced
-  and renamed, so an interruption leaves at most our own partial temporary (removed on retry), never
-  partial final bytes. A leftover empty runtime drop-in directory (interrupted after the
-  `10-bound.conf` unlink) is accepted and removed; foreign content, links or a world-writable
-  directory are preserved and refused.
+  and renamed, with the same original cutoff rechecked after fsync before publication.
+  A preexisting `.installing` or `.next` file and an empty runtime drop-in directory are
+  preserved and refused because ownership is unproven. Some interrupted preparations therefore
+  require disposal instead of an automatic retry. Partial final bytes are never published.
 - `prepare` postconditions, `verify`, `clone-start` and `clone-stop` check the ACTUAL installed unit
   and tool bytes against the receipt hashes (owner, exact `0644`, single link, no-follow), not only
   systemd's loaded path, so an edited-and-reloaded unit fails.
@@ -2950,3 +2954,9 @@ identity (to compare with the core state), not as fresh build authority.
   checkpoint and also refuses.
 - The fake core in the tests mirrors, but is not, the real core; a drift test only pins a few
   literals. Real `systemctl` output, `/proc` scanning and core loading need native evidence.
+
+Lead correction after the two author correction rounds: success reporting and return are inside
+the activation cleanup guard; retained preparation deadlines are checked after blocking writes
+and before publication. Ambiguous leftovers are preserved. The added `stop-verified` command is
+an operator completion boundary outside the unit ordering cycle. Native ordering and clone
+behavior still require measurement; these source changes do not clear access provenance.
