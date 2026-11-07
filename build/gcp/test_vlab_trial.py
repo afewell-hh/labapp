@@ -760,6 +760,33 @@ class OwnerTrial(unittest.TestCase):
         self.assertFalse(receipt['independent_cleanup_dispatched'])
         self.assertNotIn('PRIVATE', self.printed_text)
 
+    def test_interrupt_after_ready_receipt_flush_before_return_still_cancels(self):
+        original_trace = sys.gettrace()
+        target = host.trial.__code__
+        injected = False
+        def interrupt(frame, event, arg):
+            nonlocal injected
+            if frame.f_code is target and event == 'line':
+                # Publication has completed: this independently observes the mock call,
+                # then interrupts the very next production statement before return.
+                if frame.f_locals.get('handoff') == 'ready' and 'receipt' in frame.f_locals:
+                    # The print call is the last line before this becomes true.
+                    # Observe its completed mock call rather than a source line number.
+                    if getattr(self, 'print_calls', []):
+                        injected = True
+                        sys.settrace(None)
+                        raise KeyboardInterrupt()
+            return interrupt
+        sys.settrace(interrupt)
+        try:
+            code, receipt, trace, *_ = self.owner_pipeline(handoff=True)
+        finally:
+            sys.settrace(original_trace)
+        self.assertTrue(injected, 'interrupt must occur after receipt publication')
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+        self.assertEqual(trace[-1], 'captured-cancel')
+
     def test_default_mode_publication_failure_still_propagates_after_cancellation(self):
         with self.assertRaises(BrokenPipeError):
             self.owner_pipeline(print_failure=BrokenPipeError())
