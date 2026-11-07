@@ -361,7 +361,9 @@ class OwnerTrial(unittest.TestCase):
         self.assertIs(trial.call_args.kwargs['login'], login)
 
     def owner_pipeline(self, *, heartbeat_alive=None, containment_error=None, start_error=None,
-                       observed_code=0, observed_contained=True, ghcr=None):
+                       observed_code=0, observed_contained=True, ghcr=None,
+                       handoff=None, remaining=None, cancel_error=None, key_error=None, leftover=None,
+                       print_failure=None, print_failures=1):
         self.remote_inputs = []
         value = snapshot()
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
@@ -374,9 +376,13 @@ class OwnerTrial(unittest.TestCase):
         trace, pulse = [], threading.Event()
         nonce = 'd'*32
         boot = '22222222-2222-4222-8222-222222222222'
-        payload_dir = self.directory / 'inputs'
+        # Fresh private root per call so several pipeline runs in one test never collide;
+        # the production fresh-directory requirement is not relaxed.
+        root = Path(tempfile.mkdtemp(prefix='run-', dir=self.directory))
+        root.chmod(0o700)
+        payload_dir = root / 'inputs'
         payload_dir.mkdir()
-        output = self.directory / 'output'
+        output = root / 'output'
         output.mkdir(mode=0o700)
         pins = {}
         for name in guest.PAYLOADS:
@@ -430,14 +436,21 @@ class OwnerTrial(unittest.TestCase):
                 return b''
             def close(self):
                 trace.append('master-close')
+                if leftover is not None:
+                    # Unexpected local file: the fixed owned-file sweep must treat it as uncertainty.
+                    (output / leftover).write_bytes(b'x')
                 return True
         self_test = self
         def removed(*args, **kwargs):
             self.assertEqual(trace[-1], 'master-close')
             self.assertFalse(any(output.iterdir()), 'private files remain before final own-key receipt')
+            if key_error is not None:
+                raise key_error
             trace.append('removed')
         def cancel(snap):
             trace.append('captured-cancel')
+            if cancel_error is not None:
+                raise cancel_error
         heartbeat = Mock()
         heartbeat.start.side_effect = pulse.set
         heartbeat.is_alive.return_value = heartbeat_alive
@@ -449,9 +462,18 @@ class OwnerTrial(unittest.TestCase):
              patch.object(host.secrets, 'token_urlsafe', return_value='PUBLIC-NONDEPLOYABLE-PASSWORD'), \
              patch.object(host, 'cleanup_own_key', side_effect=removed), patch.object(host, 'cleanup_dispatch', side_effect=cancel), \
              (patch.object(host.threading, 'Thread', return_value=heartbeat) if heartbeat_alive is not None else nullcontext()), \
+             (patch.object(guest.Clock, 'cleanup_remaining', return_value=remaining) if remaining is not None
+              else nullcontext()), \
              patch('builtins.print') as printed:
+            print_calls = self.print_calls = []
+            def flaky_print(*args, **kwargs):
+                print_calls.append(kwargs)
+                if print_failure is not None and len(print_calls) <= print_failures:
+                    raise print_failure
+            printed.side_effect = flaky_print
             code = host.trial(value, payload_dir, output, registration=registration, records=records, login=login,
-                              **({} if ghcr is None else {'ghcr': ghcr}))
+                              **({} if ghcr is None else {'ghcr': ghcr}),
+                              **({} if handoff is None else {'handoff_on_success': handoff}))
         self.printed_text = printed.call_args.args[0]
         return code, json.loads(printed.call_args.args[0]), trace, importer, trust, heartbeat, output
 
@@ -611,6 +633,190 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic']),
                          ('valid', dict(guest.SUCCESS)))
         self.assertIsNone(receipt['guest_service'])
+
+    # --- opt-in success handoff (#523); each pipeline run gets its own private root ---
+
+    def test_default_and_explicit_false_keep_cancellation_and_receipt_shape(self):
+        for kwargs in ({}, {'handoff': False}):
+            with self.subTest(kwargs=kwargs):
+                code, receipt, trace, *_ = self.owner_pipeline(**kwargs)
+                self.assertEqual(code, 0)
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertNotIn('success_handoff', receipt)
+                self.assertTrue(receipt['independent_cleanup_dispatched'])
+
+    def test_default_failure_keeps_primary_code_cancellation_and_receipt_shape(self):
+        code, receipt, trace, *_ = self.owner_pipeline(observed_code=7, observed_contained=False)
+        self.assertEqual(code, 7)
+        self.assertEqual(trace[-1], 'captured-cancel')
+        self.assertNotIn('success_handoff', receipt)
+
+    def test_cli_option_is_explicit_default_false_and_reaches_trial(self):
+        for argv, expected in (([], False), (['--handoff-on-success'], True)):
+            with self.subTest(argv=argv):
+                value = snapshot()
+                with patch.object(guest, 'regular', return_value=guest.encoded(value)), \
+                     patch.object(host, 'private_directory', return_value=self.directory), \
+                     patch.object(host, 'GcsAccessRecords', return_value=Mock()), \
+                     patch.object(host, 'OwnerRegistration', return_value=Mock()), \
+                     patch.object(host.SelfLogin, 'for_owner', return_value=Mock()), \
+                     patch.object(host, 'trial', return_value=0) as run:
+                    host.main(['--snapshot', 'public-fixture', '--payloads', 'inputs', '--output', 'output', *argv])
+                self.assertIs(run.call_args.kwargs['handoff_on_success'], expected)
+
+    def test_explicit_handoff_after_clean_success_withholds_only_creator_cancellation(self):
+        # Real Clock: the fixture deadline leaves far more than 15 minutes.
+        code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt['success_handoff'], 'ready')
+        self.assertNotIn('captured-cancel', trace)
+        self.assertEqual(trace[-2:], ['master-close', 'removed'])
+        self.assertFalse(receipt['independent_cleanup_dispatched'])
+        self.assertTrue(all(receipt[k] for k in ('contained', 'process_absent', 'own_key_absent', 'local_files_absent')))
+        self.assertFalse(any(output.iterdir()))
+        for text in ('PRIVATE', 'ssh-ed25519', 'PUBLIC-NONDEPLOYABLE-PASSWORD'):
+            self.assertNotIn(text, self.printed_text)
+
+    def test_handoff_just_under_fifteen_minutes_of_original_deadline_is_refused(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, remaining=899.0)
+        self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+        self.assertEqual(trace[-1], 'captured-cancel')
+        self.assertEqual(receipt['code'], 0)  # primary guest outcome is preserved
+
+    def test_handoff_at_exactly_fifteen_minutes_of_original_deadline_is_ready(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, remaining=900.0)
+        self.assertEqual((code, receipt['success_handoff']), (0, 'ready'))
+        self.assertNotIn('captured-cancel', trace)
+
+    def test_handoff_budget_error_from_the_clock_refuses_and_cancels(self):
+        with patch.object(guest.Clock, 'cleanup_remaining', side_effect=guest.Failure('cutoff', 124, 'phase-cutoff')):
+            code, receipt, trace, *_ = self.owner_pipeline(handoff=True)
+        self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_requested_handoff_refuses_and_cancels_for_failure_uncertainty_and_interrupt(self):
+        cases = {
+            'guest-failure': dict(observed_code=7, observed_contained=False),
+            'guest-failure-contained': dict(observed_code=9, observed_contained=True),
+            'uncontained-success': dict(observed_contained=False),
+            'live-heartbeat': dict(heartbeat_alive=True),
+            'containment-error': dict(observed_contained=False, containment_error=RuntimeError('PRIVATE-CONTAINMENT')),
+            'local-file-uncertainty': dict(leftover='unexpected-private-file'),
+            'own-key-cleanup-failure': dict(key_error=RuntimeError('PRIVATE-KEY')),
+            'interrupted': dict(start_error=KeyboardInterrupt()),
+            'access-refusal': dict(start_error=host.AccessError('PRIVATE-ACCESS')),
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, *_ = self.owner_pipeline(handoff=True, **extra)
+                self.assertEqual(receipt['success_handoff'], 'refused')
+                if name == 'containment-error':
+                    self.assertIn(('remote', ('/usr/bin/sudo', '-n', '/usr/bin/systemctl', 'stop', guest.UNIT), 'persistence'), trace)
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertNotEqual(code, 0)
+                self.assertEqual(code, receipt['code'] or 1)
+                self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_ready_receipt_is_printed_flushed_and_default_print_is_unchanged(self):
+        self.owner_pipeline(handoff=True)
+        self.assertEqual(self.print_calls, [{'flush': True}])
+        self.owner_pipeline()
+        self.assertEqual(self.print_calls, [{}])
+        self.owner_pipeline(handoff=True, remaining=10.0)
+        self.assertEqual(self.print_calls, [{}])
+
+    def test_late_publication_failure_after_eligibility_refuses_cancels_and_exits_nonzero(self):
+        cases = {
+            'broken-pipe': BrokenPipeError(),
+            'flush-os-error': OSError('PRIVATE-FLUSH'),
+            'late-sigint': KeyboardInterrupt(),
+            'late-sigterm-as-exit': SystemExit(143),
+        }
+        for name, error in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=error)
+                self.assertEqual(code, 1)
+                self.assertEqual(trace[-1], 'captured-cancel')
+                self.assertEqual(receipt['success_handoff'], 'refused')
+                self.assertEqual(receipt['code'], 0)
+                self.assertTrue(receipt['independent_cleanup_dispatched'])
+                self.assertEqual(self.print_calls[0], {'flush': True})
+                self.assertEqual(len(self.print_calls), 2)
+                self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_failed_ready_publication_with_failing_fallback_print_still_cancels_and_exits_nonzero(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=BrokenPipeError(), print_failures=2)
+        self.assertEqual(code, 1)
+        self.assertEqual(trace[-1], 'captured-cancel')
+        self.assertEqual(len(self.print_calls), 2)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+
+    def test_failed_ready_publication_with_cancellation_failure_never_reports_dispatch_or_success(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, print_failure=BrokenPipeError(),
+                                                       cancel_error=RuntimeError('PRIVATE-CANCEL'))
+        self.assertEqual(code, 1)
+        self.assertIn('captured-cancel', trace)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+        self.assertFalse(receipt['independent_cleanup_dispatched'])
+        self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_interrupt_after_ready_receipt_flush_before_return_still_cancels(self):
+        original_trace = sys.gettrace()
+        target = host.trial.__code__
+        injected = False
+        def interrupt(frame, event, arg):
+            nonlocal injected
+            if frame.f_code is target and event == 'line':
+                # Publication has completed: this independently observes the mock call,
+                # then interrupts the very next production statement before return.
+                if frame.f_locals.get('handoff') == 'ready' and 'receipt' in frame.f_locals:
+                    # The print call is the last line before this becomes true.
+                    # Observe its completed mock call rather than a source line number.
+                    if getattr(self, 'print_calls', []):
+                        injected = True
+                        sys.settrace(None)
+                        raise KeyboardInterrupt()
+            return interrupt
+        sys.settrace(interrupt)
+        try:
+            code, receipt, trace, *_ = self.owner_pipeline(handoff=True)
+        finally:
+            sys.settrace(original_trace)
+        self.assertTrue(injected, 'interrupt must occur after receipt publication')
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['success_handoff'], 'refused')
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_default_mode_publication_failure_still_propagates_after_cancellation(self):
+        with self.assertRaises(BrokenPipeError):
+            self.owner_pipeline(print_failure=BrokenPipeError())
+
+    def test_local_file_uncertainty_withholds_key_receipt_and_never_hands_off(self):
+        code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, leftover='unexpected-private-file')
+        self.assertFalse(receipt['local_files_absent'])
+        self.assertFalse(receipt['own_key_absent'])
+        self.assertNotIn('removed', trace)
+        self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_refused_handoff_preserves_primary_guest_code(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, observed_code=7, observed_contained=False)
+        self.assertEqual((code, receipt['code']), (7, 7))
+        self.assertEqual(trace[-1], 'captured-cancel')
+
+    def test_cancellation_failure_after_refused_handoff_is_nonzero_and_never_ready(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, remaining=10.0,
+                                                       cancel_error=RuntimeError('PRIVATE-CANCEL'))
+        self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+        self.assertIn('captured-cancel', trace)
+        self.assertFalse(receipt['independent_cleanup_dispatched'])
+        self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_cancellation_failure_on_primary_failure_keeps_primary_code_and_refusal(self):
+        code, receipt, trace, *_ = self.owner_pipeline(handoff=True, observed_code=7, observed_contained=False,
+                                                       cancel_error=RuntimeError('PRIVATE-CANCEL'))
+        self.assertEqual((code, receipt['success_handoff']), (7, 'refused'))
+        self.assertFalse(receipt['independent_cleanup_dispatched'])
 
     def test_live_heartbeat_withholds_containment_channel_files_and_key_receipt(self):
         code, receipt, trace, _, _, heartbeat, output = self.owner_pipeline(
