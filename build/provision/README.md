@@ -2257,6 +2257,25 @@ Strict readers (`result.json`, auth/credential, contract, writer sequence,
 `auth_publish_check`) never recover. This proves neither legitimate publication, ordering
 nor interference-free history, and does not establish the cause of canonical13.
 
+Initial-open race and read-site labels (#527). A replacement published between `open()` and
+`regular()`'s FIRST `fstat` leaves the opened inode at link count 0. `regular()` stays strict
+for every caller (same "file type/owner/size refused" message, code 1, category `policy`), but
+when the file is otherwise valid (regular, owned, within bounds and mode where required, link
+count exactly 0) and the path now names a different regular inode, the refusal is the same
+private `Failure` subtype used above and no byte was read. Only `guardian_state()` for the two
+fixed files acts on it, with the identical bounded sequence: `Clock` check, ONE complete
+fresh `regular()`, `Clock` check; a second failure, expiry, signal or any ineligible input
+(wrong owner/mode/type, oversize, symlink, removed path, hardlink) is the terminal primary.
+This race was reproduced on a real filesystem and matches the native diagnostic class
+(guardian, `worker-supervision`, `policy`) only; the native initiating predicate of the failed
+corrected-core run is UNKNOWN and this change does not claim to be its cause.
+A failure of the guardian's own read of `phase.json` or `heartbeat.json` (the read, including
+the recovery read, not parsing, freshness, boot, OOM, resource or clock checks) now reports the
+fixed guardian operation `phase-state-read` or `heartbeat-state-read` instead of
+`worker-supervision`, in any phase. The diagnostic schema, fields, categories, child-status
+rules and primary code are unchanged; the host imports the same validator. Signals and clock
+expiry during recovery keep their code, category and previous operation.
+
 All cutoffs are absolute from durable admission, with wall AND monotonic bounds:
 
 | Phase | Cutoff in minutes |
