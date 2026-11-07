@@ -1558,6 +1558,57 @@ sanitize, capture and disposal; `ready` is not capture, sealing, guest
 quiescence, image acceptance or production readiness, and does not bypass
 existing capture/seal gates. All failed paths remain disposable.
 
+#### Opt-in private image preparation bridge (#530, SOURCE only, not activated)
+
+`--prepare-private-image` (library `prepare_private_image=False`) is owner-only, default off and
+**requires `--handoff-on-success`**; the CLI refuses before any work (argparse error, exit 2) and the
+library refuses before any work with a fixed `guest.Failure`. Without it the behavior, receipt, order
+and exit status are exactly as before. It is a host bridge to the guest module of #526 (PR528);
+that module is a **provisional dependency**: this feature is not runnable, and must not be activated,
+until the guest files and this bridge are accepted together in one captured main source SHA.
+
+When requested, preparation runs inside the finalizer only after a validated full-core terminal
+success (`code 0`, `contained`, the exact `SUCCESS` diagnostic), after the heartbeat thread was
+joined (a live heartbeat means it is skipped), and before the ORIGINAL master closes. It reuses that
+master, the same VM/boot/lease/source/ownership and the ORIGINAL work (`persistence`) and cleanup
+cutoffs: no reconnect, new key or session, renewal or permission expansion. The budget is
+`min(persistence remaining, cleanup remaining - 15 min)` (at least 120 s, at most 900 s); the 15
+minute handoff reserve is never spent.
+
+Order, all through the original master:
+
+1. Positive proof the original guardian is `inactive`/`success` (fixed `systemctl show`) and the
+   genuine result file is unchanged. Trial state is not deleted while a heartbeat could still run.
+2. Registration and trusted-creator checks, then exactly TWO fixed PUBLIC files at the captured
+   `snapshot.source_sha` (never moving main): `build/provision/vlab_image.py` and
+   `build/provision/labapp-vlab-clone.service`, bounded (256 KiB), exact length and complete git blob
+   SHA-1 checked, written exclusively into the private output directory and covered by the fixed
+   owned local-file cleanup table.
+3. SFTP into a fresh `/tmp/labapp-vlab-image-<nonce>` (0700). A root stdlib bootstrap then verifies,
+   BEFORE executing anything: root-owned non-writable ancestry, the exact two-entry incoming set,
+   regular/single-link/non-symlink/owner/size/SHA-256 of both files against the host hashes, a trusted
+   installed `owned_process.py`, and that no target exists. It installs both files as root `0644` under
+   `/usr/local/lib/labapp`, re-verifies, and runs the installed module with `python3 -I`, with the trusted
+   library directory first on `sys.path` (owner-writable incoming directories are never imported). No
+   owner or GHCR credential is in argv, SFTP, hashes, receipts or any new artifact.
+4. The module is invoked `prepare --private-candidate --source-sha --nonce --lease --build-boot
+   --tool-sha256 --unit-sha256`. The wrapper exits 0 whenever the module ran and prints a closed
+   canonical record carrying the REAL module exit code and bounded stdout; it never relabels a code.
+
+Only exact code `3` with `owned_sealed: true`, `unmet` exactly `["access-material-provenance"]`, a
+bounded closed `access` count map and bounded `removed_count` is accepted, and only as the fixed
+receipt value `image_preparation: "partial-owned"`. That is partial preparation, **not** a complete seal,
+capture-gate clearance, image creation, production readiness or trusted pre-login sealing. Nothing from
+the guest report is relayed. A requested receipt carries `image_preparation` as `partial-owned`,
+`refused` (any failure, malformed/extra/unknown output, wrong code or binding, insufficient time,
+interruption or uncertainty) or `skipped` (no validated contained success to prepare). Anything other
+than `partial-owned` makes the handoff `refused`, runs the existing exact captured-creator cancellation
+and exits nonzero, while the receipt `code`/`contained` keep the original core result. Cleanup
+uncertainty raised during preparation is sticky like every other host process/file uncertainty
+(`process_absent`, `local_files_absent` and the own-key receipt stay false). The existing late
+publication/return guard is unchanged and truthful (`partial-owned` is kept if the guest was changed).
+The lead still owns stop, sanitize, capture and disposal; no GCP image/cloud API is added here.
+
 The fixed owner SELF adapter addresses the existing authenticated email while
 binding records to its configured numeric user ID. Only POST response key names
 may use that exact fixed email prefix; profile identity, key-map fingerprints,
