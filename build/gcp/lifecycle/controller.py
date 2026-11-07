@@ -19,6 +19,7 @@ occupied. See ../README.md for the guarantees and the unverified assumptions.
 """
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -122,6 +123,16 @@ class Controller:
             for name in IMMUTABLE:
                 if prev.get(name) != rec.get(name):
                     raise AssertionError(f"immutable field {name} changed")
+        old_window, new_window = prev.get("private_capture_window"), rec.get("private_capture_window")
+        if rec.get("state") != FREE and old_window != new_window:
+            # One-time arm only: absent -> present with every other field unchanged.
+            # A present window can never be altered, renewed, re-armed or removed
+            # while the lease is held; FREE (a fresh record) is the only reset.
+            if (old_window is not None or new_window is None or prev.get("state") != ACTIVE or
+                    rec.get("state") != ACTIVE or
+                    {k: v for k, v in prev.items()} != {k: v for k, v in rec.items()
+                                                        if k != "private_capture_window"}):
+                raise AssertionError("private capture window is one-time and immutable")
         old_access = prev.get("access")
         if old_access is not None and rec.get("state") != FREE:
             new_access = rec.get("access")
@@ -655,7 +666,149 @@ class Controller:
                 self.cfg.now() >= _parse(rec["deadline"]):
             return True
         inst = self._get("instances", rec["names"]["instance"])
-        return inst is not None and inst.get("status") in NOT_RUNNING
+        if inst is None or inst.get("status") not in NOT_RUNNING:
+            return False
+        return not self._window_open(rec, inst)
+
+    def _window_open(self, rec: dict, inst: dict) -> bool:
+        """True only for a valid, bound, unexpired owner-private capture window.
+
+        Consulted only by the automatic NON-forced janitor trigger for a stopped
+        VM. Any invalid/foreign/expired window returns False so cleanup proceeds.
+        """
+        if "private_capture_window" not in rec:
+            return False
+        try:
+            if (rec.get("schema") != 2 or rec.get("state") != ACTIVE or
+                    rec.get("profile") != spec.UBUNTU_VLAB_CORE or "capture" in rec):
+                return False
+            window = inline_history.capture_window(rec)
+            ends = _parse(window["ends_at"])
+            now = self.cfg.now()
+            return (_parse(window["armed_at"]) <= now < ends and
+                    now < _parse(rec["deadline"]) - timedelta(
+                        seconds=inline_history.WINDOW_CLEANUP_RESERVE_SECONDS) and
+                    inst.get("id") == window["vm_id"] == rec["ids"]["instance"] and
+                    inst.get("name") == rec["names"]["instance"])
+        except (inline_history.HistoryError, KeyError, TypeError, ValueError, AttributeError):
+            return False
+
+    _RECEIPT_FIELDS = frozenset({
+        "schema", "code", "contained", "process_absent", "phase", "failure_category",
+        "host_operation", "own_key_absent", "local_files_absent",
+        "independent_cleanup_dispatched", "lease", "guest_diagnostic_status",
+        "guest_diagnostic", "guest_service", "private_diagnostic", "success_handoff",
+        "image_preparation"})
+    _GUEST_SUCCESS = {"origin": "worker", "phase": "persistence", "operation": "complete",
+                      "category": "none", "child_status": None}
+
+    # Copied from the CURRENT host build/gcp/vlab_trial.py closed service domains.
+    _SERVICE_ACTIVE = ('active', 'inactive', 'failed', 'activating', 'deactivating',
+                       'reloading', 'maintenance')
+    _SERVICE_RESULTS = ('success', 'resources', 'timeout', 'exit-code', 'signal', 'core-dump',
+                        'watchdog', 'start-limit-hit', 'oom-kill', 'protocol', 'exec-condition')
+
+    def _check_host_receipt(self, receipt, rec) -> None:
+        """Closed shape/values of the accepted host's completed ready receipt.
+
+        This only checks the claimed content. It does not authenticate the caller
+        or prove the receipt is genuine; the trusted Root caller must compare the
+        supplied receipt/source digests with privately captured evidence.
+        """
+        r = receipt
+        ok = (type(r) is dict and set(r) == self._RECEIPT_FIELDS
+              and type(r["schema"]) is int and r["schema"] == 1
+              and type(r["code"]) is int and r["code"] == 0
+              and r["contained"] is True and r["process_absent"] is True
+              and r["local_files_absent"] is True and r["own_key_absent"] is True
+              and r["independent_cleanup_dispatched"] is False
+              and r["lease"] == rec["request_id"]
+              and r["phase"] == "guest-result" and r["failure_category"] == "none"
+              and r["guest_diagnostic_status"] == "valid"
+              and r["guest_diagnostic"] == self._GUEST_SUCCESS
+              and r["private_diagnostic"] == "skipped"
+              and r["success_handoff"] == "ready"
+              and r["image_preparation"] == "partial-owned"
+              and r["host_operation"] == "result-validate")
+        service = r.get("guest_service") if type(r) is dict else None
+        if ok and service is not None:
+            # Observation is diagnostic: only its closed value domains are checked,
+            # never inactive/success as a new gate. bool is not an integer here.
+            ok = (type(service) is dict and
+                  set(service) == {"active_state", "result", "exec_code", "exec_status"} and
+                  type(service["active_state"]) is str and
+                  service["active_state"] in self._SERVICE_ACTIVE and
+                  type(service["result"]) is str and
+                  service["result"] in self._SERVICE_RESULTS and
+                  type(service["exec_code"]) is int and 0 <= service["exec_code"] <= 7 and
+                  type(service["exec_status"]) is int and 0 <= service["exec_status"] <= 255)
+        if not ok:
+            raise Refused("host receipt is not the exact completed ready/partial-owned success")
+
+    def arm_private_capture_window(self, request_id, *, receipt, source_sha, receipt_sha256,
+                                   vm_id, boot_id, expected_trial):
+        """Owner-library-only, one-time bounded stop/imaging time for Root (#533).
+
+        Not a managed capture gate, seal or lease renewal. The immutable epoch,
+        lease, IDs, deadline, body, profile, image and VM TTL are unchanged; the
+        successful CAS ADVANCES the storage generation exactly once. Persists at
+        most one ``private_capture_window`` with a single CAS (no retry): a lost
+        CAS raises and nothing is claimed armed. ``source_sha`` and ``receipt_sha256``
+        are metadata bindings the trusted caller must have checked against its
+        privately captured evidence. Cannot revoke an already-issued delete by an
+        older janitor; the lead must establish none is queued/running first.
+        An invalid window (``_window_open`` false) does not itself guarantee
+        deletion or release: whole-record validation can still block malformed
+        metadata under the existing fail-closed ownership rules.
+        """
+        rec, gen = self.store.read(self.cfg.key)
+        if (rec is None or rec.get("schema") != 2 or rec.get("state") != ACTIVE or
+                rec.get("request_id") != request_id or
+                rec.get("profile") != spec.UBUNTU_VLAB_CORE or
+                "private_capture_window" in rec or "capture" in rec):
+            raise Refused("window requires the current ACTIVE unarmed schema-2 VLAB lease")
+        self._lease_kinds(rec)
+        self._accounting(rec, reserve=True, adding=True)
+        access = rec.get("access")
+        if (type(access) is not dict or access.get("phase") != "registered" or
+                access["binding"].get("lease") != request_id):
+            raise Refused("window requires the current registered owner access")
+        fields = ("profile", "request_id", "epoch", "run_id", "attempt", "body_hash", "ids",
+                  "boot_image", "boot_image_id", "reserved_at", "deadline", "operation")
+        if expected_trial != {k: rec.get(k) for k in fields}:
+            raise Refused("window snapshot changed")
+        if (not isinstance(vm_id, str) or not isinstance(boot_id, str) or
+                vm_id != rec["ids"]["instance"] or boot_id != rec["ids"]["boot"] or
+                None in rec["ids"].values()):
+            raise Refused("window requires the confirmed instance and boot IDs")
+        import re
+        if (not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha) or
+                not isinstance(receipt_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)):
+            raise Refused("window source/receipt digests are malformed")
+        self._check_host_receipt(receipt, rec)
+        if (access["binding"]["vm_id"] != vm_id or access["binding"]["boot_id"] != boot_id):
+            raise Refused("window access binding mismatch")
+        reason, found = self._inspect(rec, rec["ids"]["instance"])
+        if reason or set(found) != {"instance", "boot"}:
+            raise Refused("window requires current exact VM/boot ownership")
+        now = _parse(spec.rfc3339(self.cfg.now()))
+        ceiling = _parse(rec["deadline"]) - timedelta(
+            seconds=inline_history.WINDOW_CLEANUP_RESERVE_SECONDS)
+        room = (ceiling - now).total_seconds()
+        if now < _parse(rec["reserved_at"]) or room < inline_history.WINDOW_MIN_SECONDS:
+            raise Refused("insufficient room before the cleanup reserve")
+        ends = now + timedelta(seconds=min(inline_history.WINDOW_MAX_SECONDS, room))
+        prev = copy.deepcopy(rec)
+        rec["private_capture_window"] = dict(
+            lease=request_id, run_id=rec["run_id"], attempt=rec["attempt"], epoch=rec["epoch"],
+            vm_id=vm_id, boot_id=boot_id, source_sha=source_sha, receipt_sha256=receipt_sha256,
+            armed_at=spec.rfc3339(now), ends_at=spec.rfc3339(ends))
+        self._accounting(rec, reserve=True, adding=True)
+        try:
+            self._cas(prev, rec, gen)
+        except _Conflict as exc:
+            raise Refused("window not armed: lost ownership of the slot") from exc
+        return dict(rec["private_capture_window"])
 
     def _fail(self, rec: dict, gen: int, reason: str, ev: list) -> Outcome:
         if rec.get("schema") == 2:

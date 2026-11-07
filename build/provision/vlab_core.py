@@ -1536,6 +1536,7 @@ def initial_readyz_failed(raw):
 # Pinned kubectl v0.35.0 client-side request timeout text (exact bytes, README).
 INITIAL_READYZ_CLIENT_TIMEOUT = (b'Unable to connect to the server: context deadline exceeded '
                                  b'(Client.Timeout exceeded while awaiting headers)\n')
+INITIAL_READYZ_CLIENT_TIMEOUT_SHORT = b'Unable to connect to the server: context deadline exceeded\n'
 
 
 def kubectl(args, deadline, route=None):
@@ -1556,7 +1557,8 @@ def kubectl(args, deadline, route=None):
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
         matched = (initial and error.route == route
                    and getattr(error, '_executed_child', False) is True)
-        health_failed = matched and (initial_readyz_failed(raw) or raw == INITIAL_READYZ_CLIENT_TIMEOUT)
+        health_failed = matched and (initial_readyz_failed(raw) or raw in (
+            INITIAL_READYZ_CLIENT_TIMEOUT, INITIAL_READYZ_CLIENT_TIMEOUT_SHORT))
         # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
         # original Failure propagates and can never lead to another readiness poll.
         if (error.code == 1 and str(error) == 'child command failed'

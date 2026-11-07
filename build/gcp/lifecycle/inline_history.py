@@ -97,6 +97,15 @@ OCCUPIED_FIELDS = frozenset({
     'boot_image', 'boot_image_id', 'profile', 'children', 'names', 'reserved_at',
     'deadline', 'submit_attempts', 'max_submit_attempts', 'operation', 'ids',
     'reason', 'evidence'})
+OPTIONAL_OCCUPIED = frozenset({'access', 'private_capture_window'})
+# Owner-private capture window (#533). Bounded stop/imaging time only; it is NOT a
+# managed capture permission, seal, or lease renewal.
+WINDOW_FIELDS = frozenset({
+    'lease', 'run_id', 'attempt', 'epoch', 'vm_id', 'boot_id', 'source_sha',
+    'receipt_sha256', 'armed_at', 'ends_at'})
+WINDOW_MAX_SECONDS = 600
+WINDOW_MIN_SECONDS = 120
+WINDOW_CLEANUP_RESERVE_SECONDS = 900
 
 MIGRATION_ALLOWED_TOP = frozenset({
     'schema', 'slot', 'state', 'epoch', 'access_history', 'quarantine',
@@ -115,6 +124,7 @@ FAILED_RELEASE = NORMAL_RELEASE | {
     'outcome', 'trial', 'import_status', 'recovery'}
 
 _SHA_RE = re.compile(r'[0-9a-f]{64}\Z')
+_GIT_RE = re.compile(r'[0-9a-f]{40}\Z')
 _ID_RE = re.compile(r'[1-9][0-9]{0,19}\Z')
 _UUID_RE = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
@@ -471,7 +481,7 @@ def _access(value) -> None:
 def _occupied2(record) -> None:
     present = set(record)
     required = COMMON2 | OCCUPIED_FIELDS
-    if not required <= present or not present - required <= {'access'}:
+    if not required <= present or not present - required <= OPTIONAL_OCCUPIED:
         raise HistoryError('occupied schema-2 field set')
     if record['state'] not in OCCUPIED_STATES:
         raise HistoryError('occupied schema-2 state')
@@ -555,9 +565,48 @@ def _occupied2(record) -> None:
                 b['deadline'] != record['deadline'] or
                 deadline - work_deadline != timedelta(minutes=15)):
             raise HistoryError('occupied access binding does not correlate with the slot')
+    if 'private_capture_window' in record:
+        capture_window(record)
     live = {k: v for k, v in record.items() if k not in COMMON2 and k != 'evidence'}
     if len(_canonical(live)) > LIVE_BYTES:
         raise HistoryError('occupied live portion exceeds reserve')
+
+
+def capture_window(record) -> dict:
+    """Strictly validate the optional private capture window of an occupied record.
+
+    Closed fields; exact lease/run/attempt/epoch/VM/boot correlation with the slot;
+    a span of 2..10 minutes inside the lease; ends_at never later than the ORIGINAL
+    deadline minus the fifteen minute cleanup reserve. It never changes the
+    deadline. Raises HistoryError; returns the window.
+    """
+    window = record.get('private_capture_window')
+    if type(window) is not dict or set(window) != WINDOW_FIELDS:
+        raise HistoryError('private capture window fields')
+    ids = record.get('ids')
+    if type(ids) is not dict:
+        raise HistoryError('private capture window requires slot ids')
+    if (not _uuid(window['lease']) or window['lease'] != record.get('request_id') or
+            type(window['run_id']) is not int or window['run_id'] != record.get('run_id') or
+            type(window['attempt']) is not int or window['attempt'] != record.get('attempt') or
+            type(window['epoch']) is not int or window['epoch'] != record.get('epoch') or
+            not isinstance(ids.get('instance'), str) or not isinstance(ids.get('boot'), str) or
+            window['vm_id'] != ids['instance'] or window['boot_id'] != ids['boot'] or
+            not _ID_RE.fullmatch(window['vm_id']) or not _ID_RE.fullmatch(window['boot_id'])):
+        raise HistoryError('private capture window does not correlate with the slot')
+    if not isinstance(window['source_sha'], str) or not _GIT_RE.fullmatch(window['source_sha']):
+        raise HistoryError('private capture window source SHA')
+    if not _hex(window['receipt_sha256']):
+        raise HistoryError('private capture window receipt digest')
+    armed = _timestamp(window['armed_at'], 'armed_at')
+    ends = _timestamp(window['ends_at'], 'ends_at')
+    reserved = _timestamp(record.get('reserved_at'), 'reserved_at')
+    deadline = _timestamp(record.get('deadline'), 'deadline')
+    span = (ends - armed).total_seconds()
+    if (armed < reserved or not WINDOW_MIN_SECONDS <= span <= WINDOW_MAX_SECONDS or
+            ends > deadline - timedelta(seconds=WINDOW_CLEANUP_RESERVE_SECONDS)):
+        raise HistoryError('private capture window outside its bounded span')
+    return window
 
 
 def _free2(record) -> None:

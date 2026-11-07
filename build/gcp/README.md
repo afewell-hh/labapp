@@ -1964,3 +1964,36 @@ Current primary text read2026-10-31: [OpenSSH multiplexing](https://man.openbsd.
 [GitHub captured run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run),
 [v0.43.1 template](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.tmpl.yaml)
 and [template input](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/initconfig.go).
+
+## Owner-private capture window (#533, source only, not activated)
+
+`Controller.arm_private_capture_window` is an owner-library-only method (no CLI,
+workflow, stop/image/create API). For the CURRENT ACTIVE schema-2 `ubuntu-vlab-core`
+lease it persists one closed `private_capture_window` with a single CAS:
+lease/run/attempt/epoch, confirmed instance and boot IDs, `source_sha` and
+`receipt_sha256` (metadata bindings the trusted Root caller must check against
+privately captured evidence; this is not sealing and does not authenticate the
+caller), `armed_at` and `ends_at`. The span is at most ten minutes, clipped to the
+original deadline minus the fifteen-minute cleanup reserve; under two minutes of
+room is refused. The immutable epoch, lease, IDs, deadline, body, profile, image and
+VM TTL are unchanged; the successful CAS advances the storage generation exactly
+once. The window is open only for `armed_at <= now < ends_at`, and cannot be
+re-armed, altered or removed before FREE.
+
+Only the automatic non-forced janitor's NOT_RUNNING trigger is deferred, and only
+while the window is valid, unexpired and bound to the exact instance. Force
+cancellation, `CLEANUP_FAILED`, the original deadline and any invalid, foreign or
+expired window leave cleanup unchanged. A false window check does not by itself
+guarantee deletion or release: whole-record validation can still block malformed
+metadata under the existing fail-closed ownership, and no bypass exists. The managed `_access_capture_gate` and
+schema-2's ban on capture inventory stay held.
+
+The receipt must be the exact closed 17-field host receipt with
+`host_operation == 'result-validate'`; optional `guest_service` values are checked
+against the host's closed state/result domains and integer ranges (diagnostic only).
+
+Limits: the field cannot revoke a delete an older runner already issued. The lead
+must show no older queued/running cleanup job exists before arming and stopping,
+and must wait for the native build against frozen `4e9254f` to finish. The receipt
+check validates claimed content only. No native or positive proof exists; the tests
+were authored unrun.
