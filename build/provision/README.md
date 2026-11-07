@@ -784,8 +784,9 @@ hard-killed (exit 124, fatal) before it returns its bounded timeout error. Only 
 all other routes (including `api-final-readyz`) and every other deadline, limit and kill/reap
 semantic are unchanged, with no renewal. Under the same conditions as the health policy above
 (executed child, exit1, `child command failed`, same route, no `cleanup_uncertain`), only the exact
-whole output `Unable to connect to the server: context deadline exceeded (Client.Timeout exceeded
-while awaiting headers)\n` becomes Pending. Generic timeout substrings, x509/authentication/other
+whole outputs `Unable to connect to the server: context deadline exceeded (Client.Timeout exceeded
+while awaiting headers)\n` and `Unable to connect to the server: context deadline exceeded\n`
+become Pending. Generic timeout substrings, x509/authentication/other
 exit1, other args or routes, 124 and 130/143 stay fatal with the original exception.
 A lead-run credential-free, network-none check with the pinned kubectl 1.35 and a synthetic TLS
 loopback endpoint showed 10s client/10s cap killed at ~10.02s with no output, while a 5s client
@@ -793,6 +794,15 @@ exited 1 at ~5.08s with that exact text and a next request succeeded. This shows
 only; it does not establish the underlying Kubernetes or network cause, and no successful resume or
 production readiness is claimed until actual native proof. Native validation remains pending. The
 #452 proof harness still labels and checks the `10s` binding; it is not updated here.
+
+**Native short timeout form (#536).** Run42416813718 passed fresh strict startup and verified
+stop/offline checks, then reported resume `core-start-resume` child1. Its validated private bundle
+identified unit-ready route `api-initial-readyz` and child code1; the supplemental last-command
+context exactly matched the public 59-byte short form above. The context is observed data, not
+standalone proof of the inner initiating predicate. Source accepted only the longer form, so the
+short form is now covered by the same narrow route/argv/executed-child/exit/message/certainty gates.
+Both forms share the existing negative boundary tests. This is a source classifier correction;
+actual successful resumed persistence and a usable image still require another native trial.
 
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
