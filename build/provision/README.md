@@ -2781,3 +2781,84 @@ Primary text read2026-10-31: [Docker group and fresh credentials](https://docs.d
 [v0.43.1 public CLI](https://github.com/githedgehog/fabricator/blob/v0.43.1/cmd/hhfab/main.go),
 [selected Fabric0.96.2 attachment schema](https://github.com/githedgehog/fabric/blob/v0.96.2/api/vpc/v1beta1/vpcattachment_types.go),
 and [kubectl1.35 raw DeleteOptions path](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/cmd/delete/delete.go).
+
+## Private candidate image preparation and clone-boot start (issue #526, source only)
+
+`vlab_image.py` + `labapp-vlab-clone.service` + `test_vlab_image.py`. **Nothing here has been run
+or clone-tested**; it needs lead native evidence. It is not production, not Marketplace and not a
+replacement lifecycle. GCP stop / `images create` / clone creation stay lead-owned (manual path in
+AGENTS.md). Google recommends imaging a *stopped* VM
+([create-custom](https://docs.cloud.google.com/compute/docs/images/create-custom)).
+
+**Design judgment.** The core already ends a successful trial in `phase=resumable` with a verified
+owned stop and the resume unit enabled, and its `unit-gate`/`start-resume` mint a fresh operation,
+deadline and `boot` on every start. So the minimum is not a new framework: (1) remove the trial's
+lease/nonce/boot-bound state, (2) make the core the only starter on a clone, (3) report what cannot
+be proven.
+
+### `prepare` (root, in the finished build guest, same boot)
+
+```
+python3 vlab_image.py prepare --private-candidate --source-sha <40hex> --nonce <32hex> \
+  --lease <uuid> --build-boot <uuid> --tool-sha256 <sha256 of this vlab_image.py>
+```
+
+Refuses, before any mutation, unless: opt-in and all bindings equal `contract.json`/`manifest.json`/
+`started.json`; the current boot is the build boot and the original deadline has not passed (no
+renewal); `result.json` is exactly schema 2, code 0, contained, success diagnostic;
+`worker-status.json` is `succeeded persistence/complete`; `success.json` matches; no QEMU/hhfab
+process (`/proc/*/exe`; uncertainty refuses); fresh/resume/trial units inactive with unpopulated
+cgroups; core state is `resumable`, `stop_verified` matches, and the core's own `verify_contract` +
+`critical_snapshot` pass (the checks its resume gate makes); no `/run/labapp-vlab-docker` and no
+fallback registry stores; the trial root holds only the fixed `OWNED_NAMES` table (regular, root,
+single-link; `__pycache__` of `*.pyc`); the installed trial unit equals its root copy; any runtime
+drop-in is the exact bootstrap one; no installation conflict.
+
+Then it writes `/var/lib/labapp-vlab-image/seal.json` (`sealing`; names, ids and hashes of terminal
+records only), installs itself and the clone unit (no overwrite), unlinks the table through a pinned
+directory fd (terminal records last, so an interrupted run can be repeated), removes the trial unit,
+runs `daemon-reload`, `disable hhfab-vlab-resume.service`, `enable labapp-vlab-clone.service`, checks
+postconditions and marks `sealed`. `/home/ubuntu/hhfab` and its cache (the preserved lab state) are
+never touched. Exit 0 only if access material is also absent; **exit 3** means the owned portion is
+sealed and the access portion is unmet. `verify` re-checks the postconditions read-only.
+
+### Clone boot
+
+`labapp-vlab-clone.service` (oneshot, `RemainAfterExit`) runs `clone-start`: the receipt must be
+`sealed`, the boot must differ from the build boot, owned-state absence and the core's offline
+checks must pass, then it runs the unchanged `vlab_core.py start-resume` (fresh
+operation/invocation/deadline; the old lease, nonce, deadline and heartbeat are never read) and
+requires `phase=ready`, `boot=<this boot>` and a new operation id before exiting 0 (writes
+`clone-start.json`). **Readiness signal = core `state.json` `phase=ready` for this boot** (the
+unit-ready API/bridge/strict-switch checks), not unit activity. VLAB runs in
+`hhfab-vlab-resume.service`'s cgroup (`KillMode=control-group`), not in the clone unit. `ExecStop`
+runs `vlab_core.py stop`, so a clean shutdown leaves `resumable`.
+
+### Gates: satisfied and unmet
+
+- Satisfied for the **trial-owned portion only**: an installed, narrowly scoped cleanup manifest
+  with metadata-only postconditions. `lifecycle/controller.py::_access_capture_gate` is unchanged;
+  that hold stays.
+- **Unmet: trusted pre-login ownership.** `prelogin/hook.py` is inventory-only
+  (`SUPPORTED_MANIFESTS = {}`), so ownership of the owner login account's home, OS Login caches
+  (`/etc/oslogin_*.cache`), guest-agent state and any `authorized_keys`/`id_*`/`.google_authenticator`
+  was never established. They are counted (not named), never deleted, and reported as
+  `access-material-provenance`. No `seal` access record or hash is produced for the controller, and
+  the controller's profile limit is untouched.
+- The lab identity (random per-build password/key/join token in `fab.yaml`, `vlab/sshkey`) is
+  preserved by design and is not an owner or registry credential, but **every clone shares it**.
+
+### Limitations / lead decisions
+
+- Not done: machine-id reset, SSH host-key regeneration, `cloud-init clean`
+  ([`--machine-id`/`--logs`/`--seed`](https://docs.cloud-init.io/en/latest/reference/cli.html));
+  these are broad and outside trial-owned state.
+- Unlink does not scrub blocks, so a disk image can contain freed trial data. Registry credentials
+  lived on `/run` tmpfs only (#378).
+- Core `critical_snapshot` records `st_dev`/`st_ino`; a clone with a different root device number
+  fails closed.
+- An unclean shutdown or crash of a running clone leaves core `failed` (`unit_finished`); the next
+  `clone-start` refuses until the lead decides on recovery.
+- `After=hhfab-vlab-resume.service` shutdown ordering and `oneshot`+`ExecStop`
+  ([systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html))
+  are untested here.

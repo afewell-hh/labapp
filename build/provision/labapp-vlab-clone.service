@@ -1,0 +1,25 @@
+[Unit]
+Description=Labapp clone-boot VLAB resume (new boot only; no build lease authority)
+Wants=network-online.target
+# After= the resume unit only orders SHUTDOWN: this unit's ExecStop runs the core's owned stop
+# before systemd stops hhfab-vlab-resume.service. No dependency pulls that unit in: start is
+# delegated to the core, which is the only starter of the resume unit on a sealed image.
+After=network-online.target hhfab-vlab-resume.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+UnsetEnvironment=SSH_AUTH_SOCK PYTHONPATH PYTHONHOME HHFAB_LOG_LEVEL
+ExecStart=/usr/bin/python3 /usr/local/lib/labapp/vlab_image.py clone-start
+ExecStop=/usr/bin/python3 /usr/local/lib/labapp/vlab_core.py stop
+TimeoutStartSec=1100
+TimeoutStopSec=120
+# QEMU/hhfab run in hhfab-vlab-resume.service's own cgroup, never in this unit's.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
