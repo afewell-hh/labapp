@@ -559,11 +559,11 @@ def install_exact(target, raw, mode, alive=lambda: None):
     TEMPORARY (preserved and refused on retry without ownership proof) but never partial
     final bytes. The final path was just proven absent and its parent is root-only.
     """
-    if install_conflict(target, raw):
-        return
     temporary = Path(str(target) + '.installing')
     no_links(temporary)
     require(not os.path.lexists(temporary), 'unproven temporary file; preserved')
+    if install_conflict(target, raw):
+        return
     alive()
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     with os.fdopen(fd, 'wb') as stream:

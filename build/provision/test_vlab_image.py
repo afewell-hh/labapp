@@ -1295,6 +1295,18 @@ class LeadCompletionTests(Activated):
         self.assertTrue(self.w.dropin.is_dir())
         self.assertEqual([], list(self.w.dropin.iterdir()))
 
+    def test_identical_final_files_do_not_bypass_foreign_temporary_refusal(self):
+        for target, raw in ((self.w.lib / 'vlab_image.py', b'public tool'),
+                            (self.w.units / image.CLONE_UNIT, CLONE_BYTES)):
+            with self.subTest(target=target.name):
+                write(target, raw, 0o644)
+                temporary = Path(str(target) + '.installing')
+                write(temporary, b'foreign sibling', 0o666)
+                with self.assertRaises(image.Refused):
+                    image.install_exact(target, raw, 0o644)
+                self.assertEqual(raw, target.read_bytes())
+                self.assertEqual(b'foreign sibling', temporary.read_bytes())
+
 
 class RunTests(unittest.TestCase):
     """The real ``run`` on tiny interpreter children (no systemd, no project code)."""
