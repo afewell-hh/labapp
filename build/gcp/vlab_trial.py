@@ -746,33 +746,59 @@ def extract_failure(master, clock, nonce, snapshot, boot, directory, lease, proc
         return 'unavailable'
 
 
-# Child (root) that runs the installed, hash-verified guest module as __main__. ``-I`` removes
-# script/cwd/user-site/PYTHONPATH; the trusted library directory is then put FIRST so the module's
-# top-level ``import owned_process`` can only resolve to the installed trusted copy.
-IMAGE_RUNNER = """import hashlib,os,stat,sys
-lib,tool=sys.argv[1],sys.argv[2]
+# Child (root) that runs the installed, hash-verified guest module as __main__. ``-I -B`` removes
+# script/cwd/user-site/PYTHONPATH and bytecode writing. The trusted ``owned_process`` is NOT imported
+# from a path: its installed bytes are re-read, checked against the SHA-256 the parent already
+# verified, and registered as the module, so nested ``import owned_process`` can only be that exact
+# copy. Cooperative SIGTERM/INT/HUP become ``SystemExit`` so the module's own ``run()``/core ``finally``
+# blocks can close their owned children before this process exits (never an abrupt default kill).
+IMAGE_RUNNER = """import hashlib,os,signal,stat,sys,types
+lib,tool,osha=sys.argv[1],sys.argv[2],sys.argv[3]
+def stop(n,f): sys.exit(128+n)
+for n in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP): signal.signal(n,stop)
+def rd(p,sha,mode):
+    f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    s=os.fstat(f)
+    if not(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==0 and (stat.S_IMODE(s.st_mode)==mode if mode else not s.st_mode&0o022) and 0<s.st_size<=262144): sys.exit(2)
+    b=os.read(f,262145); os.close(f)
+    if len(b)!=s.st_size or hashlib.sha256(b).hexdigest()!=sha: sys.exit(2)
+    return b
+ob=rd(lib+'/owned_process.py',osha,0)
 p=lib+'/vlab_image.py'
-f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-s=os.fstat(f)
-if not(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o644 and 0<s.st_size<=262144): sys.exit(2)
-b=os.read(f,262145); os.close(f)
-if len(b)!=s.st_size or hashlib.sha256(b).hexdigest()!=tool: sys.exit(2)
+b=rd(p,tool,0o644)
+m=types.ModuleType('owned_process')
+m.__file__=lib+'/owned_process.py'
+exec(compile(ob,lib+'/owned_process.py','exec',dont_inherit=True),m.__dict__)
+sys.modules['owned_process']=m
 sys.path.insert(0,lib)
-sys.argv=[p]+sys.argv[3:]
-exec(compile(b,p,'exec'),{'__name__':'__main__','__file__':p})
+sys.argv=[p]+sys.argv[4:]
+exec(compile(b,p,'exec',dont_inherit=True),{'__name__':'__main__','__file__':p})
 """
 
 # Root bootstrap for the two fixed public files. Everything is verified BEFORE any byte is executed:
 # trusted root ancestry, exact incoming set, regular/single-link/owner/size/SHA-256 of both files, the
-# trusted installed owned_process, and the absence of any preexisting target. Then exclusive 0644
-# root files, re-verification, and one bounded run. The wrapper exits 0 whenever the module ran, and
-# reports the REAL module exit code in a closed record; it never relabels a code. Any pre-run refusal
-# exits 2 with no report. argv: incoming source nonce lease boot tool-sha unit-sha seconds.
-IMAGE_BOOTSTRAP = """import hashlib,json,os,re,select,signal,stat,subprocess,sys,time
+# trusted installed owned_process (whose exact bytes both this process and the child then use), and
+# the absence of any preexisting target. Then exclusive 0644 root files, re-verification, and ONE
+# bounded run supervised by the trusted ``owned_process.OwnedGroup`` (the leader stays an unreaped
+# child until owned signals and the sole reaper; positive group ESRCH is required). It never relabels
+# the REAL module exit code. Exit codes (closed):
+#   0 module ran AND its group was positively absent; closed record printed
+#   2 refused before the module was started (nothing executed)
+#   3 module started, group positively closed, NO record (timeout/oversize/handled cancel/bad output)
+#   4 module started, closure NOT positively established (escaped sessions are outside this boundary)
+# One wrapper budget: ``secs`` covers verification, the run and the closure reserve; nothing renews.
+# Signals only set a flag (never raise at an arbitrary point); the loop polls it every <=0.2 s.
+# argv: incoming source nonce lease boot tool-sha unit-sha seconds.
+IMAGE_BOOTSTRAP = """import hashlib,json,os,re,select,signal,stat,subprocess,sys,time,types
+sys.dont_write_bytecode=True
+T0=time.monotonic()
 LIB=%(lib)r
 NAMES=('vlab_image.py','labapp-vlab-clone.service')
 RUNNER=%(runner)r
-sys.excepthook=lambda *a: os._exit(2)
+STARTED=[]
+STOP=[]
+sys.excepthook=lambda *a: os._exit(4 if STARTED else 2)
+for _n in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP): signal.signal(_n,lambda n,f: STOP.append(n))
 def need(c):
     if not c: sys.exit(2)
 def tdir(q):
@@ -796,7 +822,7 @@ def get(path,uid,mode=None):
 a=sys.argv[1:]
 need(len(a)==8)
 inc,src,nonce,lease,boot,tool,unit,secs=a
-H=lambda v,n: re.fullmatch('[0-9a-f]{%%d}'%%n,v) is not None
+H=lambda v,n: re.fullmatch('[0-9a-f]{'+str(n)+'}',v) is not None
 U=lambda v: re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}',v) is not None
 need(H(src,40) and H(nonce,32) and U(lease) and U(boot) and H(tool,64) and H(unit,64) and re.fullmatch('[0-9]{2,3}',secs))
 secs=int(secs); need(10<=secs<=900)
@@ -808,7 +834,11 @@ need(sorted(os.listdir(inc))==sorted(NAMES))
 want={'vlab_image.py':tool,'labapp-vlab-clone.service':unit}
 body={n:get(inc+'/'+n,s.st_uid,None) for n in NAMES}
 need(all(hashlib.sha256(body[n]).hexdigest()==want[n] for n in NAMES))
-get(LIB+'/owned_process.py',0)
+ob=get(LIB+'/owned_process.py',0)
+osha=hashlib.sha256(ob).hexdigest()
+op=types.ModuleType('owned_process')
+op.__file__=LIB+'/owned_process.py'
+exec(compile(ob,LIB+'/owned_process.py','exec',dont_inherit=True),op.__dict__)
 for n in NAMES: need(not os.path.lexists(LIB+'/'+n))
 for n in NAMES:
     fd=os.open(LIB+'/'+n,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644)
@@ -819,36 +849,78 @@ for n in NAMES:
     finally:
         os.close(fd)
 for n in NAMES: need(get(LIB+'/'+n,0,0o644)==body[n])
-cmd=['/usr/bin/python3','-I','-c',RUNNER,LIB,tool,'prepare','--private-candidate','--source-sha',src,'--nonce',nonce,
+need(get(LIB+'/owned_process.py',0)==ob)
+RES=min(8.0,secs/2)
+TOTAL=T0+secs
+END=TOTAL-RES
+cmd=['/usr/bin/python3','-I','-B','-c',RUNNER,LIB,tool,osha,'prepare','--private-candidate','--source-sha',src,'--nonce',nonce,
      '--lease',lease,'--build-boot',boot,'--tool-sha256',tool,'--unit-sha256',unit]
 env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','HOME':'/root'}
+need(not STOP and time.monotonic()<END-1)
 p=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
                    start_new_session=True,env=env,cwd='/')
-end=time.monotonic()+secs; out=b''
-def kill():
-    os.killpg(p.pid,signal.SIGKILL); p.wait(); sys.exit(2)
-while True:
-    left=end-time.monotonic()
-    if left<=0 or len(out)>%(limit)d: kill()
-    r=select.select([p.stdout],[],[],min(left,1))[0]
-    if r:
-        c=os.read(p.stdout.fileno(),4096)
-        if not c: break
-        out+=c
+STARTED.append(1)
+g=op.OwnedGroup(p)
+out=b''; why=None; rc=None; eof=False
 try:
-    rc=p.wait(timeout=max(1,end-time.monotonic()))
-except subprocess.TimeoutExpired:
-    kill()
-code=rc if rc>=0 else 128-rc
-if len(out)>%(limit)d: sys.exit(2)
-print(json.dumps({'schema':1,'code':code,'stdout':out.decode('ascii')},sort_keys=True,separators=(',',':')),flush=True)
+    while True:
+        left=END-time.monotonic()
+        if STOP: why='stop'; break
+        if left<=0: why='time'; break
+        if not eof:
+            if select.select([p.stdout],[],[],min(left,0.2))[0]:
+                c=os.read(p.stdout.fileno(),4096)
+                if not c: eof=True
+                else:
+                    out+=c
+                    if len(out)>%(limit)d: why='size'; break
+        else:
+            time.sleep(min(left,0.05))
+            rc=g.status()
+            if rc is not None: break
+except BaseException:
+    why='error'
+try:
+    closed=g.close(0 if why is None else RES*5/8,RES*3/8,until=TOTAL)
+except BaseException:
+    closed=False
+try:
+    p.stdout.close()
+except BaseException:
+    closed=False
+if not closed or time.monotonic()>TOTAL: sys.exit(4)
+if why is not None or rc is None or STOP: sys.exit(3)
+try:
+    text=out.decode('ascii')
+except BaseException:
+    sys.exit(3)
+print(json.dumps({'schema':1,'code':rc if rc>=0 else 128-rc,'stdout':text},sort_keys=True,separators=(',',':')),flush=True)
 sys.exit(0)
 """ % {'lib': IMAGE_LIBRARY, 'runner': IMAGE_RUNNER, 'limit': IMAGE_STDOUT_LIMIT}
 
 
 def image_command(incoming, source_sha, nonce, lease, boot, tool, unit, seconds):
-    return ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', IMAGE_BOOTSTRAP, incoming, source_sha,
+    return ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-B', '-c', IMAGE_BOOTSTRAP, incoming, source_sha,
             nonce, lease, boot, tool, unit, str(seconds)]
+
+
+IMAGE_ACCESS_KEYS = ('key_files', 'other_home_dirs', 'symlinked_homes', 'oslogin_caches', 'agent_state_paths')
+
+
+def wrapper_record(raw):
+    """The closed bootstrap record ``{"code","schema","stdout"}`` or None (nothing is ever relayed)."""
+    try:
+        guest.require(type(raw) is bytes and 0 < len(raw) <= IMAGE_REPORT_LIMIT and raw.endswith(b'\n'))
+        body = raw[:-1]
+        outer = guest.data(body)
+        guest.require(type(outer) is dict and body == guest.encoded(outer)
+                      and set(outer) == {'schema', 'code', 'stdout'}
+                      and type(outer['schema']) is int and outer['schema'] == 1
+                      and type(outer['code']) is int and 0 <= outer['code'] <= 255
+                      and type(outer['stdout']) is str and 0 < len(outer['stdout']) <= IMAGE_STDOUT_LIMIT)
+        return outer
+    except BaseException:
+        return None
 
 
 def accept_preparation(raw):
@@ -856,26 +928,23 @@ def accept_preparation(raw):
 
     Wrapper record is canonical ``{"code","schema","stdout"}`` with the REAL module code 3; the inner
     module report must be exactly ``owned_sealed`` true, ``unmet`` exactly the one expected category,
-    a closed metadata-count map and a bounded removed count. Every other shape, code or extra field is
+    ``access`` EXACTLY ``{status: "unproven", key_files, other_home_dirs, symlinked_homes, oslogin_caches,
+    agent_state_paths}`` (the public shape of the #526 access inventory: exact keys, exact status, bounded
+    non-bool integer counts) and a bounded removed count. Every other shape, code, key or status is
     refused (so a full seal, a different gap, or an evolved report is NOT accepted by this bridge).
     """
     try:
-        guest.require(type(raw) is bytes and 0 < len(raw) <= IMAGE_REPORT_LIMIT and raw.endswith(b'\n'))
-        body = raw[:-1]
-        outer = guest.data(body)
-        guest.require(type(outer) is dict and body == guest.encoded(outer)
-                      and set(outer) == {'schema', 'code', 'stdout'})
-        guest.require(type(outer['schema']) is int and outer['schema'] == 1
-                      and type(outer['code']) is int and outer['code'] == IMAGE_PARTIAL_CODE
-                      and type(outer['stdout']) is str and 0 < len(outer['stdout']) <= IMAGE_STDOUT_LIMIT)
+        outer = wrapper_record(raw)
+        guest.require(outer is not None and outer['code'] == IMAGE_PARTIAL_CODE)
         inner = guest.data(outer['stdout'].encode('ascii'))
         guest.require(type(inner) is dict and set(inner) == {'owned_sealed', 'access', 'unmet', 'removed_count'}
-                      and inner['owned_sealed'] is True and inner['unmet'] == IMAGE_UNMET
-                      and type(inner['unmet']) is list)
+                      and inner['owned_sealed'] is True and type(inner['unmet']) is list
+                      and inner['unmet'] == IMAGE_UNMET)
         access = inner['access']
-        guest.require(type(access) is dict and len(access) <= 16
-                      and all(type(k) is str and re.fullmatch('[a-z][a-z0-9_-]{0,47}', k)
-                              and type(v) is int and 0 <= v <= IMAGE_COUNT_LIMIT for k, v in access.items()))
+        guest.require(type(access) is dict and set(access) == {'status', *IMAGE_ACCESS_KEYS}
+                      and type(access['status']) is str and access['status'] == 'unproven'
+                      and all(type(access[k]) is int and 0 <= access[k] <= IMAGE_COUNT_LIMIT
+                              for k in IMAGE_ACCESS_KEYS))
         guest.require(type(inner['removed_count']) is int and 0 <= inner['removed_count'] <= IMAGE_COUNT_LIMIT)
         return True
     except BaseException:
@@ -915,11 +984,25 @@ def prepare_image(master, clock, snapshot, nonce, boot, registration, output, pr
     master.transfer(incoming, sorted(IMAGE_SOURCES), 'persistence', until=until)
     room(60)
     seconds = int(min(900, max(10, until - owned_process.monotonic() - 10)))
-    raw = master.remote(image_command(incoming, snapshot['source_sha'], nonce, snapshot['request_id'], boot,
-                                      table['vlab_image.py']['sha256'], table['labapp-vlab-clone.service']['sha256'],
-                                      seconds),
-                        'persistence', cap=seconds + 10, until=until, limit=IMAGE_REPORT_LIMIT + 1)
-    guest.require(owned_process.monotonic() <= until and accept_preparation(raw), 'image preparation refused')
+    # From here the guest module may run. Only a bootstrap exit 2 (nothing started) or 3 (started, owned
+    # group positively closed, no record) is a definite non-uncertain refusal. ANY other outcome (timeout,
+    # transport loss, local cancel, exit 4, odd status, malformed or late record) is sticky process
+    # uncertainty, so the handoff is refused and the receipt asserts no process absence. Escaped
+    # sessions and hard-kill are not covered by this boundary.
+    try:
+        raw = master.remote(image_command(incoming, snapshot['source_sha'], nonce, snapshot['request_id'], boot,
+                                          table['vlab_image.py']['sha256'],
+                                          table['labapp-vlab-clone.service']['sha256'], seconds),
+                            'persistence', cap=seconds + 10, until=until, limit=IMAGE_REPORT_LIMIT + 1)
+    except BaseException as error:
+        if not (type(error) is guest.Failure and getattr(error, 'code', None) in (2, 3)
+                and not getattr(error, 'cleanup_uncertain', False)):
+            process_uncertain.set()
+        raise
+    if owned_process.monotonic() > until or wrapper_record(raw) is None:
+        process_uncertain.set()
+        raise guest.Failure('image preparation outcome unproven')
+    guest.require(accept_preparation(raw), 'image preparation refused')
     return 'partial-owned'
 
 
@@ -1225,7 +1308,7 @@ def trial(snapshot, payloads, output, *, registration, records, login, private=N
         # socket may survive master exit but its original inode is bound above.
         owned = {*guest.FILES, 'manifest.json', 'oslogin', 'oslogin.pub', 'candidate', 'candidate.pub',
                  'candidate.password', 'known_hosts', 'marker', 'sftp.batch', 'master.sock',
-                 *IMAGE_SOURCES}
+                 *(IMAGE_SOURCES if prepare_private_image else ())}
         local_absent = process_absent
         for name in (owned if process_absent else ()):
             path = output / name

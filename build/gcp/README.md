@@ -1586,28 +1586,69 @@ Order, all through the original master:
    owned local-file cleanup table.
 3. SFTP into a fresh `/tmp/labapp-vlab-image-<nonce>` (0700). A root stdlib bootstrap then verifies,
    BEFORE executing anything: root-owned non-writable ancestry, the exact two-entry incoming set,
-   regular/single-link/non-symlink/owner/size/SHA-256 of both files against the host hashes, a trusted
-   installed `owned_process.py`, and that no target exists. It installs both files as root `0644` under
-   `/usr/local/lib/labapp`, re-verifies, and runs the installed module with `python3 -I`, with the trusted
-   library directory first on `sys.path` (owner-writable incoming directories are never imported). No
-   owner or GHCR credential is in argv, SFTP, hashes, receipts or any new artifact.
+   regular/single-link/non-symlink/owner/size/SHA-256 of both files against the host hashes, and a
+   trusted installed `owned_process.py` (root-owned, non-writable). The bootstrap runs as
+   `python3 -I -B` (no bytecode). The closure module's exact bytes are loaded once, never imported from a
+   path, and their SHA-256 is passed to the child, which refuses unless the installed file still matches.
+   It also requires that no target exists, installs both files as root `0644` under
+   `/usr/local/lib/labapp`, re-verifies, and runs the installed module with `python3 -I -B`, with the
+   trusted library directory first on `sys.path` (owner-writable incoming directories are never
+   imported). No owner or GHCR credential is in argv, SFTP, hashes, receipts or any new artifact.
 4. The module is invoked `prepare --private-candidate --source-sha --nonce --lease --build-boot
-   --tool-sha256 --unit-sha256`. The wrapper exits 0 whenever the module ran and prints a closed
-   canonical record carrying the REAL module exit code and bounded stdout; it never relabels a code.
+   --tool-sha256 --unit-sha256` as the leader of its own session/group, owned by the already installed
+   `owned_process.OwnedGroup` (no new framework). The leader stays an unreaped child until owned signals
+   and the sole reaper; the wrapper prints a closed canonical record carrying the REAL module exit code
+   and bounded stdout (never relabelled) only after positive absence of that process group. The child
+   runner turns cooperative SIGTERM/INT/HUP into `SystemExit`, so the module's nested `finally`/owned
+   child closure can run; the wrapper's own signals only set a flag that its loop polls (<= 0.2 s). On
+   normal return the group is killed and checked; on timeout, oversize/non-ASCII output or a handled
+   cancel the group gets TERM, a bounded grace, then KILL. There is ONE wrapper budget (`secs`, at most
+   900 s) that includes an 8 s closure reserve; nothing is renewed or extended. Wrapper exit codes:
+   `0` record printed after positive group absence; `2` refused before the module started; `3` started,
+   group positively closed, no record; `4` started but closure not positively established. Both the
+   wrapper's and the child's `owned_process` module objects get `__file__` set to the validated installed
+   absolute path before their bytes execute, because the real guest module reads and hashes
+   `owned_process.__file__` against the installed core copy (never imported from incoming/cwd/PYTHONPATH;
+   byte/owner/hash checks unchanged). A stop flag or the original TOTAL cutoff observed after closure
+   yields exit `3` (no record); nothing is claimed after the wrapper returns, for escaped sessions or
+   hard kill. Positive group absence (ESRCH) is deliberately not weakened: a zombie is not absence, so
+   a venue without an orphan reaper (a bare container PID 1) can report exit `4` for a lingering
+   descendant. A real VM's init reaps orphans; host tests that exercise the lingering-descendant
+   control must run the container with `--init`. That is a venue qualification, not a source change.
 
-Only exact code `3` with `owned_sealed: true`, `unmet` exactly `["access-material-provenance"]`, a
-bounded closed `access` count map and bounded `removed_count` is accepted, and only as the fixed
-receipt value `image_preparation: "partial-owned"`. That is partial preparation, **not** a complete seal,
+Only exact code `3` with `owned_sealed: true`, `unmet` exactly `["access-material-provenance"]`,
+`access` EXACTLY `{status: "unproven", key_files, other_home_dirs, symlinked_homes, oslogin_caches,
+agent_state_paths}` (exact keys, exact status, bounded non-bool integer counts; any other key or status
+is refused) and bounded `removed_count` is accepted, and only as the fixed receipt value
+`image_preparation: "partial-owned"`. That is partial preparation, **not** a complete seal,
 capture-gate clearance, image creation, production readiness or trusted pre-login sealing. Nothing from
 the guest report is relayed. A requested receipt carries `image_preparation` as `partial-owned`,
 `refused` (any failure, malformed/extra/unknown output, wrong code or binding, insufficient time,
 interruption or uncertainty) or `skipped` (no validated contained success to prepare). Anything other
 than `partial-owned` makes the handoff `refused`, runs the existing exact captured-creator cancellation
-and exits nonzero, while the receipt `code`/`contained` keep the original core result. Cleanup
-uncertainty raised during preparation is sticky like every other host process/file uncertainty
-(`process_absent`, `local_files_absent` and the own-key receipt stay false). The existing late
-publication/return guard is unchanged and truthful (`partial-owned` is kept if the guest was changed).
-The lead still owns stop, sanitize, capture and disposal; no GCP image/cloud API is added here.
+and exits nonzero, while the receipt `code`/`contained` keep the original core result.
+
+Guest process uncertainty is sticky. Only a bootstrap exit `2` or `3` (or a valid closed wrapper record
+whose real module code is not `3`) is a definite refusal without uncertainty. Every other outcome after
+the run command was sent (timeout, ssh/transport loss, local interruption, exit `4`, `1`, `255`, any
+unparsed or late record) sets the same sticky uncertainty as other host process/file uncertainty
+(`process_absent`, `local_files_absent` and the own-key receipt stay false), so the handoff is refused and
+the receipt never asserts process absence. Limits: only the module's own process group is closed. Escaped
+sessions (`setsid`, daemons), a hard kill of the bootstrap itself, and a bootstrap that the transport
+stops before it can react are NOT proven closed, which is why those outcomes are uncertainty, not absence.
+The bootstrap's own budget bounds an orphaned run even if the transport disappears. No cgroup, service,
+controller, authentication, session or timeout renewal is added.
+
+The two image staging file names (`vlab_image.py`, `labapp-vlab-clone.service`) are part of the fixed
+owned local-file cleanup table ONLY when `--prepare-private-image` is requested; without it they are
+foreign files exactly as before and are never deleted. The existing late publication/return guard is
+unchanged and truthful (`partial-owned` is kept if the guest was changed). The lead still owns stop,
+sanitize, capture and disposal; no GCP image/cloud API is added here.
+
+Qualification: the guest module of #526 is not in this tree, so the report-shape tests use a fixed copy
+of the exact public shape the lead probed (`status: "unproven"` plus the five counts), not an import of
+the module; the real-child tests use safe synthetic public fixtures. All of it is authored UNRUN. An
+isolated lead integration probe against the final guest `report()` is still required.
 
 The fixed owner SELF adapter addresses the existing authenticated email while
 binding records to its configured numeric user ID. Only POST response key names

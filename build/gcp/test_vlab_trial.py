@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import signal
 import stat
 import sys
 import tempfile
@@ -45,7 +46,11 @@ def result_value(nonce, code, contained, detail=None):
     return {'schema': 2, 'code': code, 'contained': contained, 'nonce': nonce, 'diagnostic': detail}
 
 
-PARTIAL_INNER = {'owned_sealed': True, 'access': {'metadata': 2}, 'unmet': ['access-material-provenance'],
+# Exact public shape of the final #526 access_inventory() report (fixture; the guest module itself is
+# not in this tree, so this is a fixed copy of the shape the lead probed, not an import of the module).
+ACCESS = {'status': 'unproven', 'key_files': 0, 'other_home_dirs': 1, 'symlinked_homes': 0, 'oslogin_caches': 2,
+          'agent_state_paths': 0}
+PARTIAL_INNER = {'owned_sealed': True, 'access': ACCESS, 'unmet': ['access-material-provenance'],
                  'removed_count': 3}
 
 
@@ -467,7 +472,7 @@ class OwnerTrial(unittest.TestCase):
                     if prep.get('service_error') is not None:
                         raise prep['service_error']
                     return prep.get('service', b'ActiveState=inactive\nResult=success\nExecMainCode=1\nExecMainStatus=0\n')
-                if prepare and len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP:
+                if prepare and len(args) > 6 and args[6] == host.IMAGE_BOOTSTRAP:
                     if prep.get('run_error') is not None:
                         raise prep['run_error']
                     return prep.get('report', prep_report())
@@ -882,8 +887,8 @@ class OwnerTrial(unittest.TestCase):
 
     @staticmethod
     def image_remotes(trace):
-        return [e for e in trace if isinstance(e, tuple) and e[0] == 'remote' and len(e[1]) > 5
-                and e[1][5] == host.IMAGE_BOOTSTRAP]
+        return [e for e in trace if isinstance(e, tuple) and e[0] == 'remote' and len(e[1]) > 6
+                and e[1][6] == host.IMAGE_BOOTSTRAP]
 
     def test_default_and_handoff_only_runs_never_touch_image_preparation(self):
         for kwargs in ({}, {'handoff': True}):
@@ -941,7 +946,7 @@ class OwnerTrial(unittest.TestCase):
         self.assertFalse(any(output.iterdir()), 'staged public files and all local extras must be removed')
         self.assertTrue(receipt['local_files_absent'] and receipt['own_key_absent'])
         # Public receipt carries the closed status only, never guest text or counts.
-        for text in ('owned_sealed', 'access-material-provenance', 'removed_count', 'metadata', 'PRIVATE'):
+        for text in ('owned_sealed', 'access-material-provenance', 'removed_count', 'unproven', 'oslogin_caches', 'PRIVATE'):
             self.assertNotIn(text, self.printed_text)
 
     def test_preparation_runs_only_after_heartbeat_join_on_the_original_master_in_fixed_order(self):
@@ -953,7 +958,7 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(sum(e[0] == 'image-sources' for e in tuples), 1)
         sources = [i for i, e in enumerate(tuples) if e[0] == 'image-sources']
         transfer = [i for i, e in enumerate(tuples) if e[0] == 'transfer' and e[1] == tuple(sorted(host.IMAGE_SOURCES))]
-        run = [i for i, e in enumerate(tuples) if e[0] == 'remote' and len(e[1]) > 5 and e[1][5] == host.IMAGE_BOOTSTRAP]
+        run = [i for i, e in enumerate(tuples) if e[0] == 'remote' and len(e[1]) > 6 and e[1][6] == host.IMAGE_BOOTSTRAP]
         self.assertEqual((len(transfer), len(run)), (1, 1))
         self.assertTrue(service < sources[0] < transfer[0] < run[0])
         self.assertEqual(tuples[transfer[0]][2], 'persistence')
@@ -964,15 +969,15 @@ class OwnerTrial(unittest.TestCase):
 
     def test_guest_command_binds_lease_boot_source_nonce_and_exact_file_hashes_without_secrets(self):
         self.owner_pipeline(handoff=True, prepare=True)
-        runs = [args for args, _ in self.remote_inputs if len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP]
+        runs = [args for args, _ in self.remote_inputs if len(args) > 6 and args[6] == host.IMAGE_BOOTSTRAP]
         self.assertEqual(len(runs), 1)
         args = runs[0]
         tool, unit = (guest.sha(('PUBLIC-IMAGE-' + n).encode()) for n in ('vlab_image.py', 'labapp-vlab-clone.service'))
-        self.assertEqual(args[:5], ('/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c'))
-        self.assertEqual(args[6:13], ('/tmp/labapp-vlab-image-' + 'd' * 32, 'a' * 40, 'd' * 32,
-                                      snapshot()['request_id'], '22222222-2222-4222-8222-222222222222', tool, unit))
-        self.assertTrue(args[13].isdigit() and 10 <= int(args[13]) <= host.IMAGE_CAP_SECONDS)
-        self.assertEqual(len(args), 14)
+        self.assertEqual(tuple(args[:6]), ('/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-B', '-c'))  # no bytecode
+        self.assertEqual(tuple(args[7:14]), ('/tmp/labapp-vlab-image-' + 'd' * 32, 'a' * 40, 'd' * 32,
+                                             snapshot()['request_id'], '22222222-2222-4222-8222-222222222222', tool, unit))
+        self.assertTrue(args[14].isdigit() and 10 <= int(args[14]) <= host.IMAGE_CAP_SECONDS)
+        self.assertEqual(len(args), 15)
         self.assertEqual([d for a, d in self.remote_inputs if a == args], [None])  # nothing on stdin
         for text in ('ghp_', 'PUBLIC-NONDEPLOYABLE-PASSWORD', 'oslogin', 'candidate.password', 'known_hosts'):
             self.assertFalse(any(text in part for part in args))
@@ -985,7 +990,7 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(len(carriers), 1)  # only the original bootstrap stdin carries it
         self.assertIn(host.BOOTSTRAP, carriers[0][0])
         canary = self.GHCR['token']
-        self.assertNotIn(canary, repr([a for a, _ in self.remote_inputs if len(a) > 5 and a[5] == host.IMAGE_BOOTSTRAP]))
+        self.assertNotIn(canary, repr([a for a, _ in self.remote_inputs if len(a) > 6 and a[6] == host.IMAGE_BOOTSTRAP]))
         self.assertNotIn(canary, self.printed_text)
 
     def test_every_non_exact_guest_report_refuses_cancels_and_preserves_core_result(self):
@@ -1004,17 +1009,29 @@ class OwnerTrial(unittest.TestCase):
             'inner-extra-field': prep_report(inner=dict(inner, note='free text')),
             'inner-missing-field': prep_report(inner={k: v for k, v in inner.items() if k != 'removed_count'}),
             'outer-extra-field': prep_report(extra=1),
-            'access-negative': prep_report(inner=dict(inner, access={'metadata': -1})),
-            'access-bool-count': prep_report(inner=dict(inner, access={'metadata': True})),
-            'access-bad-key': prep_report(inner=dict(inner, access={'Bad Key': 1})),
-            'access-nested': prep_report(inner=dict(inner, access={'metadata': {'x': 1}})),
+            'access-negative': prep_report(inner=dict(inner, access=dict(ACCESS, key_files=-1))),
+            'access-bool-count': prep_report(inner=dict(inner, access=dict(ACCESS, key_files=True))),
+            'access-huge-count': prep_report(inner=dict(inner, access=dict(ACCESS, key_files=10**9))),
+            'access-float-count': prep_report(inner=dict(inner, access=dict(ACCESS, key_files=1.0))),
+            'access-unknown-key': prep_report(inner=dict(inner, access=dict(ACCESS, metadata=1))),
+            'access-missing-key': prep_report(inner=dict(inner, access={k: v for k, v in ACCESS.items()
+                                                                        if k != 'oslogin_caches'})),
+            'access-missing-status': prep_report(inner=dict(inner, access={k: v for k, v in ACCESS.items()
+                                                                           if k != 'status'})),
+            'access-status-other': prep_report(inner=dict(inner, access=dict(ACCESS, status='proven'))),
+            'access-status-bool': prep_report(inner=dict(inner, access=dict(ACCESS, status=True))),
+            'access-status-int': prep_report(inner=dict(inner, access=dict(ACCESS, status=1))),
+            'access-empty': prep_report(inner=dict(inner, access={})),
+            'access-old-count-only-shape': prep_report(inner=dict(inner, access={'metadata': 2})),
+            'access-nested': prep_report(inner=dict(inner, access=dict(ACCESS, key_files={'x': 1}))),
             'removed-bool': prep_report(inner=dict(inner, removed_count=True)),
             'removed-huge': prep_report(inner=dict(inner, removed_count=10**9)),
             'inner-not-json': prep_report(inner='PRIVATE not json'),
-            'inner-duplicate-key': prep_report(inner='{"owned_sealed":true,"owned_sealed":true,"access":{},'
-                                                      '"unmet":["access-material-provenance"],"removed_count":0}'),
-            'inner-nan': prep_report(inner='{"owned_sealed":true,"access":{},"unmet":["access-material-provenance"],'
-                                          '"removed_count":NaN}'),
+            'inner-duplicate-key': prep_report(inner='{"owned_sealed":true,"owned_sealed":true,"access":'
+                                                      + json.dumps(ACCESS) + ',"unmet":["access-material-provenance"],'
+                                                      '"removed_count":0}'),
+            'inner-nan': prep_report(inner='{"owned_sealed":true,"access":' + json.dumps(ACCESS)
+                                          + ',"unmet":["access-material-provenance"],"removed_count":NaN}'),
             'empty': b'',
             'garbage': b'PRIVATE Traceback (most recent call last)\n',
             'no-newline': prep_report().rstrip(b'\n'),
@@ -1032,7 +1049,13 @@ class OwnerTrial(unittest.TestCase):
                 self.assertEqual((receipt['code'], receipt['contained']), (0, True))  # core result separate
                 self.assertEqual(trace[-1], 'captured-cancel')
                 self.assertTrue(receipt['independent_cleanup_dispatched'])
-                self.assertFalse(any(output.iterdir()))
+                if host.wrapper_record(report) is not None:
+                    # A valid closed wrapper record means the bootstrap positively closed the group.
+                    self.assertFalse(any(output.iterdir()))
+                    self.assertTrue(receipt['process_absent'])
+                else:
+                    # An unparseable/extra-key wrapper record cannot establish closure: sticky uncertainty.
+                    self.assertFalse(receipt['process_absent'])
                 self.assertNotIn('PRIVATE', self.printed_text)
                 self.assertNotIn('Traceback', self.printed_text)
 
@@ -1046,10 +1069,10 @@ class OwnerTrial(unittest.TestCase):
             'fetch-error': dict(fetch_error=RuntimeError('PRIVATE-FETCH')),
             'fetch-guest-failure': dict(fetch_error=guest.Failure('PRIVATE', 1)),
             'transfer-error': dict(transfer_error=RuntimeError('PRIVATE-COPY')),
-            'run-timeout': dict(run_error=guest.Failure('bounded host child timeout', 124)),
-            'run-error': dict(run_error=RuntimeError('PRIVATE-RUN')),
-            'run-interrupt': dict(run_error=KeyboardInterrupt()),
-            'run-sigterm-failure': dict(run_error=guest.Failure('signal', 143)),
+            # Definite bootstrap refusals only: exit 2 (nothing started) and exit 3 (started, owned group
+            # positively closed, no record). Every other run outcome is sticky uncertainty (next test).
+            'run-bootstrap-refused-2': dict(run_error=guest.Failure('host child failed', 2)),
+            'run-closed-without-record-3': dict(run_error=guest.Failure('host child failed', 3)),
         }
         for name, prep in cases.items():
             with self.subTest(name):
@@ -1076,7 +1099,7 @@ class OwnerTrial(unittest.TestCase):
     def test_exact_minimum_original_budget_still_prepares_and_keeps_the_reserve(self):
         code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, remaining=1020.0)
         self.assertEqual((code, receipt['image_preparation'], receipt['success_handoff']), (0, 'partial-owned', 'ready'))
-        seconds = [args for args, _ in self.remote_inputs if len(args) > 5 and args[5] == host.IMAGE_BOOTSTRAP][0][13]
+        seconds = [args for args, _ in self.remote_inputs if len(args) > 6 and args[6] == host.IMAGE_BOOTSTRAP][0][14]
         self.assertLessEqual(int(seconds), 120)  # never reaches into the 15 minute handoff reserve
 
     def test_preparation_skipped_when_core_result_is_not_a_validated_contained_success(self):
@@ -1117,6 +1140,21 @@ class OwnerTrial(unittest.TestCase):
                 self.assertTrue(any(output.iterdir()), 'uncertain ownership must not claim files are gone')
                 self.assertEqual(trace[-1], 'captured-cancel')
 
+    def test_image_named_local_files_are_owned_only_when_preparation_is_requested(self):
+        for name in sorted(host.IMAGE_SOURCES):
+            with self.subTest(name=name, prepare=False):
+                # Option absent: an image-named file is foreign -> never deleted, handoff refused (original shape).
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, leftover=name)
+                self.assertEqual((code, receipt['success_handoff']), (1, 'refused'))
+                self.assertFalse(receipt['local_files_absent'])
+                self.assertTrue((output / name).exists(), 'default run silently deleted an image-named foreign file')
+                self.assertNotIn('image_preparation', receipt)
+            with self.subTest(name=name, prepare=True):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True, leftover=name)
+                self.assertEqual(receipt['image_preparation'], 'partial-owned')
+                self.assertTrue(receipt['local_files_absent'])  # the two fixed staging names are owned only here
+                self.assertFalse((output / name).exists())
+
     def test_leftover_foreign_local_file_still_refuses_a_prepared_handoff(self):
         code, receipt, trace, *_ = self.owner_pipeline(handoff=True, prepare=True, leftover='unexpected-private-file')
         self.assertEqual(receipt['image_preparation'], 'partial-owned')
@@ -1131,12 +1169,62 @@ class OwnerTrial(unittest.TestCase):
         self.assertEqual(receipt['image_preparation'], 'partial-owned')  # truthful: guest state was changed
         self.assertEqual(trace[-1], 'captured-cancel')
 
+    def test_run_outcomes_that_do_not_prove_remote_closure_are_sticky_process_uncertainty(self):
+        """Timeout, transport loss, exit 4/255/odd, local interrupt, unparsed/late record: never absence."""
+        cases = {
+            'run-timeout': dict(run_error=guest.Failure('bounded host child timeout', 124)),
+            'run-error': dict(run_error=RuntimeError('PRIVATE-RUN')),
+            'run-interrupt': dict(run_error=KeyboardInterrupt()),
+            'run-sigterm-failure': dict(run_error=guest.Failure('signal', 143)),
+            'bootstrap-closure-unproven-4': dict(run_error=guest.Failure('host child failed', 4)),
+            'ssh-transport-255': dict(run_error=guest.Failure('host child failed', 255)),
+            'sudo-or-generic-1': dict(run_error=guest.Failure('host child failed', 1)),
+            'garbage-report': dict(report=b'PRIVATE not a record\n'),
+            'empty-report': dict(report=b''),
+            'unknown-outer-key': dict(report=prep_report(extra=1)),
+        }
+        for name, prep in cases.items():
+            with self.subTest(name):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(handoff=True, prepare=True, prep=prep)
+                self.assertEqual(receipt['image_preparation'], 'refused')
+                self.assertEqual((receipt['success_handoff'], code), ('refused', 1))
+                self.assertEqual(receipt['code'], 0)
+                self.assertFalse(receipt['process_absent'])      # never asserts process absence
+                self.assertFalse(receipt['own_key_absent'])
+                self.assertFalse(receipt['local_files_absent'])
+                self.assertNotIn('removed', trace)
+                self.assertEqual(trace[-1], 'captured-cancel')   # exact captured-creator cancellation
+                self.assertNotIn('PRIVATE', self.printed_text)
+
+    def test_a_valid_wrapper_record_with_a_different_real_code_is_a_closed_refusal_not_uncertainty(self):
+        for code_ in (0, 1, 4, 137):
+            with self.subTest(code_):
+                code, receipt, trace, _, _, _, output = self.owner_pipeline(
+                    handoff=True, prepare=True, prep={'report': prep_report(code=code_)})
+                self.assertEqual((receipt['image_preparation'], receipt['success_handoff'], code), ('refused', 'refused', 1))
+                self.assertTrue(receipt['process_absent'] and receipt['local_files_absent'])
+                self.assertEqual(trace[-1], 'captured-cancel')
+
     def test_accept_preparation_unit_exactness(self):
         self.assertTrue(host.accept_preparation(prep_report()))
-        self.assertTrue(host.accept_preparation(prep_report(inner={**PARTIAL_INNER, 'access': {}, 'removed_count': 0})))
+        self.assertTrue(host.accept_preparation(prep_report(inner={
+            **PARTIAL_INNER, 'access': dict.fromkeys(ACCESS, 0) | {'status': 'unproven'}, 'removed_count': 0})))
+        self.assertFalse(host.accept_preparation(prep_report(inner={**PARTIAL_INNER, 'access': {}})))
         self.assertFalse(host.accept_preparation(None))
         self.assertFalse(host.accept_preparation('text'))
         self.assertFalse(host.accept_preparation(prep_report(code=0)))
+
+    def test_access_shape_is_the_exact_closed_526_public_inventory_shape(self):
+        self.assertEqual(set(ACCESS), {'status', *host.IMAGE_ACCESS_KEYS})
+        self.assertEqual(host.IMAGE_ACCESS_KEYS, ('key_files', 'other_home_dirs', 'symlinked_homes',
+                                                   'oslogin_caches', 'agent_state_paths'))
+        for key in host.IMAGE_ACCESS_KEYS:  # each count independently bounded, non-bool
+            for bad in (-1, True, False, 1.0, '1', None, host.IMAGE_COUNT_LIMIT + 1):
+                with self.subTest(key=key, bad=bad):
+                    self.assertFalse(host.accept_preparation(
+                        prep_report(inner=dict(PARTIAL_INNER, access=dict(ACCESS, **{key: bad})))))
+            self.assertTrue(host.accept_preparation(
+                prep_report(inner=dict(PARTIAL_INNER, access=dict(ACCESS, **{key: host.IMAGE_COUNT_LIMIT})))))
 
     # --- public source acquisition: two fixed files at the captured SHA with complete verification ---
 
@@ -1234,9 +1322,13 @@ class ImageBootstrap(unittest.TestCase):
     LEASE = '11111111-1111-4111-8111-111111111111'
     BOOT = '22222222-2222-4222-8222-222222222222'
     MODULE = (b"import json, sys\nimport owned_process\n"
-              b"print(json.dumps({'owned_sealed': True, 'access': {'metadata': 1}, 'unmet': ['access-material-provenance'],"
-              b" 'removed_count': 2}))\nsys.exit(3)\n")
+              b"print(json.dumps({'owned_sealed': True, 'access': {'status': 'unproven', 'key_files': 0,"
+              b" 'other_home_dirs': 1, 'symlinked_homes': 0, 'oslogin_caches': 2, 'agent_state_paths': 0},"
+              b" 'unmet': ['access-material-provenance'], 'removed_count': 2}))\nsys.exit(3)\n")
     UNIT = b'[Unit]\nDescription=PUBLIC fixture\n'
+    # The ACTUAL trusted closure module (same bytes the guest installs from this tree) plus a marker, so the
+    # bootstrap and the child run the real OwnedGroup; only the marker line differs from the shipped file.
+    TRUSTED_SOURCE = (Path(__file__).with_name('owned_process.py').read_text() + '\nMARK = "trusted"\n')
 
     def setUp(self):
         import shutil
@@ -1247,7 +1339,7 @@ class ImageBootstrap(unittest.TestCase):
         self.lib.mkdir(mode=0o755)
         self.lib.chmod(0o755)
         self.trusted = self.lib / 'owned_process.py'
-        self.trusted.write_text('MARK = "trusted"\n')
+        self.trusted.write_text(self.TRUSTED_SOURCE)
         self.trusted.chmod(0o644)
         self.decoy = self.base / 'decoy'
         self.decoy.mkdir()
@@ -1284,8 +1376,73 @@ class ImageBootstrap(unittest.TestCase):
         unit = unit or hashlib_sha(self.incoming / 'labapp-vlab-clone.service')
         argv = [str(incoming or self.incoming), self.SOURCE, nonce or self.NONCE, self.LEASE, self.BOOT, tool, unit, seconds]
         import subprocess as sp
-        return sp.run([sys.executable, '-I', '-c', code or self.variant(), *argv], cwd=self.decoy, capture_output=True,
-                      env={'PATH': '/usr/bin:/bin', 'PYTHONPATH': str(self.decoy)}, timeout=60)
+        # ``-I -B``: no user site/PYTHONPATH and no bytecode, so the exact installed inventory stays exact.
+        return sp.run([sys.executable, '-I', '-B', '-c', code or self.variant(), *argv], cwd=self.decoy,
+                      capture_output=True, env={'PATH': '/usr/bin:/bin', 'PYTHONPATH': str(self.decoy)}, timeout=60)
+
+    def start(self, *, seconds='20', code=None):
+        """Same bootstrap as a live child the test can signal (cooperative parent cancellation)."""
+        import subprocess as sp
+        argv = [str(self.incoming), self.SOURCE, self.NONCE, self.LEASE, self.BOOT,
+                hashlib_sha(self.incoming / 'vlab_image.py'), hashlib_sha(self.incoming / 'labapp-vlab-clone.service'),
+                seconds]
+        proc = sp.Popen([sys.executable, '-I', '-B', '-c', code or self.variant(), *argv], cwd=self.decoy,
+                        stdout=sp.PIPE, stderr=sp.PIPE, env={'PATH': '/usr/bin:/bin', 'PYTHONPATH': str(self.decoy)})
+        self.addCleanup(self.reap, proc)
+        return proc
+
+    def reap(self, proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()
+        for pid in self.pids():
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+    def pids(self):
+        try:
+            return [int(v) for v in (self.base / 'pids').read_text().split()]
+        except (OSError, ValueError):
+            return []
+
+    def wait_pids(self):
+        import time as t
+        end = t.monotonic() + 15
+        while t.monotonic() < end:
+            if len(self.pids()) == 2:
+                return self.pids()
+            t.sleep(.05)
+        self.fail('fixture module never reported its processes')
+
+    @staticmethod
+    def gone(pid):
+        """True when the process is absent or only an unreaped zombie (cannot run anything)."""
+        try:
+            state = Path('/proc/%d/stat' % pid).read_text().rpartition(')')[2].split()[0]
+        except OSError:
+            return True
+        return state in 'ZX'
+
+    def watcher(self, tail=b''):
+        """Safe synthetic PUBLIC module: reports pid + a same-group descendant, then runs forever.
+
+        ``finally`` records that a cooperative stop reached nested code as an exception, not an abrupt kill.
+        """
+        pids, mark = self.base / 'pids', self.base / 'closed'
+        return (f"import os, subprocess, sys, time\n"
+                f"child = subprocess.Popen(['/usr/bin/sleep', '300'], stdin=subprocess.DEVNULL,\n"
+                f"                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                f"open({str(pids) + '.t'!r}, 'w').write(str(os.getpid()) + ' ' + str(child.pid))\n"
+                f"os.rename({str(pids) + '.t'!r}, {str(pids)!r})\n"
+                f"try:\n    time.sleep(300)\nfinally:\n    open({str(mark)!r}, 'w').write('closed')\n").encode() + tail
+
+    def reset(self):
+        for name in self.installed():
+            (self.lib / name).unlink()
+        for name in ('pids', 'closed'):
+            (self.base / name).unlink(missing_ok=True)
 
     def installed(self):
         return sorted(p.name for p in self.lib.iterdir() if p.name != 'owned_process.py')
@@ -1426,15 +1583,130 @@ class ImageBootstrap(unittest.TestCase):
                 self.assertEqual(before, after)
         self.lib.chmod(0o755)
 
-    def test_oversize_or_non_ascii_module_output_is_never_reported(self):
+    def closed_without_record(self, done):
+        """Started, owned group positively closed, no record (bootstrap exit 3)."""
+        self.assertEqual((done.returncode, done.stdout), (3, b''))
+
+    def test_oversize_or_non_ascii_module_output_is_never_reported_and_the_group_is_closed(self):
         self.stage(b"import sys\nsys.stdout.write('x' * 5000)\nsys.stdout.flush()\nsys.exit(3)\n")
-        self.refused(self.run_bootstrap())
-        for name in self.installed():
-            (self.lib / name).unlink()
+        self.closed_without_record(self.run_bootstrap())
+        self.reset()
         self.stage(b"import sys\nsys.stdout.buffer.write(b'\\xff')\nsys.exit(3)\n")
         done = self.run_bootstrap()
-        self.assertNotEqual(done.returncode, 0)
+        self.closed_without_record(done)
         self.assertNotIn(b'\xff', done.stdout)
+
+    def test_oversize_output_from_a_still_running_module_closes_its_whole_group(self):
+        self.stage(self.watcher().replace(b"try:\n    time.sleep(300)",
+                                          b"sys.stdout.write('x' * 5000)\nsys.stdout.flush()\ntry:\n    time.sleep(300)"))
+        done = self.run_bootstrap()
+        self.closed_without_record(done)
+        for pid in self.pids():
+            self.assertTrue(self.gone(pid), 'descendant survived oversize closure')
+        self.assertEqual((self.base / 'closed').read_text(), 'closed')  # TERM reached nested code first
+
+    def test_normal_return_kills_a_lingering_same_group_descendant_before_reporting(self):
+        self.stage(self.watcher().replace(b"try:\n    time.sleep(300)\nfinally:",
+                                          b"try:\n    pass\nfinally:") + b"sys.exit(3)\n")
+        done = self.run_bootstrap()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(guest.data(done.stdout)['code'], 3)
+        pid = self.pids()[1]
+        self.assertTrue(self.gone(pid), 'record was printed while a descendant could still run')
+
+    def test_cooperative_parent_cancellation_closes_module_and_descendants_without_a_record(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=int(number)):
+                self.reset()
+                self.stage(self.watcher())
+                proc = self.start()
+                module, descendant = self.wait_pids()
+                proc.send_signal(number)
+                out, err = proc.communicate(timeout=30)
+                self.assertEqual((proc.returncode, out), (3, b''))  # closed, no record; never exit 0
+                self.assertEqual(err, b'')
+                self.assertTrue(self.gone(module) and self.gone(descendant))
+                # SIGTERM became SystemExit in the child runner, so nested ``finally`` ran (not abrupt death).
+                self.assertEqual((self.base / 'closed').read_text(), 'closed')
+                self.assertFalse(host.accept_preparation(out))
+
+    def test_timeout_uses_one_budget_with_a_closure_reserve_and_closes_everything(self):
+        import time as t
+        self.stage(self.watcher())
+        started = t.monotonic()
+        proc = self.start(seconds='10')
+        out, _ = proc.communicate(timeout=30)
+        elapsed = t.monotonic() - started
+        self.assertEqual((proc.returncode, out), (3, b''))
+        self.assertLess(elapsed, 10 + 5, 'wrapper outlived its single budget by more than interpreter start-up')
+        module, descendant = self.pids()
+        self.assertTrue(self.gone(module) and self.gone(descendant))
+        self.assertEqual((self.base / 'closed').read_text(), 'closed')
+
+    def test_closure_not_positively_established_exits_4_and_never_prints_a_record(self):
+        trusted = self.TRUSTED_SOURCE + '\nOwnedGroup.close = lambda self, *a, **k: False\n'
+        self.trusted.write_text(trusted)
+        done = self.run_bootstrap()
+        self.assertEqual((done.returncode, done.stdout), (4, b''))
+        self.assertFalse(host.accept_preparation(done.stdout))
+
+    def test_a_bad_ownership_module_cannot_report_and_leaves_no_bytecode(self):
+        self.trusted.write_text(self.TRUSTED_SOURCE + '\nraise RuntimeError("PRIVATE")\n')
+        done = self.run_bootstrap()
+        self.refused(done)  # failed to load the trusted closure before anything was installed or run
+        self.assertEqual(self.installed(), [])
+        self.assertFalse(list(self.lib.rglob('__pycache__')))
+
+    def test_exact_installed_inventory_without_bytecode_after_success(self):
+        done = self.run_bootstrap()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(sorted(p.name for p in self.lib.iterdir()),
+                         ['labapp-vlab-clone.service', 'owned_process.py', 'vlab_image.py'])
+        self.assertFalse(list(self.base.rglob('__pycache__')))
+
+    def test_imported_closure_module_has_the_validated_installed_file_and_matching_bytes(self):
+        """Actual #526 prepare reads ``owned_process.__file__`` and hashes it against the installed core copy.
+
+        Authored UNRUN. The fixture performs that same read+hash and records the result for the assertion.
+        """
+        out = self.base / 'filecheck'
+        self.stage(("import hashlib, os, sys, owned_process\n"
+                    "p = getattr(owned_process, '__file__', None)\n"
+                    "ok = p == %r and hashlib.sha256(open(p, 'rb').read()).hexdigest() == %r\n"
+                    "open(%r, 'w').write('ok' if ok else 'bad:%%r' %% (p,))\n"
+                    "sys.exit(3)\n") % (str(self.trusted), hashlib_sha(self.trusted), str(out)))
+        done = self.run_bootstrap()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(guest.data(done.stdout)['code'], 3)
+        self.assertEqual(out.read_text(), 'ok')
+
+    def test_stop_arriving_during_closure_is_not_reported_as_an_accepted_preparation(self):
+        """A cancellation that lands while the group is being closed must publish no record (exit 3)."""
+        trusted = self.TRUSTED_SOURCE + (
+            "\n_close = OwnedGroup.close\n"
+            "def _late(self, *a, **k):\n"
+            "    import os, signal\n"
+            "    r = _close(self, *a, **k)\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    return r\n"
+            "OwnedGroup.close = _late\n")
+        self.trusted.write_text(trusted)
+        # The child runner verifies the closure hash it was given, so it sees the same patched bytes.
+        done = self.run_bootstrap()
+        self.assertEqual((done.returncode, done.stdout), (3, b''))
+        self.assertFalse(host.accept_preparation(done.stdout))
+
+    def test_child_runner_requires_the_exact_trusted_closure_bytes(self):
+        """The child exits 2 before executing anything if owned_process differs from the hash the parent saw."""
+        marker = self.base / 'executed'
+        self.stage(('open(%r, "w").write("x")\n' % str(marker)).encode())
+        text = self.variant().replace("RUNNER,LIB,tool,osha,", "RUNNER,LIB,tool,'0'*64,")
+        self.assertNotEqual(text, self.variant())
+        done = self.run_bootstrap(code=text)
+        self.assertEqual(done.returncode, 0)  # the child ran (and refused); its REAL code is reported
+        self.assertEqual(guest.data(done.stdout)['code'], 2)
+        self.assertFalse(marker.exists())
+        self.assertFalse(host.accept_preparation(done.stdout))
 
 
 def hashlib_sha(path):
