@@ -804,6 +804,30 @@ short form is now covered by the same narrow route/argv/executed-child/exit/mess
 Both forms share the existing negative boundary tests. This is a source classifier correction;
 actual successful resumed persistence and a usable image still require another native trial.
 
+**Native Go client timeout family (#540).** Native34 passed fresh strict/API/nonce and verified
+stop/offline checks, then failed at initial resume readyz child1; the supplemental command context
+exactly equaled the public 138-byte literal `Unable to connect to the server: net/http: request
+canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)\n`. The
+primary failure was a systemctl failure, so the API delay root cause is not proved. The exact
+whole-output family is now four forms: bare and suffixed `context deadline exceeded`, plus suffixed
+`net/http: request canceled` and suffixed `net/http: request canceled while waiting for connection`.
+Bare `net/http: request canceled` forms, other suffixes, whitespace/case variants, TLS/x509/auth
+text and all other strings stay fatal. Route, argv, executed-child, exit1, `child command failed`
+and no-`cleanup_uncertain` gates, timeouts, budgets, stop and mount behavior are unchanged; there is
+no blanket retry and final-readyz stays strict. The existing positive and negative table tests are
+extended over all four forms.
+
+The pinned formatter path is kubectl v0.35.0 [`RawGet`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/rawhttp/raw.go)
+→ client-go v0.35.0 [`Request.Stream`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go)
+→ `http.Client.Do`; [`HTTPClientFor`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/transport.go)
+sets `Client.Timeout`. This raw GET path does not use the separate `Request.request()` timeout path.
+Go 1.25.5 [`client.go`](https://github.com/golang/go/blob/go1.25.5/src/net/http/client.go)
+adds the awaiting-headers suffix; [`transport.go`](https://github.com/golang/go/blob/go1.25.5/src/net/http/transport.go)
+distinguishes connection acquisition cancellation from an in-flight cancellation. Kubernetes
+v1.35.0's [build dependencies](https://github.com/kubernetes/kubernetes/blob/v1.35.0/build/dependencies.yaml)
+pin Go 1.25.5. These version-pinned sources explain the finite family; they do not establish
+why a native API was delayed. Native resume success remains UNPROVEN.
+
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
 introduced. Only the initial production loop catches this new Pending, under the original fresh2700s
