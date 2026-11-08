@@ -147,7 +147,8 @@ class InlineFlows(unittest.TestCase):
         self.assertEqual(plan['replacement']['last_release'], before['last_release'])
         self.assertEqual(plan['replacement']['access_history'], before['access_history'])
         prefix = canonical(before['access_history'])
-        for number in range(17, 25):
+        frozen24 = None
+        for number in range(17, 33):
             f.trial(number, failed=number % 2 == 0)
             rec = f.w.record()
             self.assertEqual(rec['schema'], 2)
@@ -155,12 +156,27 @@ class InlineFlows(unittest.TestCase):
             self.assertEqual(rec['legacy_history'], plan['replacement']['legacy_history'])
             self.assertEqual(len(rec['access_history']), number)
             self.assertLessEqual(len(canonical(rec)), MAX_RECORD_BYTES)
+            if number == 24:
+                # Freeze the canonical COMPLETE 24-entry history.
+                frozen24 = canonical(rec['access_history'])
+            elif number > 24:
+                self.assertEqual(canonical(rec['access_history'][:24]), frozen24)
+            if number == 25:
+                # TEST-ONLY simulation: patching the constant to 24 is NOT the
+                # actual old source; it only shows a 24-limit history() gate
+                # refuses the first incompatible 25-entry record.
+                with patch.object(inline, 'HISTORY_LIMIT', 24):
+                    with self.assertRaises(inline.HistoryError):
+                        inline.history(rec)
         rec, generation = f.w.store.read(f.w.cfg.key)
-        self.assertEqual(len({h['binding']['lease'] for h in rec['access_history']}), 24)
-        self.assertEqual(len({h['binding']['key_sha256'] for h in rec['access_history']}), 24)
-        self.assertEqual(sum(h.get('import_status') == 'UNKNOWN' for h in rec['access_history']), 12)
+        self.assertEqual(inline.HISTORY_LIMIT, 32)
+        self.assertEqual(inline.LEGACY_LIMIT, 16)
+        self.assertEqual(rec['state'], 'FREE')
+        self.assertEqual(len({h['binding']['lease'] for h in rec['access_history']}), 32)
+        self.assertEqual(len({h['binding']['key_sha256'] for h in rec['access_history']}), 32)
+        self.assertEqual(sum(h.get('import_status') == 'UNKNOWN' for h in rec['access_history']), 16)
         calls = len(f.w.raw.calls)
-        with self.assertRaises(Refused): f.w.ctl.admit(25, 1, lease(25))
+        with self.assertRaises(Refused): f.w.ctl.admit(33, 1, lease(33))
         self.assertEqual(len(f.w.raw.calls), calls)
         self.assertEqual(f.w.store.read(f.w.cfg.key), (rec, generation))
         self.assertEqual((f.w.raw.instances, f.w.raw.disks), ({}, {}))
