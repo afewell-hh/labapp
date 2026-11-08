@@ -842,7 +842,8 @@ unknown; this does not establish native success.
   `/api/v1/namespaces/kube-system`, and `/apis/<group>/v1beta1/<plural>` for the nine existing
   custom-resource lists (all-namespace list semantics; no namespace segment). Final reads
   (`api-final-*`, and any call without the `initial` stage) stay structured `get ... -o json` with the
-  10s client timeout, get no retry, and are unchanged. Stream still honours response-driven
+  10s client timeout, get NO READINESS-LOOP RECOVERY (the original structured-client internal retries
+  remain unchanged), and are otherwise unchanged. Stream still honours response-driven
   `Retry-After` retries (429/503); this is bounded only by the unchanged 10s hard cap, which stays
   fatal (exit 124). No claim is made that internal retries are absent.
 - **Closed version binding.** The group versions are the pinned constants `v1beta1` for
@@ -877,7 +878,8 @@ The tests extend the same-code full-readiness fixture (raw paths served from the
 and cover all twelve routes/argv/timeout headroom, version binding (including zero FabNode),
 negative grammar boundaries, interruption at each of the twelve initial read positions with a full
 restart under one deadline, persistent expiry and fatal final reads. Root's real-client matrix
-(`.agent-tmp/startup-transport-matrix-542/`) is pre-change observation, not candidate test evidence.
+(recorded in #542 comment 6716696329) is pre-change observation, not candidate test evidence; its
+`cleanup_uncertain` qualification stays: the 6 baseline and 2 H2-cap cases were uncertain.
 
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is

@@ -1607,7 +1607,7 @@ def bind_initial_versions(expected):
 
 
 def kubectl(args, deadline, route=None):
-    # Only the exact initial readyz context gets a client timeout BELOW the unchanged
+    # Only the ALL 12 exact allowlisted initial reads get a client timeout BELOW the unchanged
     # 10s process cap, so the client can return its own bounded error before the cap
     # (which starts before client startup) hard-kills it. Everything else stays 10s.
     # #542: exact route + raw argv allowlist for ALL 12 initial reads, not route prefix alone.

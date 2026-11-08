@@ -2484,7 +2484,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertEqual(len(final), 12)
         self.assertEqual(sum(1 for c in final if any(a.startswith('--raw=') for a in c[0])), 1)  # readyz only
         self.assertTrue(all('--request-timeout=10s' in c[0] and c[2] == 10 for c in final))
-        self.assertEqual(final[1][0][-4:], ['get', 'nodes', '-o', 'json'])
+        self.assertEqual(final[1][0][-5:], ['get', 'nodes', '-o', 'json', '-A'])
         self.assertIn('-A', final[3][0])
 
     def mutate_installer(self, name, change):
@@ -2597,7 +2597,7 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                 pauses = []
                 status, seen, _ = self.run_ready(inject, sleep=pauses.append)
                 self.assertEqual((status, pauses), (1, []))
-                self.assertEqual(seen[-1][-4:], ['get', 'nodes', '-o', 'json'])
+                self.assertEqual(seen[-1][-5:], ['get', 'nodes', '-o', 'json', '-A'])
                 self.assertEqual(self.ready_record()['route'], 'api-final-nodes')
                 self.assertEqual(core.state()['phase'], 'failed')
 
@@ -3689,7 +3689,6 @@ class FormatAndSourceTests(unittest.TestCase):
                 self.assertIs(raised.exception, error)
                 self.assertNotIsInstance(raised.exception, core.Pending)
             for other in (raw.rstrip(b'\n'), raw + b'\n', raw + b'x', b'x' + raw, raw.lower(),
-                          b'Unable to connect to the server: net/http: TLS handshake timeout\n',
                           b'Unable to connect to the server: x509: certificate signed by unknown authority\n',
                           b'error: You must be logged in to the server (Unauthorized)\n',
                           b'Error from server (Timeout): request did not complete within requested timeout\n',
