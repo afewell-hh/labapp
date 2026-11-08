@@ -4984,49 +4984,70 @@ class PrivateCloneOrchestration(CloneCase):
 
 
 class SummaryIO:
-    """Synthetic guest IO for the ACTUAL clone.SUMMARY source. Every read advances an optional scheduled
-    producer (READY core -> atomic checkpoint -> clone unit active/success) by one step."""
+    """Synthetic guest IO driving a SUMMARY source (default: the ACTUAL clone.SUMMARY).
+
+    schedule maps a read-tick index to the producer steps executed at that tick. Every file read (on close) and every
+    systemctl call is one tick, so publications land between the reads of a single collection. second_boot=True starts
+    from the first boot's published checkpoint and the first boot's core identity (the retry's real starting state).
+    """
     BOOT = '10000001-0000-4000-8000-000000000001'
+    OLD_BOOT = '10000001-0000-4000-8000-000000000000'
     BUILD = '00000000-0000-4000-8000-00000000000b'
     OP, INV = '1' * 32, '2' * 32
+    OLD_OP, OLD_INV = '3' * 32, '4' * 32
+    CLONE_OLD, CLONE_NEW = '5' * 32, '6' * 32
 
-    def __init__(self, steps=(), start=0):
+    def __init__(self, schedule=None, second_boot=False):
+        core = {'nonce': 'a' * 32, 'phase': 'resumable', 'mode': 'resume', 'boot': self.BOOT,
+                'operation': 'e' * 32, 'invocation': 'f' * 32, 'critical': {'k': 1}, 'cluster': {'k': 2}}
         self.files = {
             '/var/lib/labapp-vlab-image/seal.json': {'state': 'sealed', 'owned_sealed': True, 'nonce': 'a' * 32,
                                                       'build_boot': self.BUILD, 'core_operation': 'c' * 32,
                                                       'core_invocation': 'd' * 32},
-            '/var/lib/labapp-vlab-core/state.json': {'nonce': 'a' * 32, 'phase': 'resumable', 'mode': 'resume',
-                                                      'boot': self.BOOT, 'operation': 'e' * 32,
-                                                      'invocation': 'f' * 32, 'critical': {'k': 1},
-                                                      'cluster': {'k': 2}}}
-        self.units = {'labapp-vlab-clone.service': ('activating', 'x', 'success'),
+            '/var/lib/labapp-vlab-core/state.json': core}
+        if second_boot:
+            core.update(boot=self.OLD_BOOT, operation=self.OLD_OP, invocation=self.OLD_INV)
+            self.files['/var/lib/labapp-vlab-image/clone-start.json'] = {
+                'boot': self.OLD_BOOT, 'operation': self.OLD_OP, 'invocation': self.OLD_INV}
+        self.units = {'labapp-vlab-clone.service': ('activating', self.CLONE_OLD, 'success'),
                       'hhfab-vlab-resume.service': ('active', self.INV, 'success')}
-        self.steps, self.start, self.reads, self.fds = list(steps), start, 0, {}
+        self.schedule = {k: list(v) for k, v in (schedule or {}).items()}
+        self.reads, self.fds = 0, {}
+
+    @staticmethod
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    def prior(self):
+        """The first boot's accepted ready proof (what a real second-boot readiness compares against)."""
+        return {'boot': self.OLD_BOOT, 'nonce': 'a' * 32, 'build_boot': self.BUILD, 'operation': self.OLD_OP,
+                'invocation': self.OLD_INV, 'critical': self.digest({'k': 1}), 'cluster': self.digest({'k': 2})}
 
     def tick(self):
-        if self.reads >= self.start and self.steps:
-            self.steps.pop(0)(self)
+        for step in self.schedule.pop(self.reads, ()):
+            step(self)
         self.reads += 1
 
     def publish_core(self):
         core = self.files['/var/lib/labapp-vlab-core/state.json']
-        core.update(phase='ready', operation=self.OP, invocation=self.INV)
+        core.update(phase='ready', boot=self.BOOT, operation=self.OP, invocation=self.INV)
 
     def publish_checkpoint(self, op=None):
         self.files['/var/lib/labapp-vlab-image/clone-start.json'] = {
             'boot': self.BOOT, 'operation': op or self.OP, 'invocation': self.INV}
 
     def publish_clone(self):
-        self.units['labapp-vlab-clone.service'] = ('active', 'y', 'success')
+        self.units['labapp-vlab-clone.service'] = ('active', self.CLONE_NEW, 'success')
 
-    def producer(self, wrong_checkpoint=None):
-        return [SummaryIO.publish_core, lambda s: s.publish_checkpoint(wrong_checkpoint), SummaryIO.publish_clone]
+    def producer(self):
+        """The real producer contract: READY core, then atomic checkpoint, then clone unit success/active."""
+        return [SummaryIO.publish_core, SummaryIO.publish_checkpoint, SummaryIO.publish_clone]
 
     def os_open(self, path, flags, *a):
         if path not in self.files:
             raise FileNotFoundError(path)
         fd = 100 + len(self.fds)
-        self.fds[fd] = json.dumps(self.files[path]).encode()
+        self.fds[fd] = json.dumps(self.files[path]).encode()   # the content as of open, like a real read
         return fd
 
     def fdopen(self, fd, mode):
@@ -5051,67 +5072,141 @@ class SummaryIO:
         return SimpleNamespace(st_uid=0, st_nlink=1, st_mode=0o100600, st_size=len(self.fds[fd]))
 
     def run(self, argv, **kwargs):
-        active, invocation, result = self.units[argv[2]]
+        active, invocation, result = self.units[argv[2]]   # state as of this call, before any later publication
         self.tick()
         return SimpleNamespace(stdout=f'ActiveState={active}\nInvocationID={invocation}\nResult={result}\n')
 
-    def execute(self):
+    def execute(self, source=None):
         real_open, out = open, io.StringIO()
 
         def fake_open(path, *a, **k):
             return io.StringIO(self.BOOT + '\n') if path == '/proc/sys/kernel/random/boot_id' else real_open(path, *a, **k)
         with patch('os.open', self.os_open), patch('os.fdopen', self.fdopen), patch('os.fstat', self.fstat), \
                 patch('subprocess.run', self.run), patch('builtins.open', fake_open), patch('sys.stdout', out):
-            exec(compile(clone.SUMMARY, 'summary', 'exec'), {'__name__': 'summary'})
+            exec(compile(clone.SUMMARY if source is None else source, 'summary', 'exec'), {'__name__': 'summary'})
         return out.getvalue().encode()
 
 
+def former_summary_source():
+    """The pre-correction SUMMARY: the clone unit was read LAST, after the checkpoint and core state."""
+    source = clone.SUMMARY
+    early, late = "clone=unit('labapp-vlab-clone.service')\n", "'clone':clone,"
+    assert source.count(early) == 1 and source.count(late) == 1
+    return source.replace(early, '').replace(late, "'clone':unit('labapp-vlab-clone.service'),")
+
+
 class PrivateCloneSummaryOrdering(CloneCase):
-    def observe(self, io_world):
-        return clone.parse_summary(io_world.execute())
+    FIELDS = (('seal', 'state'), ('core', 'phase'), ('core', 'mode'), ('clone', 'ActiveState'),
+              ('clone', 'InvocationID'), ('clone', 'Result'), ('resume', 'ActiveState'),
+              ('resume', 'InvocationID'), ('resume', 'Result'))
+
+    def observe(self, io_world, source=None):
+        return clone.parse_summary(io_world.execute(source))
 
     def test_stable_ready_passes(self):
-        stable = SummaryIO()
+        stable = SummaryIO(second_boot=True)
         for step in stable.producer():
             step(stable)
-        self.assertEqual(clone.readiness(self.observe(stable)), 'ready')
+        self.assertEqual(clone.readiness(self.observe(stable), stable.prior()), 'ready')
 
-    def test_scheduled_publication_at_every_interleaving_never_mismatches(self):
-        for start in range(0, 8):
-            with self.subTest(start=start):
-                world = SummaryIO(SummaryIO().producer(), start)
-                states = []
-                for _ in range(3):
-                    states.append(clone.readiness(self.observe(world)))   # a Mismatch would raise here
-                self.assertEqual(states[-1], 'ready')
+    def test_hazard_exists_on_the_former_summary_order(self):
+        # Old first-boot checkpoint is read, then the legal producer publishes core, checkpoint and clone before the
+        # former order reads core and the clone unit: a hard Mismatch from a LEGAL interleaving.
+        world = SummaryIO({1: [SummaryIO.publish_core], 2: [SummaryIO.publish_checkpoint, SummaryIO.publish_clone]},
+                          second_boot=True)
+        summary = self.observe(world, former_summary_source())
+        self.assertEqual(summary['checkpoint']['boot'], SummaryIO.OLD_BOOT)
+        self.assertEqual((summary['core']['phase'], summary['clone']['ActiveState']), ('ready', 'active'))
+        with self.assertRaises(clone.Mismatch):
+            clone.readiness(summary, world.prior())
 
-    def test_checkpoint_after_clone_unit_variant_passes(self):
-        world = SummaryIO([SummaryIO.publish_core, SummaryIO.publish_clone, lambda s: s.publish_checkpoint()], 0)
-        for _ in range(4):
-            try:
-                state = clone.readiness(self.observe(world))
-            except clone.Mismatch:
-                state = 'mismatch'
-        self.assertEqual(state, 'ready')
+    def test_same_schedule_never_mismatches_on_the_actual_summary(self):
+        world = SummaryIO({1: [SummaryIO.publish_core], 2: [SummaryIO.publish_checkpoint, SummaryIO.publish_clone]},
+                          second_boot=True)
+        states = [clone.readiness(self.observe(world), world.prior()) for _ in range(3)]   # a Mismatch raises
+        self.assertEqual(states[0], 'pending')
+        self.assertEqual(states[-1], 'ready')
+        self.assertFalse(world.schedule)
+
+    def test_every_legal_producer_interleaving_never_mismatches(self):
+        steps, checked = SummaryIO().producer(), 0
+        for a in range(7):
+            for b in range(a, 7):
+                for c in range(b, 7):
+                    with self.subTest(core=a, checkpoint=b, clone=c):
+                        schedule = {}
+                        for tick, step in zip((a, b, c), steps):
+                            schedule.setdefault(tick, []).append(step)   # same tick keeps producer order
+                        world = SummaryIO(schedule, second_boot=True)
+                        states = []
+                        for _ in range(4):   # bounded: the synthetic producer is fully progressed by then
+                            states.append(clone.readiness(self.observe(world), world.prior()))   # never swallowed
+                            if states[-1] == 'ready':
+                                break
+                        self.assertEqual(states[-1], 'ready')
+                        self.assertEqual(set(states[:-1]), set(['pending'] * (len(states) - 1)))
+                        self.assertFalse(world.schedule)
+                        checked += 1
+        self.assertEqual(checked, 84)
 
     def test_stable_wrong_checkpoint_stays_mismatch(self):
-        stable = SummaryIO()
-        for step in stable.producer(wrong_checkpoint='9' * 32):
-            step(stable)
+        stable = SummaryIO(second_boot=True)
+        stable.publish_core(), stable.publish_clone()      # checkpoint stays the first boot's, permanently
         with self.assertRaises(clone.Mismatch):
-            clone.readiness(self.observe(stable))
+            clone.readiness(self.observe(stable), stable.prior())
+        wrong = SummaryIO(second_boot=True)
+        wrong.publish_core(), wrong.publish_checkpoint('9' * 32), wrong.publish_clone()
+        with self.assertRaises(clone.Mismatch):
+            clone.readiness(self.observe(wrong), wrong.prior())
 
     def test_failed_clone_unit_and_transition_without_publication(self):
         world = SummaryIO()
-        world.units['labapp-vlab-clone.service'] = ('failed', 'x', 'exit-code')
+        world.units['labapp-vlab-clone.service'] = ('failed', SummaryIO.CLONE_OLD, 'exit-code')
         with self.assertRaises(clone.Mismatch):
             clone.readiness(self.observe(world))
         pending = SummaryIO()
         pending.publish_core(), pending.publish_checkpoint()   # clone unit still activating: not yet ready
         self.assertEqual(clone.readiness(self.observe(pending)), 'pending')
 
+    def good_summary(self):
+        world = SummaryIO(second_boot=True)
+        for step in world.producer():
+            step(world)
+        return self.observe(world)
+
+    def test_diagnostic_validation_is_closed_for_every_nominal_field(self):
+        good = self.good_summary()
+        self.assertEqual(clone.diagnostic_summary(good), good)   # a fully valid summary is retained unchanged
+        for group, field in self.FIELDS:
+            for bad in ('TOP-SECRET-VALUE', 'ACTIVE', ' active', 'a' * 31, '0' * 33, 7):
+                with self.subTest(group=group, field=field, bad=bad):
+                    summary = json.loads(json.dumps(good))
+                    summary[group][field] = bad
+                    self.assertIsNone(clone.diagnostic_summary(summary))
+        for group, field in self.FIELDS:   # optional absent forms stay valid where the producer can omit them
+            if group != 'seal':
+                summary = json.loads(json.dumps(good))
+                summary[group][field] = None
+                self.assertIsNotNone(clone.diagnostic_summary(summary), (group, field))
+
+    def test_hostile_text_in_each_field_is_never_persisted(self):
+        run = clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit)
+        good = self.good_summary()
+        for number, (group, field) in enumerate(self.FIELDS):
+            with self.subTest(group=group, field=field):
+                summary = json.loads(json.dumps(good))
+                summary[group][field] = 'TOP-SECRET-VALUE'
+                run.phase = 'hostile%d' % number
+                run.reject('readiness', clone.Mismatch('ready state does not match the clone-boot checkpoint contract'),
+                           summary)
+                raw = self.store.raw('rejected-hostile%d' % number)
+                self.assertNotIn(b'TOP-SECRET', raw)
+                self.assertEqual(json.loads(raw), {'stage': 'readiness', 'code': 'unrecognized',
+                                                   'reason': 'unrecognized', 'summary': None})
+
     def test_rejected_terminal_summary_is_retained_exclusively_and_bounded(self):
         def wrong(out, w):
+            out['clone']['InvocationID'] = 'b' * 32
             if w.boot_n == 1 and out['core']['phase'] == 'ready':
                 out['checkpoint']['operation'] = '9' * 32
         self.world.mutate_summary = wrong
@@ -5128,6 +5223,19 @@ class PrivateCloneSummaryOrdering(CloneCase):
             self.store.create('rejected-boot1', {})
         self.assert_disposed(result)
 
+    def test_failed_unit_projection_is_retained(self):
+        def failed(out, w):
+            if w.boot_n == 1:
+                out['clone'] = {'ActiveState': 'failed', 'InvocationID': 'b' * 32, 'Result': 'exit-code'}
+        self.world.mutate_summary = failed
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Mismatch'))
+        saved = self.store.read('rejected-boot1')
+        self.assertEqual((saved['code'], saved['reason']), ('mismatch', 'unchanged clone auto-start failed'))
+        self.assertEqual(saved['summary']['clone'],
+                         {'ActiveState': 'failed', 'InvocationID': 'b' * 32, 'Result': 'exit-code'})
+        self.assert_disposed(result)
+
     def test_malformed_summary_gets_only_a_fixed_classification(self):
         def hostile(out, w):
             out['config'] = {'secret': 'TOP-SECRET-VALUE'}
@@ -5140,11 +5248,14 @@ class PrivateCloneSummaryOrdering(CloneCase):
         self.assertNotIn(b'TOP-SECRET', raw)
         self.assert_disposed(result)
 
-    def test_diagnostic_write_failure_preserves_primary_failure_and_cleanup(self):
+    def wrong_checkpoint(self):
         def wrong(out, w):
             if w.boot_n == 1 and out['core']['phase'] == 'ready':
                 out['checkpoint']['operation'] = '9' * 32
         self.world.mutate_summary = wrong
+
+    def test_diagnostic_write_failure_preserves_primary_failure_and_cleanup(self):
+        self.wrong_checkpoint()
         original = clone.Store.create
 
         def failing(store, kind, value):
@@ -5155,6 +5266,21 @@ class PrivateCloneSummaryOrdering(CloneCase):
             code, result = self.execute()
         self.assertEqual((code, result['failure']), (1, 'Mismatch'))
         self.assertFalse(self.store.has('rejected-boot1'))
+        self.assert_disposed(result)
+
+    def test_diagnostic_cancellation_preserves_primary_failure_and_cleanup(self):
+        self.wrong_checkpoint()
+        original = clone.Store.create
+
+        def cancelled(store, kind, value):
+            if kind.startswith('rejected-'):
+                raise host.HostCancelled(signal.SIGTERM)   # BaseException, not Exception
+            return original(store, kind, value)
+        with patch.object(clone.Store, 'create', cancelled):
+            code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Mismatch'))   # not 143/'cancelled'
+        self.assertFalse(self.store.has('rejected-boot1'))
+        self.assertTrue(self.store.has('failure'))
         self.assert_disposed(result)
 
 

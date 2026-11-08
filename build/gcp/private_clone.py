@@ -671,6 +671,63 @@ REJECT_REASONS = frozenset((
     'second boot is not a new boot of the same sealed image', 'core nonce differs from the sealed nonce',
     'unchanged clone auto-start failed', 'ready state does not match the clone-boot checkpoint contract',
     'backend is not positively offline at the verified stop'))
+# Diagnostic-only finite vocabularies (readiness itself stays strict and does not use them). Anything else is
+# never persisted: the retained record then carries only a fixed classification and summary null.
+DIAG_SEAL_STATES = frozenset(('sealing', 'sealed'))
+DIAG_PHASES = frozenset(('prepared', 'resumable', 'starting', 'ready', 'stopped', 'failed', 'stop-observed'))
+DIAG_MODES = frozenset(('fresh', 'resume'))
+DIAG_ACTIVE = frozenset(('active', 'activating', 'deactivating', 'inactive', 'failed', 'reloading', 'maintenance'))
+DIAG_RESULTS = frozenset(('success', 'exit-code', 'signal', 'core-dump', 'timeout', 'watchdog', 'resources',
+                          'start-limit-hit', 'protocol', 'oom-kill'))
+
+
+def _diag(value, allowed=None, pattern=None, optional=False, empty=False):
+    """The value only if it is None (optional), '' (empty) or exactly one finite enum/pattern member."""
+    if value is None and optional:
+        return value
+    if value == '' and empty:
+        return value
+    if not isinstance(value, str) or (allowed is None) == (pattern is None):
+        raise ValueError
+    if (allowed is not None and value not in allowed) or (pattern is not None and not pattern.fullmatch(value)):
+        raise ValueError
+    return value
+
+
+def _diag_unit(u):
+    return {'ActiveState': _diag(u['ActiveState'], DIAG_ACTIVE, optional=True),
+            'InvocationID': _diag(u['InvocationID'], pattern=HEX32, optional=True, empty=True),
+            'Result': _diag(u['Result'], DIAG_RESULTS, optional=True)}
+
+
+def diagnostic_summary(s):
+    """Rebuilt copy of a parsed summary made only of finite enums, hex IDs and booleans, else None."""
+    try:
+        seal, core, cp = s['seal'], s['core'], s['checkpoint']
+        sv = core['stop_verified']
+        return {'boot': _diag(s['boot'], pattern=BOOT_RE),
+                'seal': {'state': _diag(seal['state'], DIAG_SEAL_STATES), 'owned_sealed': seal['owned_sealed'] is True,
+                         'nonce': _diag(seal['nonce'], pattern=HEX32),
+                         'build_boot': _diag(seal['build_boot'], pattern=BOOT_RE),
+                         'core_operation': _diag(seal['core_operation'], pattern=HEX32),
+                         'core_invocation': _diag(seal['core_invocation'], pattern=HEX32)},
+                'checkpoint': None if cp is None else {'boot': _diag(cp['boot'], pattern=BOOT_RE),
+                                                       'operation': _diag(cp['operation'], pattern=HEX32),
+                                                       'invocation': _diag(cp['invocation'], pattern=HEX32)},
+                'core': {'nonce': _diag(core['nonce'], pattern=HEX32, optional=True),
+                         'phase': _diag(core['phase'], DIAG_PHASES, optional=True),
+                         'mode': _diag(core['mode'], DIAG_MODES, optional=True),
+                         'boot': _diag(core['boot'], pattern=BOOT_RE, optional=True),
+                         'operation': _diag(core['operation'], pattern=HEX32, optional=True),
+                         'invocation': _diag(core['invocation'], pattern=HEX32, optional=True),
+                         'stop_verified': None if sv is None else {
+                             'operation': _diag(sv['operation'], pattern=HEX32, optional=True),
+                             'invocation': _diag(sv['invocation'], pattern=HEX32, optional=True)},
+                         'critical_sha256': _diag(core['critical_sha256'], pattern=HEX64, optional=True),
+                         'cluster_sha256': _diag(core['cluster_sha256'], pattern=HEX64, optional=True)},
+                'clone': _diag_unit(s['clone']), 'resume': _diag_unit(s['resume'])}
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def readiness(s, prior=None):
@@ -1490,15 +1547,23 @@ class Run:
             raise Uncertain('access window passed before remote proof acceptance') from None
 
     def reject(self, stage, error, summary):
-        """Retain the validated rejected summary and a fixed reason before cleanup. Never raises, never raw output."""
+        """Retain a finite-validated rejected summary and a fixed reason before cleanup.
+
+        Never raw output, exception text or unvalidated strings. Never raises anything (BaseException included, so a
+        cancellation during this diagnostic cannot replace the initiating failure or skip cleanup)."""
         try:
+            safe = None if summary is None else diagnostic_summary(summary)
             reason = str(error)
-            self.store.try_create('rejected-' + self.phase, {
-                'stage': stage,
-                'code': 'malformed' if summary is None else 'mismatch' if isinstance(error, Mismatch) else 'refused',
-                'reason': 'malformed' if summary is None else reason if reason in REJECT_REASONS else 'other',
-                'summary': summary})
-        except Exception:
+            if summary is None:
+                code, why = 'malformed', 'malformed'
+            elif safe is None:
+                code, why = 'unrecognized', 'unrecognized'
+            else:
+                code = 'mismatch' if isinstance(error, Mismatch) else 'refused'
+                why = reason if reason in REJECT_REASONS else 'other'
+            self.store.try_create('rejected-' + self.phase, {'stage': stage, 'code': code, 'reason': why,
+                                                             'summary': safe})
+        except BaseException:   # diagnostic only: the primary failure and cleanup must win
             pass
 
     def await_ready(self, master, window, prior):
