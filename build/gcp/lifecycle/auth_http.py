@@ -8,15 +8,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import socket
 import subprocess
 from typing import Callable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class TransportError(Exception):
     """Sanitized authentication, network or response-bound failure."""
+
+
+class NetworkUnavailable(TransportError):
+    """Only a known connection/timeout or temporary DNS exchange failure; no response proof."""
+
+
+def _network_unavailable(error):
+    if isinstance(error, HTTPError):
+        return False
+    if isinstance(error, URLError):
+        error = error.reason
+    return (isinstance(error, (TimeoutError, ConnectionError)) or
+            isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN)
 
 
 @dataclass(frozen=True)
@@ -91,6 +105,8 @@ class HttpTransport:
                 if len(payload) > max_bytes:
                     raise ValueError("response exceeds limit")
                 return HttpResponse(response.code, payload)
-        except Exception:
+        except Exception as error:
             # Never echo URL, request headers, body, token or server diagnostics.
+            if _network_unavailable(error):
+                raise NetworkUnavailable("cloud network exchange unavailable") from None
             raise TransportError("cloud HTTP request failed or exceeded bounds") from None

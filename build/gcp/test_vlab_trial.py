@@ -2644,8 +2644,10 @@ class GuestDiagnostics(unittest.TestCase):
     # -- actual trial orchestration: fake master/process only ---------------------
     def drive(self, replies, *, fail_bootstrap=False, service=b'', observation_down=False,
               observation_error=None, stop_error=None, private=None, export=b'absent', close=True,
-              fault=None, primary_error=None, candidate_command=None, close_error=None, cleanup_error=None):
+              fault=None, primary_error=None, candidate_command=None, close_error=None, cleanup_error=None,
+              reads=None):
         value = snapshot()
+        script, self.registration_reads = list(reads or ()), []
         rec = dict(value, names=host.spec.names(123, 1, host.spec.UBUNTU_VLAB_CORE))
         registration, records = Mock(), Mock()
         registration.current.return_value = rec
@@ -2663,6 +2665,11 @@ class GuestDiagnostics(unittest.TestCase):
             if bootstrapped.is_set():
                 self.assertIn('bootstrap-complete', trace)
                 inject('registration')
+                self.registration_reads.append('read')
+                if script:
+                    step = script.pop(0)
+                    if step is not None:
+                        raise step
             return rec
         registration.current.side_effect = current
         real_trust = host.trusted_source
@@ -2834,7 +2841,7 @@ class GuestDiagnostics(unittest.TestCase):
         self.assertLess(trace.index('export'), trace.index('master-close'))
         self.assertEqual(self.exports[0]['cap'], host.EXPORT_CAP_SECONDS)
         self.assertLessEqual(self.exports[0]['until'] - host.owned_process.monotonic(), host.EXPORT_CAP_SECONDS)
-        self.assertEqual(next(private.iterdir()).read_bytes(), self.export_bytes())
+        self.assertEqual(next(self.kept(private)).read_bytes(), self.export_bytes())
         self.assertNotIn(SENTINEL, text)
 
     # -- #368 owner-private first-failure extraction (fake original master only) ------
@@ -2867,6 +2874,553 @@ class GuestDiagnostics(unittest.TestCase):
         return private, self.drive([self.encoded(result_value(self.nonce, 17, True))], private=private,
                                    export=export, **kwargs)
 
+    @staticmethod
+    def kept(private):
+        # Guest-bundle files only; the host's closed failure record is a distinct, separately tested file.
+        return iter([p for p in private.iterdir() if not p.name.startswith('host-failure-')])
+
+    # -- #537 closed first HOST failure record and finite periodic READ recovery ---------------
+    RECEIPT_KEYS = {'schema', 'code', 'contained', 'process_absent', 'phase', 'failure_category', 'host_operation',
+                    'own_key_absent', 'local_files_absent', 'independent_cleanup_dispatched', 'lease',
+                    'guest_diagnostic_status', 'guest_diagnostic', 'guest_service', 'private_diagnostic'}
+    HOST_RECORD_KEYS = {'schema', 'kind', 'source_sha', 'nonce', 'lease', 'epoch', 'run_id', 'attempt', 'phase',
+                        'host_operation', 'failure_category', 'code', 'exception', 'http_status', 'recheck_attempts'}
+
+    def host_record_path(self, private):
+        return private / ('host-failure-' + snapshot()['request_id'] + '.json')
+
+    def host_drive(self, reads, *, replies=None, **kwargs):
+        self.exports = []
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        with patch.object(host, 'RECHECK_PAUSES', (0.0, 0.0)):
+            outcome = self.drive(replies or [b'absent'], private=private, reads=reads, **kwargs)
+        return private, outcome
+
+    def test_transient_periodic_reads_recover_with_complete_fresh_success_and_no_failure_file(self):
+        success = [self.encoded(result_value(self.nonce, 0, True))]
+        for reads in ([host.ReadUnavailable(503), None], [host.TransientRead(None), host.ReadUnavailable(None), None],
+                      [host.ReadUnavailable(429), host.TransientRead(500), None]):
+            with self.subTest(reads=len(reads)):
+                private, (code, receipt, trace, text) = self.host_drive(reads, replies=success)
+                self.assertEqual(self.registration_reads, ['read'] * len(reads))
+                self.assertEqual((code, receipt['code'], receipt['failure_category'], receipt['phase']),
+                                 (0, 0, 'none', 'guest-result'))
+                self.assertEqual(list(private.iterdir()), [])  # recovered polling leaves no failure file
+                self.assertEqual(set(receipt), self.RECEIPT_KEYS)
+                self.assertEqual(trace.count('master-start'), 1)  # no reconnect
+                self.assertEqual(trace.count('remove-key'), 1)
+            self.setUp()
+
+    def test_all_three_periodic_attempts_fail_with_closed_correlated_host_record(self):
+        cases = ((host.ReadUnavailable(503), 'store-read-unavailable', 503),
+                 (host.TransientRead(429), 'cloud-read-unavailable', 429),
+                 (host.ReadUnavailable(None), 'store-read-unavailable', None))
+        for error, name, status in cases:
+            with self.subTest(exception=name, status=status):
+                private, (code, receipt, trace, text) = self.host_drive([error, error, error, None])
+                self.assertEqual(self.registration_reads, ['read'] * host.RECHECK_ATTEMPTS)  # never a 4th
+                self.assertEqual((code, receipt['code'], receipt['phase'], receipt['failure_category'],
+                                  receipt['host_operation']), (1, 1, 'guest-work', 'unknown', 'registration-check'))
+                self.assertEqual(set(receipt), self.RECEIPT_KEYS)
+                self.assertIn('stop', trace)
+                self.assertLess(trace.index('stop'), trace.index('master-close'))
+                self.assertIn('remove-key', trace)
+                self.assertIn('dispatch-cleanup', trace)
+                path = self.host_record_path(private)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(path.stat().st_nlink, 1)
+                raw = path.read_bytes()
+                record = json.loads(raw)
+                self.assertEqual(raw, guest.encoded(record))
+                self.assertEqual(set(record), self.HOST_RECORD_KEYS)
+                value = snapshot()
+                self.assertEqual(record, {
+                    'schema': 1, 'kind': 'host-failure', 'source_sha': value['source_sha'], 'nonce': self.nonce,
+                    'lease': value['request_id'], 'epoch': value['epoch'], 'run_id': value['run_id'],
+                    'attempt': value['attempt'], 'phase': 'guest-work', 'host_operation': 'registration-check',
+                    'failure_category': 'unknown', 'code': 1, 'exception': name, 'http_status': status,
+                    'recheck_attempts': 3})
+                self.assertNotIn(str(self.directory).encode(), raw)
+                self.assertEqual([p.name for p in private.iterdir() if p.name.startswith('first-failure')], [])
+            self.setUp()
+
+    def test_hard_registration_failures_are_not_retried_and_record_only_closed_names(self):
+        cases = ((host.StoreError(SENTINEL), 'store-error', None), (host.NotFound(SENTINEL), 'cloud-not-found', 404),
+                 (host.ApiError(401, SENTINEL), 'cloud-api-error', 401), (host.ApiError(403, SENTINEL), 'cloud-api-error', 403),
+                 (host.Uncertain(SENTINEL), 'cloud-uncertain', None), (host.Refused(SENTINEL), 'controller-refused', None),
+                 (host.ForbiddenOperation(SENTINEL), 'cloud-forbidden', None), (host.AccessError(SENTINEL), 'access-error', None),
+                 (RuntimeError(SENTINEL), 'other', None), (ValueError(SENTINEL), 'other', None),
+                 (OSError(SENTINEL), 'os-error', None),
+                 (guest.Failure(SENTINEL, 17), 'failure', None))
+        for error, name, status in cases:
+            with self.subTest(exception=name, status=status):
+                private, (code, receipt, trace, text) = self.host_drive([error, None, None])
+                self.assertEqual(self.registration_reads, ['read'])  # no retry
+                record = json.loads(self.host_record_path(private).read_bytes())
+                self.assertEqual((record['exception'], record['http_status'], record['recheck_attempts']),
+                                 (name, status, None))
+                self.assertEqual(record['code'], code)
+                self.assertNotIn(SENTINEL, self.host_record_path(private).read_text())
+                self.assertNotIn(SENTINEL, text)
+                self.assertEqual(set(receipt), self.RECEIPT_KEYS)
+            self.setUp()
+
+    def test_foreign_changed_lease_identity_and_deadline_failures_stay_hard(self):
+        # `current()` raises guest.Failure for every changed lease/source/ID/VM/boot/deadline/status.
+        for message in ('owner lease changed', 'insert not terminal', 'fixed trial refused'):
+            with self.subTest(message=message):
+                private, (code, receipt, trace, text) = self.host_drive([guest.Failure(message, 1), None])
+                self.assertEqual((code, self.registration_reads), (1, ['read']))
+                self.assertEqual(json.loads(self.host_record_path(private).read_bytes())['exception'], 'failure')
+            self.setUp()
+
+    def test_cancellation_during_periodic_recheck_is_not_retried_and_keeps_primary(self):
+        for error, code, category, name in ((guest.Failure('signal', 143), 143, 'guest', 'failure'),
+                                            (KeyboardInterrupt(), 130, 'interrupted', 'interrupted')):
+            with self.subTest(code=code):
+                private, (result, receipt, trace, text) = self.host_drive([error, None])
+                self.assertEqual((result, receipt['code'], receipt['failure_category']), (code, code, category))
+                self.assertEqual(self.registration_reads, ['read'])
+                self.assertEqual(json.loads(self.host_record_path(private).read_bytes())['exception'], name)
+            self.setUp()
+
+    def test_guest_reported_failure_without_host_exception_has_no_host_record(self):
+        private, (code, receipt, trace, text) = self.private_drive(self.export_bytes())
+        self.assertEqual(code, 17)
+        self.assertEqual([p.name for p in private.iterdir()], ['first-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertEqual(receipt['guest_diagnostic'], worker_detail())
+
+    def test_host_record_is_first_only_and_never_overwrites_adopts_or_follows_links(self):
+        name = 'host-failure-' + snapshot()['request_id'] + '.json'
+        # Preexisting regular file: untouched, primary result and cleanup unchanged.
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        (private / name).write_bytes(b'PREEXISTING')
+        private, (code, receipt, trace, text) = self.host_drive([RuntimeError(SENTINEL)])
+        self.assertEqual((private / name).read_bytes(), b'PREEXISTING')
+        self.assertEqual((code, receipt['failure_category']), (1, 'unknown'))
+        self.assertIn('remove-key', trace)
+        self.assertIn('dispatch-cleanup', trace)
+        self.setUp()
+        # Symlink at the target: not followed, link and victim untouched.
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        victim = self.directory / 'victim'
+        victim.write_bytes(b'KEEP')
+        os.symlink(victim, private / name)
+        private, (code, receipt, trace, text) = self.host_drive([RuntimeError(SENTINEL)])
+        self.assertEqual(victim.read_bytes(), b'KEEP')
+        self.assertTrue((private / name).is_symlink())
+        self.assertEqual(code, 1)
+        self.assertIn('dispatch-cleanup', trace)
+        self.setUp()
+        # Direct second write refuses; the first record is preserved.
+        private = self.directory / 'private'
+        private.mkdir(mode=0o700)
+        initial = {'source_sha': 'a' * 40, 'nonce': 'd' * 32, 'lease': snapshot()['request_id'], 'epoch': 1,
+                   'run_id': 123, 'attempt': 1}
+        first = host.host_failure_record(initial, 'guest-work', 'registration-check', 'unknown', 1, RuntimeError('x'))
+        host.retain_host_failure(private, first)
+        later = host.host_failure_record(initial, 'guest-work', 'poll-check', 'guest', 17, guest.Failure('y', 17))
+        with self.assertRaises(FileExistsError):
+            host.retain_host_failure(private, later)
+        self.assertEqual(json.loads((private / name).read_bytes()), first)
+
+    def test_host_record_write_failure_cannot_change_primary_cleanup_or_success(self):
+        with patch.object(host, 'retain_host_failure', side_effect=OSError(SENTINEL)):
+            private, (code, receipt, trace, text) = self.host_drive([RuntimeError(SENTINEL)])
+        self.assertEqual((code, receipt['code'], receipt['failure_category'], receipt['host_operation']),
+                         (1, 1, 'unknown', 'registration-check'))
+        self.assertEqual(list(private.iterdir()), [])
+        self.assertNotIn(SENTINEL, text)
+        self.assertLess(trace.index('stop'), trace.index('master-close'))
+        self.assertLess(trace.index('master-close'), trace.index('remove-key'))
+        self.assertLess(trace.index('remove-key'), trace.index('dispatch-cleanup'))
+        self.assertTrue(receipt['process_absent'] and receipt['local_files_absent'] and receipt['own_key_absent'])
+        self.setUp()
+        # Even a record that would be unbuildable (invalid state) never raises out of the trial.
+        with patch.object(host, 'host_failure_record', side_effect=guest.Failure('record refused', 99)):
+            private, (code, receipt, trace, text) = self.host_drive([RuntimeError(SENTINEL)])
+        self.assertEqual(code, 1)
+        self.assertEqual(list(private.iterdir()), [])
+
+    def test_no_private_directory_means_no_host_record_and_unchanged_behavior(self):
+        with patch.object(host, 'retain_host_failure') as retain:
+            code, receipt, trace, text = self.drive([b'absent'], fault='registration')
+        retain.assert_not_called()
+        self.assertEqual((code, receipt['private_diagnostic']), (1, 'skipped'))
+
+    def test_host_record_requires_closed_inputs(self):
+        initial = {'source_sha': 'a' * 40, 'nonce': 'd' * 32, 'lease': snapshot()['request_id'], 'epoch': 1,
+                   'run_id': 123, 'attempt': 1}
+        for phase, operation, category, code in (('x', 'registration-check', 'unknown', 1),
+                                                 ('guest-work', 'free text', 'unknown', 1),
+                                                 ('guest-work', 'registration-check', 'other', 1),
+                                                 ('guest-work', 'registration-check', 'unknown', 0),
+                                                 ('guest-work', 'registration-check', 'unknown', 256),
+                                                 ('guest-work', 'registration-check', 'unknown', True)):
+            with self.subTest(phase=phase, operation=operation, category=category, code=code):
+                with self.assertRaises(guest.Failure):
+                    host.host_failure_record(initial, phase, operation, category, code, RuntimeError())
+        hostile = host.ReadUnavailable(503)
+        hostile.status, hostile.recheck_attempts = 99999, 99
+        record = host.host_failure_record(initial, 'guest-work', 'registration-check', 'unknown', 1, hostile)
+        self.assertEqual((record['http_status'], record['recheck_attempts']), (None, None))
+        self.assertEqual(host.host_failure_record(initial, 'guest-work', 'registration-check', 'unknown', 1,
+                                                  RuntimeError(SENTINEL))['exception'], 'other')
+        for lease in ('../escape', 'x' * 36, ''):
+            with self.assertRaises(guest.Failure):
+                host.retain_host_failure(self.directory, dict(record, lease=lease))
+        loose = self.directory / 'loose'
+        loose.mkdir(mode=0o755)
+        loose.chmod(0o755)
+        with self.assertRaises(guest.Failure):
+            host.retain_host_failure(loose, record)
+        self.assertEqual(list(loose.iterdir()), [])
+
+    def test_retry_allowance_constants_are_small_and_finite(self):
+        self.assertEqual(host.RECHECK_ATTEMPTS, 3)
+        self.assertEqual(host.RECHECK_ALLOWANCE_SECONDS, 30.0)
+        self.assertEqual(len(host.RECHECK_PAUSES), host.RECHECK_ATTEMPTS - 1)
+        self.assertLess(sum(host.RECHECK_PAUSES), host.RECHECK_ALLOWANCE_SECONDS)
+
+    # -- recheck_registration: exact budget semantics with a fake clock ------------------------
+    class Recheck:
+        def __init__(self, outcomes, budget=600.0):
+            self.outcomes, self.budget, self.now, self.calls, self.waits = list(outcomes), budget, 1000.0, 0, []
+            self.exhaust_on_call = self.fail_on_call = self.wait_result = self.wait_error = None
+            self.exhausted, self.failed = False, threading.Event()
+            self.registration = SimpleNamespace(current=self.current)
+            self.clock = SimpleNamespace(remaining=self.remaining)
+
+        def mono(self):
+            return self.now
+
+        def remaining(self, phase):
+            assert phase == 'persistence'
+            if self.exhausted:
+                raise guest.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+            return self.budget
+
+        def current(self):
+            self.calls += 1
+            if self.calls == self.exhaust_on_call:
+                self.exhausted = True
+            if self.calls == self.fail_on_call:
+                self.failed.set()
+            cost, value = self.outcomes.pop(0)
+            self.now += cost
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            if self.wait_error is not None:
+                raise self.wait_error
+            self.now += seconds
+            return bool(self.wait_result)
+
+        def run(self):
+            return host.recheck_registration(self.registration, self.clock, self.failed,
+                                             monotonic=self.mono, wait=self.wait)
+
+    def test_recheck_first_success_and_recovery_are_fully_fresh(self):
+        fixture = self.Recheck([(1, 'rec')])
+        self.assertEqual(fixture.run(), 'rec')
+        self.assertEqual((fixture.calls, fixture.waits), (1, []))
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, host.TransientRead(None)), (1, 'rec')])
+        self.assertEqual(fixture.run(), 'rec')
+        self.assertEqual((fixture.calls, fixture.waits), (3, [2.0, 4.0]))
+
+    def test_recheck_exhaustion_reraises_last_typed_error_with_attempt_count(self):
+        errors = [host.ReadUnavailable(503), host.TransientRead(429), host.ReadUnavailable(None)]
+        fixture = self.Recheck([(1, e) for e in errors])
+        with self.assertRaises(host.ReadUnavailable) as caught:
+            fixture.run()
+        self.assertIs(caught.exception, errors[-1])
+        self.assertEqual((caught.exception.recheck_attempts, fixture.calls, fixture.waits), (3, 3, [2.0, 4.0]))
+
+    def test_recheck_hard_failures_and_signals_are_never_retried(self):
+        for error in (guest.Failure('foreign', 1), guest.Failure('signal', 143), KeyboardInterrupt(), host.StoreError('x'),
+                      host.NotFound('x'), host.ApiError(401, 'x'), host.ApiError(403, 'x'), host.Uncertain('x'),
+                      host.Refused('x'), RuntimeError('x'), ValueError('x')):
+            with self.subTest(error=type(error).__name__):
+                fixture = self.Recheck([(1, error), (1, 'rec')])
+                with self.assertRaises(type(error)) as caught:
+                    fixture.run()
+                self.assertIs(caught.exception, error)
+                self.assertEqual((fixture.calls, fixture.waits), (1, []))
+
+    def test_recheck_cancellation_during_pause_and_heartbeat_failure_refuse(self):
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')])
+        fixture.wait_error = guest.Failure('signal', 143)
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual((caught.exception.code, fixture.calls), (143, 1))
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')])
+        fixture.wait_result = True  # heartbeat failure ends the pause
+        with self.assertRaisesRegex(guest.Failure, 'heartbeat'):
+            fixture.run()
+        self.assertEqual(fixture.calls, 1)
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')])
+        fixture.fail_on_call = 2  # heartbeat failed while the retry was in flight: late success refused
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual((caught.exception.code, fixture.calls), (1, 2))
+
+    def test_recheck_original_work_window_is_enforced_before_and_after_each_attempt(self):
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')], budget=6.0)  # < pause + minimum
+        with self.assertRaises(host.ReadUnavailable) as caught:
+            fixture.run()
+        self.assertEqual((fixture.calls, fixture.waits, caught.exception.recheck_attempts), (1, [], 1))
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')])
+        fixture.exhaust_on_call = 2  # window closes during the retry: the late positive read grants nothing
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual((caught.exception.code, fixture.calls), (124, 2))
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (1, 'rec')])
+        fixture.exhausted = True  # already closed after the first failure
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual(caught.exception.code, 124)
+        self.assertEqual((fixture.calls, fixture.waits), (0, []))
+
+    def test_recheck_aggregate_allowance_is_one_budget_with_no_reset_per_attempt(self):
+        # One allowance starts at entry: 1 failure + 2 pause + 27 read exhausts all30s.
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (27, host.ReadUnavailable(503)), (1, 'rec')])
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual((fixture.calls, caught.exception.code), (2, 124))
+        # A positive read that lands after the aggregate allowance is refused, not returned.
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (40, 'rec')])
+        with self.assertRaises(guest.Failure) as caught:
+            fixture.run()
+        self.assertEqual((caught.exception.code, fixture.calls), (124, 2))
+        # Exactly inside the allowance is accepted.
+        fixture = self.Recheck([(1, host.ReadUnavailable(503)), (20, 'rec')])
+        self.assertEqual(fixture.run(), 'rec')
+
+    def test_recheck_uses_only_current_no_writes_reconnects_or_renewal(self):
+        registration = Mock()
+        registration.current.side_effect = [host.ReadUnavailable(503), 'rec']
+        fixture = self.Recheck([])
+        self.assertEqual(host.recheck_registration(registration, fixture.clock, fixture.failed,
+                                                   monotonic=fixture.mono, wait=fixture.wait), 'rec')
+        self.assertEqual([call[0] for call in registration.mock_calls], ['current', 'current'])
+
+    # -- typed Compute READ outcome: HTTP facts only, never messages ---------------------------
+    def read_cloud(self, responder):
+        from build.gcp.lifecycle.auth_http import HttpResponse
+        class Http:
+            def __init__(self):
+                self.calls = []
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url))
+                result = responder()
+                if isinstance(result, BaseException):
+                    raise result
+                return HttpResponse(*result)
+        http = Http()
+        outcome = host.ReadOutcome(http)
+        raw = host.ComputeRestTransport(outcome, token_provider=lambda: 'dummy-token')
+        return host.ReadCloud(host.PolicyCloud(raw, host.spec.PROJECT, host.spec.ZONE), outcome), http
+
+    def test_compute_reads_type_only_transport_loss_and_documented_transient_statuses(self):
+        for status in (408, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                cloud, http = self.read_cloud(lambda: (status, b'SECRET-BODY'))
+                with self.assertRaises(host.TransientRead) as caught:
+                    cloud.call('instances', 'get', name='fixed')
+                self.assertEqual(caught.exception.status, status)
+                self.assertNotIn('SECRET', str(caught.exception))
+                self.assertEqual([c[0] for c in http.calls], ['GET'])  # one GET, no hidden retry
+        for loss in (host.NetworkUnavailable('SECRET'),):
+            cloud, http = self.read_cloud(lambda: loss)
+            with self.assertRaises(host.TransientRead) as caught:
+                cloud.call('zoneOperations', 'get', name='op-fixed')
+            self.assertIsNone(caught.exception.status)
+            self.assertEqual(len(http.calls), 1)
+
+    def test_compute_reads_keep_auth_notfound_malformed_and_token_failures_hard(self):
+        for status in (400, 401, 403, 409):
+            cloud, http = self.read_cloud(lambda: (status, b'{}'))
+            with self.assertRaises(host.ApiError) as caught:
+                cloud.call('instances', 'get', name='fixed')
+            self.assertEqual(caught.exception.status, status)
+            self.assertNotIsInstance(caught.exception, host.TransientRead)
+        cloud, _ = self.read_cloud(lambda: (404, b'{}'))
+        with self.assertRaises(host.NotFound):
+            cloud.call('instances', 'get', name='fixed')
+        for reply in ((200, b'not json'), (200, b'[]'), (200, b'')):
+            cloud, _ = self.read_cloud(lambda: reply)
+            with self.assertRaises(host.Uncertain) as caught:
+                cloud.call('disks', 'get', name='fixed')
+            self.assertNotIsInstance(caught.exception, host.TransientRead)
+        # Credential acquisition failure never reaches HTTP, so no transient fact exists.
+        from build.gcp.lifecycle.auth_http import HttpResponse
+        outcome = host.ReadOutcome(Mock(request=Mock(return_value=HttpResponse(200, b'{}'))))
+        def no_token():
+            raise host.TransportError('credential')
+        raw = host.ComputeRestTransport(outcome, token_provider=no_token)
+        cloud = host.ReadCloud(host.PolicyCloud(raw, host.spec.PROJECT, host.spec.ZONE), outcome)
+        with self.assertRaises(host.Uncertain) as caught:
+            cloud.call('instances', 'get', name='fixed')
+        self.assertNotIsInstance(caught.exception, host.TransientRead)
+        outcome.http.request.assert_not_called()
+
+    def test_stale_transient_fact_cannot_type_a_later_untyped_failure(self):
+        calls = iter([(503, b''), (200, b'not json')])
+        cloud, _ = self.read_cloud(lambda: next(calls))
+        with self.assertRaises(host.TransientRead):
+            cloud.call('instances', 'get', name='fixed')
+        with self.assertRaises(host.Uncertain) as caught:
+            cloud.call('instances', 'get', name='fixed')
+        self.assertNotIsInstance(caught.exception, host.TransientRead)
+
+    def test_first_attempt_obeys_original_clock_heartbeat_and_aggregate_end(self):
+        for kind in ('expired', 'heartbeat', 'late', 'expires-during'):
+            with self.subTest(kind=kind):
+                f = self.Recheck([(31 if kind == 'late' else 1, 'rec')])
+                if kind == 'expired': f.exhausted = True
+                if kind == 'heartbeat': f.failed.set()
+                if kind == 'expires-during': f.exhaust_on_call = 1
+                with self.assertRaises(guest.Failure) as caught: f.run()
+                self.assertEqual(f.calls, 0 if kind in ('expired', 'heartbeat') else 1)
+                self.assertEqual(caught.exception.code, 1 if kind == 'heartbeat' else 124)
+
+    def test_actual_owner_signals_cross_real_http_and_token_adapters_without_retry(self):
+        from build.gcp.lifecycle.auth_http import HttpTransport, gcloud_token
+        from build.gcp.lifecycle.gcs import GcsSlotStore
+        for number, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
+            previous = signal.signal(number, host.interrupted)
+            try:
+                for where in ('http', 'token'):
+                    for service in ('compute', 'gcs'):
+                        with self.subTest(number=number, where=where, service=service):
+                            def send(*args, **kwargs):
+                                os.kill(os.getpid(), number)
+                                raise AssertionError('signal was swallowed')
+                            def token():
+                                if where == 'token':
+                                    with patch('build.gcp.lifecycle.auth_http.subprocess.run', side_effect=send):
+                                        return gcloud_token()
+                                return 'public-test-token'
+                            outcome = host.ReadOutcome(HttpTransport(opener=Mock(open=Mock(side_effect=send))))
+                            cloud = host.ReadCloud(host.PolicyCloud(host.ComputeRestTransport(outcome, token_provider=token),
+                                                                    host.spec.PROJECT, host.spec.ZONE), outcome)
+                            store = GcsSlotStore('public-test-bucket', transport=outcome.http, token_provider=token)
+                            fn = (lambda: cloud.call('instances', 'get', name='fixed')) if service == 'compute' else (lambda: store.read('slots/slot-1.json'))
+                            registration = SimpleNamespace(current=Mock(side_effect=fn))
+                            f = self.Recheck([])
+                            with self.assertRaises(host.HostCancelled) as caught:
+                                host.recheck_registration(registration, f.clock, f.failed, monotonic=f.mono, wait=f.wait)
+                            self.assertEqual(caught.exception.code, code)
+                            self.assertEqual(registration.current.call_count, 1)
+                            self.assertEqual(f.waits, [])
+            finally:
+                signal.signal(number, previous)
+
+    def test_host_cancellation_keeps_primary_closed_record_and_cleanup(self):
+        for number, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
+            with self.subTest(number=number):
+                private, (actual, receipt, trace, text) = self.host_drive([host.HostCancelled(number)])
+                self.assertEqual((actual, receipt['code'], receipt['failure_category']), (code, code, 'interrupted'))
+                record = json.loads(self.host_record_path(private).read_bytes())
+                self.assertEqual((record['exception'], record['code'], record['http_status']), ('interrupted', code, None))
+                self.assertEqual(set(receipt), self.RECEIPT_KEYS)
+                for step in ('stop', 'master-close', 'remove-key', 'dispatch-cleanup'):
+                    self.assertIn(step, trace)
+            self.setUp()
+
+    def test_actual_main_entrypoint_keeps_cancellation_before_trial(self):
+        import ast
+        tree = ast.parse(Path(host.__file__).read_bytes())
+        entry = next(n for n in tree.body if isinstance(n, ast.If)
+                     and isinstance(n.test, ast.Compare) and isinstance(n.test.left, ast.Name)
+                     and n.test.left.id == '__name__')
+        for number, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
+            previous = {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGINT)}
+            scope = dict(vars(host))
+            def before_trial():
+                os.kill(os.getpid(), number)
+                raise AssertionError('cancellation was swallowed')
+            scope.update(__name__='__main__', main=before_trial)
+            try:
+                with patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    exec(compile(ast.Module(body=[entry], type_ignores=[]), host.__file__, 'exec'), scope)
+                self.assertEqual(caught.exception.code, code)
+            finally:
+                for n, handler in previous.items(): signal.signal(n, handler)
+
+    def test_transient_types_cannot_launder_permanent_or_invalid_statuses(self):
+        for kind in (host.TransientRead, host.ReadUnavailable):
+            for status in (True, False, '503', 0, 200, 401, 403, 404, 499, 600):
+                with self.subTest(kind=kind.__name__, status=status):
+                    with self.assertRaises(ValueError): kind(status)
+
+    def test_closed_host_record_retains_genuine_hard_gcs_status_without_retry(self):
+        private, (code, receipt, trace, text) = self.host_drive([host.StoreError('fixed client message', status=403)])
+        self.assertEqual((code, receipt['failure_category']), (1, 'unknown'))
+        self.assertEqual(self.registration_reads, ['read'])
+        record = json.loads(self.host_record_path(private).read_bytes())
+        self.assertEqual((record['exception'], record['http_status']), ('store-error', 403))
+
+    def test_compute_unknown_http_exception_remains_hard(self):
+        for error in (OSError('unknown'), RuntimeError('unknown'), host.TransportError('bounds')):
+            cloud, http = self.read_cloud(lambda: error)
+            with self.assertRaises(host.Uncertain) as caught:
+                cloud.call('instances', 'get', name='fixed')
+            self.assertNotIsInstance(caught.exception, host.TransientRead)
+            self.assertEqual(len(http.calls), 1)
+
+    def test_host_record_rejects_ancestor_link_and_changed_directory_before_write(self):
+        initial = {'source_sha': 'a'*40, 'nonce': 'd'*32, 'lease': snapshot()['request_id'], 'epoch': 1, 'run_id': 123, 'attempt': 1}
+        record = host.host_failure_record(initial, 'guest-work', 'registration-check', 'unknown', 1, RuntimeError())
+        parent = self.directory/'real'; parent.mkdir(mode=0o700)
+        private = parent/'private'; private.mkdir(mode=0o700)
+        alias = self.directory/'alias'; alias.symlink_to(parent, target_is_directory=True)
+        with self.assertRaises(guest.Failure): host.retain_host_failure(alias/'private', record)
+        self.assertEqual(list(private.iterdir()), [])
+        actual_open = os.open
+        moved = parent/'moved'
+        def replace_after_open(path, flags, *args, **kwargs):
+            fd = actual_open(path, flags, *args, **kwargs)
+            if Path(path) == private and flags & os.O_DIRECTORY:
+                private.rename(moved); private.mkdir(mode=0o700)
+            return fd
+        with patch.object(host.os, 'open', side_effect=replace_after_open):
+            with self.assertRaises(guest.Failure): host.retain_host_failure(private, record)
+        self.assertEqual(list(private.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [])
+
+    def test_partial_host_record_is_preserved_after_write_failure(self):
+        initial = {'source_sha': 'a'*40, 'nonce': 'd'*32, 'lease': snapshot()['request_id'], 'epoch': 1, 'run_id': 123, 'attempt': 1}
+        record = host.host_failure_record(initial, 'guest-work', 'registration-check', 'unknown', 1, RuntimeError())
+        private = self.directory/'private'; private.mkdir(mode=0o700)
+        real_fdopen = os.fdopen
+        class Partial:
+            def __init__(self, fd, *args, **kwargs): self.stream = real_fdopen(fd, *args, **kwargs)
+            def __enter__(self): return self
+            def __exit__(self, *args): self.stream.close()
+            def write(self, raw):
+                self.stream.write(raw[:17]); self.stream.flush()
+                raise OSError('synthetic write failure')
+        with patch.object(host.os, 'fdopen', Partial):
+            with self.assertRaises(OSError): host.retain_host_failure(private, record)
+        target = self.host_record_path(private)
+        self.assertEqual(target.read_bytes(), guest.encoded(record)[:17])
+        with self.assertRaises(FileExistsError): host.retain_host_failure(private, record)
+        self.assertEqual(target.read_bytes(), guest.encoded(record)[:17])
+
+    def test_read_surface_still_refuses_mutating_verbs_with_outcome_wrapper(self):
+        cloud, http = self.read_cloud(lambda: (200, b'{}'))
+        for resource, verb in (('instances', 'insert'), ('instances', 'delete'), ('images', 'insert')):
+            with self.assertRaises(host.ForbiddenOperation):
+                cloud.call(resource, verb)
+        self.assertEqual(http.calls, [])
+
     def test_failed_trial_captures_exactly_once_between_stop_and_original_master_close(self):
         private, (code, receipt, trace, text) = self.private_drive(self.export_bytes(), fail_bootstrap=True)
         self.assertEqual((code, receipt['private_diagnostic']), (17, 'captured'))
@@ -2879,7 +3433,7 @@ class GuestDiagnostics(unittest.TestCase):
                          (['/usr/bin/sudo', '-n', '/usr/bin/python3', str(guest.ROOT / 'vlab_trial.py')],
                           ['export-failure', '--nonce'], True, 'persistence'))
         self.assertLessEqual(call['until'] - host.owned_process.monotonic(), host.EXPORT_CAP_SECONDS)
-        files = list(private.iterdir())
+        files = list(self.kept(private))
         self.assertEqual([f.name for f in files], ['first-failure-' + snapshot()['request_id'] + '.bin'])
         self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
         self.assertEqual(files[0].read_bytes(), self.export_bytes())
@@ -2966,7 +3520,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.setUp()
                 private, (code, receipt, trace, text) = self.private_drive(raw)
                 self.assertEqual((code, receipt['private_diagnostic']), (17, 'invalid'))
-                self.assertEqual(list(private.iterdir()), [])
+                self.assertEqual(list(self.kept(private)), [])
                 self.assertNotIn(SENTINEL, text)
 
     def test_schema3_unit_ready_section_is_typed_and_diagnostic_only(self):
@@ -2982,7 +3536,7 @@ class GuestDiagnostics(unittest.TestCase):
                 bundle = self.failure_bundle(unit_ready=section)
                 private, (code, receipt, _, _) = self.private_drive(self.export_bytes(bundle))
                 self.assertEqual((code, receipt['private_diagnostic']), (17, 'captured'))
-                self.assertEqual(next(private.iterdir()).read_bytes(), self.export_bytes(bundle))
+                self.assertEqual(next(self.kept(private)).read_bytes(), self.export_bytes(bundle))
 
     def test_reservation_style_null_bundle_and_absent_are_accepted_or_explicit(self):
         null = self.failure_bundle(stage='reserve', operation=None, invocation=None,
@@ -2997,7 +3551,7 @@ class GuestDiagnostics(unittest.TestCase):
         self.assertEqual(receipt['private_diagnostic'], 'invalid')  # old live operation cannot vouch for null
         self.setUp()
         private, (code, receipt, _, _) = self.private_drive(b'absent')
-        self.assertEqual((receipt['private_diagnostic'], list(private.iterdir())), ('absent', []))
+        self.assertEqual((receipt['private_diagnostic'], list(self.kept(private))), ('absent', []))
 
     # -- #412 terminal-result-bound resume export (host side) ---------------------
     RESUME = {'phase': 'resume', 'operation': 'core-start-resume'}
@@ -3033,7 +3587,7 @@ class GuestDiagnostics(unittest.TestCase):
         resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
         private, (code, receipt, trace, text) = self.resume_drive(resume)
         self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'captured', True))
-        self.assertEqual(next(private.iterdir()).read_bytes(), resume)
+        self.assertEqual(next(self.kept(private)).read_bytes(), resume)
         self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
         self.assertEqual(len(self.exports), 1)
         self.assertEqual(self.exports[0]['args'][-3:-1], ['export-failure', '--nonce'])  # remote command fixed
@@ -3055,7 +3609,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.setUp()
                 private, (code, receipt, _, _) = self.resume_drive(raw, detail or {'phase': 'stage', 'operation': 'install-hhfab'})
                 self.assertEqual((code, receipt['private_diagnostic']), (17, expected))
-                self.assertEqual(len(list(private.iterdir())), 1 if expected == 'captured' else 0)
+                self.assertEqual(len(list(self.kept(private))), 1 if expected == 'captured' else 0)
 
     def test_resume_mode_is_frozen_before_supplemental_observation_and_never_from_unvalidated_result(self):
         resume = self.export_bytes(self.failure_bundle(mode='resume'), mode='resume')
@@ -3070,7 +3624,7 @@ class GuestDiagnostics(unittest.TestCase):
         self.assertEqual(receipt['guest_diagnostic'], worker_detail(**self.RESUME))
         self.assertEqual(receipt['guest_diagnostic_status'], 'valid')
         self.assertLess(trace.index('read-result'), trace.index('stop'))
-        self.assertEqual(list(private.iterdir()), [])
+        self.assertEqual(list(self.kept(private)), [])
         for primary in (b'absent', b'invalid'):
             with self.subTest(primary=primary):
                 self.setUp()
@@ -3080,13 +3634,13 @@ class GuestDiagnostics(unittest.TestCase):
                 code, receipt, _, _ = self.drive([primary], fail_bootstrap=(primary == b'absent'),
                                                 private=private, export=resume)
                 self.assertEqual(receipt['private_diagnostic'], 'invalid')
-                self.assertEqual(list(private.iterdir()), [])
+                self.assertEqual(list(self.kept(private)), [])
 
     def test_resume_query_cleanup_uncertainty_retains_bytes_and_primary_result(self):
         resume = self.export_bytes(self.failure_bundle(mode='resume', query_cleanup='uncertain'), mode='resume')
         private, (code, receipt, trace, _) = self.resume_drive(resume)
         self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'invalid', True))
-        self.assertEqual(next(private.iterdir()).read_bytes(), resume)
+        self.assertEqual(next(self.kept(private)).read_bytes(), resume)
         self.assertTrue(all(receipt[k] for k in ('process_absent', 'local_files_absent', 'own_key_absent')))
         self.assertIn('master-close', trace)
         self.assertIn('dispatch-cleanup', trace)
@@ -3108,7 +3662,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual(receipt['local_files_absent'], not uncertain)
                 self.assertEqual(receipt['own_key_absent'], not uncertain)
                 self.assertEqual('remove-key' in trace, not uncertain)
-                self.assertEqual(list(private.iterdir()), [])
+                self.assertEqual(list(self.kept(private)), [])
                 self.assertNotIn(SENTINEL, text)
 
     def private_dir(self):
@@ -3127,7 +3681,7 @@ class GuestDiagnostics(unittest.TestCase):
         bundle = self.failure_bundle(query_cleanup='uncertain')
         private, (code, receipt, _, _) = self.private_drive(self.export_bytes(bundle))
         self.assertEqual((code, receipt['private_diagnostic']), (17, 'invalid'))
-        self.assertEqual(len(list(private.iterdir())), 1)  # retained, but never labelled captured
+        self.assertEqual(len(list(self.kept(private))), 1)  # retained, but never labelled captured
         self.assertTrue(receipt['process_absent'])  # guest namespace is not host process absence
 
     def test_extraction_failure_timeout_or_budget_never_changes_primary_or_containment(self):
@@ -3140,7 +3694,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, 'unavailable', False))
                 self.assertTrue(receipt['process_absent'] and receipt['own_key_absent'])
                 self.assertIn('stop', trace)
-                self.assertEqual(list(private.iterdir()), [])
+                self.assertEqual(list(self.kept(private)), [])
                 self.assertNotIn(SENTINEL, text)
         self.setUp()
         with patch.object(guest.Clock, 'cleanup_remaining', return_value=host.EXPORT_TEARDOWN_RESERVE + 1):
@@ -3257,7 +3811,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual(calls[0][0], host.export_command(self.nonce))
                 self.assertEqual((calls[0][1:4], calls[0][4]), (('persistence', host.EXPORT_CAP_SECONDS, True),
                                                                  host.EXPORT_READ_LIMIT))
-                kept = list(private.iterdir())
+                kept = list(self.kept(private))
                 self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
                 self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode)), (raw, 0o600))
                 self.assertLessEqual(len(raw), host.EXPORT_READ_LIMIT)
@@ -3287,7 +3841,7 @@ class GuestDiagnostics(unittest.TestCase):
         self.assertFalse(uncertain.is_set())
         self.assertEqual(calls, [(host.export_command(self.nonce), 'persistence', host.EXPORT_CAP_SECONDS,
                                  True, 100 + host.EXPORT_CAP_SECONDS, host.EXPORT_READ_LIMIT)])
-        kept = list(private.iterdir())
+        kept = list(self.kept(private))
         self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
         self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode), kept[0].stat().st_nlink,
                           kept[0].stat().st_uid), (raw, 0o600, 1, os.geteuid()))
@@ -3372,7 +3926,7 @@ class GuestDiagnostics(unittest.TestCase):
                          (17, 17, 'captured', True))
         self.assertEqual(receipt['guest_diagnostic'], worker_detail(operation='install-docker'))
         self.assertEqual(len(self.exports), 1)
-        self.assertEqual([f.name for f in private.iterdir()], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertEqual([f.name for f in self.kept(private)], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
         self.assertLess(trace.index('export'), trace.index('master-close'))
         self.assertLess(trace.index('master-close'), trace.index('remove-key'))
         self.assertIn('dispatch-cleanup', trace)
@@ -3416,7 +3970,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.assertEqual(status, 'captured')
                 self.assertFalse(uncertain.is_set())
                 self.assertEqual(calls, [(host.export_command(self.nonce), 'persistence', host.EXPORT_CAP_SECONDS, True)])
-                kept = list(private.iterdir())
+                kept = list(self.kept(private))
                 self.assertEqual([p.name for p in kept], ['installer-failure-' + snap['request_id'] + '.bin'])
                 self.assertEqual((kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode)), (raw, 0o600))
 
@@ -3428,7 +3982,7 @@ class GuestDiagnostics(unittest.TestCase):
                          (100, 100, 'captured', True))
         self.assertEqual(receipt['guest_diagnostic'], worker_detail(status=100, operation='aux-update'))
         self.assertEqual(len(self.exports), 1)
-        self.assertEqual([f.name for f in private.iterdir()], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
+        self.assertEqual([f.name for f in self.kept(private)], ['installer-failure-' + snapshot()['request_id'] + '.bin'])
         self.assertLess(trace.index('export'), trace.index('master-close'))
         self.assertLess(trace.index('master-close'), trace.index('remove-key'))
         self.assertIn('dispatch-cleanup', trace)
@@ -3476,7 +4030,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.setUp()
                 private, (code, receipt, _, _) = self.resume_drive(export, detail)
                 self.assertEqual((code, receipt['private_diagnostic']), (17, expected))
-                self.assertEqual(len(list(private.iterdir())), 1 if expected == 'captured' else 0)
+                self.assertEqual(len(list(self.kept(private))), 1 if expected == 'captured' else 0)
 
     def test_installer_extraction_failures_budget_collision_and_stickiness_preserve_primary(self):
         raw, snap, terminal = self.installer_export()
@@ -3490,7 +4044,7 @@ class GuestDiagnostics(unittest.TestCase):
                 self.setUp()
                 private, (code, receipt, trace, text) = self.resume_drive(export, self.INSTALLER)
                 self.assertEqual((code, receipt['private_diagnostic'], receipt['contained']), (17, expected, True))
-                self.assertEqual(list(private.iterdir()), [])
+                self.assertEqual(list(self.kept(private)), [])
                 self.assertIn('master-close', trace)
                 self.assertNotIn(SENTINEL, text)
         self.setUp()
@@ -3516,7 +4070,7 @@ class GuestDiagnostics(unittest.TestCase):
         for kind in ('../escape', 'other', '', None):
             with self.subTest(kind=kind), self.assertRaises(guest.Failure):
                 host.retain_private(private, lease, b'x', kind)
-        self.assertEqual(list(private.iterdir()), [])
+        self.assertEqual(list(self.kept(private)), [])
         host.retain_private(private, lease, b'x', 'installer-failure')
         with self.assertRaises(FileExistsError):
             host.retain_private(private, lease, b'y', 'installer-failure')

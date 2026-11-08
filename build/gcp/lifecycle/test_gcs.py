@@ -8,9 +8,9 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from .auth_http import (HttpResponse, HttpTransport, TransportError,
+from .auth_http import (HttpResponse, HttpTransport, NetworkUnavailable, TransportError,
                         _NoRedirect, bearer_headers, gcloud_token)
-from .gcs import GcsSlotStore, MAX_RECORD_BYTES, StoreError
+from .gcs import GcsSlotStore, MAX_RECORD_BYTES, ReadUnavailable, StoreError
 from .store import PreconditionFailed
 
 KEY = "slots/slot-1.json"
@@ -128,6 +128,59 @@ class GcsTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.store(OSError("untrusted diagnostic")).read(KEY)
 
+    def test_only_documented_transient_get_failures_are_typed_closed_metadata(self):
+        for status in (408, 429, 500, 502, 503, 504, 599):
+            for position in ("metadata", "media"):
+                with self.subTest(status=status, position=position):
+                    responses = ([HttpResponse(status, b"secret-body")] if position == "metadata"
+                                 else [metadata(), HttpResponse(status, b"secret-body")])
+                    with self.assertRaises(ReadUnavailable) as caught:
+                        self.store(*responses).read(KEY)
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertNotIn("secret", str(caught.exception))
+                    self.assertIsInstance(caught.exception, StoreError)
+                    self.assertEqual(len(self.http.calls), 1 if position == "metadata" else 2)
+        for status in (301, 400, 401, 403, 409, 412):
+            with self.subTest(hard=status):
+                with self.assertRaises(StoreError) as caught:
+                    self.store(HttpResponse(status, b"{}")).read(KEY)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+                self.assertEqual(caught.exception.status, status)
+        with self.assertRaises(StoreError) as caught:  # media 401/403 after metadata is hard too
+            self.store(metadata(), HttpResponse(403, b"{}")).read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_get_transport_loss_is_typed_but_token_and_bad_responses_are_not(self):
+        for error in (NetworkUnavailable("secret-diagnostic"),):
+            with self.assertRaises(ReadUnavailable) as caught:
+                self.store(error).read(KEY)
+            self.assertIsNone(caught.exception.status)
+            self.assertNotIn("secret", str(caught.exception))
+        def no_token():
+            raise TransportError("credential")
+        store = GcsSlotStore(BUCKET, token_provider=no_token, transport=HTTP())
+        with self.assertRaises(StoreError) as caught:
+            store.read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+        for response in (HttpResponse("200", b"{}"), HttpResponse(200, "text")):
+            with self.assertRaises(StoreError) as caught:
+                self.store(response).read(KEY)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_writes_are_never_typed_read_unavailable_and_never_retried(self):
+        for response in (HttpResponse(503, b"{}"), HttpResponse(429, b"{}"), OSError("x")):
+            with self.assertRaises(StoreError) as caught:
+                self.store(response).write(KEY, FREE, if_generation_match=0)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+            self.assertEqual(len(self.http.calls), 1)
+
+    def test_not_found_after_observation_and_absence_semantics_are_unchanged(self):
+        self.assertEqual(self.store(HttpResponse(404, b"{}")).read(KEY), (None, 0))
+        with self.assertRaises(StoreError) as caught:
+            self.store(metadata(), HttpResponse(404, b"{}"), HttpResponse(404, b"{}"),
+                       HttpResponse(404, b"{}")).read(KEY)
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
     def test_metadata_identity_generation_and_size_validation(self):
         for changes in ({"bucket": "other"}, {"name": "other"}, {"generation": 101},
                         {"generation": "0"}, {"generation": "1e3"},
@@ -224,6 +277,48 @@ class Opener:
 
 
 class AuthHttpTests(unittest.TestCase):
+    def test_actual_transport_types_only_known_network_exchanges(self):
+        import socket
+        from urllib.error import URLError
+        for error in (TimeoutError(), ConnectionResetError(), URLError(TimeoutError()),
+                      socket.gaierror(socket.EAI_AGAIN, 'temporary')):
+            with self.subTest(kind=type(error).__name__):
+                class Failed:
+                    def open(self, *args, **kwargs): raise error
+                http = HttpTransport(opener=Failed())
+                with self.assertRaises(NetworkUnavailable):
+                    http.request('GET', 'https://storage.googleapis.com/x', headers={})
+                store = GcsSlotStore(BUCKET, transport=http, token_provider=lambda:'public-test-token')
+                with self.assertRaises(ReadUnavailable): store.read(KEY)
+                with self.assertRaises(StoreError) as caught:
+                    store.write(KEY, FREE, if_generation_match=0)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_actual_transport_unknown_certificate_and_truncation_stay_hard(self):
+        import socket, ssl
+        from urllib.error import URLError
+        from http.client import IncompleteRead
+        errors = (ValueError('unknown'), RuntimeError('unknown'), OSError('unknown'),
+                  URLError('unknown'), ssl.SSLCertVerificationError(),
+                  socket.gaierror(socket.EAI_NONAME, 'permanent'), IncompleteRead(b'partial', 99))
+        for error in errors:
+            with self.subTest(kind=type(error).__name__):
+                class Failed:
+                    def open(self, *args, **kwargs): raise error
+                http = HttpTransport(opener=Failed())
+                with self.assertRaises(TransportError) as caught:
+                    http.request('GET', 'https://storage.googleapis.com/x', headers={})
+                self.assertNotIsInstance(caught.exception, NetworkUnavailable)
+                store = GcsSlotStore(BUCKET, transport=http, token_provider=lambda:'public-test-token')
+                with self.assertRaises(StoreError) as caught: store.read(KEY)
+                self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_actual_oversize_and_malformed_get_responses_are_not_network_loss(self):
+        for raw in (b'x'*8193, b'not-json'):
+            store = GcsSlotStore(BUCKET, transport=HttpTransport(opener=Opener(raw)), token_provider=lambda:'public-test-token')
+            with self.assertRaises(StoreError) as caught: store.read(KEY)
+            self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
     def test_transport_reads_at_most_bound_plus_one(self):
         opener = Opener(b"1234")
         http = HttpTransport(opener=opener)
