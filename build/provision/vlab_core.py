@@ -1548,13 +1548,71 @@ INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING = (
 INITIAL_READYZ_CLIENT_TIMEOUTS = (
     INITIAL_READYZ_CLIENT_TIMEOUT, INITIAL_READYZ_CLIENT_TIMEOUT_SHORT,
     INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED, INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING)
+# Finite whole-output PRE-RESPONSE transport forms (#542): pinned kubectl v0.35.0
+# cmd/util/helpers.go "Unable to connect to the server: %v" over Go 1.25.5 net/http errors.
+INITIAL_TRANSPORT_FIXED = (
+    b'Unable to connect to the server: EOF\n',               # HTTP/1 clean close before response
+    b'Unable to connect to the server: unexpected EOF\n',    # HTTP/2 clean close before response
+    b'Unable to connect to the server: net/http: TLS handshake timeout\n')
+INITIAL_TRANSPORT_RESET = re.compile(
+    rb'Unable to connect to the server: (read|write) tcp 127\.0\.0\.1:([1-9][0-9]{0,4})'
+    rb'->127\.0\.0\.1:6443: (read|write): connection reset by peer\n')
+
+
+def initial_transport_failed(raw):
+    """Anchored whole-output grammar; no substring, stripping or unknown-text acceptance."""
+    if raw in INITIAL_TRANSPORT_FIXED:
+        return True
+    match = INITIAL_TRANSPORT_RESET.fullmatch(raw)
+    return bool(match) and match.group(1) == match.group(3) and 1 <= int(match.group(2)) <= 65535
+
+
+# Closed pinned initial raw read mapping (#542). Fabricator v0.43.1 and Fabric v0.96.2
+# groupversion_info.go all declare v1beta1; versions are never taken from observed data.
+INITIAL_API_VERSION = 'v1beta1'
+INITIAL_CUSTOM_KINDS = {
+    'Fabricator': ('fabricator.githedgehog.com', 'fabricators'),
+    'ControlNode': ('fabricator.githedgehog.com', 'controlnodes'),
+    'FabNode': ('fabricator.githedgehog.com', 'fabnodes'),
+    'Switch': ('wiring.githedgehog.com', 'switches'),
+    'Server': ('wiring.githedgehog.com', 'servers'),
+    'Connection': ('wiring.githedgehog.com', 'connections'),
+    'SwitchGroup': ('wiring.githedgehog.com', 'switchgroups'),
+    'VLANNamespace': ('wiring.githedgehog.com', 'vlannamespaces'),
+    'IPv4Namespace': ('vpc.githedgehog.com', 'ipv4namespaces')}
+INITIAL_RAW_PATHS = {
+    'api-initial-readyz': '/readyz', 'api-initial-nodes': '/api/v1/nodes',
+    'api-initial-kube-system-ns': '/api/v1/namespaces/kube-system'}
+INITIAL_RAW_PATHS.update({
+    'api-initial-' + plural: '/apis/%s/%s/%s' % (group, INITIAL_API_VERSION, plural)
+    for group, plural in INITIAL_CUSTOM_KINDS.values()})
+
+
+def bind_initial_versions(expected):
+    """Every expected object must match the pinned group/version for its kind (hard failure).
+
+    Zero-count FabNode yields no installer object, so it is bound through the pinned mapping
+    only after Fabricator and ControlNode corroborate the fabricator group version.
+    """
+    groups = set()
+    for doc in expected:
+        entry = INITIAL_CUSTOM_KINDS.get(doc.get('kind'))
+        if entry is None or doc.get('apiVersion') != '%s/%s' % (entry[0], INITIAL_API_VERSION):
+            raise Failure('initial API version binding refused')
+        groups.add(entry[0])
+    kinds = {doc['kind'] for doc in expected}
+    require({'Fabricator', 'ControlNode'} <= kinds
+            and groups == {group for group, _ in INITIAL_CUSTOM_KINDS.values()},
+            'initial API version binding refused')
 
 
 def kubectl(args, deadline, route=None):
-    # Only the exact initial readyz context gets a client timeout BELOW the unchanged
+    # Only the ALL 12 exact allowlisted initial reads get a client timeout BELOW the unchanged
     # 10s process cap, so the client can return its own bounded error before the cap
     # (which starts before client startup) hard-kills it. Everything else stays 10s.
-    initial = route == 'api-initial-readyz' and args == ['get', '--raw=/readyz']
+    # #542: exact route + raw argv allowlist for ALL 12 initial reads, not route prefix alone.
+    raw_path = INITIAL_RAW_PATHS.get(route)
+    initial = raw_path is not None and args == ['get', '--raw=' + raw_path]
     request_timeout = '--request-timeout=5s' if initial else '--request-timeout=10s'
     try:
         return routed(route, [KUBECTL, '--kubeconfig', str(WORK / 'vlab/kubeconfig'),
@@ -1568,8 +1626,9 @@ def kubectl(args, deadline, route=None):
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
         matched = (initial and error.route == route
                    and getattr(error, '_executed_child', False) is True)
-        health_failed = matched and (initial_readyz_failed(raw)
-                                 or raw in INITIAL_READYZ_CLIENT_TIMEOUTS)
+        health_failed = matched and (raw in INITIAL_READYZ_CLIENT_TIMEOUTS
+                                     or initial_transport_failed(raw)
+                                     or (route == 'api-initial-readyz' and initial_readyz_failed(raw)))
         # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
         # original Failure propagates and can never lead to another readiness poll.
         if (error.code == 1 and str(error) == 'child command failed'
@@ -1775,9 +1834,12 @@ def project_expected(expected):
     return projected
 
 
-def api_objects(resource, namespace, deadline, route=None):
-    args = ['get', resource, '-o', 'json']
-    args += ['-A'] if namespace is None else ['-n', namespace]
+def api_objects(resource, namespace, deadline, route=None, raw_path=None):
+    if raw_path is not None:
+        args = ['get', '--raw=' + raw_path]
+    else:
+        args = ['get', resource, '-o', 'json']
+        args += ['-A'] if namespace is None else ['-n', namespace]
     data = json_data(kubectl(args, deadline, route))
     require(type(data) is dict and type(data.get('items')) is list and len(data['items']) <= 128,
             'API object list refused')
@@ -1789,16 +1851,21 @@ def api_ready(deadline, stage=None):
     def route(name):
         return None if stage is None else 'api-%s-%s' % (stage, name)
     ca = kubeconfig()
+    raw = stage == 'initial'  # only initial reads are raw; final structured reads are unchanged
+
+    def raw_path(name):
+        return INITIAL_RAW_PATHS['api-initial-' + name] if raw else None
     if kubectl(['get', '--raw=/readyz'], deadline, route('readyz')).strip() != b'ok':
         raise Pending('API not ready')
-    nodes = api_objects('nodes', None, deadline, route('nodes'))
+    nodes = api_objects('nodes', None, deadline, route('nodes'), raw_path('nodes'))
     if not nodes:
         raise Pending('control node pending')
     require(len(nodes) == 1 and nodes[0]['metadata']['name'] == 'control-1', 'control node identity differs')
     if not any(c.get('type') == 'Ready' and c.get('status') == 'True'
                for c in nodes[0].get('status', {}).get('conditions', [])):
         raise Pending('control node not ready')
-    ns = json_data(kubectl(['get', 'namespace', 'kube-system', '-o', 'json'], deadline,
+    ns = json_data(kubectl(['get', '--raw=' + raw_path('kube-system-ns')] if raw
+                           else ['get', 'namespace', 'kube-system', '-o', 'json'], deadline,
                            route('kube-system-ns')))
     cluster_uid = ns['metadata']['uid']
     require(type(cluster_uid) is str and 0 < len(cluster_uid) <= 128, 'cluster UID refused')
@@ -1814,9 +1881,11 @@ def api_ready(deadline, stage=None):
              'VLANNamespace': ('vlannamespaces.wiring.githedgehog.com', 1, 'vlannamespaces'),
              'IPv4Namespace': ('ipv4namespaces.vpc.githedgehog.com', 1, 'ipv4namespaces')}
     require(all(d.get('kind') in kinds for d in expected), 'unexpected installer kind')
+    if raw:
+        bind_initial_versions(expected)  # before any custom-resource request
     observed = []
     for kind, (resource, count, short) in kinds.items():
-        items = api_objects(resource, None, deadline, route(short))
+        items = api_objects(resource, None, deadline, route(short), raw_path(short))
         if len(items) < count:
             raise Pending('canonical API objects pending')
         require(len(items) == count and all(d.get('kind') == kind for d in items),
