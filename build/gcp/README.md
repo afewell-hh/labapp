@@ -2204,6 +2204,20 @@ Root obligations BEFORE `run` (none is inferred by the module):
   resume unit invocation, and unchanged cluster/critical digests. Readiness is observed for
   at most 13 of each 20 minutes; the rest is reserved for the stop and teardown (the
   guest's 900 s bound is unchanged). Critical-snapshot mismatch after clone stays a failure.
+  The fixed summary reads `labapp-vlab-clone.service` BEFORE the checkpoint and core state
+  (producer order: ready core, atomic checkpoint, clone success/active), so an observed
+  active/success proves the later reads are final; no retry, grace or deadline extension exists
+  and a stable wrong checkpoint, reused pair, changed identity or failed unit still fails closed.
+  Before cleanup a rejected readiness/offline summary is kept once (`O_EXCL`, 0600) as
+  `rejected-boot<N>.json`: fixed `stage`, `code` and whitelisted `reason` plus a summary rebuilt
+  only from finite values (hex IDs, booleans, the closed seal-state/core-phase/core-mode/unit
+  ActiveState/Result enums and hex-or-empty InvocationID, with absent forms where the producer may
+  omit them). The structural parser is not that validation and readiness stays strict and
+  unchanged. A summary with any value outside those sets keeps only the fixed `unrecognized`
+  classification and `summary: null`; malformed output keeps only the fixed `malformed`
+  classification. No arbitrary guest string, raw output or exception text is retained. Any diagnostic
+  failure, including a cancellation (`BaseException`), is swallowed so the initiating failure and the
+  cleanup are preserved; this is source-level and unexecuted here.
 - First boot is checkpointed, `stop-verified` and positively offline; the master is closed
   and the key removed BEFORE the one provider reset. The second boot needs a terminal reset
   operation, same VM, disk, image and deadline, a different kernel boot, same nonce and
