@@ -70,7 +70,9 @@ SIZES = {'control': {'cpu': 6, 'ram': 6144, 'disk': 100},
 VMS = {'control-1': 'control', **{f'leaf-{n:02}': 'switch' for n in range(1, 6)},
        **{f'spine-{n:02}': 'switch' for n in range(1, 3)},
        **{f'server-{n:02}': 'server' for n in range(1, 11)}}
-WIRING_SHA = 'c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a'
+# Fixed course input (#552): build/provision/course-wiring.yaml = root wiringd.yaml (c522c64d...) plus the single
+# IPv4Namespace prefix 10.10.0.0/16. The expected hash was computed by Root and supplied in #552; not independently verified here.
+WIRING_SHA = '3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060'
 TOOL_PINS = {HHFAB: (170709176, 'b5c7e0265339b9b95fa1073967bfb6c6fede6086755c85eca24cb80637b04e37'),
              KUBECTL: (58597560, 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989')}
 PACKAGE_PINS = {'qemu-system-x86': '1:8.2.2+ds-0ubuntu1.11',

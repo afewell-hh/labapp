@@ -6096,8 +6096,10 @@ PILOT_UID = '11111111-2222-3333-4444-555555555555'
 
 
 def pilot_report(**change):
-    value = {'agents': 7, 'cleanup': 'removed', 'code': 'ok', 'config': 'installed', 'packages': 'installed',
-             'phase': 'done', 'plugin': 'installed', 'status': 'passed', 'vpc_uid': PILOT_UID}
+    value = {'agents': 7, 'capacity': {'ipv4_web': True, 'ipv4_worker': True, 'no_conflict': True,
+                                       'vlan_web': True, 'vlan_worker': True},
+             'cleanup': 'removed', 'code': 'ok', 'config': 'installed', 'packages': 'installed',
+             'phase': 'done', 'plugin': 'installed', 'status': 'passed', 'step': 'post-apply', 'vpc_uid': PILOT_UID}
     value.update(change)
     return json.dumps(value, sort_keys=True).encode() + b'\n'
 
@@ -6338,9 +6340,19 @@ class StudentPilotHost(PilotCase):
         self.assert_disposed(result)
 
     def test_a_failed_pilot_is_a_primary_failure_with_exact_cleanup(self):
+        refusal = dict(status='failed', code='refused', phase='accept', cleanup='not-needed', agents=0, vpc_uid='',
+                       step='namespaces',
+                       capacity={'ipv4_web': False, 'ipv4_worker': False, 'no_conflict': None,
+                                 'vlan_web': True, 'vlan_worker': True})
         for report in (pilot_report(status='failed', code='refused', phase='config', cleanup='not-needed'),
+                       pilot_report(**refusal),
+                       pilot_report(**dict(refusal, step='vpc-absent',
+                                           capacity=dict.fromkeys(clone.pilot_guest.CAPACITY_KEYS))),
                        pilot_report(cleanup='preserved'), pilot_report(cleanup='uncertain'),
-                       pilot_report(agents=6), pilot_report(vpc_uid=''), pilot_report(plugin='-')):
+                       pilot_report(agents=6), pilot_report(vpc_uid=''), pilot_report(plugin='-'),
+                       *(pilot_report(step=step) for step in clone.pilot_guest.STEPS if step != 'post-apply'),
+                       *(pilot_report(capacity=dict.fromkeys(clone.pilot_guest.CAPACITY_KEYS, True) | {key: value})
+                         for key in clone.pilot_guest.CAPACITY_KEYS for value in (False, None))):
             with self.subTest(report=report):
                 self.fresh_world()
                 self.world.pilot_report = report
@@ -6357,6 +6369,17 @@ class StudentPilotHost(PilotCase):
         extra['note'] = 'x'
         for report in (b'', b'not json', b'{"event":"done"}', json.dumps(extra).encode(),
                        pilot_report(code='zzz'), pilot_report(vpc_uid='not-a-uid'), pilot_report(agents=True),
+                       pilot_report(step='bogus'), pilot_report(step='CANARY free text'), pilot_report(step=None),
+                       pilot_report(step=7), pilot_report(capacity=None), pilot_report(capacity={}),
+                       pilot_report(capacity={'ipv4_web': True}),
+                       pilot_report(capacity={'ipv4_web': 'yes', 'ipv4_worker': True, 'no_conflict': True,
+                                              'vlan_web': True, 'vlan_worker': True}),
+                       pilot_report(capacity={'ipv4_web': 1, 'ipv4_worker': True, 'no_conflict': True,
+                                              'vlan_web': True, 'vlan_worker': True}),
+                       pilot_report(capacity={'ipv4_web': True, 'ipv4_worker': True, 'no_conflict': True,
+                                              'vlan_web': True, 'vlan_worker': True, 'extra': True}),
+                       json.dumps({k: v for k, v in json.loads(pilot_report()).items() if k != 'step'}).encode(),
+                       json.dumps({k: v for k, v in json.loads(pilot_report()).items() if k != 'capacity'}).encode(),
                        b'x' * (clone.PILOT_REPORT_LIMIT + 1), pilot_report().replace(b'ok', b'\xc3\xa9'),
                        b'{"status":"passed","status":"passed"}'):
             with self.subTest(report=report[:40]):
@@ -6626,3 +6649,25 @@ class StudentPilotDefaultOff(CloneCase):
         self.assertTrue(clone.pilot_passed(good))
         self.assertEqual(set(good), set(clone.pilot_guest.RESULT_KEYS))
         self.assertTrue(clone.pilot_guest.UID_RE.fullmatch(good['vpc_uid']))
+        self.assertIn(good['step'], clone.pilot_guest.STEPS)
+        self.assertEqual(set(good['capacity']), set(clone.pilot_guest.CAPACITY_KEYS))
+        # A refusal report with observed/unobserved capacity is valid but can never be a pass.
+        refusal = json.loads(pilot_report(status='failed', code='refused', phase='accept', cleanup='not-needed',
+                                          agents=0, vpc_uid='', step='namespaces',
+                                          capacity={'ipv4_web': False, 'ipv4_worker': False, 'no_conflict': None,
+                                                    'vlan_web': True, 'vlan_worker': True}))
+        self.assertEqual(clone.check_pilot_report(json.dumps(refusal).encode()), refusal)
+        self.assertFalse(clone.pilot_passed(refusal))
+
+    def test_course_wiring_is_the_fixed_source_behind_the_logical_wiringd_name(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(guest.SOURCES['wiringd.yaml'], 'build/provision/course-wiring.yaml')
+        self.assertIn('wiringd.yaml', guest.FILES)                    # logical staging/guest name is unchanged
+        self.assertNotIn('course-wiring.yaml', guest.FILES)
+        self.assertEqual(sum(1 for p in guest.SOURCES.values() if p.endswith('wiring.yaml')), 1)
+        course = (root / guest.SOURCES['wiringd.yaml']).read_bytes()
+        original = (root / 'wiringd.yaml').read_bytes()
+        # Expected course hash supplied by Root in issue #552 (not independently verified by the author).
+        self.assertEqual(guest.sha(course), '3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060')
+        self.assertEqual(guest.sha(original), 'c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a')
+        self.assertEqual(len(course), len(original) + len(b'  - 10.10.0.0/16\n'))

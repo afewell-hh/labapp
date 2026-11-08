@@ -2254,6 +2254,17 @@ re-verified; the three source files (`student_vpc_pilot.py`, `install-kubectl-fa
 `hhfab_release.py`) come from the protected source tree. `run` re-verifies the same digest at preflight
 (before any cloud mutation) and again at use; any difference refuses.
 
+The guest report is validated by `check_pilot_report` against the guest module's closed vocabulary,
+including (#552) the closed pre-apply `step` and the five-boolean `capacity` object (`true`/`false`/`null`);
+success additionally requires `step=post-apply` and every capacity value exactly `true` in both guest and host;
+a missing, unknown, wrongly typed or free-string value is refused and never echoed. The fixed
+`wiringd.yaml` guest source is the repository's `build/provision/course-wiring.yaml` (see the
+[provision README](../provision/README.md#course-wiring-input-552)); the host fetch map is read dynamically
+from `vlab_trial.SOURCES`, so no host trial change or profile selector exists. The inspection catalog above
+keeps the unchanged root `wiringd.yaml` identity. Previously captured clone image
+`1649408968157411841` stays preserved and is known to be incompatible with this lesson; no new image or VM
+identity is recorded or repinned here.
+
 After the FIRST strict ready checkpoint and `compare_boots` of boot 1, and BEFORE the verified stop, the
 run executes the fixed sequence inside the ORIGINAL access window (it never renews or extends any
 deadline): `pilot-incoming` (user-owned 0700 `~/labapp-student-pilot-in`), one SFTP batch over the

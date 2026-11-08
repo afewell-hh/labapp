@@ -507,7 +507,8 @@ def check_pilot_report(raw):
                 and v['packages'] in g.PACKAGE_RESULTS and v['plugin'] in g.PLUGIN_RESULTS
                 and v['config'] in g.CONFIG_RESULTS and v['cleanup'] in g.CLEANUP_RESULTS
                 and type(v['agents']) is int and 0 <= v['agents'] <= 99 and isinstance(v['vpc_uid'], str)
-                and (v['vpc_uid'] == '' or g.UID_RE.fullmatch(v['vpc_uid'])))
+                and (v['vpc_uid'] == '' or g.UID_RE.fullmatch(v['vpc_uid']))
+                and isinstance(v['step'], str) and v['step'] in g.STEPS and g.capacity_valid(v['capacity']))
         return v
     except (ValueError, UnicodeError, KeyError, TypeError, RecursionError):
         raise Refused('pilot report refused') from None
@@ -517,7 +518,8 @@ def pilot_passed(v):
     g = pilot_guest
     return (v['status'] == 'passed' and v['phase'] == 'done' and v['code'] == 'ok' and v['cleanup'] == 'removed'
             and v['agents'] == g.AGENTS and v['packages'] != '-' and v['plugin'] != '-' and v['config'] != '-'
-            and v['vpc_uid'] != '')
+            and v['vpc_uid'] != '' and v['step'] == 'post-apply'
+            and all(v['capacity'][key] is True for key in g.CAPACITY_KEYS))
 
 
 # ------------------------------------------------------------------------------ Compute -------

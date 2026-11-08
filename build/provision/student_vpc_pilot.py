@@ -93,7 +93,15 @@ PACKAGE_RESULTS = ('-', 'installed', 'unchanged')
 PLUGIN_RESULTS = ('-', 'installed', 'unchanged', 'mode-repaired')
 CONFIG_RESULTS = ('-', 'installed', 'unchanged')
 CLEANUP_RESULTS = ('not-needed', 'removed', 'absent', 'preserved', 'uncertain')
-RESULT_KEYS = ('agents', 'cleanup', 'code', 'config', 'packages', 'phase', 'plugin', 'status', 'vpc_uid')
+RESULT_KEYS = ('agents', 'capacity', 'cleanup', 'code', 'config', 'packages', 'phase', 'plugin', 'status', 'step',
+               'vpc_uid')
+# Closed lesson substep last ENTERED by the acceptance child (the failing one on a refusal; '-' when none ran).
+# Pre-apply substeps come first; 'manifest' onward are at or after the first possible mutation boundary.
+STEPS = ('-', 'binary', 'context', 'contexts', 'plugin', 'fabric', 'jq', 'vpc-absent', 'ipv4-read', 'vlan-read',
+         'namespaces', 'conflicts', 'manifest', 'apply', 'post-apply')
+# Observed capacity booleans only: true/false when actually computed from a parsed read, null when not observed.
+CAPACITY_KEYS = ('ipv4_web', 'ipv4_worker', 'no_conflict', 'vlan_web', 'vlan_worker')
+CAPACITY_SUBNETS = (('web-servers', 'ipv4_web'), ('worker-nodes', 'ipv4_worker'))
 
 UID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:@-]{0,252}\Z')
@@ -681,15 +689,35 @@ def cidr_conflict(document):
     return False
 
 
-def namespaces_ok(ipv4, vlan):
-    wanted = [ipaddress.ip_network(c[0]) for c in SUBNETS.values()]
+def ipv4_capacity(ipv4):
+    """-> {'ipv4_web': bool, 'ipv4_worker': bool} actually computed from the parsed object, or None if malformed."""
     try:
         have = [ipaddress.ip_network(s) for s in ((ipv4.get('spec') or {}).get('subnets') or [])]
+        return {key: any(ipaddress.ip_network(SUBNETS[name][0]).subnet_of(h) for h in have)
+                for name, key in CAPACITY_SUBNETS}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def vlan_capacity(vlan):
+    """-> {'vlan_web': bool, 'vlan_worker': bool} actually computed from the parsed object, or None if malformed."""
+    try:
         ranges = [(r['from'], r['to']) for r in ((vlan.get('spec') or {}).get('ranges') or [])]
-    except (ValueError, TypeError, KeyError):
-        return False
-    return (all(any(w.subnet_of(h) for h in have) for w in wanted)
-            and all(any(lo <= v[2] <= hi for lo, hi in ranges) for v in SUBNETS.values()))
+        return {key.replace('ipv4', 'vlan'): any(lo <= SUBNETS[name][2] <= hi for lo, hi in ranges)
+                for name, key in CAPACITY_SUBNETS}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def namespaces_ok(ipv4, vlan):
+    have_ipv4, have_vlan = ipv4_capacity(ipv4), vlan_capacity(vlan)
+    return have_ipv4 is not None and have_vlan is not None and all(have_ipv4.values()) and all(have_vlan.values())
+
+
+def capacity_valid(value):
+    """Closed shape of the diagnostic booleans: exactly the five keys, each true, false or null (unobserved)."""
+    return (isinstance(value, dict) and set(value) == set(CAPACITY_KEYS)
+            and all(v is None or type(v) is bool for v in value.values()))
 
 
 def observe(clock):
@@ -746,24 +774,42 @@ def remove_owned(uid, clock, work):
 def lesson(clock, state):
     """The five Lab Steps. ``state['uid']``/``['agents']`` are published as soon as they are known."""
     # Native discovery and the source-supported read-only checks (no cluster state is changed).
+    # ``state['step']``/``state['capacity']`` are fixed closed diagnostics only (no messages, CLI or config output).
+    state['step'] = 'binary'
     require(shutil.which('kubectl', path=STUDENT_ENV['PATH']) == KUBECTL, 'kubectl is not the pinned native binary')
     verify_kubectl()
+    state['step'] = 'context'
     require(kube(['config', 'current-context'], clock)[1].decode().strip() == CONTEXT, 'default context is not vlab')
+    state['step'] = 'contexts'
     require(kube(['config', 'get-contexts', '-o', 'name'], clock)[1].decode().split() == [CONTEXT], 'single context required')
+    state['step'] = 'plugin'
     require(PLUGIN in kube(['plugin', 'list'], clock)[1].decode('utf-8', 'replace').split(), 'plugin not discovered')
+    state['step'] = 'fabric'
     kube(['fabric', '--help'], clock)
     require(kube(['fabric', '--version'], clock)[1].strip(), 'fabric version was empty')
     # The signed Ubuntu 1.7.1-3ubuntu0.24.04.2 package reports its binary as "jq-1.7" (confirmed native check).
+    state['step'] = 'jq'
     code, out, _ = run_child(['jq', '--version'], min(10, clock.left()), env=STUDENT_ENV, limit=256)
     require(code == 0 and re.fullmatch(rb'jq-1\.7\n?', out), 'jq is not the pinned version')
     # Refuse conflicts before mutating: preexisting webapp-prod, missing namespaces, overlapping CIDR/VLAN.
+    state['step'] = 'vpc-absent'
     require(not kube(['get', 'vpc', VPC_NAME, '-o', 'name', '--ignore-not-found'], clock)[1].strip(), 'webapp-prod preexists')
+    capacity = state.setdefault('capacity', dict.fromkeys(CAPACITY_KEYS))
+    state['step'] = 'ipv4-read'
     ipv4 = kube_json(['get', 'ipv4namespace', 'default', '-o', 'json'], clock)
+    capacity.update(ipv4_capacity(ipv4) or {})
+    state['step'] = 'vlan-read'
     vlan = kube_json(['get', 'vlannamespace', 'default', '-o', 'json'], clock)
+    capacity.update(vlan_capacity(vlan) or {})
+    state['step'] = 'namespaces'
     require(namespaces_ok(ipv4, vlan), 'default namespaces cannot hold the lesson VPC')
-    if cidr_conflict(kube_json(['get', 'vpcs', '-o', 'json'], clock)):
+    state['step'] = 'conflicts'
+    conflict = cidr_conflict(kube_json(['get', 'vpcs', '-o', 'json'], clock))
+    capacity['no_conflict'] = not conflict
+    if conflict:
         raise Conflict('lesson CIDR or VLAN already in use')
     # Step 1: write and check the manifest.
+    state['step'] = 'manifest'
     work = Path(tempfile.mkdtemp(prefix='labapp-student-pilot-'))
     state['work'] = work
     manifest = work / 'webapp-prod-vpc.yaml'
@@ -778,6 +824,7 @@ def lesson(clock, state):
     # continues). Absence preflight plus this response establishes ownership only under that operational assumption:
     # apply itself is not creation proof under concurrent writers, and work.lock is not a Kubernetes writer lock.
     # An ambiguous/unproven response leaves the UID unknown; the object is never adopted or deleted.
+    state['step'] = 'apply'
     state['attempted'] = True
     _, applied = kube(['apply', '-f', str(manifest), '-o', 'json'], clock)
     created = parse_json(applied)
@@ -787,6 +834,7 @@ def lesson(clock, state):
             and isinstance(uid, str) and UID_RE.fullmatch(uid) and meta.get('generation') == 1
             and vpc_spec_ok(created), 'apply response did not prove a created VPC')
     state['uid'] = uid
+    state['step'] = 'post-apply'
     emit({'event': 'uid', 'uid': uid})
     obj = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
     require((obj.get('metadata') or {}).get('uid') == uid, 'created VPC was replaced')
@@ -831,7 +879,8 @@ def lesson(clock, state):
 def accept():
     """Child as ubuntu (`-I -` stdin program). Prints uid/done events only; always tears down what it created."""
     student_identity()
-    state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None, 'endstate': False}
+    state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None, 'endstate': False,
+             'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)}
     code = 'ok'
     work = Clock(ACCEPT_SECONDS, TEARDOWN_SECONDS)
     try:
@@ -850,7 +899,11 @@ def accept():
         cleanup = 'uncertain'
     if STICKY and code == 'ok':
         code = 'uncertain'
-    emit({'event': 'done', 'code': code, 'cleanup': cleanup, 'agents': state['agents']})
+    # Diagnostics are closed by construction; anything unexpected degrades to the empty form, never a free string.
+    step = state['step'] if state['step'] in STEPS else '-'
+    capacity = state['capacity'] if capacity_valid(state['capacity']) else dict.fromkeys(CAPACITY_KEYS)
+    emit({'event': 'done', 'code': code, 'cleanup': cleanup, 'agents': state['agents'],
+          'step': step, 'capacity': capacity})
     return 0
 
 
@@ -866,7 +919,8 @@ def teardown_only(uid):
             verdict = 'uncertain'
         finally:
             shutil.rmtree(work, ignore_errors=True)
-    emit({'event': 'done', 'code': 'ok', 'cleanup': verdict, 'agents': 0})
+    emit({'event': 'done', 'code': 'ok', 'cleanup': verdict, 'agents': 0,
+          'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)})
     return 0
 
 
@@ -893,8 +947,9 @@ def parse_events(raw):
             events['uid'] = value['uid']
         elif kind == 'config' and set(value) == {'event', 'status'} and value['status'] in CONFIG_RESULTS[1:]:
             events['config'] = value['status']
-        elif kind == 'done' and set(value) == {'event', 'code', 'cleanup', 'agents'} \
+        elif kind == 'done' and set(value) == {'event', 'code', 'cleanup', 'agents', 'step', 'capacity'} \
                 and value['code'] in CODES and value['cleanup'] in CLEANUP_RESULTS \
+                and isinstance(value['step'], str) and value['step'] in STEPS and capacity_valid(value['capacity']) \
                 and type(value['agents']) is int and 0 <= value['agents'] <= 99:
             events['done'] = value
     return events
@@ -909,7 +964,8 @@ def student_child(mode, seconds, source, extra=()):
 
 def run():
     result = {'status': 'failed', 'phase': 'preflight', 'code': 'failed', 'packages': '-', 'plugin': '-',
-              'config': '-', 'vpc_uid': '', 'agents': 0, 'cleanup': 'not-needed'}
+              'config': '-', 'vpc_uid': '', 'agents': 0, 'cleanup': 'not-needed',
+              'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)}
     clock = Clock(TOTAL_SECONDS, TEARDOWN_SECONDS)
     source, unfinished = b'', False
     try:
@@ -935,6 +991,7 @@ def run():
         done = events.get('done')
         if done is not None:
             result['agents'], result['cleanup'] = done['agents'], done['cleanup']
+            result['step'], result['capacity'] = done['step'], done['capacity']   # closed diagnostics; primary code unchanged
         if state != 'ok' or code is None or code < 0:
             # Forcibly stopped worker: its nested kubectl children run in their OWN sessions and may outlive the
             # killed group, so its state is unprovable. Sticky uncertain: no teardown, no further guest mutation,
@@ -947,6 +1004,8 @@ def run():
         unfinished = False
         if done['code'] != 'ok':
             raise Coded(done['code'])
+        require(done['step'] == 'post-apply' and all(done['capacity'][key] is True for key in CAPACITY_KEYS),
+                'student acceptance checks incomplete')
         result['phase'] = 'teardown'
         require(result['cleanup'] == 'removed', 'test-owned VPC was not removed')
         result['phase'], result['status'], result['code'] = 'done', 'passed', 'ok'
