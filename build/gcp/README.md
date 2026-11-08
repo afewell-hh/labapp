@@ -1768,6 +1768,18 @@ the recheck boundary. Cancellation and hard failures remain hard, without a
 mutation retry. urllib socket timeouts and postchecks bound acceptance, not a
 hard total-response duration under trickling replies.
 
+The captured original-work ceiling is never renewed by a later larger
+remaining-time observation. When both captured ceilings are observed expired,
+the earlier deadline determines the cause; original-work wins equal deadlines.
+A direct failure124 from the original Clock is recorded as the observed
+`original-clock` branch. These labels do not establish the physical order of
+wall-clock changes during a blocking call. Definitive auth exceptions
+and permanent non2xx HTTP responses retain their existing adapter failure/status
+even when late, without a retry or a following GET. Late positive responses
+are refused before decoding, including a late200 with malformed JSON; that case
+is deliberately cutoff-first, not a claim that the body was validated. Typed
+transient responses/exchange failures at cutoff retain their closed kind/status.
+
 Only periodic terminal failures may add a closed `recheck` object to the private
 host record: attempt0-3, fixed stage, cutoff (`allowance`, `original-clock`, or
 null), elapsed milliseconds capped at86400000, last typed transient kind and

@@ -6683,7 +6683,7 @@ def periodic_http_fixture():
     w.clock.t = datetime.now(timezone.utc).replace(microsecond=0)
     rec = w.started(run=123)
     value = {k: rec[k] for k in host.SNAPSHOT_FIELDS}
-    value.update(source_sha='a'*40, self_user='users/12345')
+    value.update(source_sha='a'*40, self_user='users/110405050082684214272')
     value['preflight'] = dict(snapshot()['preflight'], lease=rec['request_id'],
                              vm_id=rec['ids']['instance'], checked_at=rec['reserved_at'])
     body = host.spec.build_body(boot_image=host.spec.COMPONENT_IMAGE, request_id=rec['request_id'],
@@ -6909,3 +6909,152 @@ class PeriodicReadEnvelopeTests(unittest.TestCase):
             for value in (0, -1, 31, True, '3', float('nan')):
                 with self.assertRaises(auth_http.TransportError):
                     auth_http.gcloud_token(timeout=value)
+
+    def capture_envelopes(self):
+        registration = self.registration()
+        envelopes = []
+        def factory(owner, envelope):
+            envelopes.append(envelope)
+            return host.periodic_registration(owner, envelope)
+        registration.periodic_factory = factory
+        return registration, envelopes
+
+    def test_frozen_original_ceiling_wins_even_if_remaining_grows_and_clips_each_call(self):
+        remaining = iter([10])
+        self.clock.remaining = lambda phase: next(remaining, 600)
+        self.http.before = lambda stage: setattr(self, 'now', self.now+2)
+        with self.assertRaises(guest.Failure) as caught:
+            self.run_read()
+        self.assertEqual(self.auth, [10])
+        self.assertEqual([timeout for _, timeout in self.http.calls], [9, 7, 5, 3, 1])
+        self.assertEqual((caught.exception.code, caught.exception.recheck_detail['cutoff']), (124, 'original-clock'))
+        self.assertEqual(caught.exception.recheck_detail['elapsed_ms'], 11000)
+
+    def test_original_clock_has_priority_at_simultaneous_expiry(self):
+        remaining = iter([30])
+        self.clock.remaining = lambda phase: next(remaining, 600)
+        self.http.before = lambda stage: setattr(self, 'now', 1030)
+        with self.assertRaises(guest.Failure) as caught:
+            self.run_read()
+        self.assertEqual(caught.exception.recheck_detail['cutoff'], 'original-clock')
+
+    def test_earlier_captured_ceiling_wins_when_both_are_observed_expired(self):
+        for original, expected in ((10, 'original-clock'), (30, 'original-clock'), (60, 'allowance')):
+            with self.subTest(original=original):
+                self.setUp()
+                remaining = iter([original])
+                self.clock.remaining = lambda phase: next(remaining, 600)
+                self.http.before = lambda stage: setattr(self, 'now', 1000+max(original, 30)+1)
+                with self.assertRaises(guest.Failure) as caught:
+                    self.run_read()
+                self.assertEqual(caught.exception.recheck_detail['cutoff'], expected)
+
+    def test_auth_cost_reduces_exact_http_caps_under_same_allowance(self):
+        def token(*, timeout=30):
+            self.auth.append(timeout)
+            self.now += 12
+            return 'PUBLIC_SYNTHETIC_TOKEN'
+        self.token = token
+        self.http.before = lambda stage: setattr(self, 'now', self.now+2)
+        self.assertEqual(self.run_read(), self.rec)
+        self.assertEqual(self.auth, [30])
+        self.assertEqual([timeout for _, timeout in self.http.calls], [18, 16, 14, 12, 10, 8])
+
+    def test_late_hard_auth_failure_keeps_adapter_failure_and_clears_token(self):
+        def token(**kwargs):
+            self.now += 31
+            raise host.TransportError('public synthetic auth failure')
+        self.token = token
+        registration, envelopes = self.capture_envelopes()
+        with self.assertRaises(host.StoreError) as caught:
+            self.run_read(registration)
+        self.assertNotIsInstance(caught.exception, guest.Failure)
+        self.assertIsNone(caught.exception.recheck_detail['cutoff'])
+        self.assertEqual(self.http.calls, [])
+        self.assertEqual(len(envelopes), 1)
+        self.assertIsNone(envelopes[0].token)
+
+    def test_late_permanent_http_failures_keep_actual_adapter_status_and_stop(self):
+        for location in ('ledger-metadata', 'operation'):
+            for status in (401, 403):
+                with self.subTest(location=location, status=status):
+                    self.setUp()
+                    def late(stage):
+                        self.http.status = status if stage == location else 200
+                        if stage == location:
+                            self.now += 31
+                    self.http.before = late
+                    registration, envelopes = self.capture_envelopes()
+                    kind = host.StoreError if location == 'ledger-metadata' else host.ApiError
+                    with self.assertRaises(kind) as caught:
+                        self.run_read(registration)
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertIsNone(caught.exception.recheck_detail['cutoff'])
+                    self.assertEqual(len(self.auth), 1)
+                    self.assertEqual([stage for stage, _ in self.http.calls],
+                                     ['ledger-metadata'] if location == 'ledger-metadata' else
+                                     ['ledger-metadata', 'ledger-media', 'operation'])
+                    self.assertTrue(all(e.token is None for e in envelopes))
+
+    def test_late_malformed_positive_response_is_defined_cutoff_first(self):
+        for location in ('ledger-metadata', 'operation'):
+            with self.subTest(location=location):
+                self.setUp()
+                def malformed(stage):
+                    if stage == location:
+                        self.http.malformed = True
+                        self.now += 31
+                self.http.before = malformed
+                with self.assertRaises(guest.Failure) as caught:
+                    self.run_read()
+                self.assertEqual((caught.exception.code, caught.exception.recheck_detail['cutoff']), (124, 'allowance'))
+                self.assertEqual(len(self.auth), 1)
+
+    def test_compute_transient_recovery_repeats_fresh_reads_and_fresh_auth(self):
+        count = 0
+        def transient(stage):
+            nonlocal count
+            if stage == 'operation':
+                count += 1
+            self.http.status = 503 if stage == 'operation' and count == 1 else 200
+        self.http.before = transient
+        registration, envelopes = self.capture_envelopes()
+        self.assertEqual(self.run_read(registration), self.rec)
+        self.assertEqual(len(self.auth), 2)
+        self.assertEqual([stage for stage, _ in self.http.calls],
+                         ['ledger-metadata', 'ledger-media', 'operation']+
+                         ['ledger-metadata', 'ledger-media', 'operation', 'instance', 'disk', 'disk'])
+        self.assertEqual(len(envelopes), 2)
+        self.assertTrue(all(e.token is None for e in envelopes))
+
+    def test_compute_transient_at_cutoff_keeps_status_and_clears_token(self):
+        def late(stage):
+            if stage == 'operation':
+                self.http.status = 503
+                self.now += 31
+        self.http.before = late
+        registration, envelopes = self.capture_envelopes()
+        with self.assertRaises(guest.Failure) as caught:
+            self.run_read(registration)
+        detail = caught.exception.recheck_detail
+        self.assertEqual((detail['cutoff'], detail['last_error'], detail['last_status']),
+                         ('allowance', 'compute-transient', 503))
+        self.assertEqual(len(self.auth), 1)
+        self.assertIsNone(envelopes[0].token)
+
+    def test_actual_http_cancellation_preserves_object_and_clears_token(self):
+        for location in ('ledger-metadata', 'operation'):
+            for error in (host.HostCancelled(signal.SIGTERM), KeyboardInterrupt()):
+                with self.subTest(location=location, error=type(error).__name__):
+                    self.setUp()
+                    def cancel(stage):
+                        if stage == location:
+                            raise error
+                    self.http.before = cancel
+                    registration, envelopes = self.capture_envelopes()
+                    with self.assertRaises(type(error)) as caught:
+                        self.run_read(registration)
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(len(self.auth), 1)
+                    self.assertEqual(len(envelopes), 1)
+                    self.assertIsNone(envelopes[0].token)

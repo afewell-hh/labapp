@@ -407,11 +407,13 @@ class PeriodicReadEnvelope:
         now = self.monotonic()
         if self.original_end is None:
             self.original_end = now + original
-        left = min(original, self.original_end - now, self.end - now)
-        if left <= 0:
-            self.cause = 'allowance'
+        # Earlier captured ceiling wins if both are observed expired;
+        # original-work wins equality. This classifies observed bounds, not
+        # the physical order of wall-clock changes during a blocking call.
+        if now >= min(self.original_end, self.end):
+            self.cause = 'original-clock' if self.original_end <= self.end else 'allowance'
             raise _ReadCutoff()
-        return left
+        return min(original, self.original_end - now, self.end - now)
 
     def begin_attempt(self, attempt):
         self.attempt, self.stage, self.token, self.disk_reads = attempt, 'entry', None, 0
@@ -424,11 +426,9 @@ class PeriodicReadEnvelope:
         if self.token is None:
             stage = self.stage
             self.stage = 'auth'
-            try:
-                self.token = gcloud_token(timeout=min(30, self.left()))
-            except Exception:
-                self.left()  # a timed-out auth call keeps the actual cutoff cause
-                raise
+            # Definitive auth failures retain the existing adapter mapping,
+            # even if they arrive late. Only a positive token is post-checked.
+            self.token = gcloud_token(timeout=min(30, self.left()))
             self.left()
             self.stage = stage
         return self.token
@@ -476,11 +476,18 @@ class PeriodicReadHTTP:
             if isinstance(error, NetworkUnavailable):
                 envelope.last_error = (ReadUnavailable(None) if url.startswith('https://storage.googleapis.com/')
                                        else TransientRead(None))
-            envelope.left()
+                envelope.left()
             raise
-        if transient_status(getattr(response, 'status', None)):
+        status = getattr(response, 'status', None)
+        if transient_status(status):
             envelope.last_error = (ReadUnavailable(response.status) if url.startswith('https://storage.googleapis.com/')
                                    else TransientRead(response.status))
+        elif type(status) is int and not 200 <= status < 300:
+            # Preserve definitive permanent HTTP failures for the actual
+            # adapter to classify; never turn a late401/403 into a cutoff.
+            return response
+        # For positive responses, acceptance cutoff precedes body decoding.
+        # Thus late200 malformed data is refused as a cutoff, never authority.
         envelope.left()
         return response
 
@@ -507,8 +514,9 @@ def recheck_registration(registration, clock, failed, *, monotonic=None, wait=No
 
     At most RECHECK_ATTEMPTS complete attempts run in total. Before and after EVERY attempt the
     ORIGINAL ``persistence`` window, heartbeat and one allowance from entry are enforced, so
-    a late positive read is refused (never authority). Everything else (foreign/changed lease, identity,
-    deadline, 401/403/404, malformed, accounting, refusal, Failure/signal) propagates untouched. When
+    a late positive read is refused (never authority), before decoding its body. Definitive auth and
+    permanent HTTP errors retain existing adapter classification even when late. Within budget,
+    foreign/changed identity, malformed data, accounting, refusal and signals stay hard. When
     retrying stops, the last typed error is re-raised with ``recheck_attempts`` for the closed record.
     ``wait`` returns True if the heartbeat failed, which ends the pause and refuses.
     """
