@@ -816,13 +816,19 @@ class CloneMaster:
 
 # ------------------------------------------------------------------------------ units ---------
 def parse_unit_show(raw):
-    """``systemctl show -p ...`` text -> exact property dict (duplicates or missing properties refused)."""
+    """Parse requested properties; systemctl omits empty Exec command arrays on the owner host.
+
+    Only these five known empty arrays may be omitted. A configured command is rendered and
+    remains nonempty for Units.check to refuse. Other missing properties still fail closed.
+    """
     fields = {}
     for line in raw.decode('utf-8', 'replace').splitlines():
         if '=' in line:
             key, value = line.split('=', 1)
             require(key not in fields, 'duplicate unit property')
             fields[key] = value
+    for prop in ('ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload'):
+        fields.setdefault(prop, '')
     require(set(UNIT_PROPERTIES) <= set(fields), 'unit properties incomplete')
     return fields
 

@@ -2127,6 +2127,9 @@ MainPID ControlGroup InvocationID Type User WorkingDirectory Restart KillMode Se
 TimeoutStopUSec RemainAfterExit ExecStart ExecStartPre ExecStartPost ExecStop ExecStopPost
 ExecReload`) and compares the WHOLE `path=` and `argv[]=` of the single ExecStart with the
 exact expected list; substring checks and any self-reported "armed" value are not used.
+On the qualified owner host, `systemctl show` omits the five empty auxiliary Exec command
+arrays even with `--all`. Only those five omissions are normalized to empty; a configured
+command is rendered and refused, and missing identity, ExecStart or other properties refuse.
 `run` additionally requires the owner to be `active/running` with `MainPID` equal to its own PID,
 `ControlGroup=/system.slice/<owner>` and a 32-hex `InvocationID`, and records these in the `run`
 record. The check is repeated immediately before the INSERT.

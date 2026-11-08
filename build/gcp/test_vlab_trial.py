@@ -5623,7 +5623,8 @@ class PrivateCloneLeadIntegration(CloneCase):
 
                     check = patch.object(clone.CloneMaster, 'check', side_effect=cancellation) \
                         if boundary == 'check' else nullcontext()
-                    window = clone.Window(self.deps, run.budget, self.world.wall() + 1200)
+                    window = clone.Window(self.deps, run.budget, self.world.wall() + 1200,
+                                          self.deps.mono() + 1200)
                     with patch.object(clone.owned_process, 'OwnedGroup', return_value=group), \
                             patch.object(run.store, 'create', side_effect=create), check:
                         with self.assertRaises(host.HostCancelled) as caught:
@@ -5684,7 +5685,8 @@ class PrivateCloneLeadIntegration(CloneCase):
             with self.subTest(clock=clock):
                 self.fresh_world()
                 budget = clone.Budget(self.manifest, self.deps)
-                window = clone.Window(self.deps, budget, self.world.wall() + 1200)
+                window = clone.Window(self.deps, budget, self.world.wall() + 1200,
+                                      self.deps.mono() + 1200)
                 master = clone.CloneMaster(self.world.tmp, self.manifest['name'], '123', 'ubuntu', self.deps)
 
                 def remote_result(*args, **kwargs):
@@ -5695,3 +5697,26 @@ class PrivateCloneLeadIntegration(CloneCase):
                 with patch.object(master, 'check'):
                     with self.assertRaises(clone.Uncertain):
                         master.remote('summary', window)
+
+    def test_systemctl_empty_command_omission_does_not_hide_configured_commands(self):
+        commands = ('ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload')
+        props = self.world.unit_props(self.world.owner)
+        omitted = {k: v for k, v in props.items() if k not in commands}
+
+        def show(fields):
+            return '\n'.join(k + '=' + v for k, v in fields.items()).encode()
+
+        parsed = clone.parse_unit_show(show(omitted))
+        self.units().check(parsed, 'owner')
+        for command in commands:
+            with self.subTest(command=command):
+                configured = dict(omitted, **{command: self.world.exec_line(['/usr/bin/true'])})
+                parsed = clone.parse_unit_show(show(configured))
+                with self.assertRaises(clone.Refused):
+                    self.units().check(parsed, 'owner')
+        for required in ('User', 'ExecStart', 'KillMode'):
+            with self.subTest(missing=required):
+                missing = dict(omitted)
+                del missing[required]
+                with self.assertRaises(clone.Refused):
+                    clone.parse_unit_show(show(missing))
