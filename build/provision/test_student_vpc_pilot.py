@@ -468,7 +468,7 @@ class PackageParserThroughInstallTests(unittest.TestCase):
                       (0, good + b'garbage line\n', 'ok'),                                    # unknown line
                       (0, good.replace(b'ii |jq|1.7.1-3ubuntu0.24.04.2', b'ii |jq|'), 'ok'), # installed, no version
                       (2, good, 'ok'), (0, good, 'timeout'), (0, good, 'overflow')):
-            with self.subTest(query[0], query[2]):
+            with self.subTest(code=query[0], state=query[2]):
                 self.query = query
                 with self.assertRaises(pilot.Refused):
                     pilot.install_packages(pilot.Clock(60))
@@ -921,7 +921,7 @@ class RunTests(unittest.TestCase):
     def test_a_forcibly_stopped_worker_is_sticky_uncertain_with_no_further_guest_work(self):
         for plan in ((-9, {'uid': UID}, 'timeout'), (-9, {'uid': UID}, 'ok'), (0, {'uid': UID}, 'overflow'),
                      (-15, {}, 'timeout')):
-            with self.subTest(plan[2], plan[0]):
+            with self.subTest(state=plan[2], code=plan[0]):
                 pilot.STICKY.clear()
                 self.children.clear()
                 self.plan['accept'] = plan

@@ -3131,3 +3131,9 @@ the activation cleanup guard; retained preparation deadlines are checked after b
 and before publication. Ambiguous leftovers are preserved. The added `stop-verified` command is
 an operator completion boundary outside the unit ordering cycle. Native ordering and clone
 behavior still require measurement; these source changes do not clear access provenance.
+
+This private-VM pilot requires Root to exclude other writers of `webapp-prod` while normal Fabric
+reconcilers continue. The host work lock does not enforce Kubernetes writer exclusivity. An absent
+preflight plus successful `apply -o json` response establishes ownership only under that assumption;
+creation with concurrent writers and shared-cluster ownership safety remain unproven. The later
+UID-conditioned delete protects against a replaced object but does not turn apply into creation proof.

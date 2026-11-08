@@ -773,9 +773,11 @@ def lesson(clock, state):
     text = manifest.read_text(encoding='utf-8')
     require(text == VPC_YAML and text.count('subnet:') == 2, 'manifest check failed')
     # Step 2: apply and confirm creation.
-    # The same lesson action as ``kubectl apply -f``; ``-o json`` additionally returns the object the server CREATED,
-    # whose UID is the only proof of ownership. An ambiguous result (timeout, overflow, failure, unparseable or
-    # unproven response) leaves the UID unknown: the object is then unresolved and is never adopted or deleted.
+    # The same lesson action as ``kubectl apply -f``; ``-o json`` returns its successful mutation response.
+    # Root must exclude competing writers of webapp-prod in this private-VM pilot (normal Fabric reconciliation
+    # continues). Absence preflight plus this response establishes ownership only under that operational assumption:
+    # apply itself is not creation proof under concurrent writers, and work.lock is not a Kubernetes writer lock.
+    # An ambiguous/unproven response leaves the UID unknown; the object is never adopted or deleted.
     state['attempted'] = True
     _, applied = kube(['apply', '-f', str(manifest), '-o', 'json'], clock)
     created = parse_json(applied)

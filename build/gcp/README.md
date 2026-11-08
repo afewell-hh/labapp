@@ -2302,3 +2302,9 @@ existing suite command in the isolated credential-free container (with `docker r
 i.e. `unittest.TestLoader().discover('build/gcp', pattern='test_vlab_trial.py')` run from the
 repository root (equivalently `python3 -m unittest build.gcp.test_vlab_trial -v`), then
 independent review before any cloud admission. No live proof exists.
+
+This private-VM pilot requires Root to exclude other writers of `webapp-prod` while normal Fabric
+reconcilers continue. The host work lock does not enforce Kubernetes writer exclusivity. An absent
+preflight plus successful `apply -o json` response establishes ownership only under that assumption;
+creation with concurrent writers and shared-cluster ownership safety remain unproven. The later
+UID-conditioned delete protects against a replaced object but does not turn apply into creation proof.
