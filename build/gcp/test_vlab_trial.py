@@ -4983,6 +4983,181 @@ class PrivateCloneOrchestration(CloneCase):
         self.assert_disposed(result)
 
 
+class SummaryIO:
+    """Synthetic guest IO for the ACTUAL clone.SUMMARY source. Every read advances an optional scheduled
+    producer (READY core -> atomic checkpoint -> clone unit active/success) by one step."""
+    BOOT = '10000001-0000-4000-8000-000000000001'
+    BUILD = '00000000-0000-4000-8000-00000000000b'
+    OP, INV = '1' * 32, '2' * 32
+
+    def __init__(self, steps=(), start=0):
+        self.files = {
+            '/var/lib/labapp-vlab-image/seal.json': {'state': 'sealed', 'owned_sealed': True, 'nonce': 'a' * 32,
+                                                      'build_boot': self.BUILD, 'core_operation': 'c' * 32,
+                                                      'core_invocation': 'd' * 32},
+            '/var/lib/labapp-vlab-core/state.json': {'nonce': 'a' * 32, 'phase': 'resumable', 'mode': 'resume',
+                                                      'boot': self.BOOT, 'operation': 'e' * 32,
+                                                      'invocation': 'f' * 32, 'critical': {'k': 1},
+                                                      'cluster': {'k': 2}}}
+        self.units = {'labapp-vlab-clone.service': ('activating', 'x', 'success'),
+                      'hhfab-vlab-resume.service': ('active', self.INV, 'success')}
+        self.steps, self.start, self.reads, self.fds = list(steps), start, 0, {}
+
+    def tick(self):
+        if self.reads >= self.start and self.steps:
+            self.steps.pop(0)(self)
+        self.reads += 1
+
+    def publish_core(self):
+        core = self.files['/var/lib/labapp-vlab-core/state.json']
+        core.update(phase='ready', operation=self.OP, invocation=self.INV)
+
+    def publish_checkpoint(self, op=None):
+        self.files['/var/lib/labapp-vlab-image/clone-start.json'] = {
+            'boot': self.BOOT, 'operation': op or self.OP, 'invocation': self.INV}
+
+    def publish_clone(self):
+        self.units['labapp-vlab-clone.service'] = ('active', 'y', 'success')
+
+    def producer(self, wrong_checkpoint=None):
+        return [SummaryIO.publish_core, lambda s: s.publish_checkpoint(wrong_checkpoint), SummaryIO.publish_clone]
+
+    def os_open(self, path, flags, *a):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        fd = 100 + len(self.fds)
+        self.fds[fd] = json.dumps(self.files[path]).encode()
+        return fd
+
+    def fdopen(self, fd, mode):
+        io_self = self
+        data = self.fds[fd]
+
+        class Stream:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                io_self.tick()
+
+            def fileno(s):
+                return fd
+
+            def read(s, n):
+                return data[:n]
+        return Stream()
+
+    def fstat(self, fd):
+        return SimpleNamespace(st_uid=0, st_nlink=1, st_mode=0o100600, st_size=len(self.fds[fd]))
+
+    def run(self, argv, **kwargs):
+        active, invocation, result = self.units[argv[2]]
+        self.tick()
+        return SimpleNamespace(stdout=f'ActiveState={active}\nInvocationID={invocation}\nResult={result}\n')
+
+    def execute(self):
+        real_open, out = open, io.StringIO()
+
+        def fake_open(path, *a, **k):
+            return io.StringIO(self.BOOT + '\n') if path == '/proc/sys/kernel/random/boot_id' else real_open(path, *a, **k)
+        with patch('os.open', self.os_open), patch('os.fdopen', self.fdopen), patch('os.fstat', self.fstat), \
+                patch('subprocess.run', self.run), patch('builtins.open', fake_open), patch('sys.stdout', out):
+            exec(compile(clone.SUMMARY, 'summary', 'exec'), {'__name__': 'summary'})
+        return out.getvalue().encode()
+
+
+class PrivateCloneSummaryOrdering(CloneCase):
+    def observe(self, io_world):
+        return clone.parse_summary(io_world.execute())
+
+    def test_stable_ready_passes(self):
+        stable = SummaryIO()
+        for step in stable.producer():
+            step(stable)
+        self.assertEqual(clone.readiness(self.observe(stable)), 'ready')
+
+    def test_scheduled_publication_at_every_interleaving_never_mismatches(self):
+        for start in range(0, 8):
+            with self.subTest(start=start):
+                world = SummaryIO(SummaryIO().producer(), start)
+                states = []
+                for _ in range(3):
+                    states.append(clone.readiness(self.observe(world)))   # a Mismatch would raise here
+                self.assertEqual(states[-1], 'ready')
+
+    def test_checkpoint_after_clone_unit_variant_passes(self):
+        world = SummaryIO([SummaryIO.publish_core, SummaryIO.publish_clone, lambda s: s.publish_checkpoint()], 0)
+        for _ in range(4):
+            try:
+                state = clone.readiness(self.observe(world))
+            except clone.Mismatch:
+                state = 'mismatch'
+        self.assertEqual(state, 'ready')
+
+    def test_stable_wrong_checkpoint_stays_mismatch(self):
+        stable = SummaryIO()
+        for step in stable.producer(wrong_checkpoint='9' * 32):
+            step(stable)
+        with self.assertRaises(clone.Mismatch):
+            clone.readiness(self.observe(stable))
+
+    def test_failed_clone_unit_and_transition_without_publication(self):
+        world = SummaryIO()
+        world.units['labapp-vlab-clone.service'] = ('failed', 'x', 'exit-code')
+        with self.assertRaises(clone.Mismatch):
+            clone.readiness(self.observe(world))
+        pending = SummaryIO()
+        pending.publish_core(), pending.publish_checkpoint()   # clone unit still activating: not yet ready
+        self.assertEqual(clone.readiness(self.observe(pending)), 'pending')
+
+    def test_rejected_terminal_summary_is_retained_exclusively_and_bounded(self):
+        def wrong(out, w):
+            if w.boot_n == 1 and out['core']['phase'] == 'ready':
+                out['checkpoint']['operation'] = '9' * 32
+        self.world.mutate_summary = wrong
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Mismatch'))
+        saved = self.store.read('rejected-boot1')
+        self.assertEqual((saved['stage'], saved['code']), ('readiness', 'mismatch'))
+        self.assertEqual(saved['reason'], 'ready state does not match the clone-boot checkpoint contract')
+        self.assertEqual(saved['summary']['checkpoint']['operation'], '9' * 32)
+        self.assertEqual(set(saved), {'stage', 'code', 'reason', 'summary'})
+        self.assertLessEqual(len(self.store.raw('rejected-boot1')), clone.LIMIT)
+        self.assertEqual(stat.S_IMODE(os.stat(self.store.path('rejected-boot1')).st_mode), 0o600)
+        with self.assertRaises(clone.Refused):
+            self.store.create('rejected-boot1', {})
+        self.assert_disposed(result)
+
+    def test_malformed_summary_gets_only_a_fixed_classification(self):
+        def hostile(out, w):
+            out['config'] = {'secret': 'TOP-SECRET-VALUE'}
+        self.world.mutate_summary = hostile
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        raw = self.store.raw('rejected-boot1')
+        self.assertEqual(json.loads(raw), {'stage': 'readiness', 'code': 'malformed', 'reason': 'malformed',
+                                           'summary': None})
+        self.assertNotIn(b'TOP-SECRET', raw)
+        self.assert_disposed(result)
+
+    def test_diagnostic_write_failure_preserves_primary_failure_and_cleanup(self):
+        def wrong(out, w):
+            if w.boot_n == 1 and out['core']['phase'] == 'ready':
+                out['checkpoint']['operation'] = '9' * 32
+        self.world.mutate_summary = wrong
+        original = clone.Store.create
+
+        def failing(store, kind, value):
+            if kind.startswith('rejected-'):
+                raise OSError('disk full')
+            return original(store, kind, value)
+        with patch.object(clone.Store, 'create', failing):
+            code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Mismatch'))
+        self.assertFalse(self.store.has('rejected-boot1'))
+        self.assert_disposed(result)
+
+
 class PrivateCloneRecovery(CloneCase):
     def intent(self, outcome, age=400):
         self.store.create('insert-intent', {'request_id': self.manifest['request_id'], 'body': {},

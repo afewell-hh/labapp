@@ -567,6 +567,9 @@ def verify_vm(vm, m, vm_id=None):
 
 
 # ------------------------------------------------------------------------------ guest summary --
+# The producer publishes READY core -> atomic checkpoint -> clone unit success/active. The clone unit is therefore
+# read FIRST: an observed active/success then proves the checkpoint and ready core read afterwards are already
+# final, while any earlier state only yields a pending (or failed) frame. No snapshot, retry or grace is needed.
 SUMMARY = r'''import hashlib,json,os,subprocess,sys
 def load(p,n):
     f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -579,6 +582,7 @@ def unit(u):
     t=subprocess.run(['/usr/bin/systemctl','show',u,'-p','ActiveState','-p','InvocationID','-p','Result'],capture_output=True,text=True,timeout=10,check=True).stdout.splitlines()
     d=dict(l.split('=',1) for l in t)
     return {k:d.get(k) for k in ('ActiveState','InvocationID','Result')}
+clone=unit('labapp-vlab-clone.service')
 seal=load('/var/lib/labapp-vlab-image/seal.json',16384)
 try: cp=load('/var/lib/labapp-vlab-image/clone-start.json',4096)
 except FileNotFoundError: cp=None
@@ -591,7 +595,7 @@ core['cluster_sha256']=h(st['cluster']) if 'cluster' in st else None
 out={'boot':open('/proc/sys/kernel/random/boot_id').read().strip(),
  'seal':{k:seal.get(k) for k in ('state','owned_sealed','nonce','build_boot','core_operation','core_invocation')},
  'checkpoint':{k:cp.get(k) for k in ('boot','operation','invocation')} if isinstance(cp,dict) else None,
- 'core':core,'clone':unit('labapp-vlab-clone.service'),'resume':unit('hhfab-vlab-resume.service')}
+ 'core':core,'clone':clone,'resume':unit('hhfab-vlab-resume.service')}
 sys.stdout.write(json.dumps(out,sort_keys=True,separators=(',',':')))
 '''
 # The only remote commands this caller can ever run (no argument, path or shell input).
@@ -660,6 +664,13 @@ def parse_summary(raw):
         return out
     except (ValueError, UnicodeError, KeyError, TypeError, RecursionError):
         raise Refused('guest summary refused') from None
+
+
+REJECT_REASONS = frozenset((
+    'image is not the sealed image', 'boot is the builder boot',
+    'second boot is not a new boot of the same sealed image', 'core nonce differs from the sealed nonce',
+    'unchanged clone auto-start failed', 'ready state does not match the clone-boot checkpoint contract',
+    'backend is not positively offline at the verified stop'))
 
 
 def readiness(s, prior=None):
@@ -1478,12 +1489,30 @@ class Run:
         except Expired:
             raise Uncertain('access window passed before remote proof acceptance') from None
 
+    def reject(self, stage, error, summary):
+        """Retain the validated rejected summary and a fixed reason before cleanup. Never raises, never raw output."""
+        try:
+            reason = str(error)
+            self.store.try_create('rejected-' + self.phase, {
+                'stage': stage,
+                'code': 'malformed' if summary is None else 'mismatch' if isinstance(error, Mismatch) else 'refused',
+                'reason': 'malformed' if summary is None else reason if reason in REJECT_REASONS else 'other',
+                'summary': summary})
+        except Exception:
+            pass
+
     def await_ready(self, master, window, prior):
         while True:
             raw = master.remote('summary', window, 30)
             self.accept_remote(window)
-            summary = parse_summary(raw)
-            if readiness(summary, prior) == 'ready':
+            summary = None
+            try:
+                summary = parse_summary(raw)
+                state = readiness(summary, prior)
+            except Refused as error:
+                self.reject('readiness', error, summary)
+                raise
+            if state == 'ready':
                 self.accept_remote(window)
                 return summary
             window.remaining()
@@ -1515,7 +1544,13 @@ class Run:
             require(STOP_MARKER in out, 'stop-verified did not report success')
             raw = master.remote('summary', window, 30)
             self.accept_remote(window)
-            check_offline(parse_summary(raw), record)
+            summary = None
+            try:
+                summary = parse_summary(raw)
+                check_offline(summary, record)
+            except Refused as error:
+                self.reject('offline', error, summary)
+                raise
             self.accept_remote(window)
             self.store.create(f'stopped-{n}', {'boot': record['boot']})
             self.accept_remote(window)
