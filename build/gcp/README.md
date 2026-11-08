@@ -828,9 +828,13 @@ erasure or old-producer-quiescence claim is made.
 from 24; every byte, depth, new-entry, live, evidence and proof bound is
 unchanged). Schema1 retains its sixteen-entry limit. Readers built with the old
 24 ceiling are not forward compatible with more than 24 entries and fail
-closed; there is no downgrade or automatic format migration. Before the first
-25th-entry release, pin/upgrade the creator, owner, cleanup and recovery
-readers and drain old queued/in-flight jobs. The 33rd admission is refused
+closed; there is no downgrade or automatic format migration. Old-24-policy
+accounting, history and Context gates fail closed on such a record (old
+`adding=True` already refuses at 24); the structural GCS `_record` reader does
+not semantically count-validate, and that separation is kept for owned physical
+cleanup. Before the FIRST expanded-policy admission, pin/upgrade the creator,
+owner, cleanup and recovery readers and drain old queued/in-flight jobs (not
+merely before the 25th release). The 33rd admission is refused
 before reservation, cloud census or insert. Earlier byte/depth/accounting
 refusal remains possible. There is no automatic conversion, additional
 storage namespace, segment upload, pruning or history reset. Existing schema1

@@ -61,7 +61,8 @@ closed rather than producing an unusable VM. No capacity PASS is claimed here.
 The schema-2 count ceiling was raised from 24 to 32 with every byte/depth bound
 unchanged. Readers built with the old 24 constant are NOT forward compatible with
 a record holding more than 24 entries and fail closed on it ('exceeds retention
-limit'); pin/upgrade all readers and drain old jobs before the 25th release.
+limit'); pin/upgrade all readers and drain old jobs before the FIRST
+expanded-policy admission.
 
 Canonical JSON and binding/timestamp validators are reused from ``access_records``
 through a lazy, function-local import so that ``access_records.Context.from_slot``
