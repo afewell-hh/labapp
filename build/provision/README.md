@@ -840,10 +840,10 @@ unknown; this does not establish native success.
 - **All twelve INITIAL `api_ready` reads use the existing pinned `kubectl get --raw=<path>`**
   (`Request.Stream`, no ordinary-GET internal retry): `/readyz`, `/api/v1/nodes`,
   `/api/v1/namespaces/kube-system`, and `/apis/<group>/v1beta1/<plural>` for the nine existing
-  custom-resource lists (all-namespace list semantics; no namespace segment). Final reads
-  (`api-final-*`, and any call without the `initial` stage) stay structured `get ... -o json` with the
-  10s client timeout, get NO READINESS-LOOP RECOVERY (the original structured-client internal retries
-  remain unchanged), and are otherwise unchanged. Stream still honours response-driven
+  custom-resource lists (all-namespace list semantics; no namespace segment). Final and unstaged
+  object reads stay structured `get ... -o json`; `/readyz` retains its existing raw query in all
+  stages. Final and unstaged reads keep the 10s client timeout and receive no new readiness-loop
+  recovery; their existing structured-client internal retries remain unchanged. Stream still honours response-driven
   `Retry-After` retries (429/503); this is bounded only by the unchanged 10s hard cap, which stays
   fatal (exit 124). No claim is made that internal retries are absent.
 - **Closed version binding.** The group versions are the pinned constants `v1beta1` for
