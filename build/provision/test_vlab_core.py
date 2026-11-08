@@ -347,6 +347,14 @@ class GuestEnvironment:
             if '--raw=/readyz' in argv:
                 return b'ok'
             resource = argv[argv.index('get') + 1]
+            if resource.startswith('--raw='):
+                # Initial raw reads (#542): the same fixture objects through fixed API paths.
+                path = resource[len('--raw='):]
+                self.assertIn(path, core.INITIAL_RAW_PATHS.values())
+                resource = {'/api/v1/namespaces/kube-system': 'namespace',
+                            '/api/v1/nodes': 'nodes'}.get(path, path.rsplit('/', 1)[-1])
+                if path.startswith('/apis/'):
+                    self.assertEqual(path.split('/')[3], 'v1beta1')
             if resource == 'namespace':
                 return json.dumps({'metadata': {'uid': self.cluster_uid}}).encode()
             if resource == 'nodes':
@@ -1383,6 +1391,10 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         if '--raw=/readyz' in argv:
             return 'readyz'
         resource = argv[argv.index('get') + 1]
+        if resource.startswith('--raw='):
+            path = resource[len('--raw='):]
+            return {'/api/v1/namespaces/kube-system': 'kube-system-ns',
+                    '/api/v1/nodes': 'nodes'}.get(path, path.rsplit('/', 1)[-1])
         return 'kube-system-ns' if resource == 'namespace' else resource.split('.')[0]
 
     def test_fixed_children_table_matches_the_actual_successful_readiness_sequence(self):
@@ -2439,6 +2451,178 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
                 self.assertEqual((self.ready_record()['message'], self.ready_record()['route']),
                                  ('child command failed', 'api-final-readyz'))
                 self.assertEqual((core.state()['phase'], core.state()['containment']), ('failed', 'verified'))
+
+    RESET = (b'Unable to connect to the server: read tcp 127.0.0.1:54321->127.0.0.1:6443: '
+             b'read: connection reset by peer\n')
+    TRANSPORT_FORMS = (RESET, b'Unable to connect to the server: EOF\n',
+                       b'Unable to connect to the server: unexpected EOF\n',
+                       b'Unable to connect to the server: net/http: TLS handshake timeout\n',
+                       core.INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING)
+
+    def test_initial_api_reads_are_raw_exact_argv_with_5s_client_under_unchanged_10s_cap(self):
+        self.prepared()
+        self.runtime_files()
+        self.assertEqual(core.api_ready(time.monotonic() + 10, 'initial')['cluster_uid'], self.cluster_uid)
+        calls = [c for c in self.calls if c[0][0] == core.KUBECTL]
+        paths = ['/readyz', '/api/v1/nodes', '/api/v1/namespaces/kube-system'] + [
+            '/apis/%s/v1beta1/%s' % (group, plural) for group, plural in (
+                ('fabricator.githedgehog.com', 'fabricators'), ('fabricator.githedgehog.com', 'controlnodes'),
+                ('fabricator.githedgehog.com', 'fabnodes'), ('wiring.githedgehog.com', 'switches'),
+                ('wiring.githedgehog.com', 'servers'), ('wiring.githedgehog.com', 'connections'),
+                ('wiring.githedgehog.com', 'switchgroups'), ('wiring.githedgehog.com', 'vlannamespaces'),
+                ('vpc.githedgehog.com', 'ipv4namespaces'))]
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(list(core.INITIAL_RAW_PATHS.values()), paths)
+        self.assertEqual(list(core.INITIAL_RAW_PATHS), ['api-initial-' + n for n in API_ROUTE_NAMES])
+        for (argv, deadline, cap, user), path in zip(calls, paths):
+            self.assertEqual(argv[-2:], ['get', '--raw=' + path])
+            self.assertEqual([a for a in argv if a.startswith('--request-timeout=')], ['--request-timeout=5s'])
+            self.assertEqual((cap, user), (10, True))  # client timeout leaves headroom under the cap
+        del self.calls[:]
+        core.api_ready(time.monotonic() + 10, 'final')
+        final = [c for c in self.calls if c[0][0] == core.KUBECTL]
+        self.assertEqual(len(final), 12)
+        self.assertEqual(sum(1 for c in final if any(a.startswith('--raw=') for a in c[0])), 1)  # readyz only
+        self.assertTrue(all('--request-timeout=10s' in c[0] and c[2] == 10 for c in final))
+        self.assertEqual(final[1][0][-4:], ['get', 'nodes', '-o', 'json'])
+        self.assertIn('-A', final[3][0])
+
+    def mutate_installer(self, name, change):
+        path = core.WORK / 'result' / core.RESULT / name
+        docs = core.yaml_documents(path.read_bytes())
+        docs = change(docs)
+        path.write_bytes(yaml.safe_dump_all(docs, sort_keys=False).encode())
+
+    def test_initial_version_binding_is_closed_and_precedes_custom_resource_requests(self):
+        def drop(kind):
+            return lambda docs: [d for d in docs if d['kind'] != kind]
+
+        def version(kind, value):
+            def change(docs):
+                for d in docs:
+                    if d['kind'] == kind:
+                        d['apiVersion'] = value
+                return docs
+            return change
+        cases = (('fab.yaml', version('Fabricator', 'fabricator.githedgehog.com/v1beta2')),
+                 ('fab.yaml', version('Fabricator', 'fabricator.githedgehog.com/v1')),
+                 ('fab.yaml', version('Fabricator', 'evil.example.com/v1beta1')),
+                 ('fab.yaml', version('Fabricator', '../../v1beta1')),
+                 ('fab.yaml', drop('ControlNode')),  # zero-count FabNode needs corroboration
+                 ('fab.yaml', drop('Fabricator')),
+                 ('include.yaml', version('Switch', 'wiring.githedgehog.com/v1beta2')),
+                 ('include.yaml', version('Server', 'fabricator.githedgehog.com/v1beta1')),
+                 ('include.yaml', version('IPv4Namespace', 'vpc.githedgehog.com/v1alpha1')),
+                 ('include.yaml', drop('IPv4Namespace')))  # a pinned group without installer coverage
+        for name, change in cases:
+            with self.subTest(name=name, change=change):
+                self.setUp()
+                self.prepared()
+                self.runtime_files()
+                self.mutate_installer(name, change)
+                with self.assertRaises(core.Failure) as caught:
+                    core.api_ready(time.monotonic() + 10, 'initial')
+                self.assertNotIsInstance(caught.exception, core.Pending)
+                self.assertFalse(any('/apis/' in a for c in self.calls for a in c[0]))
+        # Zero-count FabNode stays bound through the pinned mapping, not an observed version.
+        self.setUp()
+        self.prepared()
+        self.runtime_files()
+        self.assertFalse(any(d['kind'] == 'FabNode' for d in core.yaml_documents(
+            (core.WORK / 'result' / core.RESULT / 'fab.yaml').read_bytes())))
+        core.api_ready(time.monotonic() + 10, 'initial')
+        self.assertIn(['get', '--raw=/apis/fabricator.githedgehog.com/v1beta1/fabnodes'],
+                      [c[0][-2:] for c in self.calls])
+
+    def test_each_initial_read_position_interrupted_restarts_full_phase_under_same_deadline(self):
+        for position in range(12):
+            raw = self.TRANSPORT_FORMS[position % len(self.TRANSPORT_FORMS)]
+            with self.subTest(position=position, raw=raw):
+                self.setUp()
+                self.prepared()
+                count = [0]
+
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL:
+                        count[0] += 1
+                        if count[0] == position + 1:
+                            raise core.Failure('child command failed', 1, raw)
+                pauses = []
+                status, seen, meta = self.run_ready(inject, sleep=pauses.append)
+                self.assertEqual(status, 0, self.stderr.getvalue())
+                self.assertEqual(pauses, [5])
+                self.assertEqual([self.api_name(a) for a in seen if a[0] == core.KUBECTL],
+                                 list(API_ROUTE_NAMES[:position + 1]) + list(API_ROUTE_NAMES) * 2)
+                self.assertEqual(len({m[0] for m in meta}), 1)  # one original deadline, never renewed
+                self.assertEqual(meta[0][0], core.state()['deadline'])
+                self.assertFalse(self.ready_path().exists())
+                self.assertEqual(core.state()['phase'], 'ready')
+
+    def test_persistent_initial_transport_failure_expires_at_original_deadline(self):
+        for mode, seconds in (('fresh', 2700), ('resume', 900)):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.prepared() if mode == 'fresh' else self.resumable()
+                clock, pauses, polls = [100.0], [], []
+
+                def sleep(duration):
+                    pauses.append(duration)
+                    clock[0] += duration
+
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL and '--raw=/api/v1/nodes' in argv:
+                        polls.append(number)
+                        raise core.Failure('child command failed', 1, self.RESET)
+                begun = clock[0]
+                with patch.object(core.time, 'monotonic', side_effect=lambda: clock[0]):
+                    status, seen, meta = self.run_ready(inject, 'start-' + mode, sleep=sleep)
+                self.assertEqual(status, 124, self.stderr.getvalue())
+                self.assertEqual((len(polls), sum(pauses), clock[0]), (seconds // 5, seconds, begun + seconds))
+                self.assertEqual({m[0] for m in meta}, {begun + seconds})
+                self.assertFalse(any(a[0] == core.HHFAB for a in seen))
+                self.assertEqual(core.state()['deadline'], begun + seconds)
+
+    def test_final_reads_stay_structured_fatal_and_unretried_on_transport_forms(self):
+        for raw in self.TRANSPORT_FORMS:
+            with self.subTest(raw=raw):
+                self.setUp()
+                self.prepared()
+                count = [0]
+
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL:
+                        count[0] += 1
+                        if count[0] == 14:  # final nodes
+                            raise core.Failure('child command failed', 1, raw)
+                pauses = []
+                status, seen, _ = self.run_ready(inject, sleep=pauses.append)
+                self.assertEqual((status, pauses), (1, []))
+                self.assertEqual(seen[-1][-4:], ['get', 'nodes', '-o', 'json'])
+                self.assertEqual(self.ready_record()['route'], 'api-final-nodes')
+                self.assertEqual(core.state()['phase'], 'failed')
+
+    def test_initial_hard_forms_on_non_readyz_initial_read_stay_fatal_without_poll(self):
+        hard = (b'error: You must be logged in to the server (Unauthorized)\n',
+                b'Error from server (Forbidden): denied\n',
+                b'Unable to connect to the server: tls: failed to verify certificate: x509: bad\n',
+                b'error: read tcp 127.0.0.1:54321->127.0.0.1:6443: read: connection reset by peer\n',
+                self.RESET + b'trailing\n', b'invalid configuration: no configuration has been provided\n',
+                b'{"items": [', b'')
+        for raw in hard:
+            with self.subTest(raw=raw):
+                self.setUp()
+                self.prepared()
+                count = [0]
+
+                def inject(number, argv):
+                    if argv[0] == core.KUBECTL:
+                        count[0] += 1
+                        if count[0] == 7:  # initial switches
+                            raise core.Failure('child command failed', 1, raw)
+                pauses = []
+                status, seen, _ = self.run_ready(inject, sleep=pauses.append)
+                self.assertEqual((status, pauses), (1, []))
+                self.assertEqual(self.ready_record()['route'], 'api-initial-switches')
 
     def test_initial_health_poll_keeps_124_overflow_generic_500_and_uncertain_cleanup_fatal(self):
         cases = (
@@ -3544,6 +3728,102 @@ class FormatAndSourceTests(unittest.TestCase):
                      patch.object(core, 'execute', side_effect=error):
                     with self.assertRaises(core.Failure) as raised:
                         core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
+                self.assertIs(raised.exception, error)
+                self.assertNotIsInstance(raised.exception, core.Pending)
+
+    def test_exact_initial_route_and_raw_argv_allowlist_controls_5s_timeout_and_pending(self):
+        reset = (b'Unable to connect to the server: read tcp 127.0.0.1:54321->127.0.0.1:6443: '
+                 b'read: connection reset by peer\n')
+        self.assertEqual(len(reset), 106)  # native35 supplemental context length
+        self.assertEqual(len(core.INITIAL_RAW_PATHS), 12)
+        for route, path in core.INITIAL_RAW_PATHS.items():
+            args = ['get', '--raw=' + path]
+            self.assertEqual(self.captured_timeout(args, route), (['--request-timeout=5s'], 10, True))
+            for raw in (reset,) + core.INITIAL_TRANSPORT_FIXED + core.INITIAL_READYZ_CLIENT_TIMEOUTS:
+                error = executed_failure('child command failed', 1, raw)
+                with self.subTest(route=route, raw=raw), patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Pending):
+                        core.kubectl(args, 1000, route)
+            # Route prefix alone, wrong route/argv pairing and altered argv stay fatal and 10s.
+            for other_route, other_path in core.INITIAL_RAW_PATHS.items():
+                if other_route != route:
+                    self.assertEqual(self.captured_timeout(['get', '--raw=' + other_path], route),
+                                     (['--request-timeout=10s'], 10, True))
+            for bad in (args + ['--v=8'], ['get', '--raw=' + path + '?limit=1'], ['get', '--raw=' + path + '/'],
+                        ['get', '-o', 'json', '--raw=' + path], ['create', '--raw=' + path]):
+                self.assertEqual(self.captured_timeout(bad, route), (['--request-timeout=10s'], 10, True))
+                error = executed_failure('child command failed', 1, reset)
+                with self.subTest(route=route, bad=bad), patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Failure) as raised:
+                        core.kubectl(bad, 1000, route)
+                self.assertIs(raised.exception, error)
+                self.assertNotIsInstance(raised.exception, core.Pending)
+            final = route.replace('api-initial-', 'api-final-')
+            self.assertEqual(self.captured_timeout(args, final), (['--request-timeout=10s'], 10, True))
+        # Plaintext health text is accepted on the readyz read only.
+        error = executed_failure('child command failed', 1, HEALTH_FAILURE)
+        with patch.object(core, 'execute', side_effect=error):
+            with self.assertRaises(core.Failure):
+                core.kubectl(['get', '--raw=/api/v1/nodes'], 1000, 'api-initial-nodes')
+
+    def test_initial_transport_grammar_is_anchored_whole_output_and_bounded(self):
+        prefix = b'Unable to connect to the server: '
+        good = [prefix + b'EOF\n', prefix + b'unexpected EOF\n', prefix + b'net/http: TLS handshake timeout\n']
+        for op in (b'read', b'write'):
+            for port in (b'1', b'80', b'54321', b'65535'):
+                good.append(prefix + op + b' tcp 127.0.0.1:' + port + b'->127.0.0.1:6443: ' + op
+                            + b': connection reset by peer\n')
+        for raw in good:
+            with self.subTest(raw=raw):
+                self.assertTrue(core.initial_transport_failed(raw))
+        base = prefix + b'read tcp 127.0.0.1:54321->127.0.0.1:6443: read: connection reset by peer\n'
+        bad = [b'', b'EOF\n', prefix + b'EOF', prefix + b'EOF\n\n', prefix + b'eof\n', prefix + b'EOF \n',
+               prefix + b'unexpected EOF while reading body\n', prefix + b'io: read/write on closed pipe\n',
+               prefix + b'net/http: TLS handshake timeout (Client.Timeout exceeded)\n',
+               prefix + b'tls: handshake failure\n', prefix + b'x509: certificate has expired\n',
+               b'error: ' + base[len(prefix):], b'x509: error\n' + base, base + b'Unauthorized\n', base + base,
+               base.rstrip(b'\n'), base + b'\n', base.replace(b'127.0.0.1:54321', b'127.0.0.1:0'),
+               base.replace(b'54321', b'65536'), base.replace(b'54321', b'054321'), base.replace(b'54321', b'-1'),
+               base.replace(b'54321', b'5432a'), base.replace(b'54321', b'543210'), base.replace(b'54321', b''),
+               base.replace(b'->127.0.0.1:6443', b'->127.0.0.1:6444'),
+               base.replace(b'->127.0.0.1', b'->10.0.0.1'), base.replace(b'tcp 127.0.0.1', b'tcp 10.0.0.1'),
+               base.replace(b'tcp 127.0.0.1', b'tcp [::1]'), base.replace(b'->127.0.0.1:6443', b'->localhost:6443'),
+               base.replace(b'read tcp', b'read udp'), base.replace(b': read:', b': write:'),
+               base.replace(b'reset by peer', b'timed out'), base.replace(b'reset by peer', b'broken pipe'),
+               base.replace(b'connection reset by peer', b'Connection reset by peer'),
+               base.replace(b'127.0.0.1:54321', b'127.0.0.1:5\n4321'), base.replace(b'\n', b'\r\n'),
+               base.replace(b'read tcp', b'dial tcp'), base.replace(prefix, b'')]
+        for raw in bad:
+            with self.subTest(raw=raw):
+                self.assertFalse(core.initial_transport_failed(raw))
+                error = executed_failure('child command failed', 1, raw)
+                with patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Failure) as raised:
+                        core.kubectl(['get', '--raw=/api/v1/nodes'], 1000, 'api-initial-nodes')
+                self.assertIs(raised.exception, error)
+                self.assertNotIsInstance(raised.exception, core.Pending)
+
+    def test_transport_forms_cannot_override_status_provenance_message_or_cleanup(self):
+        reset = (b'Unable to connect to the server: read tcp 127.0.0.1:54321->127.0.0.1:6443: '
+                 b'read: connection reset by peer\n')
+        for raw in (reset,) + core.INITIAL_TRANSPORT_FIXED:
+            for message, code, executed, prior_route, uncertain in (
+                    ('child command failed', 124, True, None, False),
+                    ('child deadline exceeded', 124, True, None, False),
+                    ('child command failed', 130, True, None, False),
+                    ('child command failed', 143, True, None, False),
+                    ('child command failed', 2, True, None, False),
+                    ('private child output overflow', 1, True, None, False),
+                    ('child containment unverified', 1, True, None, False),
+                    ('child command failed', 1, False, None, False),
+                    ('child command failed', 1, True, 'api-final-nodes', False),
+                    ('child command failed', 1, True, None, True)):
+                error = core.Failure(message, code, raw)
+                error._executed_child, error.route, error.cleanup_uncertain = executed, prior_route, uncertain
+                with self.subTest(raw=raw, message=message, code=code, executed=executed, uncertain=uncertain), \
+                     patch.object(core, 'execute', side_effect=error):
+                    with self.assertRaises(core.Failure) as raised:
+                        core.kubectl(['get', '--raw=/api/v1/nodes'], 1000, 'api-initial-nodes')
                 self.assertIs(raised.exception, error)
                 self.assertNotIsInstance(raised.exception, core.Pending)
 

@@ -828,6 +828,57 @@ v1.35.0's [build dependencies](https://github.com/kubernetes/kubernetes/blob/v1.
 pin Go 1.25.5. These version-pinned sources explain the finite family; they do not establish
 why a native API was delayed. Native resume success remains UNPROVEN.
 
+**Initial raw API reads and bounded transport recovery (#542).** Native35 failed at initial readyz;
+the supplemental 106-byte context exactly matches the pinned kubectl loopback TCP read-reset
+formatter (`Unable to connect to the server: read tcp 127.0.0.1:<port>->127.0.0.1:6443: read:
+connection reset by peer\n`). Root's real pinned-client HTTP/1 matrix also showed ordinary structured
+`kubectl get <resource> -o json` reads (client-go `Request.request()` retries ordinary GETs
+internally) reaching the unchanged 10s process cap (exit 124, `cleanup_uncertain`), so adding one
+literal or stripping discovery stderr is not coherent. The underlying native API reset cause is
+unknown; this does not establish native success.
+
+- **All twelve INITIAL `api_ready` reads use the existing pinned `kubectl get --raw=<path>`**
+  (`Request.Stream`, no ordinary-GET internal retry): `/readyz`, `/api/v1/nodes`,
+  `/api/v1/namespaces/kube-system`, and `/apis/<group>/v1beta1/<plural>` for the nine existing
+  custom-resource lists (all-namespace list semantics; no namespace segment). Final reads
+  (`api-final-*`, and any call without the `initial` stage) stay structured `get ... -o json` with the
+  10s client timeout, get no retry, and are unchanged. Stream still honours response-driven
+  `Retry-After` retries (429/503); this is bounded only by the unchanged 10s hard cap, which stays
+  fatal (exit 124). No claim is made that internal retries are absent.
+- **Closed version binding.** The group versions are the pinned constants `v1beta1` for
+  `fabricator.githedgehog.com` (Fabricator, ControlNode, FabNode; Fabricator v0.43.1
+  `groupversion_info.go`), `wiring.githedgehog.com` (Switch, Server, Connection, SwitchGroup,
+  VLANNamespace) and `vpc.githedgehog.com` (IPv4Namespace) (Fabric v0.96.2). Before any custom-resource
+  request every expected installer object's apiVersion/kind must equal this mapping and each of the
+  three groups must have installer coverage; unsupported, missing or conflicting versions fail hard
+  (never Pending). Zero-count FabNode has no installer object, so it is bound only through the pinned
+  mapping, corroborated by the Fabricator and ControlNode objects. Observed `apiVersion` values are
+  never interpolated into a path. Expected-object JSON/shape/count/projection/identity/CAUID, strict
+  inspection and persistence checks are unchanged.
+- **Exact route+argv allowlist.** The `--request-timeout=5s` client timeout (below the unchanged 10s
+  process cap) and the Pending classification apply only when the route and the exact raw argv
+  `['get', '--raw=<that route's path>']` both match; a route prefix alone, another path, query string,
+  extra flag or other verb keeps `--request-timeout=10s` and stays fatal.
+- **Pre-response transport grammar** (whole output only, exit 1, `child command failed`, executed
+  child, matching route, no `cleanup_uncertain`): the four existing client-timeout forms; exactly
+  `Unable to connect to the server: EOF\n` (HTTP/1 clean close) and `... unexpected EOF\n` (HTTP/2
+  clean close); exactly `... net/http: TLS handshake timeout\n`; and the anchored loopback reset
+  `Unable to connect to the server: (read|write) tcp 127.0.0.1:<port>->127.0.0.1:6443: (read|write):
+  connection reset by peer\n` with matching verbs and a decimal source port 1..65535 without leading
+  zeros. Everything else stays fatal: certificate/TLS authentication/401/403, invalid configuration,
+  malformed JSON or schema, body truncation or body timeout (the HTTP/2 body-truncation form starts
+  `error: read tcp ...` and is not matched), mixed output, unknown text, signals, exit 124 and any
+  uncertain cleanup. Plaintext readyz health failures remain readyz-route-only.
+- **Recovery.** Pending restarts the complete initial API phase through the existing `ready_body`
+  loop and 5s sleep under the original fresh 2700s or resume 900s deadline; partial observations
+  are discarded. Persistent failure expires at that deadline.
+
+The tests extend the same-code full-readiness fixture (raw paths served from the same objects),
+and cover all twelve routes/argv/timeout headroom, version binding (including zero FabNode),
+negative grammar boundaries, interruption at each of the twelve initial read positions with a full
+restart under one deadline, persistent expiry and fatal final reads. Root's real-client matrix
+(`.agent-tmp/startup-transport-matrix-542/`) is pre-change observation, not candidate test evidence.
+
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
 introduced. Only the initial production loop catches this new Pending, under the original fresh2700s
