@@ -6,10 +6,14 @@ managed access records, and it never claims a canonical FREE. It reuses only low
 parts: ``auth_http`` bearer/HTTP, ``oslogin.SelfLogin`` primitives, canonical public-key helpers,
 ``hostkey.extract_ed25519``, ``vlab_trial.ssh_options``/``command`` and ``owned_process``.
 
-Commands (``python3 -m build.gcp.private_clone``): ``arm`` writes the immutable manifest into a
-fresh private workdir; ``run`` performs the one serial attempt; ``cleanup`` and ``watch`` are the
-independent disposal interface for the Root-installed systemd watchdog. Code grants no permission:
-fresh admission facts, the watchdog and a reviewed Ops wrapper are separate Root obligations.
+Commands (``private_clone.main`` via the fixed protected-source bootstrap, see ``unit_argv``):
+``arm`` writes the immutable manifest into a fresh private workdir; ``run`` performs the one serial
+attempt as the MainPID of the exact owner systemd service; ``cleanup`` and ``watch`` are the
+independent disposal interface (the durable watch service). Independent disposal first stops that
+bound owner service and positively proves it inactive with an empty cgroup; only the live caller's
+own ``OwnedGroup`` reaps its children in-process. There is no PID/pgid based cross-process reaper.
+Code grants no permission: fresh admission facts, the units and a reviewed Ops wrapper are separate
+Root obligations.
 """
 from __future__ import annotations
 
@@ -61,8 +65,8 @@ TEARDOWN_SECONDS = 30
 MIN_ACCESS_SECONDS = 600        # least usable access window worth importing a key for
 RESET_MIN_SECONDS = MIN_ACCESS_SECONDS + 120
 LAUNCH_WINDOW_SECONDS = 600     # `run` must start this soon after `arm`; never renewed
-SETTLE_SECONDS = 300            # an uncertain insert with no operation is only settled after this
-CLEANUP_POLL_SECONDS = 300
+CLEANUP_POLL_SECONDS = 300      # bound on one polling pass; elapsed time never settles a mutation
+STOP_RUN_SECONDS = 90           # `systemctl stop` of the owner: TimeoutStopUSec 30s + final SIGKILL margin
 MASTER_ATTEMPTS = 4
 LIMIT = 65536
 
@@ -72,8 +76,21 @@ OP_RE = re.compile(r'[A-Za-z0-9_-]{1,200}\Z')
 DIGITS = re.compile(r'[1-9][0-9]{0,19}\Z')
 BOOT_RE = re.compile(r'[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z')
 HEX32, HEX64 = re.compile(r'[0-9a-f]{32}\Z'), re.compile(r'[0-9a-f]{64}\Z')
-UNIT_RE = re.compile(r'labapp-clone-watch-[0-9a-f]{12}\.service\Z')
+UNIT_RE = re.compile(r'labapp-clone-(watch|run)-[0-9a-f]{12}\.service\Z')
 KIND_RE = re.compile(r'[a-z0-9]+(-[a-z0-9]+)*\Z')
+# Accepted runtime and protected source on the owner host (#349/#266 lineage); never configurable.
+RUNTIME_PYTHON = '/home/ubuntu/.local/opt/labapp-cpython-3.12.16-20261026/python/bin/python3.12'
+PROTECTED_SOURCE = '/home/ubuntu/.local/share/labapp-trial-egress-349/source'
+SERVICE_USER = 'ubuntu'
+SYSTEMCTL = '/usr/bin/systemctl'
+OWNER_STOP_TIMEOUT = '30s'
+# Isolated (-I), no-bytecode (-B) run of the protected source. No whitespace, so the ExecStart argv is exact.
+BOOTSTRAP = ('__import__("sys").path.insert(0,"' + PROTECTED_SOURCE + '");'
+             '__import__("sys").exit(__import__("build.gcp.private_clone",fromlist=["main"]).main())')
+UNIT_PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlGroup', 'InvocationID', 'Type',
+                   'User', 'WorkingDirectory', 'Restart', 'KillMode', 'SendSIGKILL', 'TimeoutStopUSec',
+                   'RemainAfterExit', 'ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost',
+                   'ExecReload')
 LOCAL_FILES = ('oslogin', 'oslogin.pub', 'known_hosts', 'master.sock')
 METADATA = (('block-project-ssh-keys', 'TRUE'), ('enable-oslogin', 'TRUE'),
             ('enable-guest-attributes', 'TRUE'), ('labapp-stage', 'none'))
@@ -103,6 +120,10 @@ class Rejected(CloneError):
     def __init__(self, status):
         super().__init__('Compute request rejected')
         self.status = status
+
+
+class Unreconciled(CloneError):
+    """An issued mutation has no exact terminal operation/outcome yet: the obligation stays open."""
 
 
 class Refused(CloneError):
@@ -144,8 +165,7 @@ class Deps:
     popen: Callable = subprocess.Popen
     master_factory: Optional[Callable] = None
     proc_root: str = '/proc'
-    killpg: Callable = os.killpg
-    getpgid: Callable = os.getpgid
+    cgroup_root: str = '/sys/fs/cgroup'
     shield: Callable[[], None] = lambda: None
     env: dict = field(default_factory=lambda: dict(os.environ))
 
@@ -164,30 +184,31 @@ class Budget:
         self.work_end = stamp(manifest['work_deadline'])
         self.w0, self.m0 = deps.wall(), deps.mono()
         require(stamp(manifest['admitted_at']) <= self.w0 < self.work_end, 'admission window over')
+        self.mono_end = self.m0 + (self.work_end - self.w0)
 
     def work(self):
-        left = min(self.work_end - self.deps.wall(),
-                   self.work_end - self.w0 - (self.deps.mono() - self.m0))
+        left = min(self.work_end - self.deps.wall(), self.mono_end - self.deps.mono())
         if left <= 0:
             raise Expired('work deadline reached')
         return left
 
 
 class Window:
-    """One access/readiness window: absolute wall end, monotonic-safe, clipped to the work deadline."""
-    def __init__(self, deps, budget, end_wall):
-        self.deps, self.budget, self.end = deps, budget, end_wall
-        self.w0, self.m0 = deps.wall(), deps.mono()
+    """One access/readiness window with TWO independent original ends (wall and monotonic), both
+    anchored by the creator BEFORE the work they bound and always clipped to the work deadline.
+    A child can only shorten, never re-anchor or extend, its parent's original ends."""
+    def __init__(self, deps, budget, end_wall, end_mono):
+        self.deps, self.budget, self.end_wall, self.end_mono = deps, budget, end_wall, end_mono
 
     def remaining(self):
-        left = min(self.end - self.deps.wall(), self.end - self.w0 - (self.deps.mono() - self.m0),
-                   self.budget.work())
+        left = min(self.end_wall - self.deps.wall(), self.end_mono - self.deps.mono(), self.budget.work())
         if left <= 0:
             raise Expired('access window ended')
         return left
 
     def sub(self, seconds):
-        return Window(self.deps, self.budget, min(self.end, self.deps.wall() + seconds))
+        return Window(self.deps, self.budget, min(self.end_wall, self.deps.wall() + seconds),
+                      min(self.end_mono, self.deps.mono() + seconds))
 
 
 # ------------------------------------------------------------------------------ manifest ------
@@ -229,10 +250,21 @@ def watch_unit(manifest):
     return 'labapp-clone-watch-' + manifest['name'][-12:] + '.service'
 
 
-def cleanup_argv(directory, sha, verb='watch'):
-    """Exact argv the Root-installed systemd unit must run (ExecStart)."""
-    return ['/usr/bin/python3', '-m', 'build.gcp.private_clone', verb, '--workdir', str(directory),
-            '--manifest-sha256', sha]
+def owner_unit(manifest):
+    return 'labapp-clone-run-' + manifest['name'][-12:] + '.service'
+
+
+def unit_argv(manifest, directory, sha, verb):
+    """Exact ExecStart argv for the owner (``run``), the watch (``watch``) or a one-shot ``cleanup``.
+
+    One accepted runtime and one protected source for all three; isolated (-I) and no bytecode (-B).
+    """
+    require(verb in ('run', 'watch', 'cleanup'), 'unit verb refused')
+    argv = [RUNTIME_PYTHON, '-I', '-B', '-c', BOOTSTRAP, verb, '--workdir', str(directory),
+            '--owner-unit', owner_unit(manifest)]
+    if verb == 'run':
+        argv += ['--watchdog-unit', watch_unit(manifest)]
+    return argv + ['--manifest-sha256', sha]
 
 
 def build_body(m):
@@ -337,11 +369,6 @@ def proc_start(pid, root='/proc'):
         return None
 
 
-def alive(record, deps):
-    seen = proc_start(record.get('pid'), deps.proc_root) if type(record.get('pid')) is int else None
-    return seen is not None and seen[0] == record.get('start') and seen[1] != 'Z'
-
-
 # ------------------------------------------------------------------------------ Compute -------
 def link_ok(path, value):
     return isinstance(value, str) and spec.resource_link(f'projects/{PROJECT}/{path}', value)
@@ -381,6 +408,11 @@ class CloneCompute:
             raise Uncertain('invalid Compute response') from None
         if not isinstance(data, dict):
             raise Uncertain('invalid Compute response')
+        if gate is not None:
+            try:
+                gate()  # the response itself must also arrive inside the ORIGINAL wall+monotonic budget
+            except Expired:
+                raise Uncertain('deadline passed while the request was in flight') from None
         return data
 
     @staticmethod
@@ -408,7 +440,10 @@ class CloneCompute:
     def operations_for(self, request_id):
         require(UUID_RE.fullmatch(request_id), 'request id refused')
         query = urlencode({'filter': f'clientOperationId = "{request_id}"', 'maxResults': 20})
-        items = self._call('GET', f'{BASE}/projects/{PROJECT}/zones/{ZONE}/operations?{query}').get('items', [])
+        page = self._call('GET', f'{BASE}/projects/{PROJECT}/zones/{ZONE}/operations?{query}')
+        if page.get('nextPageToken'):
+            raise Uncertain('operation list is paginated; completeness unprovable')
+        items = page.get('items', [])
         require(isinstance(items, list) and len(items) <= 20 and all(isinstance(i, dict) for i in items),
                 'operation list refused')
         return items
@@ -429,31 +464,53 @@ class CloneCompute:
         return self._call('DELETE', self._zonal(collection, name, '?' + urlencode({'requestId': request_id})))
 
 
-def check_operation(op, *, kind, collection, name, request_id, target_id=None, done):
-    """Kind, principal, client request ID, target link and ID, and (when terminal) no error."""
+def check_operation(op, *, kind, collection, name, request_id, target_id=None, done, strict=False,
+                    op_name=None, op_id=None):
+    """Kind, principal, client request ID, target link and ID, and (when terminal) no error.
+
+    ``strict`` additionally requires ``compute#operation``, the numeric immutable operation ID and the
+    zone link; ``op_name``/``op_id`` pin one already-learned operation so polling cannot drift to
+    another. An error or httpErrorStatusCode is only legal on a DONE operation.
+    """
     ok = (isinstance(op, dict) and op.get('operationType') == kind and op.get('clientOperationId') == request_id
           and op.get('user') == OWNER and isinstance(op.get('name'), str) and OP_RE.fullmatch(op['name'])
           and link_ok(f'zones/{ZONE}/{collection}/{name}', op.get('targetLink'))
           and (op.get('zone') is None or link_ok(f'zones/{ZONE}', op.get('zone')))
           and op.get('status') in ('PENDING', 'RUNNING', 'DONE')
-          and (target_id is None or op.get('targetId') == target_id))
+          and (target_id is None or op.get('targetId') == target_id)
+          and op.get('kind', 'compute#operation') == 'compute#operation'
+          and (op.get('id') is None or (isinstance(op['id'], str) and DIGITS.fullmatch(op['id'])))
+          and (op_name is None or op.get('name') == op_name) and (op_id is None or op.get('id') == op_id)
+          and (op.get('status') == 'DONE' or not (op.get('error') or op.get('httpErrorStatusCode'))))
+    if ok and strict:
+        ok = (op.get('kind') == 'compute#operation' and isinstance(op.get('id'), str)
+              and link_ok(f'zones/{ZONE}', op.get('zone')))
     if not ok:
         raise Mismatch('operation identity mismatch')
-    if done and (op.get('status') != 'DONE' or op.get('error')):
+    if done and (op.get('status') != 'DONE' or op.get('error') or op.get('httpErrorStatusCode')):
         raise Mismatch('operation not successfully terminal')
     return op
 
 
+def failed_operation(op):
+    """True for a DONE operation that carries an error (a definite, terminal, unsuccessful outcome)."""
+    return bool(op.get('error') or op.get('httpErrorStatusCode'))
+
+
 def wait_operation(cloud, deps, first, check, expired):
+    """Poll ONE operation (same name and numeric ID throughout). ``expired`` gates every answer, even DONE."""
     op = first
+    name, ident = first.get('name'), first.get('id')
     while True:
         check(op, False)
+        if op.get('name') != name or op.get('id') != ident:
+            raise Mismatch('operation identity changed while polling')
+        expired()
         if op.get('status') == 'DONE':
             check(op, True)
             return op
-        expired()
         deps.sleep(2)
-        op = cloud.operation(op['name'])
+        op = cloud.operation(name)
 
 
 def verify_image(image):
@@ -753,19 +810,129 @@ class CloneMaster:
             return False
 
 
+# ------------------------------------------------------------------------------ units ---------
+def parse_unit_show(raw):
+    """``systemctl show -p ...`` text -> exact property dict (duplicates or missing properties refused)."""
+    fields = {}
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            require(key not in fields, 'duplicate unit property')
+            fields[key] = value
+    require(set(UNIT_PROPERTIES) <= set(fields), 'unit properties incomplete')
+    return fields
+
+
+EXEC_RE = re.compile(r'\{ path=(\S+) ; argv\[\]=(.*?) ; ignore_errors=(\S+) ;')
+
+
+class Units:
+    """The exact, manifest-bound owner and watch services.
+
+    ``owner`` (``labapp-clone-run-<12>.service``) runs ``run``; ``watch`` (``labapp-clone-watch-<12>.service``)
+    runs ``watch``. Both use ONLY the accepted runtime and protected source (``unit_argv``). Verification
+    reads typed ``systemctl show`` properties and compares the whole ExecStart path/argv exactly; it never
+    uses substring matching or a self-reported "armed" value. ``quiesce`` is the only way independent
+    disposal may start: stop the bound owner, then prove it inactive with an empty cgroup.
+    """
+    def __init__(self, directory, sha, manifest, deps):
+        self.dir, self.sha, self.m, self.deps = Path(directory), sha, manifest, deps
+        self.owner, self.watch = owner_unit(manifest), watch_unit(manifest)
+
+    def argv(self, role):
+        return unit_argv(self.m, self.dir, self.sha, 'run' if role == 'owner' else 'watch')
+
+    def name(self, role):
+        return self.owner if role == 'owner' else self.watch
+
+    def show(self, role):
+        unit = self.name(role)
+        require(UNIT_RE.fullmatch(unit), 'unit name refused')
+        command = [SYSTEMCTL, 'show', unit]
+        for prop in UNIT_PROPERTIES:
+            command += ['-p', prop]
+        return parse_unit_show(self._systemctl(command, 10))
+
+    def _systemctl(self, command, seconds):
+        try:
+            return self.deps.runner(command, seconds, limit=16384)
+        except Exception:
+            raise Uncertain('systemctl outcome unavailable') from None
+
+    def check(self, props, role):
+        """Exact static configuration: identity, user, working directory, no restart, bounded kill, ExecStart."""
+        expect = {'Id': self.name(role), 'LoadState': 'loaded', 'Type': 'simple', 'User': SERVICE_USER,
+                  'WorkingDirectory': PROTECTED_SOURCE, 'Restart': 'no', 'RemainAfterExit': 'no',
+                  'ExecStartPre': '', 'ExecStartPost': '', 'ExecStop': '', 'ExecStopPost': '', 'ExecReload': ''}
+        if role == 'owner':
+            expect.update({'KillMode': 'mixed', 'SendSIGKILL': 'yes', 'TimeoutStopUSec': OWNER_STOP_TIMEOUT})
+        require(all(props.get(key) == value for key, value in expect.items()), 'unit configuration refused')
+        argv, value = self.argv(role), props['ExecStart']
+        require(value.count('{ path=') == 1 and EXEC_RE.findall(value) == [(argv[0], ' '.join(argv), 'no')],
+                'unit ExecStart is not the exact reviewed argv')
+        return props
+
+    def running(self, role):
+        """Verified, active unit. The owner must be this very process as the unit's MainPID in its cgroup."""
+        props = self.check(self.show(role), role)
+        require(props['ActiveState'] == 'active' and props['SubState'] == 'running', 'unit is not running')
+        if role == 'owner':
+            require(props['MainPID'] == str(os.getpid())
+                    and props['ControlGroup'] == '/system.slice/' + self.owner
+                    and HEX32.fullmatch(props['InvocationID']), 'owner unit is not this process')
+        return props
+
+    def owner_gone(self):
+        try:
+            props = self.check(self.show('owner'), 'owner')
+        except CloneError:
+            return False
+        return props['ActiveState'] in ('inactive', 'failed')
+
+    def procs(self):
+        path = Path(self.deps.cgroup_root, 'system.slice', self.owner, 'cgroup.procs')
+        try:
+            return path.read_text().split()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            raise Uncertain('owner cgroup unreadable') from None
+
+    def quiesce(self):
+        """Stop the BOUND owner unit (mixed kill + bounded final whole-cgroup SIGKILL) and prove it gone.
+
+        Positive proof = verified unit config, ActiveState inactive/failed, SubState dead/failed, MainPID 0,
+        no ControlGroup and an empty (or removed) cgroup.procs. Anything else is Uncertain: no disposal.
+        """
+        props = self.check(self.show('owner'), 'owner')
+        if not (props['ActiveState'] in ('inactive', 'failed') and props['MainPID'] == '0'
+                and not props['ControlGroup']):
+            self._systemctl([SYSTEMCTL, 'stop', self.owner], STOP_RUN_SECONDS)
+        after = self.check(self.show('owner'), 'owner')
+        if not (after['ActiveState'] in ('inactive', 'failed') and after['SubState'] in ('dead', 'failed')
+                and after['MainPID'] == '0' and not after['ControlGroup'] and not self.procs()):
+            raise Uncertain('owner service is not proven inactive with an empty cgroup')
+
+
 # ------------------------------------------------------------------------------ cleanup -------
 class Cleaner:
     """Independent, idempotent disposal of exactly this manifest's resources.
 
-    Used by ``run`` (normal/failure/cancel) AND by the Root watchdog (``cleanup``/``watch``).
-    Reads evidence first and binds actual owned IDs/provenance before any delete. Every delete
-    is a one-shot durable intent plus one request; nothing is replayed. It never claims a
-    canonical FREE.
+    Two modes. In-process (``units is None``, used by ``Run``): the live caller has closed its own
+    ``OwnedGroup`` masters and states so through ``quiet``; it never stops its own owner service.
+    Independent (``units`` given: ``cleanup``/``watch``): the bound owner service is stopped and proven
+    empty FIRST, then an exclusive work lock proves no work holder remains, then a durable ``disposal``
+    marker forbids any later work mutation. Every issued mutation (INSERT/RESET/VM and disk DELETE)
+    must reconcile to an exact terminal operation or a proven not-sent/rejected outcome; elapsed time and
+    404 never settle anything. Every delete is a one-shot durable intent plus one request; nothing is
+    replayed. It never claims a canonical FREE.
     """
-    def __init__(self, store, manifest, deps):
-        self.store, self.m, self.deps = store, manifest, deps
+    def __init__(self, store, manifest, deps, units=None, quiet=None):
+        self.store, self.m, self.deps, self.units = store, manifest, deps, units
         self.cloud = CloneCompute(deps.http, deps.token_provider)
         self.login = SelfLogin.for_owner(SELF_USER, token_provider=deps.token_provider, transport=deps.http)
+        self.quiet = quiet if quiet is not None else (lambda: True)
+        self._quiesced = units is None
         self._depth = 0
         self._fd = None
 
@@ -793,32 +960,23 @@ class Cleaner:
                 os.close(self._fd)
                 self._fd = None
 
-    # --- local files and recorded processes
-    def reap(self, record):
-        pid = record['pid']
-        if not alive(record, self.deps):
-            return True
+    @contextlib.contextmanager
+    def work_exclusive(self):
+        """Exclusive work lock: held shared for the whole life of ``run``, so this proves no active work."""
+        fd = os.open(self.store.dir / 'work.lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
-            if self.deps.getpgid(pid) != pid:
-                return False
-            for number, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-                self.deps.killpg(pid, number)
-                end = self.deps.mono() + wait
-                while self.deps.mono() < end:
-                    if not alive(record, self.deps):
-                        return True
-                    self.deps.sleep(.2)
-        except OSError:
-            return not alive(record, self.deps)
-        return not alive(record, self.deps)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Uncertain('work lock is still held; owner not quiescent') from None
+            yield
+        finally:
+            os.close(fd)
 
+    # --- local files (no process action: closure is proven by OwnedGroup or by the owner cgroup)
     def local(self):
-        clean = True
+        clean = bool(self._quiesced and self.quiet())
         for n in (1, 2):
-            for k in range(1, MASTER_ATTEMPTS + 1):
-                record = self.store.read(f'master-{n}-{k}')
-                if record is not None and not self.reap(record):
-                    clean = False
             directory = self.store.dir / f'b{n}'
             if not os.path.lexists(directory):
                 continue
@@ -833,89 +991,141 @@ class Cleaner:
 
     # --- own OS Login keys
     def remove_key(self, n):
-        """-> 'none' | 'absent' | 'removed' | 'expired' | 'unresolved' for key ``n`` (exact wire only)."""
+        """-> 'none' | 'absent' | 'removed' | 'unresolved' for key ``n`` (exact wire only).
+
+        Closed ONLY when a canonical SELF profile read proves the exact intended wire absent; a TTL expiry
+        with the key still listed is 'unresolved'. One DELETE per key, never repeated; unrelated keys untouched.
+        """
         with self.lock():
             intent = self.store.read(f'a{n}-intent')
             if intent is None:
                 return 'none'
-            wire, expiry = intent['public_key'], int(intent['expiration_usec'])
-            expired = self.deps.wall() * 1_000_000 >= expiry
+            wire = intent['public_key']
             previous = self.store.read(f'a{n}-removed')
+            attempted = self.store.has(f'a{n}-delete')
             try:
                 found = _match(self.login.profile(), wire)
                 if found is None:
                     if previous is None:
                         self.store.create(f'a{n}-removed', {'outcome': 'absent'})
-                    return 'removed' if previous is None and self.store.has(f'a{n}-delete') else 'absent'
-                if self.store.has(f'a{n}-delete'):
-                    return 'expired' if expired else 'unresolved'   # one-shot: never a second DELETE
+                        return 'removed' if attempted else 'absent'
+                    return 'absent'
+                if attempted:
+                    return 'unresolved'   # one-shot: never a second DELETE
                 self.store.create(f'a{n}-delete', {'fingerprint': found['fingerprint'], 'name': found['name']})
                 with contextlib.suppress(AccessError):
                     self.login._delete_exact(found)
                 if _match(self.login.profile(), wire) is None:
                     self.store.try_create(f'a{n}-removed', {'outcome': 'removed'})
                     return 'removed'
-                return 'expired' if expired else 'unresolved'
+                return 'unresolved'
             except (AccessError, CloneError, OSError):
                 return 'unresolved'
 
-    # --- VM and boot disk
-    def settled(self):
-        intent, outcome = self.store.read('insert-intent'), self.store.read('insert-outcome')
-        if outcome is not None and outcome['state'] in ('not-sent', 'rejected'):
-            return True
-        op = self.store.read('insert-op')
-        if op is not None:
-            return self.cloud.operation(op['name']).get('status') == 'DONE'
-        ops = self.cloud.operations_for(self.m['request_id'])
-        if ops:
-            return all(o.get('status') == 'DONE' for o in ops)
-        return self.deps.wall() >= stamp(intent['at']) + SETTLE_SECONDS
+    # --- operations: exact identity, terminal outcome, no time-based settlement
+    def _find_op(self, recorded, **identity):
+        """The ONE operation issued for ``identity['request_id']`` (or None when none is listed)."""
+        if recorded is not None:
+            require(isinstance(recorded, dict) and isinstance(recorded.get('name'), str)
+                    and OP_RE.fullmatch(recorded['name']) and isinstance(recorded.get('id'), str)
+                    and DIGITS.fullmatch(recorded['id']), 'operation record refused')
+            op = self.cloud.operation(recorded['name'])
+            return check_operation(op, done=False, strict=True, op_name=recorded['name'], op_id=recorded['id'],
+                                   **identity)
+        ops = self.cloud.operations_for(identity['request_id'])
+        if not ops:
+            return None
+        if len(ops) != 1:
+            raise Mismatch('ambiguous operations for one request')
+        return check_operation(ops[0], done=False, strict=True, **identity)
 
+    def _terminal(self, first, **identity):
+        """Poll the SAME operation (name and numeric ID) to DONE -> 'ok' | 'failed'; else Uncertain."""
+        end = self.deps.mono() + CLEANUP_POLL_SECONDS
+        name, ident, op = first['name'], first['id'], first
+        while True:
+            check_operation(op, done=False, strict=True, op_name=name, op_id=ident, **identity)
+            if op['status'] == 'DONE':
+                return 'failed' if failed_operation(op) else 'ok'
+            if self.deps.mono() >= end:
+                raise Uncertain('operation not terminal in the cleanup budget')
+            self.deps.sleep(2)
+            op = self.cloud.operation(name)
+
+    def _settle_op(self, recorded, **identity):
+        op = self._find_op(recorded, **identity)
+        if op is None:
+            raise Unreconciled('issued mutation has no exact operation; submission cannot be ruled out')
+        return self._terminal(op, **identity)
+
+    @staticmethod
+    def _definite(outcome):
+        return outcome is not None and outcome.get('state') in ('not-sent', 'rejected')
+
+    def _known_ids(self):
+        return self.store.read('ids') or self.store.read('bound') or {}
+
+    def settled_insert(self):
+        m, store = self.m, self.store
+        if not self._definite(store.read('insert-outcome')):
+            self._settle_op(store.read('insert-op'), kind='insert', collection='instances', name=m['name'],
+                            request_id=m['request_id'], target_id=self._known_ids().get('vm_id'))
+        return True
+
+    def settled_reset(self):
+        reset, store = self.store.read('reset-intent'), self.store
+        if reset is not None and not self._definite(store.read('reset-outcome')):
+            self._settle_op(store.read('reset-op'), kind='reset', collection='instances', name=self.m['name'],
+                            request_id=reset['request_id'], target_id=reset['vm_id'])
+        return True
+
+    def settled(self):
+        """True only when every issued INSERT/RESET is proven not-sent/rejected or exactly terminal."""
+        return self.settled_insert() and self.settled_reset()
+
+    # --- VM and boot disk
     def _owned_vm(self, vm):
         labels = vm.get('labels') or {}
-        ids, deleting = self.store.read('ids'), self.store.read('vm-delete-intent')
+        known, deleting = self._known_ids(), self.store.read('vm-delete-intent')
         disks = vm.get('disks')
         return (vm.get('name') == self.m['name'] and labels.get(LABEL_UUID) == self.m['uuid']
                 and labels.get(LABEL_OWNER) == OWNER_VALUE and isinstance(vm.get('id'), str)
-                and DIGITS.fullmatch(vm['id']) and (ids is None or ids['vm_id'] == vm['id'])
-                and (deleting is None or deleting['vm_id'] == vm['id'])
+                and DIGITS.fullmatch(vm['id']) and known.get('vm_id') in (None, vm['id'])
+                and (deleting is None or deleting.get('resource_id') == vm['id'])
                 and isinstance(disks, list) and len(disks) == 1
                 and link_ok(f'zones/{ZONE}/disks/{self.m["name"]}', disks[0].get('source')))
 
-    def _await(self, first, **identity):
-        end = self.deps.mono() + CLEANUP_POLL_SECONDS
-
-        def expired():
-            if self.deps.mono() >= end:
-                raise Uncertain('operation not terminal in the cleanup budget')
-        return wait_operation(self.cloud, self.deps, first,
-                              lambda op, done: check_operation(op, done=done, **identity), expired)
+    def _settle_delete(self, collection, kind_prefix):
+        """Reconcile an ALREADY ISSUED delete (also when the resource is already 404). Never re-sends."""
+        previous = self.store.read(f'{kind_prefix}-delete-intent')
+        require(previous is not None, 'no delete intent to reconcile')
+        if self._definite(self.store.read(f'{kind_prefix}-delete-outcome')):
+            return 'rejected'
+        require(isinstance(previous.get('resource_id'), str) and DIGITS.fullmatch(previous['resource_id'])
+                and UUID_RE.fullmatch(str(previous.get('request_id'))), 'delete intent refused')
+        return self._settle_op(self.store.read(f'{kind_prefix}-delete-op'), kind='delete', collection=collection,
+                               name=self.m['name'], request_id=previous['request_id'],
+                               target_id=previous['resource_id'])
 
     def _delete(self, collection, kind_prefix, resource_id):
         """One-shot delete: durable intent, one request, terminal checked operation. Never replayed."""
-        name, intent_kind, op_kind = self.m['name'], f'{kind_prefix}-delete-intent', f'{kind_prefix}-delete-op'
+        name, intent_kind = self.m['name'], f'{kind_prefix}-delete-intent'
         previous = self.store.read(intent_kind)
         if previous is not None:
-            require(previous['resource_id'] == resource_id, 'delete intent binds a different resource')
-            recorded = self.store.read(op_kind)
-            if recorded is None:
-                ops = self.cloud.operations_for(previous['request_id'])
-                require(len(ops) == 1, 'earlier delete operation unknown; no replay')
-                first = ops[0]
-            else:
-                first = self.cloud.operation(recorded['name'])
-        else:
-            request = str(uuid.uuid4())
-            self.store.create(intent_kind, {'request_id': request, 'resource_id': resource_id,
-                                            'at': iso(self.deps.wall())})
-            previous = {'request_id': request}
+            require(previous.get('resource_id') == resource_id, 'delete intent binds a different resource')
+            return self._settle_delete(collection, kind_prefix)
+        request = str(uuid.uuid4())
+        self.store.create(intent_kind, {'request_id': request, 'resource_id': resource_id,
+                                        'at': iso(self.deps.wall())})
+        identity = dict(kind='delete', collection=collection, name=name, request_id=request, target_id=resource_id)
+        try:
             first = self.cloud.delete(collection, name, request)
-            check_operation(first, kind='delete', collection=collection, name=name, request_id=request,
-                            target_id=resource_id, done=False)
-            self.store.create(op_kind, {'name': first['name']})
-        self._await(first, kind='delete', collection=collection, name=name,
-                    request_id=previous['request_id'], target_id=resource_id)
+        except (NotFound, Rejected):
+            self.store.try_create(f'{kind_prefix}-delete-outcome', {'state': 'rejected'})
+            raise
+        check_operation(first, done=False, strict=True, **identity)
+        self.store.create(f'{kind_prefix}-delete-op', {'name': first['name'], 'id': first['id']})
+        return self._terminal(first, **identity)
 
     def _absent(self, call):
         try:
@@ -930,6 +1140,14 @@ class Cleaner:
         if not store.has('insert-intent'):
             return 'never', 'never'
         try:
+            self.settled_insert()
+        except (CloneError, KeyError, ValueError):
+            return 'unresolved:insert-unsettled', 'unresolved:not-attempted'
+        try:
+            self.settled_reset()
+        except (CloneError, KeyError, ValueError):
+            return 'unresolved:reset-unsettled', 'unresolved:not-attempted'
+        try:
             vm = self.cloud.instance(name)
         except NotFound:
             vm = None
@@ -941,7 +1159,7 @@ class Cleaner:
                 return 'unresolved:vm-ownership-mismatch', 'unresolved:not-attempted'
             try:
                 disk = self.cloud.disk(name)
-                disk_id = verify_disk(disk, self.m, (store.read('ids') or {}).get('boot_id'), ready=False)
+                disk_id = verify_disk(disk, self.m, self._known_ids().get('boot_id'), ready=False)
             except (CloneError, KeyError):
                 return 'unresolved:disk-provenance', 'unresolved:not-attempted'
             if not store.has('ids'):
@@ -953,21 +1171,25 @@ class Cleaner:
             except (CloneError, KeyError, ValueError):
                 return 'unresolved:vm-delete', 'unresolved:not-attempted'
             vm_state = 'deleted'
-        else:
+        elif store.has('vm-delete-intent'):
             try:
-                if not self.settled():
-                    return 'unresolved:insert-unsettled', 'unresolved:not-attempted'
+                vm_state = 'absent' if self._settle_delete('instances', 'vm') == 'rejected' else 'deleted'
             except (CloneError, KeyError, ValueError):
-                return 'unresolved:insert-unsettled', 'unresolved:not-attempted'
+                return 'unresolved:vm-delete', 'unresolved:not-attempted'
         try:
             disk = self.cloud.disk(name)
         except NotFound:
+            if store.has('disk-delete-intent'):
+                try:
+                    self._settle_delete('disks', 'disk')
+                except (CloneError, KeyError, ValueError):
+                    return vm_state, 'unresolved:disk-delete'
+                return vm_state, 'deleted'
             return vm_state, 'absent'
         except CloneError:
             return vm_state, 'unresolved:disk-read'
         try:
-            known = store.read('ids') or store.read('bound') or {}
-            disk_id = verify_disk(disk, self.m, known.get('boot_id'), ready=False)
+            disk_id = verify_disk(disk, self.m, self._known_ids().get('boot_id'), ready=False)
             self._delete('disks', 'disk', disk_id)
             if not self._absent(self.cloud.disk):
                 return vm_state, 'unresolved:disk-still-present'
@@ -977,14 +1199,23 @@ class Cleaner:
 
     def run(self):
         result = {'local': False, 'keys': {}, 'vm': 'unresolved:not-run', 'disk': 'unresolved:not-run',
-                  'closed': False}
+                  'quiesced': 'in-process' if self.units is None else False, 'closed': False}
         try:
-            with self.lock():
+            if self.units is not None:
+                self._quiesced = False
+                self.units.quiesce()      # stop the bound owner and prove it empty BEFORE any disposal
+                self._quiesced = True
+                result['quiesced'] = True
+            with contextlib.ExitStack() as stack:
+                if self.units is not None:
+                    stack.enter_context(self.work_exclusive())   # no active work can coexist
+                stack.enter_context(self.lock())
+                self.store.try_create('disposal', {'at': iso(self.deps.wall())})   # no work mutation may start
                 result['local'] = self.local()
                 result['keys'] = {str(n): self.remove_key(n) for n in (1, 2)}
                 result['vm'], result['disk'] = self.dispose()
                 result['local'] = self.local() and result['local']
-                good = ('none', 'absent', 'removed', 'expired')
+                good = ('none', 'absent', 'removed')
                 result['closed'] = (result['local'] and all(v in good for v in result['keys'].values())
                                     and result['vm'] in ('never', 'absent', 'deleted')
                                     and result['disk'] in ('never', 'absent', 'deleted'))
@@ -1002,28 +1233,59 @@ class Run:
         self.store = Store(directory)
         self.budget = Budget(manifest, deps)
         self.cloud = CloneCompute(deps.http, deps.token_provider)
-        self.cleaner = Cleaner(self.store, manifest, deps)
+        self.units = Units(directory, sha, manifest, deps)
+        self.unclosed = []     # masters whose OwnedGroup closure was not proven
+        self.cleaner = Cleaner(self.store, manifest, deps, quiet=lambda: not self.unclosed)
         self.phase = 'start'
         self.ids = None
         self.boots = {}
+        self.active_window = None
+        self.work_fd = None
 
         def gated_token():
             token = deps.token_provider()
-            self.budget.work()  # after token acquisition, before any SELF request
+            self.gate()  # after token acquisition, before any SELF request
+            if self.active_window is not None:
+                self.active_window.remaining()
             return token
         self.login = SelfLogin.for_owner(SELF_USER, token_provider=gated_token, transport=deps.http)
 
     # --- guards
+    def gate(self):
+        """Original wall+monotonic work budget, and no work once disposal has begun."""
+        if self.store.has('disposal'):
+            raise Expired('disposal has begun')
+        return self.budget.work()
+
+    def late(self):
+        """Gate for an answer that arrived AFTER a possible submission: expiry is Uncertain, never NotSent."""
+        try:
+            self.gate()
+        except Expired:
+            raise Uncertain('deadline passed after a possible submission') from None
+
+    def hold_work_lock(self):
+        """Shared work lock for the whole life of ``run``; independent disposal needs it exclusively."""
+        fd = os.open(self.dir / 'work.lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise Refused('work lock unavailable; disposal may be running') from None
+        self.work_fd = fd
+        require(not self.store.has('disposal'), 'disposal already begun')
+
+    def release_work_lock(self):
+        if self.work_fd is not None:
+            os.close(self.work_fd)
+            self.work_fd = None
+
     def verify_watchdog(self):
+        """Exact owner (this process, MainPID, cgroup) and watch service; typed properties, exact argv."""
         require(self.unit == watch_unit(self.m), 'watchdog unit is not bound to this manifest')
-        raw = self.deps.runner(['/usr/bin/systemctl', 'show', self.unit, '-p', 'LoadState', '-p', 'ActiveState',
-                                '-p', 'ExecStart'], 10, limit=4096).decode('utf-8', 'replace')
-        fields = dict(line.split('=', 1) for line in raw.splitlines() if '=' in line)
-        exec_start = fields.get('ExecStart', '')
-        need = [' watch ', '--workdir ' + str(self.dir), '--manifest-sha256 ' + self.sha,
-                'build.gcp.private_clone']
-        require(fields.get('LoadState') == 'loaded' and fields.get('ActiveState') == 'active'
-                and all(token in exec_start for token in need), 'independent cleanup watchdog is not armed')
+        owner = self.units.running('owner')
+        self.units.running('watch')
+        return owner
 
     def identity(self):
         vm = self.cloud.instance(self.m['name'])
@@ -1054,11 +1316,11 @@ class Run:
         m, store = self.m, self.store
         body = build_body(m)
         self.verify_watchdog()
-        self.budget.work()
+        self.gate()
         store.create('insert-intent', {'request_id': m['request_id'], 'body': body, 'body_sha256': digest(body),
                                        'at': iso(self.deps.wall())})
         try:
-            op = self.cloud.insert(m, body, m['request_id'], self.budget.work)
+            op = self.cloud.insert(m, body, m['request_id'], self.gate)
         except NotSent:
             store.try_create('insert-outcome', {'state': 'not-sent'})
             raise
@@ -1069,43 +1331,63 @@ class Run:
             store.try_create('insert-outcome', {'state': 'uncertain'})
             raise
         store.create('insert-outcome', {'state': 'accepted'})
-        identity = dict(kind='insert', collection='instances', name=m['name'], request_id=m['request_id'])
+        identity = dict(kind='insert', collection='instances', name=m['name'], request_id=m['request_id'],
+                        strict=True)
         check_operation(op, done=False, **identity)
-        store.create('insert-op', {'name': op['name']})
+        store.create('insert-op', {'name': op['name'], 'id': op['id']})
         done = wait_operation(self.cloud, self.deps, op, lambda o, d: check_operation(o, done=d, **identity),
-                              self.budget.work)
+                              self.late)
         target = done.get('targetId')
         require(isinstance(target, str) and DIGITS.fullmatch(target), 'insert target ID missing')
         verify_vm(self.cloud.instance(m['name']), m, target)
         boot_id = verify_disk(self.cloud.disk(m['name']), m)
+        self.late()
         self.ids = {'vm_id': target, 'boot_id': boot_id}
         store.create('ids', self.ids)
 
     # --- access
     def import_key(self, n, wire):
         m, store, login = self.m, self.store, self.login
-        profile = login.profile()
-        require(_match(profile, wire) is None, 'intended key preexists; cannot import or adopt')
-        posix = _identity(profile)
-        now = self.deps.now().replace(microsecond=0)
+        # Both original ends of the per-access window are anchored BEFORE intent/import, never after the response.
+        w0, m0 = self.deps.wall(), self.deps.mono()
+        now = datetime.fromtimestamp(int(w0), timezone.utc)
         work_end = datetime.fromtimestamp(self.budget.work_end, timezone.utc)
         end = min(datetime.fromtimestamp(now.timestamp() + KEY_SECONDS, timezone.utc), work_end)
-        if (end - now).total_seconds() < MIN_ACCESS_SECONDS:
-            raise Expired('insufficient time for an access window')
-        expiry = str(int(end.timestamp() * 1_000_000))
-        baseline = digest(sorted(_wire(k['key']) for k in profile.get('sshPublicKeys', {}).values()))
-        store.create(f'a{n}-intent', {'n': n, 'public_key': wire, 'expiration_usec': expiry, 'posix': posix,
-                                      'baseline_sha256': baseline, 'created_at': spec.rfc3339(now)})
-        profile, response = login._import_once(wire, expiry, now=self.deps.now, work_deadline=work_end)
-        entry = _match(profile, wire)
-        require(entry is not None and entry.get('expirationTimeUsec') == expiry, 'import response mismatch')
-        entry = login._confirm_import(entry, wire, expiry)
-        after = self.deps.now()
-        self.budget.work()
-        require(after < end, 'access expired during import')
-        store.create(f'a{n}-import', {'server_name': entry['name'], 'fingerprint': entry['fingerprint'],
-                                      'expiration_usec': expiry, 'response_sha256': response})
-        return posix['username'], Window(self.deps, self.budget, end.timestamp())
+        window = Window(self.deps, self.budget, end.timestamp(), min(m0 + KEY_SECONDS, self.budget.mono_end))
+        self.active_window = window   # bounds every token/SELF request below, including confirmation
+        try:
+            profile = login.profile()
+            require(_match(profile, wire) is None, 'intended key preexists; cannot import or adopt')
+            posix = _identity(profile)
+            if window.remaining() < MIN_ACCESS_SECONDS:
+                raise Expired('insufficient time for an access window')
+            expiry = str(int(end.timestamp() * 1_000_000))
+            baseline = digest(sorted(_wire(k['key']) for k in profile.get('sshPublicKeys', {}).values()))
+            store.create(f'a{n}-intent', {'n': n, 'public_key': wire, 'expiration_usec': expiry, 'posix': posix,
+                                          'baseline_sha256': baseline, 'created_at': spec.rfc3339(now)})
+
+            def import_clock():
+                window.remaining()   # both original clocks, after the token, immediately before submission
+                self.gate()
+                return self.deps.now()
+            profile, response = login._import_once(wire, expiry, now=import_clock, work_deadline=work_end)
+            self._within(window)
+            entry = _match(profile, wire)
+            require(entry is not None and entry.get('expirationTimeUsec') == expiry, 'import response mismatch')
+            entry = login._confirm_import(entry, wire, expiry)
+            self._within(window)
+            store.create(f'a{n}-import', {'server_name': entry['name'], 'fingerprint': entry['fingerprint'],
+                                          'expiration_usec': expiry, 'response_sha256': response})
+        finally:
+            self.active_window = None
+        return posix['username'], window
+
+    def _within(self, window):
+        try:
+            window.remaining()
+            self.gate()
+        except Expired:
+            raise Refused('access expired during import') from None
 
     def generate_key(self, directory):
         os.mkdir(directory, 0o700)
@@ -1143,6 +1425,7 @@ class Run:
                 return master
             except Exception:
                 if not master.close():
+                    self.unclosed.append(master)
                     raise Uncertain('master process cleanup uncertain') from None
                 if k == MASTER_ATTEMPTS:
                     raise
@@ -1183,30 +1466,36 @@ class Run:
             closed = master.close()
             if closed:
                 self.cleaner.local()
+            else:
+                self.unclosed.append(master)
         require(closed, 'master process cleanup uncertain')
         require(self.cleaner.local(), 'local secret files remain')
-        state = self.cleaner.remove_key(n)
+        state = self.cleaner.remove_key(n)   # closed only by a canonical SELF read proving the exact wire absent
         require(state in ('absent', 'removed'), 'own key removal not proven before continuing')
         return record
 
     def reset_vm(self):
         self.phase = 'reset'
         m, store = self.m, self.store
-        require(self.budget.work() >= RESET_MIN_SECONDS, 'insufficient time for a second boot')
+        require(self.gate() >= RESET_MIN_SECONDS, 'insufficient time for a second boot')
         self.identity()
         request = str(uuid.uuid4())
         store.create('reset-intent', {'request_id': request, 'vm_id': self.ids['vm_id'],
                                       'boot_id': self.ids['boot_id'], 'at': iso(self.deps.wall())})
         try:
-            op = self.cloud.reset(m['name'], request, self.budget.work)
+            op = self.cloud.reset(m['name'], request, self.gate)
         except CloneError as error:
-            store.try_create('reset-outcome', {'state': 'not-sent' if isinstance(error, NotSent) else 'uncertain'})
+            state = 'not-sent' if isinstance(error, NotSent) else 'rejected' if isinstance(error, Rejected) \
+                else 'uncertain'
+            store.try_create('reset-outcome', {'state': state})
             raise
         store.create('reset-outcome', {'state': 'accepted'})
         identity = dict(kind='reset', collection='instances', name=m['name'], request_id=request,
-                        target_id=self.ids['vm_id'])
+                        target_id=self.ids['vm_id'], strict=True)
+        check_operation(op, done=False, **identity)
+        store.create('reset-op', {'name': op['name'], 'id': op['id']})
         wait_operation(self.cloud, self.deps, op, lambda o, d: check_operation(o, done=d, **identity),
-                       self.budget.work)
+                       self.late)
         self.identity()
 
     def execute(self):
@@ -1214,17 +1503,23 @@ class Run:
         passed, code, failure = False, 1, None
         result = {'status': 'failed', 'name': self.m['name']}
         try:
-            self.store.create('run', {'pid': os.getpid(), 'start': (proc_start(os.getpid(), self.deps.proc_root)
-                                                                   or (None,))[0], 'unit': self.unit})
+            self.hold_work_lock()
             require(0 <= self.deps.wall() - stamp(self.m['admitted_at']) <= LAUNCH_WINDOW_SECONDS,
                     'arm is stale; launch window over')
-            self.verify_watchdog()
+            owner = self.verify_watchdog()
+            # Evidence only; independent disposal never signals a PID. The owner service cgroup is the bound.
+            self.store.create('run', {'pid': os.getpid(), 'start': (proc_start(os.getpid(), self.deps.proc_root)
+                                                                   or (None,))[0],
+                                      'owner_unit': self.units.owner, 'watch_unit': self.unit,
+                                      'control_group': owner['ControlGroup'],
+                                      'invocation_id': owner['InvocationID']})
             self.preflight()
             self.create_vm()
             first = self.boot_phase(1)
             self.reset_vm()
             second = self.boot_phase(2, first)
             compare_boots(first, second)
+            self.late()
             self.store.create('result', {'first': first, 'second': second})
             result.update(boots=[first, second])
             passed = True
@@ -1239,7 +1534,10 @@ class Run:
             self.deps.shield()
         except Exception:
             pass
-        cleanup = self.cleaner.run()
+        try:
+            cleanup = self.cleaner.run()   # in-process: this caller's OwnedGroups are already closed (or flagged)
+        finally:
+            self.release_work_lock()
         result['cleanup'] = cleanup
         if passed and cleanup['closed']:
             result['status'] = 'passed'
@@ -1248,17 +1546,21 @@ class Run:
 
 
 def watch(directory, sha, deps, *, passes=6, pause=60):
-    """Independent watchdog loop: cleanup at the work deadline or as soon as the run process is gone."""
+    """Independent watchdog loop: at the work deadline (wall or monotonic), or once the bound owner service
+    is inactive after having recorded a run, stop the bound owner, prove it empty, then dispose."""
     manifest = load_manifest(directory, sha)
     store, end = Store(directory), stamp(manifest['work_deadline'])
+    units = Units(directory, sha, manifest, deps)
+    w0, m0 = deps.wall(), deps.mono()
     while True:
         if store.has('closed'):
             return 0
-        record = store.read('run')
-        if deps.wall() >= end or (record is not None and not alive(record, deps)):
+        if deps.wall() >= end or deps.mono() - m0 >= end - w0:
+            break
+        if store.has('run') and units.owner_gone():
             break
         deps.sleep(5)
-    cleaner = Cleaner(store, manifest, deps)
+    cleaner = Cleaner(store, manifest, deps, units=units)
     for attempt in range(passes):
         if cleaner.run()['closed']:
             return 0
@@ -1272,11 +1574,17 @@ def arm(directory, deps):
     path = private_directory(directory, empty=True)
     manifest = new_manifest(deps)
     raw = Store(path).create('manifest', manifest)
-    fd = os.open(path / 'cleanup.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.close(fd)
+    for lock in ('cleanup.lock', 'work.lock'):
+        fd = os.open(path / lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
     sha = hashlib.sha256(raw).hexdigest()
     return {'manifest_sha256': sha, 'name': manifest['name'], 'watchdog_unit': watch_unit(manifest),
-            'watchdog_exec_start': cleanup_argv(path, sha), 'cleanup_exec': cleanup_argv(path, sha, 'cleanup'),
+            'owner_unit': owner_unit(manifest),
+            'owner_exec_start': unit_argv(manifest, path, sha, 'run'),
+            'watchdog_exec_start': unit_argv(manifest, path, sha, 'watch'),
+            'cleanup_exec': unit_argv(manifest, path, sha, 'cleanup'),
+            'runtime': {'python': RUNTIME_PYTHON, 'source': PROTECTED_SOURCE, 'user': SERVICE_USER,
+                        'owner_kill_mode': 'mixed', 'owner_timeout_stop': OWNER_STOP_TIMEOUT},
             'admitted_at': manifest['admitted_at'], 'work_deadline': manifest['work_deadline'],
             'termination': manifest['termination']}
 
@@ -1294,6 +1602,7 @@ def main(argv=None, deps=None):
         item.add_argument('--workdir', required=True)
         if name != 'arm':
             item.add_argument('--manifest-sha256', required=True)
+            item.add_argument('--owner-unit', required=True)
         if name == 'run':
             item.add_argument('--watchdog-unit', required=True)
     args = parser.parse_args(argv)
@@ -1304,15 +1613,17 @@ def main(argv=None, deps=None):
             print(json.dumps(arm(args.workdir, deps), sort_keys=True))
             return 0
         directory = private_directory(args.workdir)
+        manifest = load_manifest(directory, args.manifest_sha256)
+        require(args.owner_unit == owner_unit(manifest), 'owner unit is not bound to this manifest')
         if args.action == 'watch':
             return watch(directory, args.manifest_sha256, deps)
-        manifest = load_manifest(directory, args.manifest_sha256)
         if args.action == 'cleanup':
-            result = Cleaner(Store(directory), manifest, deps).run()
+            units = Units(directory, args.manifest_sha256, manifest, deps)
+            result = Cleaner(Store(directory), manifest, deps, units=units).run()
             print(json.dumps(result, sort_keys=True))
             return 0 if result['closed'] else 1
         # A fresh attempt only: any earlier record means recovery (cleanup), never a second run.
-        require(set(os.listdir(directory)) <= {'manifest.json', 'cleanup.lock'}, 'workdir is not fresh')
+        require(set(os.listdir(directory)) <= {'manifest.json', 'cleanup.lock', 'work.lock'}, 'workdir is not fresh')
         for number in (signal.SIGTERM, signal.SIGINT):
             signal.signal(number, host.interrupted)
         deps.shield = _ignore_signals

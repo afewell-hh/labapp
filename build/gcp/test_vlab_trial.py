@@ -4285,13 +4285,67 @@ class CloneWorld:
         self.mode = 'off'
         self.mutate_summary = self.on_token = self.on_hostkey = self.after_import = self.cancel_on = None
         self.close_ok, self.stop_fails, self.master_fails = True, False, False
+        # independent wall / monotonic offsets (a wall rollback or mono-only delay moves only one clock)
+        self.wall_offset = self.mono_offset = 0.0
+        self.cgroups = tempfile.mkdtemp(prefix='cg', dir='/tmp')
+        self.manifest = self.owner = self.watch = None
+        self.owner_state = self.watch_state = None
+        self.unit_override, self.stop_ineffective, self.after_stop = {}, False, None
+        self.pin_status = self.op_hook = self.next_page = None
+        self.after_mutation, self.timeline = {}, []
 
     # clock
     def wall(self):
-        return self.t
+        return self.t + self.wall_offset
 
     def mono(self):
-        return self.t - 1_800_000_000.0
+        return self.t - 1_800_000_000.0 + self.mono_offset
+
+    # systemd (typed property fake for the exact owner and watch services)
+    RUNNING_FIELDS = {'ActiveState': 'active', 'SubState': 'running'}
+    INACTIVE_FIELDS = {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0', 'ControlGroup': ''}
+
+    def bind_units(self, manifest):
+        self.manifest, self.owner, self.watch = manifest, clone.owner_unit(manifest), clone.watch_unit(manifest)
+        self.owner_state = dict(self.RUNNING_FIELDS, MainPID=str(os.getpid()),
+                                ControlGroup='/system.slice/' + self.owner)
+        self.watch_state = dict(self.RUNNING_FIELDS, MainPID='4321', ControlGroup='/system.slice/' + self.watch)
+
+    def exec_line(self, argv, path=None):
+        return ('{ path=' + (path or argv[0]) + ' ; argv[]=' + ' '.join(argv) +
+                ' ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+
+    def unit_props(self, unit):
+        role = 'owner' if unit == self.owner else 'watch'
+        argv = clone.unit_argv(self.manifest, self.tmp, self.sha, 'run' if role == 'owner' else 'watch')
+        props = {'Id': unit, 'LoadState': 'loaded', 'Type': 'simple', 'User': 'ubuntu',
+                 'WorkingDirectory': clone.PROTECTED_SOURCE, 'Restart': 'no', 'RemainAfterExit': 'no',
+                 'KillMode': 'mixed' if role == 'owner' else 'control-group', 'SendSIGKILL': 'yes',
+                 'TimeoutStopUSec': '30s' if role == 'owner' else '1min 30s', 'InvocationID': 'a' * 32,
+                 'ExecStartPre': '', 'ExecStartPost': '', 'ExecStop': '', 'ExecStopPost': '', 'ExecReload': '',
+                 'ExecStart': self.exec_line(argv)}
+        props.update(self.owner_state if role == 'owner' else self.watch_state)
+        props.update(self.unit_override.get(role, {}))
+        return props
+
+    def cgroup_procs(self, pids):
+        path = Path(self.cgroups, 'system.slice', self.owner)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'cgroup.procs').write_text(''.join(f'{p}\n' for p in pids))
+
+    def systemctl(self, argv):
+        if argv[1] == 'stop':
+            assert argv[2] == self.owner, argv
+            self.events.append('systemctl-stop')
+            self.timeline.append('systemctl-stop')
+            if not self.stop_ineffective:
+                self.owner_state = dict(self.INACTIVE_FIELDS)
+            if self.after_stop:
+                self.after_stop()
+            return b''
+        assert argv[1] == 'show' and argv[2] in (self.owner, self.watch), argv
+        props = self.unit_props(argv[2])
+        return ''.join(f'{argv[i + 1]}={props[argv[i + 1]]}\n' for i, a in enumerate(argv) if a == '-p').encode()
 
     def sleep(self, seconds):
         self.t += seconds
@@ -4307,6 +4361,7 @@ class CloneWorld:
 
     def mutate(self, kind, apply):
         self.mutations.append(kind)
+        self.timeline.append(kind)
         mode = None
         if kind in self.failing:
             skip, mode = self.failing[kind]
@@ -4319,6 +4374,8 @@ class CloneWorld:
         if isinstance(mode, int):
             return mode, {}
         value = apply()
+        if kind in self.after_mutation:
+            self.after_mutation[kind]()
         if mode == 'lost':
             raise TransportError('synthetic')
         return 200, value
@@ -4394,19 +4451,31 @@ class CloneWorld:
         assert kind == 'operations', path
         if not tail:
             wanted = query['filter'][0]
-            items = [dict(o, status='DONE') for o in self.ops.values() if o['clientOperationId'] in wanted]
-            for o in self.ops.values():
-                o['status'] = 'DONE'
-            return 200, ({'items': items} if items else {})
+            items = [dict(o, status=self.pin_status or 'DONE') for o in self.ops.values()
+                     if o['clientOperationId'] in wanted]
+            if not self.pin_status:
+                for o in self.ops.values():
+                    o['status'] = 'DONE'
+            page = {'items': items} if items else {}
+            if self.next_page:
+                page['nextPageToken'] = 'more'
+            return 200, page
         op = self.ops.get(tail[0])
         if op is None:
             return 404, {}
-        snapshot, op['status'] = dict(op), 'DONE'
+        snapshot = dict(op)
+        if self.pin_status:
+            snapshot['status'] = self.pin_status
+        else:
+            op['status'] = 'DONE'
+        if self.op_hook:
+            snapshot = self.op_hook(snapshot)
         return 200, snapshot
 
     def op(self, kind, collection, name, target_id, request):
         self.n += 1
-        op = {'name': f'op-{self.n}', 'id': str(9000 + self.n), 'operationType': kind, 'clientOperationId': request,
+        op = {'name': f'op-{self.n}', 'id': str(9000 + self.n), 'kind': 'compute#operation',
+              'operationType': kind, 'clientOperationId': request,
               'user': clone.OWNER, 'targetLink': CLONE_P + f'zones/{clone.ZONE}/{collection}/{name}',
               'targetId': target_id, 'status': 'RUNNING', 'zone': CLONE_P + 'zones/' + clone.ZONE}
         self.ops[op['name']] = op
@@ -4517,9 +4586,8 @@ class CloneWorld:
             return json.dumps([{'namespace': 'hostkeys', 'key': 'ssh-ed25519', 'value': value}]).encode()
         assert argv[0] == '/usr/bin/systemctl', argv
         if not self.watchdog:
-            return b'LoadState=loaded\nActiveState=inactive\nExecStart=\n'
-        line = ' '.join(clone.cleanup_argv(self.tmp, self.sha))
-        return ('LoadState=loaded\nActiveState=active\nExecStart={ path=/usr/bin/python3 ; argv[]=' + line + ' ; }\n').encode()
+            self.watch_state = dict(self.INACTIVE_FIELDS)
+        return self.systemctl(argv)
 
 
 class CloneFakeMaster:
@@ -4555,20 +4623,31 @@ class CloneCase(unittest.TestCase):
         self.world = CloneWorld()
         self.addCleanup(shutil.rmtree, self.world.tmp, True)
         self.addCleanup(shutil.rmtree, self.world.proc, True)
+        self.addCleanup(shutil.rmtree, self.world.cgroups, True)
         world = self.world
         self.deps = clone.Deps(world, world.token, world.runner, wall=world.wall, mono=world.mono, sleep=world.sleep,
                                master_factory=lambda *a, **k: CloneFakeMaster(world, *a, **k),
-                               proc_root=world.proc, env={})
+                               proc_root=world.proc, cgroup_root=world.cgroups, env={})
         info = clone.arm(world.tmp, self.deps)
+        self.info = info
         self.sha, self.unit, world.sha = info['manifest_sha256'], info['watchdog_unit'], info['manifest_sha256']
         self.manifest = clone.load_manifest(world.tmp, self.sha)
+        world.bind_units(self.manifest)
         self.store = clone.Store(world.tmp)
 
     def fresh_world(self):
         """Re-arm a new world/workdir between sub-cases."""
         shutil.rmtree(self.world.tmp, True)
         shutil.rmtree(self.world.proc, True)
+        shutil.rmtree(self.world.cgroups, True)
         self.setUp()
+
+    def units(self):
+        return clone.Units(self.world.tmp, self.sha, self.manifest, self.deps)
+
+    def independent(self):
+        """The cleanup/watch disposal path: owner is quiesced first."""
+        return clone.Cleaner(self.store, self.manifest, self.deps, units=self.units())
 
     def execute(self):
         return clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit).execute()
@@ -4680,11 +4759,12 @@ class PrivateCloneContracts(CloneCase):
             self.assertEqual(clone.main(['arm', '--workdir', fresh], self.deps), 0)
         info = json.loads(output.call_args.args[0])
         self.assertEqual(info['watchdog_exec_start'][-2:], ['--manifest-sha256', info['manifest_sha256']])
-        self.assertEqual(info['watchdog_exec_start'][3:5], ['watch', '--workdir'])
+        self.assertEqual(info['watchdog_exec_start'][5:7], ['watch', '--workdir'])
         self.store.create('run', {'pid': 1})
         with patch('builtins.print'), patch('signal.signal'):
             self.assertEqual(clone.main(['run', '--workdir', self.world.tmp, '--manifest-sha256', self.sha,
-                                         '--watchdog-unit', self.unit], self.deps), 2)
+                                         '--owner-unit', self.world.owner, '--watchdog-unit', self.unit],
+                                        self.deps), 2)
         self.assertEqual(self.world.mutations, [])
 
 
@@ -4750,14 +4830,18 @@ class PrivateCloneOrchestration(CloneCase):
         self.assert_disposed(result)
         self.assertTrue(self.store.has('bound') and not self.store.has('ids'))
 
-    def test_dropped_insert_is_unsettled_until_the_window_passes(self):
+    def test_dropped_insert_stays_unsettled_no_matter_how_much_time_passes(self):
+        # Elapsed time (and a 404) never prove a possibly-submitted INSERT cannot arrive later.
         self.world.inject('insert', 'drop')
         code, result = self.execute()
         self.assertEqual(code, 1)
         self.assertFalse(result['cleanup']['closed'])
         self.assertEqual(result['cleanup']['vm'], 'unresolved:insert-unsettled')
-        self.world.t += clone.SETTLE_SECONDS + 1
-        self.assertTrue(self.cleaner().run()['closed'])
+        for hours in (1, 24):
+            self.world.t += hours * 3600
+            again = self.cleaner().run()
+            self.assertFalse(again['closed'])
+            self.assertEqual(again['vm'], 'unresolved:insert-unsettled')
         self.assertEqual(self.count('insert'), 1)
 
     def test_rejected_insert_settles_immediately(self):
@@ -4905,8 +4989,15 @@ class PrivateCloneRecovery(CloneCase):
                                             'body_sha256': '0' * 64, 'at': clone.iso(self.world.t - age)})
         self.store.create('insert-outcome', {'state': outcome})
 
+    def failed_insert_op(self):
+        """A TERMINAL, errored INSERT operation: the definite proof that nothing more will be created."""
+        op = self.world.op('insert', 'instances', self.manifest['name'], None, self.manifest['request_id'])
+        self.world.ops[op['name']].update(status='DONE', error={'errors': [{'code': 'PARTIAL'}]},
+                                          httpErrorStatusCode=500)
+
     def test_disk_only_partial_create_is_bound_and_deleted_once(self):
         self.intent('uncertain')
+        self.failed_insert_op()
         self.world.make_disk(clone.build_body(self.manifest))
         first = self.cleaner().run()
         self.assertTrue(first['closed'], first)
@@ -4969,6 +5060,7 @@ class PrivateCloneRecovery(CloneCase):
         self.intent('accepted')
         self.world.insert(clone.build_body(self.manifest), self.manifest['request_id'])
         self.store.create('run', {'pid': 424242, 'start': 5, 'unit': self.unit})
+        self.world.owner_state = dict(self.world.INACTIVE_FIELDS)   # the bound owner service is gone
         self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps, passes=1), 0)
         self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
         self.assertEqual(self.count('delete-vm'), 1)
@@ -4983,3 +5075,520 @@ class PrivateCloneRecovery(CloneCase):
         before = self.world.t
         self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps), 0)
         self.assertEqual(self.world.t, before)
+
+
+# ---------------------------------------------------------------------------------------------
+# #546 single correction: quiescence/containment, split original clocks, key absence, recovery
+# schema, operation settlement and the trusted runtime/unit contract. Same synthetic world; the
+# real Units/Cleaner/Run/watch code runs, only systemd, Compute, OS Login and the guest are fakes.
+import fcntl
+
+
+class PrivateCloneCorrection(CloneCase):
+    def intent(self, outcome='accepted'):
+        self.store.create('insert-intent', {'request_id': self.manifest['request_id'], 'body': {},
+                                            'body_sha256': '0' * 64, 'at': clone.iso(self.world.t - 400)})
+        self.store.create('insert-outcome', {'state': outcome})
+
+    def vm_with_op(self, outcome='accepted'):
+        """An INSERT that landed: VM + disk + the (RUNNING) operation, intent and outcome on record."""
+        self.intent(outcome)
+        return self.world.insert(clone.build_body(self.manifest), self.manifest['request_id'])
+
+    def vm_id(self):
+        return self.world.vms[self.manifest['name']]['id']
+
+    def key_fixture(self):
+        expiry = str(int((self.world.t + 900) * 1_000_000))
+        wire, fp = self.world.add_key(b'ours', expiry=expiry)
+        _, other = self.world.add_key(b'theirs')
+        self.store.create('a1-intent', {'n': 1, 'public_key': wire, 'expiration_usec': expiry})
+        return fp, other
+
+    HAPPY = ['insert', 'import', 'delete-key', 'reset', 'import', 'delete-key', 'delete-vm']
+
+    # ---- 1. quiescence / containment / serialization
+    def test_independent_cleanup_stops_the_bound_owner_before_any_disposal(self):
+        self.vm_with_op()
+        result = self.independent().run()
+        self.assertTrue(result['closed'], result)
+        self.assertIs(result['quiesced'], True)
+        self.assertEqual(self.world.timeline[0], 'systemctl-stop')
+        self.assertIn('delete-vm', self.world.timeline)
+        self.assertEqual(self.world.owner_state['ActiveState'], 'inactive')
+        self.assertTrue(self.store.has('disposal') and self.store.has('closed'))
+
+    def test_no_pid_record_and_hard_killed_owner_are_covered_by_the_unit_cgroup_alone(self):
+        self.vm_with_op()
+        self.assertFalse(self.store.has('run'))           # spawn-to-record gap: nothing recorded at all
+        self.world.cgroup_procs([991, 992])                # stray descendants of the dead leader
+        self.world.after_stop = lambda: self.world.cgroup_procs([])
+        result = self.independent().run()
+        self.assertTrue(result['closed'], result)
+        self.assertIn('systemctl-stop', self.world.events)
+        # The cross-process PID/pgid reaper no longer exists in any form.
+        self.assertFalse(hasattr(clone.Cleaner, 'reap'))
+        self.assertFalse(hasattr(clone, 'alive'))
+        self.assertFalse(hasattr(self.deps, 'killpg') or hasattr(self.deps, 'getpgid'))
+
+    def test_leader_gone_but_cgroup_still_nonempty_is_not_quiescent(self):
+        self.vm_with_op()
+        self.world.owner_state = dict(self.world.INACTIVE_FIELDS)   # leader exited / zombie, unit looks inactive
+        self.world.cgroup_procs([4242, 4243])                       # IAP/ssh descendants remain
+        result = self.independent().run()
+        self.assertFalse(result['closed'])
+        self.assertIs(result['quiesced'], False)
+        self.assertEqual(self.world.mutations, [])
+        self.assertFalse(self.store.has('disposal'))
+        self.assertIn(self.manifest['name'], self.world.vms)
+        self.world.cgroup_procs([])
+        self.assertTrue(self.independent().run()['closed'])
+
+    def test_stop_that_does_not_empty_the_owner_never_allows_disposal(self):
+        def ineffective():
+            self.world.stop_ineffective = True
+
+        def descendants_remain():
+            self.world.cgroup_procs([7])
+
+        def control_group_remains():
+            self.world.owner_state['ControlGroup'] = '/system.slice/' + self.world.owner
+
+        def stop_command_fails():
+            raise host.guest.Failure('systemctl stop refused', 1)
+        for label, setup in (('ineffective', ineffective), ('procs', None), ('cgroup', None), ('fails', None)):
+            with self.subTest(label):
+                self.fresh_world()
+                self.vm_with_op()
+                if label == 'ineffective':
+                    setup()
+                elif label == 'procs':
+                    self.world.after_stop = descendants_remain
+                elif label == 'cgroup':
+                    self.world.after_stop = control_group_remains
+                else:
+                    self.world.after_stop = stop_command_fails
+                result = self.independent().run()
+                self.assertFalse(result['closed'])
+                self.assertEqual(self.world.mutations, [])
+                self.assertFalse(self.store.has('disposal'))
+
+    def test_misconfigured_owner_unit_is_never_stopped_or_trusted(self):
+        self.vm_with_op()
+        self.world.unit_override['owner'] = {'User': 'root'}
+        result = self.independent().run()
+        self.assertFalse(result['closed'])
+        self.assertNotIn('systemctl-stop', self.world.events)
+        self.assertEqual(self.world.mutations, [])
+
+    def test_a_work_holder_blocks_independent_disposal_even_if_the_unit_reads_inactive(self):
+        self.vm_with_op()
+        self.world.owner_state = dict(self.world.INACTIVE_FIELDS)
+        fd = os.open(Path(self.world.tmp) / 'work.lock', os.O_RDWR)
+        self.addCleanup(lambda: os.close(fd) if fd >= 0 else None)
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        result = self.independent().run()
+        self.assertFalse(result['closed'])
+        self.assertIs(result['quiesced'], True)
+        self.assertEqual(self.world.mutations, [])
+        self.assertFalse(self.store.has('disposal'))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertTrue(self.independent().run()['closed'])
+
+    def test_no_work_mutation_can_start_after_disposal_begins(self):
+        self.store.create('disposal', {'at': 'x'})
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.world.mutations, [])
+        run = clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit)
+        with self.assertRaises(clone.Expired):
+            run.gate()
+        cloud = clone.CloneCompute(self.world, self.world.token)
+        with self.assertRaises(clone.NotSent):
+            cloud.insert(self.manifest, clone.build_body(self.manifest), self.manifest['request_id'], run.gate)
+        self.assertEqual(self.world.mutations, [])
+
+    def test_independent_cleanup_racing_an_active_run_cannot_mutate_or_close_it(self):
+        attempts = []
+
+        def race():
+            if not attempts:
+                attempts.append(self.independent().run())
+        self.world.on_hostkey = race
+        code, result = self.execute()
+        self.assertEqual((code, result['status']), (0, 'passed'), result)
+        (attempt,) = attempts
+        self.assertFalse(attempt['closed'])
+        self.assertEqual(self.world.mutations, self.HAPPY)       # the racing cleaner added no mutation at all
+
+    def test_live_caller_cleans_in_process_without_stopping_its_own_owner(self):
+        code, result = self.execute()
+        self.assertEqual((code, result['cleanup']['quiesced']), (0, 'in-process'))
+        self.assertNotIn('systemctl-stop', self.world.events)
+        record = self.store.read('run')
+        self.assertEqual((record['owner_unit'], record['watch_unit'], record['control_group']),
+                         (self.world.owner, self.unit, '/system.slice/' + self.world.owner))
+        self.assertRegex(record['invocation_id'], r'[0-9a-f]{32}\Z')
+
+    # ---- 2. original dual clocks
+    def test_child_window_clips_to_the_parent_original_monotonic_end_after_a_wall_rollback(self):
+        world, deps = self.world, self.deps
+        budget = clone.Budget(self.manifest, deps)
+        parent = clone.Window(deps, budget, deps.wall() + 1200, deps.mono() + 1200)
+        world.t += 900
+        world.wall_offset -= 900                     # wall clock rolled back; monotonic kept advancing
+        child = parent.sub(780)
+        self.assertLessEqual(child.remaining(), 300)
+        self.assertLessEqual(parent.remaining(), 300)
+        world.t += 301
+        for window in (parent, child):
+            with self.assertRaises(clone.Expired):
+                window.remaining()
+
+    def test_mono_only_delay_over_twenty_minutes_in_auth_sends_no_import(self):
+        fired = []
+
+        def hook():
+            if (Path(self.world.tmp) / 'a1-intent.json').exists() and not fired:
+                fired.append(True)
+                self.world.mono_offset += 1300       # wall clock did not move at all
+        self.world.on_token = hook
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'AccessError'))
+        self.assertEqual(self.count('import'), 0)
+        self.assertTrue(self.store.has('a1-intent') and not self.store.has('a1-import'))
+
+    def test_mono_only_delay_during_the_import_response_is_refused_and_not_persisted(self):
+        self.world.after_import = lambda: setattr(self.world, 'mono_offset', self.world.mono_offset + 1300)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.count('import'), 1)
+        self.assertFalse(self.store.has('a1-import'))
+        self.assertEqual(self.world.keys, {})
+        self.assert_disposed(result)
+
+    def test_mono_only_delay_during_canonical_confirmation_is_bounded_by_the_same_window(self):
+        profile_reads = []
+
+        def hook():
+            if (Path(self.world.tmp) / 'a1-intent.json').exists() and self.world.imported:
+                profile_reads.append(True)
+                if len(profile_reads) == 1:
+                    self.world.mono_offset += 1300   # the confirmation GET's own credential step
+        self.world.on_token = hook
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertFalse(self.store.has('a1-import'))
+        self.assertEqual(self.count('import'), 1)
+        self.assertEqual(self.world.keys, {})
+
+    def test_insert_credential_crossing_is_not_sent_but_a_late_response_is_uncertain(self):
+        fired = []
+
+        def hook():
+            if self.store.has('insert-intent') and not fired:
+                fired.append(True)
+                self.world.t += 3000
+        self.world.on_token = hook
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Expired'))
+        self.assertEqual((self.count('insert'), self.store.read('insert-outcome')['state']), (0, 'not-sent'))
+        self.assert_disposed(result)
+        self.fresh_world()
+        self.world.after_mutation['insert'] = lambda: setattr(self.world, 't', self.world.t + 3000)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Uncertain'))
+        self.assertEqual((self.count('insert'), self.store.read('insert-outcome')['state']), (1, 'uncertain'))
+        self.assertFalse(self.store.has('ids'))
+        self.assert_disposed(result)                  # recovered by request ID; deleted exactly once
+        self.assertEqual(self.count('delete-vm'), 1)
+
+    def test_terminal_done_answer_after_the_bound_is_uncertain_and_never_persisted(self):
+        def late_done(snapshot):
+            self.world.t += 3000
+            return dict(snapshot, status='DONE')
+        self.world.op_hook = late_done
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Uncertain'))
+        self.assertTrue(self.store.has('insert-op') and not self.store.has('ids'))
+        self.assert_disposed(result)
+
+    def test_reset_response_after_the_bound_is_uncertain_and_still_reconciled(self):
+        self.world.after_mutation['reset'] = lambda: setattr(self.world, 't', self.world.t + 3000)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Uncertain'))
+        self.assertEqual(self.store.read('reset-outcome')['state'], 'uncertain')
+        self.assertEqual(self.count('reset'), 1)
+        self.assert_disposed(result)
+
+    def test_wait_operation_pins_name_and_id_and_gates_even_a_done_answer(self):
+        class Cloud:
+            def __init__(self, answer):
+                self.answer = answer
+
+            def operation(self, name):
+                return self.answer
+        first = {'name': 'op-1', 'id': '11', 'status': 'RUNNING'}
+        for answer in ({'name': 'op-1', 'id': '12', 'status': 'DONE'}, {'name': 'op-2', 'id': '11', 'status': 'DONE'}):
+            with self.subTest(answer), self.assertRaises(clone.Mismatch):
+                clone.wait_operation(Cloud(answer), self.deps, first, lambda o, d: None, lambda: None)
+
+        def expired():
+            raise clone.Expired('late')
+        with self.assertRaises(clone.Expired):
+            clone.wait_operation(Cloud(None), self.deps, dict(first, status='DONE'), lambda o, d: None, expired)
+
+    # ---- 3. key absence
+    def test_expired_but_still_listed_key_is_unresolved_never_closed(self):
+        fp, other = self.key_fixture()
+        self.world.t += 1000                           # past the key TTL; the key is STILL in the profile
+        self.world.inject('delete-key', 'drop')
+        cleaner = self.cleaner()
+        self.assertEqual(cleaner.remove_key(1), 'unresolved')
+        self.assertEqual(cleaner.remove_key(1), 'unresolved')
+        self.assertEqual(self.count('delete-key'), 1)  # one-shot; no blind retry
+        result = cleaner.run()
+        self.assertFalse(result['closed'])
+        self.assertEqual(result['keys']['1'], 'unresolved')
+        self.assertNotIn('expired', result['keys'].values())
+        self.assertEqual(set(self.world.keys), {fp, other})
+        del self.world.keys[fp]                        # canonical SELF profile now proves absence
+        self.assertEqual(cleaner.remove_key(1), 'removed')
+        self.assertEqual(cleaner.remove_key(1), 'absent')
+        self.assertEqual(set(self.world.keys), {other})
+
+    # ---- 4. recovery schema
+    def test_dropped_vm_delete_recovers_without_keyerror_replay_or_adopting_another_id(self):
+        self.vm_with_op()
+        self.world.inject('delete-vm', 'drop')
+        first = self.cleaner().run()
+        self.assertFalse(first['closed'])
+        self.assertEqual(first['vm'], 'unresolved:vm-delete')
+        intent = self.store.read('vm-delete-intent')
+        self.assertEqual(intent['resource_id'], self.vm_id())
+        second = self.cleaner().run()                  # reads the real stored schema (resource_id)
+        self.assertEqual((second['closed'], second['vm']), (False, 'unresolved:vm-delete'))
+        self.assertEqual(self.count('delete-vm'), 1)
+        self.world.vms[self.manifest['name']]['id'] = '999'
+        third = self.cleaner().run()
+        self.assertEqual(third['vm'], 'unresolved:vm-ownership-mismatch')
+        self.assertEqual((self.count('delete-vm'), self.store.read('vm-delete-intent')['resource_id']),
+                         (1, intent['resource_id']))
+
+    def test_known_vm_id_is_immutable_across_recovery(self):
+        self.vm_with_op()
+        self.store.create('ids', {'vm_id': '555', 'boot_id': self.world.disks[self.manifest['name']]['id']})
+        result = self.cleaner().run()
+        self.assertFalse(result['closed'])
+        self.assertTrue(result['vm'].startswith('unresolved:'), result)
+        self.assertEqual(self.count('delete-vm'), 0)
+        self.assertEqual(self.store.read('ids')['vm_id'], '555')
+
+    # ---- 5. mutation settlement and operation identity
+    def test_pending_operation_never_settles_by_elapsed_time(self):
+        self.vm_with_op()
+        self.world.pin_status = 'RUNNING'
+        for hours in (0, 24):
+            self.world.t += hours * 3600
+            result = self.cleaner().run()
+            self.assertFalse(result['closed'])
+            self.assertEqual(result['vm'], 'unresolved:insert-unsettled')
+        self.assertEqual(self.count('delete-vm'), 0)
+        self.world.pin_status = None
+        self.assertTrue(self.cleaner().run()['closed'])
+
+    def test_missing_recorded_operation_is_unresolved(self):
+        self.vm_with_op()
+        self.store.create('insert-op', {'name': 'op-404', 'id': '1'})
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['vm']), (False, 'unresolved:insert-unsettled'))
+        self.assertEqual(self.count('delete-vm'), 0)
+
+    def test_wrong_operation_is_never_accepted(self):
+        for field, value in (('id', '5'), ('user', 'other@example.com'), ('operationType', 'reset'),
+                             ('targetId', '12345'), ('kind', 'compute#other'),
+                             ('targetLink', CLONE_P + f'zones/{clone.ZONE}/instances/labapp-clone-ffffffffffff'),
+                             ('httpErrorStatusCode', 500)):
+            with self.subTest(field):
+                self.fresh_world()
+                op = self.vm_with_op()
+                self.store.create('insert-op', {'name': op['name'], 'id': op['id']})
+                self.store.create('ids', {'vm_id': self.vm_id(), 'boot_id': self.world.disks[self.manifest['name']]['id']})
+                self.world.ops[op['name']][field] = value
+                result = self.cleaner().run()
+                self.assertFalse(result['closed'])
+                self.assertEqual(result['vm'], 'unresolved:insert-unsettled')
+                self.assertEqual(self.count('delete-vm'), 0)
+
+    def test_operation_changing_identity_while_polling_is_a_mismatch(self):
+        self.vm_with_op()
+        self.world.pin_status = 'RUNNING'
+        self.world.op_hook = lambda snapshot: dict(snapshot, id='7777')
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['vm']), (False, 'unresolved:insert-unsettled'))
+        self.assertEqual(self.count('delete-vm'), 0)
+
+    def test_lost_reset_is_reconciled_by_operation_even_after_the_vm_is_gone(self):
+        self.vm_with_op()
+        request = str(uuid4())
+        self.store.create('reset-intent', {'request_id': request, 'vm_id': self.vm_id(), 'boot_id': 'x',
+                                           'at': clone.iso(self.world.t)})
+        self.store.create('reset-outcome', {'state': 'uncertain'})
+        dropped = self.cleaner().run()                   # never delivered: cannot be ruled out
+        self.assertEqual((dropped['closed'], dropped['vm']), (False, 'unresolved:reset-unsettled'))
+        self.assertEqual(self.count('delete-vm'), 0)
+        self.world.reset(self.manifest['name'], request)  # it actually landed late; now it has an operation
+        landed = self.cleaner().run()
+        self.assertTrue(landed['closed'], landed)
+        self.assertEqual(self.count('delete-vm'), 1)
+
+    def test_unreconciled_reset_is_not_skipped_when_the_resources_are_already_404(self):
+        self.vm_with_op()
+        self.store.create('reset-intent', {'request_id': str(uuid4()), 'vm_id': self.vm_id(), 'boot_id': 'x',
+                                           'at': clone.iso(self.world.t)})
+        self.world.vms.clear()
+        self.world.disks.clear()
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['vm']), (False, 'unresolved:reset-unsettled'))
+
+    def test_vm_delete_without_an_operation_is_unresolved_even_when_the_vm_is_gone(self):
+        self.vm_with_op()
+        vm_id, request = self.vm_id(), str(uuid4())
+        self.store.create('vm-delete-intent', {'request_id': request, 'resource_id': vm_id,
+                                               'at': clone.iso(self.world.t)})
+        self.world.vms.clear()
+        self.world.disks.clear()
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['vm']), (False, 'unresolved:vm-delete'))
+        self.assertEqual(self.count('delete-vm'), 0)
+        self.world.op('delete', 'instances', self.manifest['name'], vm_id, request)   # the DELETE did land
+        reconciled = self.cleaner().run()
+        self.assertTrue(reconciled['closed'], reconciled)
+        self.assertEqual(self.count('delete-vm'), 0)
+
+    def test_disk_delete_without_an_operation_is_unresolved_even_when_the_disk_is_gone(self):
+        self.vm_with_op()
+        disk_id = self.world.disks[self.manifest['name']]['id']
+        self.store.create('disk-delete-intent', {'request_id': str(uuid4()), 'resource_id': disk_id,
+                                                 'at': clone.iso(self.world.t)})
+        self.world.vms.clear()
+        self.world.disks.clear()
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['disk']), (False, 'unresolved:disk-delete'))
+
+    def test_rejected_delete_is_a_definite_outcome_and_a_404_delete_is_never_replayed(self):
+        self.vm_with_op()
+        self.world.inject('delete-vm', 403)
+        first = self.cleaner().run()
+        self.assertEqual((first['closed'], first['vm']), (False, 'unresolved:vm-delete'))
+        self.assertEqual(self.store.read('vm-delete-outcome'), {'state': 'rejected'})
+        second = self.cleaner().run()
+        self.assertEqual((second['vm'], self.count('delete-vm')), ('unresolved:vm-still-present', 1))
+
+    def test_paginated_operation_list_is_never_assumed_complete(self):
+        self.vm_with_op()
+        self.world.next_page = True
+        cloud = clone.CloneCompute(self.world, self.world.token)
+        with self.assertRaises(clone.Uncertain):
+            cloud.operations_for(self.manifest['request_id'])
+        result = self.cleaner().run()
+        self.assertEqual((result['closed'], result['vm']), (False, 'unresolved:insert-unsettled'))
+        self.assertEqual(self.count('delete-vm'), 0)
+
+    def test_strict_operation_identity_requires_kind_numeric_id_and_zone(self):
+        name, request = self.manifest['name'], self.manifest['request_id']
+        good = {'name': 'op-1', 'id': '9001', 'kind': 'compute#operation', 'operationType': 'insert',
+                'clientOperationId': request, 'user': clone.OWNER, 'zone': CLONE_P + 'zones/' + clone.ZONE,
+                'targetLink': CLONE_P + f'zones/{clone.ZONE}/instances/{name}', 'targetId': '7', 'status': 'RUNNING'}
+        args = dict(kind='insert', collection='instances', name=name, request_id=request, target_id='7',
+                    done=False, strict=True)
+        self.assertIs(clone.check_operation(good, **args), good)
+        for field, value in (('kind', None), ('id', None), ('id', 'abc'), ('zone', None),
+                             ('error', {'errors': [{'code': 'X'}]}), ('httpErrorStatusCode', 500)):
+            with self.subTest(field), self.assertRaises(clone.Mismatch):
+                clone.check_operation({k: v for k, v in dict(good, **{field: value}).items() if v is not None}, **args)
+        with self.assertRaises(clone.Mismatch):
+            clone.check_operation(good, **dict(args, op_id='9002'))
+        with self.assertRaises(clone.Mismatch):
+            clone.check_operation(good, **dict(args, op_name='op-2'))
+
+    # ---- 6. trusted runtime and exact unit contract
+    def test_unit_argv_is_the_accepted_runtime_and_protected_source_for_all_verbs(self):
+        self.assertEqual(clone.RUNTIME_PYTHON, '/home/ubuntu/.local/opt/labapp-cpython-3.12.16-20261026/python/bin/python3.12')
+        self.assertEqual(clone.PROTECTED_SOURCE, '/home/ubuntu/.local/share/labapp-trial-egress-349/source')
+        for verb in ('run', 'watch', 'cleanup'):
+            with self.subTest(verb):
+                argv = clone.unit_argv(self.manifest, self.world.tmp, self.sha, verb)
+                self.assertEqual(argv[:5], [clone.RUNTIME_PYTHON, '-I', '-B', '-c', clone.BOOTSTRAP])
+                self.assertIn(clone.PROTECTED_SOURCE, clone.BOOTSTRAP)
+                self.assertNotIn('/usr/bin/python3', ' '.join(argv))
+                self.assertNotIn('-m', argv)
+                self.assertFalse(any(' ' in part for part in argv))
+                self.assertEqual(argv[5:9], [verb, '--workdir', self.world.tmp, '--owner-unit'])
+                self.assertEqual(argv[-2:], ['--manifest-sha256', self.sha])
+        self.assertEqual(self.info['owner_exec_start'], clone.unit_argv(self.manifest, self.world.tmp, self.sha, 'run'))
+        self.assertEqual(self.info['watchdog_exec_start'], clone.unit_argv(self.manifest, self.world.tmp, self.sha, 'watch'))
+        self.assertEqual(self.info['owner_unit'], 'labapp-clone-run-' + self.manifest['name'][-12:] + '.service')
+        self.assertEqual((self.info['runtime']['python'], self.info['runtime']['source']),
+                         (clone.RUNTIME_PYTHON, clone.PROTECTED_SOURCE))
+        with self.assertRaises(clone.Refused):
+            clone.unit_argv(self.manifest, self.world.tmp, self.sha, 'sh')
+
+    def test_unit_verification_requires_the_exact_interpreter_source_argv_user_and_kill_policy(self):
+        def argv(verb):
+            return clone.unit_argv(self.manifest, self.world.tmp, self.sha, verb)
+        exec_line = self.world.exec_line
+        run, watch = argv('run'), argv('watch')
+        cases = [
+            ('owner', {'ExecStart': exec_line(['/usr/bin/python3'] + run[1:])}),            # unqualified system 3.10
+            ('owner', {'ExecStart': exec_line(run + ['--extra'])}),                         # superset: a substring check passes
+            ('owner', {'ExecStart': exec_line([run[0]] + run[2:])}),                        # no -I
+            ('owner', {'ExecStart': exec_line(run, path='/usr/bin/python3')}),              # path != runtime
+            ('owner', {'ExecStart': exec_line(run) + ' ' + exec_line(run)}),                # two ExecStart entries
+            ('owner', {'ExecStart': exec_line(run[:-1] + ['0' * 64])}),                     # other manifest digest
+            ('owner', {'User': 'root'}), ('owner', {'WorkingDirectory': '/tmp'}), ('owner', {'Restart': 'always'}),
+            ('owner', {'KillMode': 'control-group'}), ('owner', {'KillMode': 'process'}),
+            ('owner', {'SendSIGKILL': 'no'}), ('owner', {'TimeoutStopUSec': 'infinity'}),
+            ('owner', {'ExecStartPre': '{ path=/bin/true ; argv[]=/bin/true ; }'}),
+            ('owner', {'LoadState': 'not-found'}), ('owner', {'Id': 'other.service'}),
+            ('owner', {'MainPID': '1'}), ('owner', {'ControlGroup': '/system.slice/other.service'}),
+            ('owner', {'ActiveState': 'inactive'}), ('owner', {'InvocationID': ''}),
+            ('watch', {'ExecStart': exec_line(['/usr/bin/python3'] + watch[1:])}),
+            ('watch', {'ExecStart': exec_line(watch[:-1] + ['0' * 64])}),
+            ('watch', {'ExecStart': exec_line(run)}),                                       # the owner argv is not the watch
+            ('watch', {'User': 'root'}), ('watch', {'Restart': 'on-failure'}), ('watch', {'ActiveState': 'failed'}),
+        ]
+        for role, change in cases:
+            with self.subTest(role=role, change=sorted(change)[0] + str(list(change.values()))[:40]):
+                self.fresh_world()
+                self.world.unit_override[role] = change
+                code, result = self.execute()
+                self.assertEqual((code, result['failure']), (1, 'Refused'))
+                self.assertEqual(self.world.mutations, [])
+                self.assertFalse(self.store.has('insert-intent'))
+
+    def test_cli_binds_the_owner_unit_and_cleanup_quiesces_first(self):
+        with patch('builtins.print'):
+            self.assertEqual(clone.main(['cleanup', '--workdir', self.world.tmp, '--manifest-sha256', self.sha,
+                                         '--owner-unit', 'labapp-clone-run-aaaaaaaaaaaa.service'], self.deps), 2)
+        self.assertEqual(self.world.events, [])
+        with patch('builtins.print') as output:
+            self.assertEqual(clone.main(['cleanup', '--workdir', self.world.tmp, '--manifest-sha256', self.sha,
+                                         '--owner-unit', self.world.owner], self.deps), 0)
+        self.assertIs(json.loads(output.call_args.args[0])['quiesced'], True)
+        self.assertIn('systemctl-stop', self.world.events)
+
+    def test_watch_stops_the_owner_at_the_deadline_by_either_clock(self):
+        self.vm_with_op()
+        start, rolled, original = self.world.t, [], self.deps.sleep
+
+        def sleep(seconds):
+            original(seconds)
+            if self.world.t - start > 600 and not rolled:   # the wall clock is rolled back mid-watch
+                rolled.append(True)
+                self.world.wall_offset -= 3 * 3600
+        self.deps.sleep = sleep
+        self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps, passes=1), 0)
+        self.assertLess(self.world.t - start, clone.WORK_SECONDS + 600)   # the monotonic bound fired, not 3 h later
+        self.assertEqual(self.world.timeline[0], 'systemctl-stop')
+        self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
