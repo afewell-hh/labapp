@@ -4241,3 +4241,745 @@ class GuestDiagnostics(unittest.TestCase):
         receipt = json.loads(output.call_args.args[0])
         self.assertEqual((receipt['guest_diagnostic_status'], receipt['guest_diagnostic'], receipt['guest_service']),
                          ('unavailable', None, None))
+
+
+# ---------------------------------------------------------------------------------------------
+# Manual private-image clone caller (#546). Synthetic HTTP/clock/files/processes only: the real
+# orchestration, cleaner and watchdog code run against an in-memory Compute/OS Login/guest world.
+# Authored without execution in a credential-bearing job; the lead runs these in isolated Docker.
+import hashlib
+import shutil
+import struct
+import urllib.parse
+from uuid import uuid4
+
+from build.gcp import private_clone as clone
+from build.gcp.lifecycle.access_records import canonical as clone_canonical
+from build.gcp.lifecycle.auth_http import HttpResponse, TransportError
+
+CLONE_P = 'https://www.googleapis.com/compute/v1/projects/' + clone.PROJECT + '/'
+
+
+def clone_wire(seed):
+    raw = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + hashlib.sha256(seed).digest()
+    return 'ssh-ed25519 ' + base64.b64encode(raw).decode()
+
+
+class CloneWorld:
+    """In-memory Compute v1, OS Login, guest and clock. Records every mutation attempt."""
+    BUILD = '00000000-0000-4000-8000-00000000000b'
+    NONCE = 'a' * 32
+    SEALED = ('c' * 32, 'd' * 32)
+
+    def __init__(self):
+        self.t = 1_800_000_000.0
+        self.tmp = tempfile.mkdtemp(prefix='cl', dir='/tmp')
+        os.chmod(self.tmp, 0o700)
+        self.proc = tempfile.mkdtemp(prefix='cp', dir='/tmp')
+        self.image = {'name': clone.IMAGE_NAME, 'id': clone.IMAGE_ID, 'status': 'READY',
+                      'sourceDiskId': clone.SOURCE_DISK_ID}
+        self.vms, self.disks, self.ops, self.keys = {}, {}, {}, {}
+        self.mutations, self.events, self.imported, self.failing = [], [], [], {}
+        self.watchdog, self.sha = True, None
+        self.n = self.boot_n = self.polls = self.keygen = 0
+        self.mode = 'off'
+        self.mutate_summary = self.on_token = self.on_hostkey = self.after_import = self.cancel_on = None
+        self.close_ok, self.stop_fails, self.master_fails = True, False, False
+
+    # clock
+    def wall(self):
+        return self.t
+
+    def mono(self):
+        return self.t - 1_800_000_000.0
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+    def token(self):
+        if self.on_token:
+            self.on_token()
+        return 'tok'
+
+    # fault injection: mode 'drop' (not applied, no response), 'lost' (applied, no response) or HTTP status
+    def inject(self, kind, mode, skip=0):
+        self.failing[kind] = (skip, mode)
+
+    def mutate(self, kind, apply):
+        self.mutations.append(kind)
+        mode = None
+        if kind in self.failing:
+            skip, mode = self.failing[kind]
+            if skip:
+                self.failing[kind], mode = (skip - 1, mode), None
+            else:
+                del self.failing[kind]
+        if mode == 'drop':
+            raise TransportError('synthetic')
+        if isinstance(mode, int):
+            return mode, {}
+        value = apply()
+        if mode == 'lost':
+            raise TransportError('synthetic')
+        return 200, value
+
+    # HTTP router
+    def request(self, method, url, *, headers, body=None, timeout=20, max_bytes=0):
+        parts = urllib.parse.urlsplit(url)
+        path = urllib.parse.unquote(parts.path)
+        if parts.hostname == 'oslogin.googleapis.com':
+            status, value = self.oslogin(method, path, body)
+        else:
+            status, value = self.compute(method, path, urllib.parse.parse_qs(parts.query), body)
+        return HttpResponse(status, json.dumps(value).encode())
+
+    def profile(self):
+        return {'name': 'users/110405050082684214272',
+                'posixAccounts': [{'operatingSystemType': 'LINUX', 'systemId': '', 'username': 'art_githedgehog_com',
+                                   'uid': '2000', 'gid': '2000', 'homeDirectory': '/home/art_githedgehog_com'}],
+                'sshPublicKeys': {fp: dict(entry) for fp, entry in self.keys.items()}}
+
+    def add_key(self, seed, expiry='0'):
+        wire = clone_wire(seed)
+        fp = hashlib.sha256(wire.encode()).hexdigest()[:40]
+        self.keys[fp] = {'key': wire, 'expirationTimeUsec': expiry, 'fingerprint': fp,
+                         'name': 'users/110405050082684214272/sshPublicKeys/' + fp}
+        return wire, fp
+
+    def oslogin(self, method, path, body):
+        base = '/v1/users/art@githedgehog.com'
+        assert path.startswith(base), path
+        tail = path[len(base):]
+        if tail == '/loginProfile' and method == 'GET':
+            return 200, self.profile()
+        if tail == ':importSshPublicKey' and method == 'POST':
+            return self.mutate('import', lambda: self.do_import(json.loads(body)))
+        assert tail.startswith('/sshPublicKeys/') and method == 'DELETE', (method, path)
+        fp = tail.rsplit('/', 1)[1]
+        return self.mutate('delete-key', lambda: (self.keys.pop(fp, None), {})[1])
+
+    def do_import(self, data):
+        wire = data['key']
+        fp = hashlib.sha256(wire.encode()).hexdigest()[:40]
+        self.keys[fp] = {'key': wire, 'expirationTimeUsec': data['expirationTimeUsec'], 'fingerprint': fp,
+                         'name': 'users/110405050082684214272/sshPublicKeys/' + fp}
+        self.imported.append(wire)
+        if self.after_import:
+            self.after_import()
+        return {'loginProfile': self.profile()}
+
+    def compute(self, method, path, query, body):
+        prefix = '/compute/v1/projects/' + clone.PROJECT + '/'
+        assert path.startswith(prefix), path
+        rest = path[len(prefix):].split('/')
+        if rest[:2] == ['global', 'images']:
+            return 200, self.image
+        assert rest[:2] == ['zones', clone.ZONE], path
+        kind, tail = rest[2], rest[3:]
+        request = query.get('requestId', [None])[0]
+        if kind == 'instances':
+            if not tail:
+                return self.mutate('insert', lambda: self.insert(json.loads(body), request))
+            name = tail[0]
+            if len(tail) == 2 and tail[1] == 'reset':
+                return self.mutate('reset', lambda: self.reset(name, request))
+            if method == 'DELETE':
+                return self.mutate('delete-vm', lambda: self.delete_vm(name, request))
+            return (200, self.vms[name]) if name in self.vms else (404, {})
+        if kind == 'disks':
+            name = tail[0]
+            if method == 'DELETE':
+                return self.mutate('delete-disk', lambda: self.delete_disk(name, request))
+            return (200, self.disks[name]) if name in self.disks else (404, {})
+        assert kind == 'operations', path
+        if not tail:
+            wanted = query['filter'][0]
+            items = [dict(o, status='DONE') for o in self.ops.values() if o['clientOperationId'] in wanted]
+            for o in self.ops.values():
+                o['status'] = 'DONE'
+            return 200, ({'items': items} if items else {})
+        op = self.ops.get(tail[0])
+        if op is None:
+            return 404, {}
+        snapshot, op['status'] = dict(op), 'DONE'
+        return 200, snapshot
+
+    def op(self, kind, collection, name, target_id, request):
+        self.n += 1
+        op = {'name': f'op-{self.n}', 'id': str(9000 + self.n), 'operationType': kind, 'clientOperationId': request,
+              'user': clone.OWNER, 'targetLink': CLONE_P + f'zones/{clone.ZONE}/{collection}/{name}',
+              'targetId': target_id, 'status': 'RUNNING', 'zone': CLONE_P + 'zones/' + clone.ZONE}
+        self.ops[op['name']] = op
+        return dict(op)
+
+    def make_disk(self, body):
+        self.n += 1
+        init = body['disks'][0]['initializeParams']
+        disk = {'id': str(5000 + self.n), 'name': body['name'], 'status': 'READY', 'sizeGb': '500',
+                'type': CLONE_P + f'zones/{clone.ZONE}/diskTypes/pd-balanced', 'sourceImageId': clone.IMAGE_ID,
+                'sourceImage': CLONE_P + 'global/images/' + clone.IMAGE_NAME, 'labels': dict(init['labels'])}
+        self.disks[body['name']] = disk
+        return disk
+
+    def insert(self, body, request):
+        name = body['name']
+        self.n += 1
+        vm = {'id': str(1000 + self.n), 'name': name, 'status': 'RUNNING', 'labels': body['labels'],
+              'machineType': CLONE_P + body['machineType'], 'minCpuPlatform': body['minCpuPlatform'],
+              'advancedMachineFeatures': body['advancedMachineFeatures'], 'canIpForward': False,
+              'deletionProtection': False, 'scheduling': dict(body['scheduling']),
+              'networkInterfaces': [{'subnetwork': CLONE_P + body['networkInterfaces'][0]['subnetwork']}],
+              'metadata': {'items': body['metadata']['items']},
+              'disks': [{'boot': True, 'autoDelete': True, 'mode': 'READ_WRITE',
+                         'source': CLONE_P + f'zones/{clone.ZONE}/disks/{name}'}]}
+        self.vms[name] = vm
+        self.make_disk(body)
+        self.new_boot()
+        return self.op('insert', 'instances', name, vm['id'], request)
+
+    def reset(self, name, request):
+        self.events.append('reset')
+        self.new_boot()
+        return self.op('reset', 'instances', name, self.vms[name]['id'], request)
+
+    def delete_vm(self, name, request):
+        vm = self.vms.pop(name)
+        self.disks.pop(name, None)
+        return self.op('delete', 'instances', name, vm['id'], request)
+
+    def delete_disk(self, name, request):
+        disk = self.disks.pop(name)
+        return self.op('delete', 'disks', name, disk['id'], request)
+
+    # guest
+    def boot_id(self, n=None):
+        n = self.boot_n if n is None else n
+        return '%08x-0000-4000-8000-%012x' % (0x10000000 + n, n)
+
+    def new_boot(self):
+        self.boot_n += 1
+        self.polls, self.mode = 2, 'starting'
+
+    def stop(self):
+        self.mode = 'stopped'
+
+    def summary(self):
+        n, boot = self.boot_n, self.boot_id()
+        op, inv = '%032x' % n, '%032x' % (n + 0x100)
+        if self.mode == 'starting':
+            if self.polls <= 0:
+                self.mode = 'ready'
+            else:
+                self.polls -= 1
+        unit = {'ActiveState': 'active', 'InvocationID': 'x', 'Result': 'success'}
+        clone_unit, resume = dict(unit), dict(unit, InvocationID=inv)
+        phase, stop_verified = 'ready', None
+        checkpoint = {'boot': boot, 'operation': op, 'invocation': inv}
+        if self.mode == 'starting':
+            phase = 'resumable'
+            clone_unit['ActiveState'], resume['ActiveState'] = 'activating', 'inactive'
+            checkpoint = None if n == 1 else {'boot': self.boot_id(n - 1), 'operation': '%032x' % (n - 1),
+                                              'invocation': '%032x' % (n + 0xff)}
+        elif self.mode == 'stopped':
+            phase, stop_verified = 'resumable', {'operation': op, 'invocation': inv}
+            clone_unit['ActiveState'] = resume['ActiveState'] = 'inactive'
+        out = {'boot': boot, 'checkpoint': checkpoint, 'clone': clone_unit, 'resume': resume,
+               'seal': {'state': 'sealed', 'owned_sealed': True, 'nonce': self.NONCE, 'build_boot': self.BUILD,
+                        'core_operation': self.SEALED[0], 'core_invocation': self.SEALED[1]},
+               'core': {'nonce': self.NONCE, 'phase': phase, 'mode': 'resume', 'boot': boot, 'operation': op,
+                        'invocation': inv, 'stop_verified': stop_verified, 'critical_sha256': 'e' * 64,
+                        'cluster_sha256': 'f' * 64}}
+        if self.mutate_summary:
+            self.mutate_summary(out, self)
+        return out
+
+    # processes
+    def runner(self, argv, seconds, **kwargs):
+        if self.cancel_on and self.cancel_on in argv:
+            raise host.HostCancelled(signal.SIGTERM)
+        if argv[0] == '/usr/bin/ssh-keygen' and '-t' in argv:
+            path = Path(argv[argv.index('-f') + 1])
+            self.keygen += 1
+            path.write_text('PRIVATE-KEY-FIXTURE')
+            path.chmod(0o600)
+            path.with_name(path.name + '.pub').write_text(clone_wire(b'generated%d' % self.keygen) + ' fixture\n')
+            return b''
+        if argv[0] == '/usr/bin/ssh-keygen':
+            return b'256 SHA256:fixture\n'
+        if argv[:3] == ['gcloud', 'auth', 'list']:
+            return (clone.OWNER + '\n').encode()
+        if argv[:3] == ['gcloud', 'config', 'get-value']:
+            return b'(unset)\n'
+        if 'get-guest-attributes' in argv:
+            if self.on_hostkey:
+                self.on_hostkey()
+            value = base64.b64encode(b'\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20' + b'h' * 32).decode()
+            return json.dumps([{'namespace': 'hostkeys', 'key': 'ssh-ed25519', 'value': value}]).encode()
+        assert argv[0] == '/usr/bin/systemctl', argv
+        if not self.watchdog:
+            return b'LoadState=loaded\nActiveState=inactive\nExecStart=\n'
+        line = ' '.join(clone.cleanup_argv(self.tmp, self.sha))
+        return ('LoadState=loaded\nActiveState=active\nExecStart={ path=/usr/bin/python3 ; argv[]=' + line + ' ; }\n').encode()
+
+
+class CloneFakeMaster:
+    def __init__(self, world, directory, name, vm_id, username, deps, record=None):
+        self.world, self.dir, self.record = world, Path(directory), record
+
+    def start(self, window):
+        self.world.events.append('master-start')
+        if self.world.master_fails:
+            raise clone.Expired('synthetic master failure')
+        window.remaining()
+        (self.dir / 'master.sock').write_text('socket-fixture')
+        if self.record:
+            self.record(999999)
+
+    def remote(self, key, window, cap=30):
+        window.remaining()
+        self.world.events.append(key)
+        if key == 'summary':
+            return clone_canonical(self.world.summary())
+        if self.world.stop_fails:
+            raise guest.Failure('stop refused', 17)
+        self.world.stop()
+        return clone.STOP_MARKER + b'\n'
+
+    def close(self):
+        self.world.events.append('master-close')
+        return self.world.close_ok
+
+
+class CloneCase(unittest.TestCase):
+    def setUp(self):
+        self.world = CloneWorld()
+        self.addCleanup(shutil.rmtree, self.world.tmp, True)
+        self.addCleanup(shutil.rmtree, self.world.proc, True)
+        world = self.world
+        self.deps = clone.Deps(world, world.token, world.runner, wall=world.wall, mono=world.mono, sleep=world.sleep,
+                               master_factory=lambda *a, **k: CloneFakeMaster(world, *a, **k),
+                               proc_root=world.proc, env={})
+        info = clone.arm(world.tmp, self.deps)
+        self.sha, self.unit, world.sha = info['manifest_sha256'], info['watchdog_unit'], info['manifest_sha256']
+        self.manifest = clone.load_manifest(world.tmp, self.sha)
+        self.store = clone.Store(world.tmp)
+
+    def fresh_world(self):
+        """Re-arm a new world/workdir between sub-cases."""
+        shutil.rmtree(self.world.tmp, True)
+        shutil.rmtree(self.world.proc, True)
+        self.setUp()
+
+    def execute(self):
+        return clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit).execute()
+
+    def cleaner(self):
+        return clone.Cleaner(self.store, self.manifest, self.deps)
+
+    def count(self, kind):
+        return self.world.mutations.count(kind)
+
+    def assert_disposed(self, result):
+        self.assertTrue(result['cleanup']['closed'], result)
+        self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
+        self.assertFalse((Path(self.world.tmp) / 'b1').exists() or (Path(self.world.tmp) / 'b2').exists())
+
+
+class PrivateCloneContracts(CloneCase):
+    def test_arm_manifest_and_deadlines(self):
+        m = self.manifest
+        admitted = clone.stamp(m['admitted_at'])
+        self.assertEqual(clone.stamp(m['work_deadline']) - admitted, 45 * 60)
+        self.assertEqual(clone.stamp(m['termination']) - admitted, 60 * 60)
+        self.assertGreaterEqual(clone.stamp(m['termination']) - clone.stamp(m['work_deadline']), 15 * 60)
+        self.assertRegex(m['name'], r'labapp-clone-[0-9a-f]{12}\Z')
+        self.assertEqual(self.unit, 'labapp-clone-watch-' + m['name'][-12:] + '.service')
+        for field, value in (('image_id', '1'), ('source_disk_id', '2'), ('zone', 'us-east1-b'),
+                             ('termination', clone.iso(clone.stamp(m['termination']) + 60)),
+                             ('name', 'labapp-clone-000000000000')):
+            with self.subTest(field), self.assertRaises(clone.Refused):
+                clone.check_manifest(dict(m, **{field: value}))
+        with self.assertRaises(clone.Refused):
+            clone.load_manifest(self.world.tmp, '0' * 64)
+
+    def test_body_is_the_closed_envelope(self):
+        body = clone.build_body(self.manifest)
+        self.assertEqual(body['machineType'], 'zones/us-central1-a/machineTypes/n2-standard-32')
+        self.assertEqual(body['scheduling'], {'provisioningModel': 'STANDARD', 'onHostMaintenance': 'TERMINATE',
+                                              'automaticRestart': False, 'terminationTime': self.manifest['termination'],
+                                              'instanceTerminationAction': 'DELETE'})
+        self.assertEqual((body['serviceAccounts'], body['canIpForward'], body['deletionProtection']), ([], False, False))
+        self.assertEqual(body['minCpuPlatform'], 'Intel Cascade Lake')
+        self.assertTrue(body['advancedMachineFeatures']['enableNestedVirtualization'])
+        self.assertNotIn('accessConfigs', body['networkInterfaces'][0])
+        (disk,) = body['disks']
+        self.assertEqual((disk['boot'], disk['autoDelete'], disk['initializeParams']['diskSizeGb']), (True, True, '500'))
+        self.assertTrue(disk['initializeParams']['diskType'].endswith('/pd-balanced'))
+        self.assertEqual(disk['initializeParams']['sourceImage'],
+                         'projects/teched-473722/global/images/labapp-private-r42446688327-a1')
+        self.assertFalse({'labapp-lease', 'labapp-owner', 'labapp-run'} & set(body['labels']))
+        self.assertNotIn('startup-script', {i['key'] for i in body['metadata']['items']})
+
+    def test_insert_refuses_any_altered_body_before_http(self):
+        cloud = clone.CloneCompute(self.world, self.world.token)
+        for change in ({'serviceAccounts': [{'email': 'x'}]}, {'canIpForward': True},
+                       {'machineType': 'zones/us-central1-a/machineTypes/n2-standard-64'}):
+            with self.subTest(change), self.assertRaises(clone.Refused):
+                cloud.insert(self.manifest, dict(clone.build_body(self.manifest), **change),
+                             self.manifest['request_id'], lambda: None)
+        self.assertEqual(self.world.mutations, [])
+
+    def test_operation_identity_is_fully_checked(self):
+        name, request = self.manifest['name'], self.manifest['request_id']
+        good = {'name': 'op-1', 'operationType': 'insert', 'clientOperationId': request, 'user': clone.OWNER,
+                'targetLink': CLONE_P + f'zones/{clone.ZONE}/instances/{name}', 'targetId': '7', 'status': 'DONE'}
+        args = dict(kind='insert', collection='instances', name=name, request_id=request, target_id='7', done=True)
+        self.assertIs(clone.check_operation(good, **args), good)
+        for field, value in (('operationType', 'delete'), ('clientOperationId', str(uuid4())), ('user', 'x@example.com'),
+                             ('targetLink', CLONE_P + f'zones/{clone.ZONE}/instances/labapp-clone-ffffffffffff'),
+                             ('targetId', '8'), ('error', {'errors': [{'code': 'X'}]}), ('status', 'RUNNING')):
+            with self.subTest(field), self.assertRaises(clone.Mismatch):
+                clone.check_operation(dict(good, **{field: value}), **args)
+
+    def test_summary_schema_is_closed_and_readiness_phases(self):
+        world = self.world
+        world.new_boot()
+        raw = clone_canonical(world.summary())
+        self.assertEqual(clone.readiness(clone.parse_summary(raw)), 'pending')
+        for _ in range(3):
+            summary = clone.parse_summary(clone_canonical(world.summary()))
+        self.assertEqual(clone.readiness(summary), 'ready')
+        extra = json.loads(raw)
+        extra['config'] = {'secret': 'x'}
+        nested = json.loads(raw)
+        nested['core']['config'] = 'x'
+        for hostile in (clone_canonical(extra), clone_canonical(nested),
+                        raw.replace(b'"boot"', b'"boot":"x","boot"', 1), b'x' * 5000, b'[]'):
+            with self.subTest(hostile[:30]), self.assertRaises(clone.Refused):
+                clone.parse_summary(hostile)
+
+    def test_master_commands_are_fixed_and_isolated(self):
+        master = clone.CloneMaster(Path('/tmp/x'), 'labapp-clone-aaaaaaaaaaaa', '123', 'art_githedgehog_com', self.deps)
+        for option in ('IdentityAgent=none', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
+                       'PasswordAuthentication=no', 'IdentitiesOnly=yes'):
+            self.assertIn(option, master.options)
+        self.assertIn('-M', master.start_argv())
+        self.assertIn('start-iap-tunnel labapp-clone-aaaaaaaaaaaa 22', ' '.join(master.start_argv()))
+        for argv in (master.check_argv(), master.remote_argv('summary'), master.remote_argv('stop-verified')):
+            self.assertIn('ProxyCommand=/usr/bin/false', argv)
+        self.assertIn('ControlMaster=no', master.remote_argv('summary'))
+        self.assertIn('/usr/local/lib/labapp/vlab_image.py stop-verified', master.remote_argv('stop-verified')[-1])
+        with self.assertRaises(KeyError):
+            master.remote_argv('/bin/sh')
+
+    def test_cli_arm_and_fresh_run_guard(self):
+        fresh = tempfile.mkdtemp(prefix='cl', dir='/tmp')
+        self.addCleanup(shutil.rmtree, fresh, True)
+        os.chmod(fresh, 0o700)
+        with patch('builtins.print') as output:
+            self.assertEqual(clone.main(['arm', '--workdir', fresh], self.deps), 0)
+        info = json.loads(output.call_args.args[0])
+        self.assertEqual(info['watchdog_exec_start'][-2:], ['--manifest-sha256', info['manifest_sha256']])
+        self.assertEqual(info['watchdog_exec_start'][3:5], ['watch', '--workdir'])
+        self.store.create('run', {'pid': 1})
+        with patch('builtins.print'), patch('signal.signal'):
+            self.assertEqual(clone.main(['run', '--workdir', self.world.tmp, '--manifest-sha256', self.sha,
+                                         '--watchdog-unit', self.unit], self.deps), 2)
+        self.assertEqual(self.world.mutations, [])
+
+
+class PrivateCloneOrchestration(CloneCase):
+    def test_happy_two_boot_run_and_exact_disposal(self):
+        code, result = self.execute()
+        self.assertEqual((code, result['status']), (0, 'passed'), result)
+        self.assertEqual(self.world.mutations,
+                         ['insert', 'import', 'delete-key', 'reset', 'import', 'delete-key', 'delete-vm'])
+        events = self.world.events
+        self.assertLess(events.index('stop-verified'), events.index('master-close'))
+        self.assertLess(events.index('master-close'), events.index('reset'))
+        self.assertEqual(events.count('stop-verified'), 2)
+        first, second = result['boots']
+        self.assertNotEqual(first['boot'], second['boot'])
+        self.assertEqual((first['nonce'], first['critical']), (second['nonce'], second['critical']))
+        self.assertEqual(len(set(self.world.imported)), 2)
+        self.assertEqual(self.world.keys, {})
+        self.assert_disposed(result)
+        self.assertTrue(self.store.has('closed'))
+        # A later pass finds everything absent and replays no delete.
+        self.assertTrue(self.cleaner().run()['closed'])
+        self.assertEqual(self.count('delete-vm'), 1)
+
+    def test_missing_watchdog_refuses_before_any_cloud_mutation(self):
+        self.world.watchdog = False
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.world.mutations, [])
+        self.assertFalse(self.store.has('insert-intent'))
+
+    def test_image_preflight_before_intent(self):
+        for change in ({'sourceDiskId': '1'}, {'id': '2'}, {'status': 'PENDING'}):
+            with self.subTest(change):
+                self.fresh_world()
+                self.world.image = dict(self.world.image, **change)
+                code, result = self.execute()
+                self.assertEqual((code, result['failure']), (1, 'Refused'))
+                self.assertEqual((self.world.mutations, self.store.has('insert-intent')), ([], False))
+
+    def test_unrelated_same_name_disk_is_never_deleted(self):
+        foreign = self.world.make_disk(clone.build_body(self.manifest))
+        foreign['labels'] = {'other': 'owner'}
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertIn(self.manifest['name'], self.world.disks)
+        self.assertEqual(self.world.mutations, [])
+        # Even with an insert intent on record, an unproven same-name disk is refused.
+        self.store.create('insert-intent', {'request_id': self.manifest['request_id'], 'body': {},
+                                            'body_sha256': '0' * 64, 'at': clone.iso(self.world.t - 400)})
+        self.store.create('insert-outcome', {'state': 'uncertain'})
+        again = self.cleaner().run()
+        self.assertFalse(again['closed'])
+        self.assertIn(self.manifest['name'], self.world.disks)
+        self.assertEqual(self.count('delete-disk'), 0)
+
+    def test_lost_insert_response_recovers_by_read_then_deletes_once(self):
+        self.world.inject('insert', 'lost')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Uncertain'))
+        self.assertEqual(self.count('insert'), 1)
+        self.assertEqual(self.count('delete-vm'), 1)
+        self.assert_disposed(result)
+        self.assertTrue(self.store.has('bound') and not self.store.has('ids'))
+
+    def test_dropped_insert_is_unsettled_until_the_window_passes(self):
+        self.world.inject('insert', 'drop')
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertFalse(result['cleanup']['closed'])
+        self.assertEqual(result['cleanup']['vm'], 'unresolved:insert-unsettled')
+        self.world.t += clone.SETTLE_SECONDS + 1
+        self.assertTrue(self.cleaner().run()['closed'])
+        self.assertEqual(self.count('insert'), 1)
+
+    def test_rejected_insert_settles_immediately(self):
+        self.world.inject('insert', 403)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Rejected'))
+        self.assert_disposed(result)
+        self.assertEqual(self.count('insert'), 1)
+
+    def test_stop_failure_blocks_reset_and_removes_key(self):
+        self.world.stop_fails = True
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Failure'))
+        self.assertEqual(self.count('reset'), 0)
+        self.assertEqual(self.world.keys, {})
+        self.assert_disposed(result)
+
+    def test_unclosed_master_blocks_reset(self):
+        self.world.close_ok = False
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.count('reset'), 0)
+        self.assertEqual(self.world.keys, {})
+
+    def test_reset_response_lost_is_not_replayed(self):
+        self.world.inject('reset', 'lost')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Uncertain'))
+        self.assertEqual(self.count('reset'), 1)
+        self.assert_disposed(result)
+
+    def test_second_import_uncertain_removes_only_exact_generated_keys(self):
+        _, unrelated = self.world.add_key(b'unrelated')
+        self.world.inject('import', 'lost', skip=1)
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.count('import'), 2)
+        self.assertEqual(set(self.world.keys), {unrelated})
+        self.assert_disposed(result)
+
+    def test_preexisting_intended_key_is_refused_without_post(self):
+        self.world.add_key(b'generated1')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.count('import'), 0)
+        self.assertEqual(len(self.world.keys), 1)
+        self.assert_disposed(result)
+
+    def test_expiry_or_deadline_crossing_during_token_sends_no_import(self):
+        for jump in (1300, 2800):
+            with self.subTest(jump):
+                self.fresh_world()
+                crossed = []
+
+                def hook(jump=jump, crossed=crossed):
+                    if os.path.exists(Path(self.world.tmp) / 'a1-intent.json') and not crossed:
+                        crossed.append(True)
+                        self.world.t += jump
+                self.world.on_token = hook
+                code, result = self.execute()
+                self.assertEqual((code, result['failure']), (1, 'AccessError'))
+                self.assertEqual(self.count('import'), 0)
+                self.assertTrue(self.store.has('a1-intent') and not self.store.has('a1-import'))
+
+    def test_acceptance_after_response_clock_crossing_fails_and_removes_key(self):
+        self.world.after_import = lambda: setattr(self.world, 't', self.world.t + 1300)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.count('import'), 1)
+        self.assertEqual(self.world.keys, {})
+        self.assertFalse(self.store.has('a1-import'))
+
+    def test_changed_boot_disk_between_hostkey_reads_fails_and_is_not_deleted(self):
+        self.world.on_hostkey = lambda: self.world.disks[self.manifest['name']].update(id='777')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Mismatch'))
+        self.assertNotIn('master-start', self.world.events)
+        self.assertEqual(result['cleanup']['vm'], 'unresolved:disk-provenance')
+        self.assertEqual(self.count('delete-vm'), 0)
+        self.assertEqual(self.world.keys, {})
+
+    def test_cancellation_runs_the_same_disposal(self):
+        self.world.cancel_on = 'get-guest-attributes'
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (143, 'cancelled'))
+        self.assert_disposed(result)
+        self.assertEqual(self.world.keys, {})
+
+    def test_boot_contract_mismatches_fail_and_dispose(self):
+        def builder(out, w):
+            out['boot'] = w.BUILD
+
+        def failed(out, w):
+            out['clone']['ActiveState'] = 'failed'
+
+        def nonce(out, w):
+            out['core']['nonce'] = '9' * 32
+
+        def checkpoint(out, w):
+            if out['core']['phase'] == 'ready':
+                out['checkpoint']['invocation'] = '1' * 32
+
+        def reused_pair(out, w):
+            if w.boot_n == 1:
+                out['core']['operation'], out['core']['invocation'] = w.SEALED
+                out['checkpoint'] = {'boot': out['boot'], 'operation': w.SEALED[0], 'invocation': w.SEALED[1]}
+
+        def critical_changes(out, w):
+            if w.boot_n == 2:
+                out['core']['critical_sha256'] = '9' * 64
+
+        def same_boot(out, w):
+            if w.boot_n == 2:
+                old = w.boot_id(1)
+                out['boot'] = out['core']['boot'] = old
+                if out['checkpoint']:
+                    out['checkpoint']['boot'] = old
+
+        for hook, resets in ((builder, 0), (failed, 0), (nonce, 0), (checkpoint, 0), (reused_pair, 0),
+                             (critical_changes, 1), (same_boot, 1)):
+            with self.subTest(hook.__name__):
+                self.fresh_world()
+                self.world.mutate_summary = hook
+                code, result = self.execute()
+                self.assertEqual((code, result['failure']), (1, 'Mismatch'), result)
+                self.assertEqual(self.count('reset'), resets)
+                self.assert_disposed(result)
+                self.assertEqual(self.world.keys, {})
+
+    def test_readiness_timeout_fails_without_starting_the_unit_by_hand(self):
+        def never_ready(out, w):
+            if w.boot_n == 1:
+                out['core']['phase'] = 'resumable'
+        self.world.mutate_summary = never_ready
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Expired'))
+        self.assertEqual(set(self.world.events) - {'master-start', 'master-close', 'summary'}, set())
+        self.assertEqual(self.count('reset'), 0)
+        self.assert_disposed(result)
+
+
+class PrivateCloneRecovery(CloneCase):
+    def intent(self, outcome, age=400):
+        self.store.create('insert-intent', {'request_id': self.manifest['request_id'], 'body': {},
+                                            'body_sha256': '0' * 64, 'at': clone.iso(self.world.t - age)})
+        self.store.create('insert-outcome', {'state': outcome})
+
+    def test_disk_only_partial_create_is_bound_and_deleted_once(self):
+        self.intent('uncertain')
+        self.world.make_disk(clone.build_body(self.manifest))
+        first = self.cleaner().run()
+        self.assertTrue(first['closed'], first)
+        self.assertEqual((first['vm'], first['disk']), ('absent', 'deleted'))
+        self.assertEqual(self.count('delete-disk'), 1)
+        self.assertTrue(self.cleaner().run()['closed'])
+        self.assertEqual(self.count('delete-disk'), 1)
+
+    def test_young_uncertain_insert_keeps_obligation_open(self):
+        self.intent('uncertain', age=5)
+        result = self.cleaner().run()
+        self.assertFalse(result['closed'])
+        self.assertEqual(self.world.mutations, [])
+
+    def test_uncertain_vm_delete_is_never_replayed(self):
+        self.intent('accepted')
+        self.world.insert(clone.build_body(self.manifest), self.manifest['request_id'])
+        self.world.inject('delete-vm', 'lost')
+        first = self.cleaner().run()
+        self.assertFalse(first['closed'])
+        self.assertEqual(self.count('delete-vm'), 1)
+        second = self.cleaner().run()
+        self.assertEqual(self.count('delete-vm'), 1)
+        self.assertTrue(second['closed'], second)
+
+    def test_foreign_vm_with_the_same_name_is_not_touched(self):
+        self.intent('uncertain')
+        self.world.insert(clone.build_body(self.manifest), self.manifest['request_id'])
+        self.world.vms[self.manifest['name']]['labels'] = {'labapp-manual-clone-uuid': str(uuid4())}
+        result = self.cleaner().run()
+        self.assertEqual(result['vm'], 'unresolved:vm-ownership-mismatch')
+        self.assertEqual(self.count('delete-vm'), 0)
+
+    def key_fixture(self):
+        expiry = str(int((self.world.t + 900) * 1_000_000))
+        wire, fp = self.world.add_key(b'ours', expiry=expiry)
+        _, other = self.world.add_key(b'theirs')
+        self.store.create('a1-intent', {'n': 1, 'public_key': wire, 'expiration_usec': expiry})
+        return fp, other
+
+    def test_key_delete_lost_response_is_resolved_by_profile_without_replay(self):
+        fp, other = self.key_fixture()
+        self.world.inject('delete-key', 'lost')
+        cleaner = self.cleaner()
+        self.assertEqual(cleaner.remove_key(1), 'removed')
+        self.assertEqual(cleaner.remove_key(1), 'absent')
+        self.assertEqual(self.count('delete-key'), 1)
+        self.assertEqual(set(self.world.keys), {other})
+
+    def test_key_delete_dropped_stays_unresolved_and_is_not_replayed(self):
+        fp, other = self.key_fixture()
+        self.world.inject('delete-key', 'drop')
+        cleaner = self.cleaner()
+        self.assertEqual(cleaner.remove_key(1), 'unresolved')
+        self.assertEqual(cleaner.remove_key(1), 'unresolved')
+        self.assertEqual(self.count('delete-key'), 1)
+        self.assertEqual(set(self.world.keys), {fp, other})
+
+    def test_watch_cleans_immediately_when_the_run_process_is_gone(self):
+        self.intent('accepted')
+        self.world.insert(clone.build_body(self.manifest), self.manifest['request_id'])
+        self.store.create('run', {'pid': 424242, 'start': 5, 'unit': self.unit})
+        self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps, passes=1), 0)
+        self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
+        self.assertEqual(self.count('delete-vm'), 1)
+
+    def test_watch_waits_for_the_work_deadline_when_no_run_started(self):
+        self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps, passes=1), 0)
+        self.assertGreaterEqual(self.world.t, clone.stamp(self.manifest['work_deadline']))
+        self.assertEqual(self.world.mutations, [])
+
+    def test_watch_leaves_a_closed_run_alone(self):
+        self.store.create('closed', {'at': 'x'})
+        before = self.world.t
+        self.assertEqual(clone.watch(self.world.tmp, self.sha, self.deps), 0)
+        self.assertEqual(self.world.t, before)

@@ -2065,3 +2065,95 @@ must show no older queued/running cleanup job exists before arming and stopping,
 and must wait for the native build against frozen `4e9254f` to finish. The receipt
 check validates claimed content only. No native or positive proof exists; the tests
 were authored unrun.
+
+## Manual private-image clone caller (#546, source only, not activated)
+
+`build/gcp/private_clone.py` is a standalone owner caller for ONE manual VM cloned from
+the pinned private image `labapp-private-r42446688327-a1` (immutable ID
+`1649408968157411841`, source disk `7292285895271663486`). It performs a real two-boot
+acceptance (auto-start, stop-verified, ONE provider reset, auto-start again) and exact
+disposal. It is NOT the managed lifecycle: it never reads or writes the ledger, slot,
+`Context`, `OwnerRegistration`, `Master` or managed access records, and its disposal is
+never a canonical FREE (FREE36 cannot prove it). Code grants no operational permission.
+Historical image/capture/disposal facts (#519 comments 6717641772 and 6717679812) are
+not fresh admission. Access-material provenance, generalization, shared lab identity,
+managed capture, course parity, publication and cutover remain unmet.
+
+### Interfaces (`python3 -m build.gcp.private_clone`, Python 3.12 stdlib)
+
+| Command | Purpose |
+|---|---|
+| `arm --workdir W` | `W` is a fresh empty owner-private (0700, absolute, no links, path <= 60 chars) directory. Writes the immutable `manifest.json` (ownership UUID, request UUID, name `labapp-clone-<12 hex>`, admission time, work deadline = +45 min, provider DELETE `terminationTime` = +60 min) and the empty `cleanup.lock`; prints the manifest SHA-256, watchdog unit name and exact ExecStart argv as JSON. No cloud call. |
+| `run --workdir W --manifest-sha256 H --watchdog-unit U` | The one serial attempt. Refuses unless `W` holds only the manifest and lock, the arm is <= 10 min old, and the watchdog is verified (below). Exit 0 only when both boots passed AND disposal closed. |
+| `cleanup --workdir W --manifest-sha256 H` | One idempotent disposal pass (also the manual recovery command). Exit 0 only when closed. |
+| `watch --workdir W --manifest-sha256 H` | The loop the Root systemd watchdog runs: waits until the work deadline or until the recorded `run` process is gone, then repeats `cleanup` (default 6 passes, 60 s apart). Exits 0 when closed. |
+
+Root obligations BEFORE `run` (none is inferred by the module):
+
+1. Fresh same-code, census, quota, original-11 and candidate, settings, SELF and ledger checks
+   immediately before launch. The module only rechecks the exact image (`READY`, ID, source
+   disk ID), target VM and disk name absence, the active `art@githedgehog.com` account, no
+   impersonation and the canonical SELF profile.
+2. A trusted private `W`, then `arm`, then an independent root systemd unit named exactly
+   `labapp-clone-watch-<last 12 chars of name>.service` whose ExecStart is the printed
+   `watchdog_exec_start` argv (`/usr/bin/python3 -m build.gcp.private_clone watch --workdir W
+   --manifest-sha256 H`) from the accepted checkout, running with the owner's gcloud identity
+   but not as a child of `run`. The unit must be `loaded` and `active` before `run`; `run`
+   re-verifies it with `systemctl show -p LoadState -p ActiveState -p ExecStart` immediately
+   before the INSERT and refuses with zero cloud mutation otherwise. Root wraps `run` and
+   `cleanup` in reviewed inert Ops wrappers with no extra arguments.
+3. After `run`, retain `W` (public evidence only: records, no private keys, tokens or profile
+   keys) and verify exact VM and boot disk `404`, own-key absence and no residual SSH/IAP
+   process before disabling the unit.
+
+### What the run does
+
+- One VM in `teched-473722` / `us-central1-a` / default subnet: `n2-standard-32`, one 500 GB
+  `pd-balanced` boot disk with `autoDelete=true`, nested virtualization, Cascade Lake,
+  `TERMINATE`, `automaticRestart=false`, no external IP, service account, scopes, IP
+  forwarding, deletion protection or startup script. `terminationTime` is set once with
+  `DELETE`; reset does not change it (official limit-vm-runtime behaviour), and stop/start is
+  never substituted. Ownership labels are `labapp-manual-clone` and
+  `labapp-manual-clone-uuid`, distinct from the managed lifecycle labels.
+- A durable exclusive intent (body, request UUID) precedes the single INSERT. The terminal
+  operation is checked for kind, principal, `clientOperationId`, target link and ID and
+  no error; then VM ID, boot disk ID, `disk.sourceImageId` == the pin and the full envelope.
+  Nothing is replayed after an uncertain POST: recovery is read-only by name, request ID and
+  labels.
+- Per boot a fresh one-shot ED25519 key (<= 20 min, clipped to the work deadline, never
+  renewed) is imported with the existing `SelfLogin` primitives: key absent before import,
+  exclusive intent before the POST, deadline checks after token acquisition and after the
+  response, canonical GET confirmation. Only the exact generated wire is ever deleted, once.
+  The public host key comes from guest attributes (surrounded by VM and boot disk ID checks)
+  into a pinned `known_hosts`; SSH uses the existing strict `ssh_options`, the original
+  `OwnedGroup`/socket identity and a failing `ProxyCommand` on every subordinate call. Only
+  two fixed remote commands exist: a read-only summary and the unchanged
+  `vlab_image.py stop-verified`. A retained or copied host key is not generalization proof.
+- Boot acceptance reads the unchanged `labapp-vlab-clone.service` result; the caller never
+  starts it. It requires a different kernel boot than the builder, sealed nonce, a new
+  checkpoint operation/invocation matching an active successful clone unit and the active
+  resume unit invocation, and unchanged cluster/critical digests. Readiness is observed for
+  at most 13 of each 20 minutes; the rest is reserved for the stop and teardown (the
+  guest's 900 s bound is unchanged). Critical-snapshot mismatch after clone stays a failure.
+- First boot is checkpointed, `stop-verified` and positively offline; the master is closed
+  and the key removed BEFORE the one provider reset. The second boot needs a terminal reset
+  operation, same VM, disk, image and deadline, a different kernel boot, same nonce and
+  digests, a new activation pair and its own `stop-verified`. SSH disconnection is not
+  reboot proof and nothing in guest state is rewritten to pass.
+- Disposal (`run` finally, cancellation and the watchdog) closes recorded SSH groups, removes
+  local secret files, removes only the exact generated keys, binds actual owned IDs and
+  provenance (also when only the disk exists), then performs one durable-intent DELETE per
+  resource and requires terminal operations plus `404`. An unsettled uncertain insert stays
+  open for five minutes. Unrelated same-name resources are never deleted.
+
+### Tests (offline, no cloud)
+
+The tests are classes `PrivateCloneContracts`, `PrivateCloneOrchestration` and
+`PrivateCloneRecovery` in `build/gcp/test_vlab_trial.py`, wired through the existing CI
+command for that file. They drive the real orchestration, cleaner and watchdog against an
+in-memory Compute/OS Login/guest world with injected clock and processes. This change was
+authored without executing any Python; Root runs the existing suite command in the isolated
+credential-free container, i.e. the existing CI step
+`unittest.TestLoader().discover('build/gcp', pattern='test_vlab_trial.py')` run from the
+repository root (equivalently `python3 -m unittest build.gcp.test_vlab_trial -v`), then
+independent review before any cloud admission. No live proof exists.
