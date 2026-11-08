@@ -530,6 +530,71 @@ SHA256, the target path, hash and mode, and the status. It does not verify signa
 compatibility, plugin discovery or student access (all UNRUN). Standalone component success is not
 course, image, service or efficiency proof.
 
+### Student VPC pilot recipe (#550)
+
+`student_vpc_pilot.py` is an internal, self-contained guest recipe and proof (Python 3.12 stdlib,
+Ubuntu 24.04 amd64), not a student command or wrapper, and it adds no RBAC, service account,
+management cluster/context, impersonation or controller SSH shortcut. The private-clone host
+([gcp README](../gcp/README.md)) stages it with the unchanged `install-kubectl-fabric.py` and
+`hhfab_release.py`, the pinned hhfctl archive and three pinned jq packages (`jq`/`libjq1`
+1.7.1-3ubuntu0.24.04.2, `libonig5` 6.9.9-1build1; sizes/SHA256 are constants in the module) into the
+exclusive root-private `/run/labapp-student-pilot` and runs `run` once as root. Nothing under
+`/usr/local/lib/labapp` or `/home/ubuntu/hhfab` (core contract, critical assets, the generated
+kubeconfig) is modified; the kubeconfig is only read.
+
+Phases (closed vocabulary): `preflight`, `packages`, `plugin`, `config`, `accept`, `teardown`, `done`.
+`packages`: guest libc6 >= 2.39 is checked; absent packages are installed offline with one
+`dpkg --install --refuse-downgrade` of exactly the missing pinned files (no force, no network, no
+dependency upgrade); equal state is `unchanged`; the `dpkg-query` rows of all requested packages are
+parsed completely (any dpkg status such as `iU`, `iF`, `iHR`, `rc`), and only DEFINITE absence (dpkg's
+"no packages found" line, or an `un` row without version) is installable; every other version or
+non-`ii` state of a wanted package, an unaccounted package or an unknown line, or a foreign
+`/usr/bin/jq`, is refused and preserved before any dpkg mutation. `plugin`: the unchanged installer with `--archive`
+(`installed`/`unchanged`/`mode-repaired`; a differing existing `kubectl-fabric` is refused and kept).
+`config` (child as the real `ubuntu` uid/gid/groups): the single real binding of
+`/home/ubuntu/hhfab/vlab/kubeconfig` (strictly shaped, API `https://127.0.0.1:6443`) is exposed as
+`~/.kube/config` with cluster/user names, CA and client credentials preserved and the one context
+renamed `vlab` (default). Published by no-clobber link from a private stage; an equal existing file is
+`unchanged`; a different, symlinked or wide-mode file is refused and preserved. It does not use
+`configure-student-kubeconfig.py` (which needs two real sources) and fabricates no management binding.
+`accept` (child as `ubuntu`, normal `HOME`/`PATH`, no `KUBECONFIG`, no `--kubeconfig`/`--context`):
+native discovery (`kubectl plugin list`, `kubectl fabric --help`, `kubectl fabric --version`, read-only
+`kubectl fabric switch ip --name leaf-01`, `jq --version` which the signed 1.7.1 package prints as
+`jq-1.7`), refusal of a preexisting
+`webapp-prod`, missing/insufficient default IPv4/VLAN namespaces or an overlapping CIDR/VLAN, then
+the five Lab Steps of hh-learn `0a62674` VPC Provisioning Essentials v1.0.0 with ordinary kubectl
+(apply the exact default/webapp-prod YAML, get/describe, all 7 agents `lastAppliedGen` ==
+`generation` with `Applied=True` observed twice for exactly the canonical seven names `leaf-01..05`,
+`spine-01..02` from `wiringd.yaml`, and the JSONPath-to-`jq` DHCP view). The apply is the lesson's
+`kubectl apply -f` with `-o json`; the created UID is taken ONLY from that successful response
+(kind/name/namespace/spec, generation 1). An ambiguous or unproven create stays unresolved
+(`cleanup: uncertain`) and is never adopted or deleted, even if an object with the requested spec
+exists. After the end-state checkpoint, the harness (not a lesson step) deletes only that UID with one
+native `kubectl delete --raw` carrying `DeleteOptions.preconditions.uid`, so the API server refuses it
+atomically if the name was replaced; a replaced or foreign object is preserved and reported.
+The accepted `owned_process.py` (guest `/usr/local/lib/labapp`, SHA256 `873c77d8...6e599`) is loaded
+unmodified from its hashed bytes and closes every normal child group with positive absence; a child group
+that is not proven closed, or a forcibly stopped student worker (whose nested kubectl children live in
+other sessions), makes the run sticky uncertain: no further guest mutation or teardown and no pass, and
+the existing exact whole-VM disposal owns the rest. Query output is bounded at the accepted core's finite
+1 MiB allowance (a full seven-agent query is unmeasured). The Agent/namespace field names (`status.lastAppliedGen`,
+`metadata.generation`, `spec.ranges`, `spec.subnets`) are source-assumed and need Root's native
+check. The lesson has no server attachment, dataplane or GUI step: this is not dataplane, course or
+production acceptance.
+
+Output is ONE closed JSON line (fixed keys, enums, counters and a UID; never kubectl output, config,
+certificate, key or token bytes, or guest strings); child output is captured internally and bounded,
+and exit status is 0 whenever a report was printed. There is no rollback after a publication or a
+dpkg install; failures are reported and good state is preserved, not repaired.
+
+```bash
+# Offline synthetic tests (no guest, kubectl, dpkg or cluster; small local children only):
+python3 -m unittest discover -s build/provision -p test_student_vpc_pilot.py -v
+```
+
+Author-written, NOT run. Not covered here (Root's native checks): the real pinned kubectl/plugin/jq,
+dpkg on a real guest, root-owned payload identity, `ubuntu` privilege drop and live Fabric CRDs.
+
 ### Native kubectl install and rerun proof
 
 `kubectl_native_proof.py` runs the unchanged `install-kubectl.py` CLI twice
@@ -3066,3 +3131,9 @@ the activation cleanup guard; retained preparation deadlines are checked after b
 and before publication. Ambiguous leftovers are preserved. The added `stop-verified` command is
 an operator completion boundary outside the unit ordering cycle. Native ordering and clone
 behavior still require measurement; these source changes do not clear access provenance.
+
+This private-VM pilot requires Root to exclude other writers of `webapp-prod` while normal Fabric
+reconcilers continue. The host work lock does not enforce Kubernetes writer exclusivity. An absent
+preflight plus successful `apply -o json` response establishes ownership only under that assumption;
+creation with concurrent writers and shared-cluster ownership safety remain unproven. The later
+UID-conditioned delete protects against a replaced object but does not turn apply into creation proof.

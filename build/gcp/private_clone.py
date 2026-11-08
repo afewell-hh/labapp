@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 from urllib.parse import urlencode
 
+from build.provision import student_vpc_pilot as pilot_guest
 from . import owned_process
 from . import vlab_trial as host
 from .inspection.hostkey import extract_ed25519
@@ -87,6 +88,77 @@ OWNER_STOP_TIMEOUT = '30s'
 # Isolated (-I), no-bytecode (-B) run of the protected source. No whitespace, so the ExecStart argv is exact.
 BOOTSTRAP = ('__import__("sys").path.insert(0,"' + PROTECTED_SOURCE + '");'
              '__import__("sys").exit(__import__("build.gcp.private_clone",fromlist=["main"]).main())')
+# Opt-in student CLI pilot (#550), DEFAULT OFF: only a manifest armed with ``--student-pilot`` runs it, once, after the
+# FIRST strict ready checkpoint and before the verified stop, inside the ORIGINAL access window. The pilot budget is
+# clipped so the ORIGINAL stop minimum and teardown reserve always remain (no key, readiness, work or DELETE clock is
+# extended and no stop gate is weakened). Inputs are fixed public files only. The measured startup is 11-13 min of the
+# 20 min key, so only 7-9 min remain at the first ready checkpoint; the pilot therefore asks for at most 240 s and
+# refuses BEFORE any staging when its feasible minimum does not fit. All numbers are finite assumptions, not
+# measured fit: the guest run (``pilot_guest.TOTAL_SECONDS``) is shorter than its host run cap, and the sequential
+# caps below sum to the feasible minimum, which is inside the cap.
+PILOT_SECONDS = 240             # explicit finite cap (transfer + stage + guest run)
+PILOT_INCOMING_SECONDS = 10
+PILOT_TRANSFER_SECONDS = 45
+PILOT_STAGE_SECONDS = 15
+PILOT_RUN_SECONDS = pilot_guest.TOTAL_SECONDS + 10
+PILOT_MIN_SECONDS = (PILOT_INCOMING_SECONDS + PILOT_TRANSFER_SECONDS + PILOT_STAGE_SECONDS + PILOT_RUN_SECONDS)
+PILOT_RESERVE_SECONDS = STOP_MIN_SECONDS + TEARDOWN_SECONDS      # the original stop minimum + teardown
+PILOT_REPORT_LIMIT = 2048
+PILOT_CACHE = '/home/ubuntu/.local/share/labapp-student-pilot'
+PILOT_INCOMING = 'labapp-student-pilot-in'     # relative to the OS Login home, created 0700 by the user
+PILOT_SOURCE_LIMIT = 262144
+PILOT_STAGED = b'student pilot staged'
+PILOT_STAGE_TEMPLATE = r'''import hashlib,json,os,pwd,re,stat,sys
+PINS=json.loads('@PINS@')
+SRC=json.loads('@SRC@')
+U=os.environ.get('SUDO_USER','')
+D=sys.argv[1:]
+if not re.fullmatch('[a-z_][a-z0-9_-]{0,63}',U) or len(D)!=len(SRC) or not all(re.fullmatch('[0-9a-f]{64}',x) for x in D): sys.exit(3)
+p=pwd.getpwnam(U)
+if p.pw_uid==0: sys.exit(3)
+want=[(n,s,h,True) for n,s,h in PINS]+[(n,@LIMIT@,d,False) for n,d in zip(SRC,D)]
+fl=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+home=os.open(p.pw_dir,fl)
+inc=os.open('@INCOMING@',fl,dir_fd=home)
+i=os.fstat(inc)
+if i.st_uid!=p.pw_uid or i.st_mode&0o077 or set(os.listdir(inc))!={w[0] for w in want}: sys.exit(3)
+os.mkdir('@DEST@',0o700)
+dest=os.open('@DEST@',fl)
+ok=False
+try:
+    for n,s,h,exact in want:
+        with os.fdopen(os.open(n,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=inc),'rb') as src:
+            st=os.fstat(src.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or st.st_uid!=p.pw_uid or st.st_size>s: sys.exit(3)
+            m=hashlib.sha256(); t=0
+            with os.fdopen(os.open(n,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dest),'wb') as out:
+                for b in iter(lambda:src.read(1<<20),b''):
+                    t+=len(b)
+                    if t>s: sys.exit(3)
+                    m.update(b); out.write(b)
+                out.flush(); os.fsync(out.fileno())
+            if m.hexdigest()!=h or (exact and t!=s): sys.exit(3)
+    ok=True
+finally:
+    if not ok:
+        for n in os.listdir(dest): os.unlink(n,dir_fd=dest)
+        os.rmdir('@DEST@')
+for w in want: os.unlink(w[0],dir_fd=inc)
+os.rmdir('@INCOMING@',dir_fd=home)
+print('student pilot staged')
+'''
+
+
+def pilot_stage_script(pins, dest):
+    """The staging program for exact ``pins`` into ``dest``. Production uses the real pins and payload directory;
+    tests build it with synthetic bounded pins under a temporary destination and RUN it."""
+    return PILOT_STAGE_TEMPLATE.replace('@PINS@', json.dumps([list(p) for p in pins], separators=(',', ':'))) \
+        .replace('@SRC@', json.dumps(list(pilot_guest.SOURCE_NAMES), separators=(',', ':'))) \
+        .replace('@LIMIT@', str(PILOT_SOURCE_LIMIT)).replace('@INCOMING@', PILOT_INCOMING).replace('@DEST@', str(dest))
+
+
+PILOT_STAGE_PINS = pilot_guest.CACHE_PINS
+PILOT_STAGE = pilot_stage_script(PILOT_STAGE_PINS, pilot_guest.PAYLOAD)
 UNIT_PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlGroup', 'InvocationID', 'Type',
                    'User', 'WorkingDirectory', 'Restart', 'KillMode', 'SendSIGKILL', 'TimeoutStopUSec',
                    'RemainAfterExit', 'ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost',
@@ -168,6 +240,8 @@ class Deps:
     cgroup_root: str = '/sys/fs/cgroup'
     shield: Callable[[], None] = lambda: None
     env: dict = field(default_factory=lambda: dict(os.environ))
+    pilot_cache: str = PILOT_CACHE            # tests inject a synthetic cache/source; never a CLI input
+    pilot_source: str = PROTECTED_SOURCE
 
     def now(self):
         return datetime.fromtimestamp(self.wall(), timezone.utc)
@@ -216,18 +290,28 @@ MANIFEST_FIELDS = {'schema', 'uuid', 'request_id', 'name', 'project', 'zone', 'i
                    'source_disk_id', 'admitted_at', 'work_deadline', 'termination'}
 
 
-def new_manifest(deps):
+def new_manifest(deps, pilot=None):
     ownership = str(uuid.uuid4())
     admitted = int(deps.wall())
-    return {'schema': 1, 'uuid': ownership, 'request_id': str(uuid.uuid4()),
-            'name': 'labapp-clone-' + ownership.replace('-', '')[:12], 'project': PROJECT, 'zone': ZONE,
-            'image_name': IMAGE_NAME, 'image_id': IMAGE_ID, 'source_disk_id': SOURCE_DISK_ID,
-            'admitted_at': iso(admitted), 'work_deadline': iso(admitted + WORK_SECONDS),
-            'termination': iso(admitted + DELETE_SECONDS)}
+    manifest = {'schema': 1, 'uuid': ownership, 'request_id': str(uuid.uuid4()),
+                'name': 'labapp-clone-' + ownership.replace('-', '')[:12], 'project': PROJECT, 'zone': ZONE,
+                'image_name': IMAGE_NAME, 'image_id': IMAGE_ID, 'source_disk_id': SOURCE_DISK_ID,
+                'admitted_at': iso(admitted), 'work_deadline': iso(admitted + WORK_SECONDS),
+                'termination': iso(admitted + DELETE_SECONDS)}
+    if pilot is not None:   # historical and default manifests carry no such field
+        manifest['student_pilot'] = {'schema': 1, 'inputs_sha256': pilot, 'cap_seconds': PILOT_SECONDS}
+    return manifest
 
 
 def check_manifest(m):
-    require(isinstance(m, dict) and set(m) == MANIFEST_FIELDS and m['schema'] == 1, 'manifest fields')
+    require(isinstance(m, dict) and set(m) in (MANIFEST_FIELDS, MANIFEST_FIELDS | {'student_pilot'})
+            and m['schema'] == 1, 'manifest fields')
+    if 'student_pilot' in m:
+        pilot = m['student_pilot']
+        require(isinstance(pilot, dict) and set(pilot) == {'schema', 'inputs_sha256', 'cap_seconds'}
+                and pilot['schema'] == 1 and type(pilot['cap_seconds']) is int and pilot['cap_seconds'] == PILOT_SECONDS
+                and isinstance(pilot['inputs_sha256'], str) and HEX64.fullmatch(pilot['inputs_sha256']),
+                'pilot manifest binding')
     require(all(isinstance(m[k], str) and UUID_RE.fullmatch(m[k]) for k in ('uuid', 'request_id'))
             and m['uuid'] != m['request_id'], 'manifest UUIDs')
     require(m['name'] == 'labapp-clone-' + m['uuid'].replace('-', '')[:12], 'manifest name')
@@ -367,6 +451,73 @@ def proc_start(pid, root='/proc'):
         return int(rest[19]), rest[0]
     except (OSError, ValueError, IndexError):
         return None
+
+
+# ------------------------------------------------------------------------------ student pilot ---
+def _file_sha256(path):
+    result = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            result.update(block)
+    return result.hexdigest()
+
+
+def pilot_inputs(deps):
+    """Verify the fixed public pilot inputs on the owner host -> {'items', 'digests', 'sha256'}.
+
+    Root prepares the owner-private cache BEFORE ``arm``: an owner-only real directory holding exactly the pinned
+    public archive and the three pinned jq packages as single-link regular files (size and SHA256 re-verified
+    here). The three source files come from the protected source tree. Nothing is caller selectable; the
+    returned digest binds every name, size and hash and is what the manifest records."""
+    cache = host.guest.no_links(deps.pilot_cache)
+    info = cache.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+            'pilot cache directory refused')
+    items, listing = [], []
+    for name, size, sha in pilot_guest.CACHE_PINS:
+        path = cache / name
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                and not info.st_mode & 0o022 and info.st_size == size and _file_sha256(path) == sha,
+                'pilot cache file refused')
+        items.append((name, path))
+        listing.append([name, size, sha])
+    source = host.guest.no_links(Path(deps.pilot_source) / 'build' / 'provision')
+    digests = []
+    for name in pilot_guest.SOURCE_NAMES:
+        path = source / name
+        raw = host.guest.regular(path, PILOT_SOURCE_LIMIT, os.geteuid())
+        require(0 < len(raw) <= PILOT_SOURCE_LIMIT, 'pilot source file refused')
+        digests.append(hashlib.sha256(raw).hexdigest())
+        items.append((name, path))
+        listing.append([name, len(raw), digests[-1]])
+    return {'items': items, 'digests': digests, 'sha256': digest(listing)}
+
+
+def check_pilot_report(raw):
+    """Exact closed schema of the guest pilot report (last line); anything else is refused. -> dict"""
+    g = pilot_guest
+    try:
+        require(isinstance(raw, bytes) and 0 < len(raw) <= PILOT_REPORT_LIMIT)
+        lines = raw.decode('ascii').splitlines()
+        require(lines)
+        v = json.loads(lines[-1], object_pairs_hook=_unique)
+        require(isinstance(v, dict) and set(v) == set(g.RESULT_KEYS)
+                and v['status'] in ('passed', 'failed') and v['phase'] in g.PHASES and v['code'] in g.CODES
+                and v['packages'] in g.PACKAGE_RESULTS and v['plugin'] in g.PLUGIN_RESULTS
+                and v['config'] in g.CONFIG_RESULTS and v['cleanup'] in g.CLEANUP_RESULTS
+                and type(v['agents']) is int and 0 <= v['agents'] <= 99 and isinstance(v['vpc_uid'], str)
+                and (v['vpc_uid'] == '' or g.UID_RE.fullmatch(v['vpc_uid'])))
+        return v
+    except (ValueError, UnicodeError, KeyError, TypeError, RecursionError):
+        raise Refused('pilot report refused') from None
+
+
+def pilot_passed(v):
+    g = pilot_guest
+    return (v['status'] == 'passed' and v['phase'] == 'done' and v['code'] == 'ok' and v['cleanup'] == 'removed'
+            and v['agents'] == g.AGENTS and v['packages'] != '-' and v['plugin'] != '-' and v['config'] != '-'
+            and v['vpc_uid'] != '')
 
 
 # ------------------------------------------------------------------------------ Compute -------
@@ -603,6 +754,12 @@ REMOTE = {
     'summary': ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', SUMMARY],
     'stop-verified': ['/usr/bin/sudo', '-n', '/usr/bin/python3', '/usr/local/lib/labapp/vlab_image.py',
                       'stop-verified'],
+    # Student pilot only (#550); no selector exists. ``pilot-stage`` additionally takes exactly the three verified
+    # source digests as hex arguments (see ``CloneMaster.remote``); nothing else is ever appended.
+    'pilot-incoming': ['/usr/bin/mkdir', '-m', '0700', '--', PILOT_INCOMING],
+    'pilot-stage': ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-c', PILOT_STAGE],
+    'pilot-run': ['/usr/bin/sudo', '-n', '/usr/bin/python3', '-B', str(pilot_guest.PAYLOAD / 'student_vpc_pilot.py'),
+                  'run'],
 }
 STOP_MARKER = b'checkpointed backend stop verified'
 
@@ -814,10 +971,12 @@ class CloneMaster:
     def check_argv(self):
         return ['/usr/bin/ssh', *self.options, '-o', 'ProxyCommand=/usr/bin/false', '-O', 'check', self.target]
 
-    def remote_argv(self, key):
+    def remote_argv(self, key, extra=()):
         # ControlMaster=no alone would reconnect; the failing ProxyCommand is mandatory on every call.
+        require(not extra or (key == 'pilot-stage' and len(extra) == len(pilot_guest.SOURCE_NAMES) and
+                              all(isinstance(x, str) and HEX64.fullmatch(x) for x in extra)), 'remote arguments refused')
         return ['/usr/bin/ssh', *self.options, '-o', 'ControlMaster=no', '-o', 'ProxyCommand=/usr/bin/false',
-                self.target, shlex.join(REMOTE[key])]
+                self.target, shlex.join([*REMOTE[key], *extra])]
 
     def live(self):
         try:
@@ -857,18 +1016,37 @@ class CloneMaster:
             self.deps.sleep(.1)
         raise Expired('master startup timed out')
 
-    def remote(self, key, window, cap=30):
+    def remote(self, key, window, cap=30, extra=()):
         require(key in REMOTE, 'remote command refused')
         seconds = min(cap, window.remaining())
         until = owned_process.monotonic() + seconds
         self.check(until)
-        raw = self.deps.runner(self.remote_argv(key), host.Master.slice(seconds, until), limit=8192, until=until)
+        raw = self.deps.runner(self.remote_argv(key, extra), host.Master.slice(seconds, until), limit=8192, until=until)
         self.check(until)
         try:
             window.remaining()
         except Expired:
             raise Uncertain('access window passed after a remote command') from None
         return raw
+
+    def transfer(self, window, names, cap):
+        """SFTP ``put`` of exactly the verified fixed public files over the ORIGINAL master channel.
+
+        ``names`` maps fixed remote file names to verified local paths; the batch goes through stdin so no local
+        batch file exists. Destination is only the OS Login user's own ``PILOT_INCOMING`` directory."""
+        seconds = min(cap, window.remaining())
+        until = owned_process.monotonic() + seconds
+        self.check(until)
+        batch = ''.join(f'put {shlex.quote(str(path))} {PILOT_INCOMING}/{name}\n' for name, path in names).encode()
+        require(0 < len(batch) <= 4096, 'transfer batch refused')
+        self.deps.runner(['/usr/bin/sftp', '-b', '-', *self.options, '-o', 'ControlMaster=no',
+                          '-o', 'ProxyCommand=/usr/bin/false', self.target],
+                         host.Master.slice(seconds, until), input_bytes=batch, limit=8192, until=until)
+        self.check(until)
+        try:
+            window.remaining()
+        except Expired:
+            raise Uncertain('access window passed after a transfer') from None
 
     def close(self):
         if self.group is None:
@@ -1321,6 +1499,7 @@ class Run:
         self.boots = {}
         self.active_window = None
         self.work_fd = None
+        self.pilot = None
 
         def gated_token():
             token = deps.token_provider()
@@ -1401,6 +1580,49 @@ class Run:
             except NotFound:
                 continue
             raise Refused('target name already exists')
+        if self.m.get('student_pilot'):   # the bound public inputs must still be exactly what arm verified
+            require(pilot_inputs(self.deps)['sha256'] == self.m['student_pilot']['inputs_sha256'],
+                    'pilot inputs differ from the manifest binding')
+
+    def student_pilot(self, master, window):
+        """The fixed student CLI pilot on boot 1: after the ready checkpoint, before the verified stop.
+
+        Runs inside the ORIGINAL access window: the pilot budget is clipped so the stop cap and teardown reserve
+        always remain, and nothing extends any deadline. Any failure propagates (the caller's primary failure and
+        the unchanged cleanup win); a pass needs the exact closed guest report, including the owned-VPC teardown."""
+        m, store = self.m, self.store
+        self.phase = 'pilot'
+        inputs = pilot_inputs(self.deps)
+        require(inputs['sha256'] == m['student_pilot']['inputs_sha256'], 'pilot inputs differ from the manifest binding')
+        # Gate BEFORE any staging: keep the ORIGINAL stop minimum + teardown reserve (not the 360 s stop cap).
+        budget = int(window.remaining()) - PILOT_RESERVE_SECONDS
+        require(budget >= PILOT_MIN_SECONDS, 'insufficient time for the pilot and the stop reserve')
+        budget = min(budget, PILOT_SECONDS)
+        pilot = window.sub(budget)
+        store.create('pilot-intent', {'budget': budget, 'inputs_sha256': inputs['sha256'],
+                                      'at': iso(self.deps.wall())})
+        try:
+            master.remote('pilot-incoming', pilot, PILOT_INCOMING_SECONDS)
+            self.accept_remote(pilot)
+            master.transfer(pilot, inputs['items'], PILOT_TRANSFER_SECONDS)
+            self.accept_remote(pilot)
+            staged = master.remote('pilot-stage', pilot, PILOT_STAGE_SECONDS, extra=inputs['digests'])
+            self.accept_remote(pilot)
+            require(PILOT_STAGED in staged, 'pilot staging was not confirmed')
+            raw = master.remote('pilot-run', pilot, PILOT_RUN_SECONDS)
+            self.accept_remote(pilot)
+        except BaseException as error:
+            store.try_create('pilot-result', {'status': 'failed', 'error': type(error).__name__})
+            raise
+        try:
+            report = check_pilot_report(raw)
+        except Refused:
+            store.try_create('pilot-result', {'status': 'failed', 'error': 'unparseable'})
+            raise
+        self.pilot = report
+        store.try_create('pilot-result', report)
+        require(pilot_passed(report), 'student pilot did not pass')
+        self.phase = 'boot1'
 
     def create_vm(self):
         self.phase = 'insert'
@@ -1602,6 +1824,8 @@ class Run:
             self.accept_remote(ready_window)
             if prior is not None:
                 compare_boots(prior, record)
+            if prior is None and self.m.get('student_pilot'):
+                self.student_pilot(master, window)
             left = window.remaining()
             require(left >= STOP_MIN_SECONDS + TEARDOWN_SECONDS, 'insufficient time to stop the backend')
             out = master.remote('stop-verified', window, min(STOP_SECONDS, left - TEARDOWN_SECONDS))
@@ -1679,6 +1903,8 @@ class Run:
             self.late()
             self.store.create('result', {'first': first, 'second': second})
             result.update(boots=[first, second])
+            if self.pilot is not None:
+                result['pilot'] = self.pilot
             passed = True
         except host.HostCancelled as error:
             code, failure = error.code, 'cancelled'
@@ -1687,6 +1913,8 @@ class Run:
         if failure is not None:
             self.store.try_create('failure', {'phase': self.phase, 'type': failure})
             result.update(phase=self.phase, failure=failure)
+            if self.pilot is not None:
+                result['pilot'] = self.pilot
         try:
             self.deps.shield()
         except Exception:
@@ -1727,15 +1955,18 @@ def watch(directory, sha, deps, *, passes=6, pause=60):
 
 
 # ------------------------------------------------------------------------------ CLI ----------
-def arm(directory, deps):
+def arm(directory, deps, pilot=False):
+    """``pilot`` (``--student-pilot``) is the one closed opt-in: it binds the verified fixed public inputs into the
+    manifest. Without it the manifest, units and behavior are exactly the historical ones."""
     path = private_directory(directory, empty=True)
-    manifest = new_manifest(deps)
+    manifest = new_manifest(deps, pilot_inputs(deps)['sha256'] if pilot else None)
     raw = Store(path).create('manifest', manifest)
     for lock in ('cleanup.lock', 'work.lock'):
         fd = os.open(path / lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
     sha = hashlib.sha256(raw).hexdigest()
-    return {'manifest_sha256': sha, 'name': manifest['name'], 'watchdog_unit': watch_unit(manifest),
+    report = {} if not pilot else {'student_pilot': manifest['student_pilot']}
+    return {**report, 'manifest_sha256': sha, 'name': manifest['name'], 'watchdog_unit': watch_unit(manifest),
             'owner_unit': owner_unit(manifest),
             'owner_exec_start': unit_argv(manifest, path, sha, 'run'),
             'watchdog_exec_start': unit_argv(manifest, path, sha, 'watch'),
@@ -1757,7 +1988,9 @@ def main(argv=None, deps=None):
     for name in ('arm', 'run', 'cleanup', 'watch'):
         item = sub.add_parser(name, allow_abbrev=False)
         item.add_argument('--workdir', required=True)
-        if name != 'arm':
+        if name == 'arm':
+            item.add_argument('--student-pilot', action='store_true')
+        else:
             item.add_argument('--manifest-sha256', required=True)
             item.add_argument('--owner-unit', required=True)
         if name == 'run':
@@ -1767,7 +2000,7 @@ def main(argv=None, deps=None):
     os.umask(0o077)
     try:
         if args.action == 'arm':
-            print(json.dumps(arm(args.workdir, deps), sort_keys=True))
+            print(json.dumps(arm(args.workdir, deps, pilot=args.student_pilot), sort_keys=True))
             return 0
         directory = private_directory(args.workdir)
         manifest = load_manifest(directory, args.manifest_sha256)
