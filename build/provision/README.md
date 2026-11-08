@@ -817,12 +817,16 @@ and no-`cleanup_uncertain` gates, timeouts, budgets, stop and mount behavior are
 no blanket retry and final-readyz stays strict. The existing positive and negative table tests are
 extended over all four forms.
 
-Source basis and limits: this was authored from the in-repo classifier and the issue's description
-of pinned kubectl v0.35.0, client-go v0.35.0 and Go 1.25.5 net/http. The author job did **not**
-read those upstream sources (helpers.go, request.go, transport.go, client.go) and did not execute
-any code or tests; upstream framing of these strings is taken from the issue and the observed
-native34 bytes and is still to be verified by the lead's real pinned-kubectl TLS probe and
-isolated tests. Native success remains UNPROVEN.
+The pinned formatter path is kubectl v0.35.0 [`RawGet`](https://github.com/kubernetes/kubectl/blob/v0.35.0/pkg/rawhttp/raw.go)
+→ client-go v0.35.0 [`Request.Stream`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/request.go)
+→ `http.Client.Do`; [`HTTPClientFor`](https://github.com/kubernetes/client-go/blob/v0.35.0/rest/transport.go)
+sets `Client.Timeout`. This raw GET path does not use the separate `Request.request()` timeout path.
+Go 1.25.5 [`client.go`](https://github.com/golang/go/blob/go1.25.5/src/net/http/client.go)
+adds the awaiting-headers suffix; [`transport.go`](https://github.com/golang/go/blob/go1.25.5/src/net/http/transport.go)
+distinguishes connection acquisition cancellation from an in-flight cancellation. Kubernetes
+v1.35.0's [build dependencies](https://github.com/kubernetes/kubernetes/blob/v1.35.0/build/dependencies.yaml)
+pin Go 1.25.5. These version-pinned sources explain the finite family; they do not establish
+why a native API was delayed. Native resume success remains UNPROVEN.
 
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
