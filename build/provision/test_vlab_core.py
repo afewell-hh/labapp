@@ -3469,9 +3469,17 @@ class FormatAndSourceTests(unittest.TestCase):
                               b'(Client.Timeout exceeded while awaiting headers)\n')
         self.assertEqual(core.INITIAL_READYZ_CLIENT_TIMEOUT_SHORT,
                          b'Unable to connect to the server: context deadline exceeded\n')
-        for raw in (core.INITIAL_READYZ_CLIENT_TIMEOUT, core.INITIAL_READYZ_CLIENT_TIMEOUT_SHORT):
+        self.assertEqual(core.INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED,
+                         b'Unable to connect to the server: net/http: request canceled '
+                         b'(Client.Timeout exceeded while awaiting headers)\n')
+        self.assertEqual(core.INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING,
+                         b'Unable to connect to the server: net/http: request canceled while waiting '
+                         b'for connection (Client.Timeout exceeded while awaiting headers)\n')
+        self.assertEqual(len(core.INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING), 138)
+        self.assertEqual(len(core.INITIAL_READYZ_CLIENT_TIMEOUTS), 4)
+        for raw in core.INITIAL_READYZ_CLIENT_TIMEOUTS:
             error = executed_failure('child command failed', 1, raw)
-            with patch.object(core, 'execute', side_effect=error):
+            with self.subTest(raw=raw), patch.object(core, 'execute', side_effect=error):
                 with self.assertRaises(core.Pending) as raised:
                     core.kubectl(['get', '--raw=/readyz'], 1000, 'api-initial-readyz')
             self.assertEqual((str(raised.exception), raised.exception.code,
@@ -3481,7 +3489,7 @@ class FormatAndSourceTests(unittest.TestCase):
 
     def test_client_timeout_stays_fatal_outside_exact_initial_context_or_with_other_bytes(self):
         raw = core.INITIAL_READYZ_CLIENT_TIMEOUT
-        for raw in (core.INITIAL_READYZ_CLIENT_TIMEOUT, core.INITIAL_READYZ_CLIENT_TIMEOUT_SHORT):
+        for raw in core.INITIAL_READYZ_CLIENT_TIMEOUTS:
             for route, args in (
                     (None, ['get', '--raw=/readyz']),
                     ('api-final-readyz', ['get', '--raw=/readyz']),
@@ -3501,6 +3509,13 @@ class FormatAndSourceTests(unittest.TestCase):
                           b'Unable to connect to the server: x509: certificate signed by unknown authority\n',
                           b'error: You must be logged in to the server (Unauthorized)\n',
                           b'Error from server (Timeout): request did not complete within requested timeout\n',
+                          b'Unable to connect to the server: net/http: request canceled\n',
+                          b'Unable to connect to the server: net/http: request canceled while '
+                          b'waiting for connection\n',
+                          b'Unable to connect to the server: net/http: request canceled while '
+                          b'waiting for connection (Client.Timeout exceeded while awaiting headers) \n',
+                          b'Unable to connect to the server: net/http: request canceled (Client.Timeout '
+                          b'exceeded while reading body)\n',
                           b'Client.Timeout exceeded while awaiting headers\n', b'other', b''):
                 error = executed_failure('child command failed', 1, other)
                 with self.subTest(other=other), patch.object(core, 'execute', side_effect=error):
@@ -3511,7 +3526,7 @@ class FormatAndSourceTests(unittest.TestCase):
 
     def test_client_timeout_cannot_override_status_provenance_message_or_cleanup(self):
         raw = core.INITIAL_READYZ_CLIENT_TIMEOUT
-        for raw in (core.INITIAL_READYZ_CLIENT_TIMEOUT, core.INITIAL_READYZ_CLIENT_TIMEOUT_SHORT):
+        for raw in core.INITIAL_READYZ_CLIENT_TIMEOUTS:
             for message, code, executed, prior_route, uncertain in (
                     ('child command failed', 124, True, None, False),
                     ('child deadline exceeded', 124, True, None, False),

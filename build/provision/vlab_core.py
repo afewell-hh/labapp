@@ -1537,6 +1537,17 @@ def initial_readyz_failed(raw):
 INITIAL_READYZ_CLIENT_TIMEOUT = (b'Unable to connect to the server: context deadline exceeded '
                                  b'(Client.Timeout exceeded while awaiting headers)\n')
 INITIAL_READYZ_CLIENT_TIMEOUT_SHORT = b'Unable to connect to the server: context deadline exceeded\n'
+# Go net/http Client.Timeout family (#540); native34 supplemental context was the 138-byte
+# CANCELED_WAITING form. Bare (unsuffixed) request-canceled forms are deliberately not accepted.
+INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED = (
+    b'Unable to connect to the server: net/http: request canceled '
+    b'(Client.Timeout exceeded while awaiting headers)\n')
+INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING = (
+    b'Unable to connect to the server: net/http: request canceled while waiting for connection '
+    b'(Client.Timeout exceeded while awaiting headers)\n')
+INITIAL_READYZ_CLIENT_TIMEOUTS = (
+    INITIAL_READYZ_CLIENT_TIMEOUT, INITIAL_READYZ_CLIENT_TIMEOUT_SHORT,
+    INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED, INITIAL_READYZ_CLIENT_TIMEOUT_CANCELED_WAITING)
 
 
 def kubectl(args, deadline, route=None):
@@ -1557,8 +1568,8 @@ def kubectl(args, deadline, route=None):
         unavailable = re.fullmatch(rb'Error from server \(ServiceUnavailable\): [^\r\n]{1,4096}\n?', raw)
         matched = (initial and error.route == route
                    and getattr(error, '_executed_child', False) is True)
-        health_failed = matched and (initial_readyz_failed(raw) or raw in (
-            INITIAL_READYZ_CLIENT_TIMEOUT, INITIAL_READYZ_CLIENT_TIMEOUT_SHORT))
+        health_failed = matched and (initial_readyz_failed(raw)
+                                 or raw in INITIAL_READYZ_CLIENT_TIMEOUTS)
         # Unconfirmed process-group kill/direct-child reap must stay fatal: the same
         # original Failure propagates and can never lead to another readiness poll.
         if (error.code == 1 and str(error) == 'child command failed'

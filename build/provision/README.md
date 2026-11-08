@@ -804,6 +804,26 @@ short form is now covered by the same narrow route/argv/executed-child/exit/mess
 Both forms share the existing negative boundary tests. This is a source classifier correction;
 actual successful resumed persistence and a usable image still require another native trial.
 
+**Native Go client timeout family (#540).** Native34 passed fresh strict/API/nonce and verified
+stop/offline checks, then failed at initial resume readyz child1; the supplemental command context
+exactly equaled the public 138-byte literal `Unable to connect to the server: net/http: request
+canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)\n`. The
+primary failure was a systemctl failure, so the API delay root cause is not proved. The exact
+whole-output family is now four forms: bare and suffixed `context deadline exceeded`, plus suffixed
+`net/http: request canceled` and suffixed `net/http: request canceled while waiting for connection`.
+Bare `net/http: request canceled` forms, other suffixes, whitespace/case variants, TLS/x509/auth
+text and all other strings stay fatal. Route, argv, executed-child, exit1, `child command failed`
+and no-`cleanup_uncertain` gates, timeouts, budgets, stop and mount behavior are unchanged; there is
+no blanket retry and final-readyz stays strict. The existing positive and negative table tests are
+extended over all four forms.
+
+Source basis and limits: this was authored from the in-repo classifier and the issue's description
+of pinned kubectl v0.35.0, client-go v0.35.0 and Go 1.25.5 net/http. The author job did **not**
+read those upstream sources (helpers.go, request.go, transport.go, client.go) and did not execute
+any code or tests; upstream framing of these strings is taken from the issue and the observed
+native34 bytes and is still to be verified by the lead's real pinned-kubectl TLS probe and
+isolated tests. Native success remains UNPROVEN.
+
 The existing exception-path group kill/direct-child reap and uncertainty guard are unchanged;
 absence of `cleanup_uncertain` is **not** positive group-absence proof. No124/timeout recovery is
 introduced. Only the initial production loop catches this new Pending, under the original fresh2700s
