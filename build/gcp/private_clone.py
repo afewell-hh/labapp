@@ -796,6 +796,10 @@ class CloneMaster:
         self.check(until)
         raw = self.deps.runner(self.remote_argv(key), host.Master.slice(seconds, until), limit=8192, until=until)
         self.check(until)
+        try:
+            window.remaining()
+        except Expired:
+            raise Uncertain('access window passed after a remote command') from None
         return raw
 
     def close(self):
@@ -1422,19 +1426,40 @@ class Run:
             master = factory(directory, self.m['name'], self.ids['vm_id'], username, self.deps, record=record)
             try:
                 master.start(window)
+                self.accept_remote(window)
                 return master
-            except Exception:
-                if not master.close():
+            except BaseException as error:
+                try:
+                    closed = master.close()
+                except BaseException:
+                    closed = False
+                if not closed:
                     self.unclosed.append(master)
+                # Cancellation is control flow, including during startup/closure. Preserve it
+                # after recording whether the original group was positively closed.
+                if not isinstance(error, Exception):
+                    raise
+                if not closed:
                     raise Uncertain('master process cleanup uncertain') from None
                 if k == MASTER_ATTEMPTS:
                     raise
                 self.deps.sleep(15)
 
+    def accept_remote(self, window):
+        """A remote answer/proof cannot outlive its original access window or work authority."""
+        self.late()
+        try:
+            window.remaining()
+        except Expired:
+            raise Uncertain('access window passed before remote proof acceptance') from None
+
     def await_ready(self, master, window, prior):
         while True:
-            summary = parse_summary(master.remote('summary', window, 30))
+            raw = master.remote('summary', window, 30)
+            self.accept_remote(window)
+            summary = parse_summary(raw)
             if readiness(summary, prior) == 'ready':
+                self.accept_remote(window)
                 return summary
             window.remaining()
             self.deps.sleep(10)
@@ -1453,15 +1478,22 @@ class Run:
         try:
             summary = self.await_ready(master, ready_window, prior)
             record = ready_record(summary)
+            self.accept_remote(ready_window)
             self.store.create(f'checkpoint-{n}', {**record, 'hostkey_sha256': hashlib.sha256(line.encode()).hexdigest()})
+            self.accept_remote(ready_window)
             if prior is not None:
                 compare_boots(prior, record)
             left = window.remaining()
             require(left >= STOP_MIN_SECONDS + TEARDOWN_SECONDS, 'insufficient time to stop the backend')
             out = master.remote('stop-verified', window, min(STOP_SECONDS, left - TEARDOWN_SECONDS))
+            self.accept_remote(window)
             require(STOP_MARKER in out, 'stop-verified did not report success')
-            check_offline(parse_summary(master.remote('summary', window, 30)), record)
+            raw = master.remote('summary', window, 30)
+            self.accept_remote(window)
+            check_offline(parse_summary(raw), record)
+            self.accept_remote(window)
             self.store.create(f'stopped-{n}', {'boot': record['boot']})
+            self.accept_remote(window)
         finally:
             closed = master.close()
             if closed:

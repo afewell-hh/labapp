@@ -5592,3 +5592,106 @@ class PrivateCloneCorrection(CloneCase):
         self.assertLess(self.world.t - start, clone.WORK_SECONDS + 600)   # the monotonic bound fired, not 3 h later
         self.assertEqual(self.world.timeline[0], 'systemctl-stop')
         self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
+
+
+class PrivateCloneLeadIntegration(CloneCase):
+    def test_cancel_during_real_master_start_closes_original_group_and_preserves_primary(self):
+        import socket
+        for boundary in ('record', 'check'):
+            for closes in (True, False):
+                with self.subTest(boundary=boundary, closes=closes):
+                    self.fresh_world()
+                    run = clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit)
+                    run.ids = {'vm_id': '123', 'boot_id': '456'}
+                    directory = Path(self.world.tmp) / 'b1'
+                    directory.mkdir(mode=0o700)
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.addCleanup(sock.close)
+                    sock.bind(str(directory / 'master.sock'))
+                    group = Mock(outcome=None)
+                    group.status.return_value = None
+                    group.close.return_value = closes
+                    self.deps.master_factory = None
+                    self.deps.popen = Mock(return_value=SimpleNamespace(pid=999999))
+                    cancellation = host.HostCancelled(signal.SIGTERM)
+                    original = run.store.create
+
+                    def create(kind, value):
+                        if boundary == 'record' and kind.startswith('master-'):
+                            raise cancellation
+                        return original(kind, value)
+
+                    check = patch.object(clone.CloneMaster, 'check', side_effect=cancellation) \
+                        if boundary == 'check' else nullcontext()
+                    window = clone.Window(self.deps, run.budget, self.world.wall() + 1200)
+                    with patch.object(clone.owned_process, 'OwnedGroup', return_value=group), \
+                            patch.object(run.store, 'create', side_effect=create), check:
+                        with self.assertRaises(host.HostCancelled) as caught:
+                            run.start_master(1, directory, 'ubuntu', window)
+                    self.assertIs(caught.exception, cancellation)
+                    self.deps.popen.assert_called_once()
+                    group.close.assert_called_once()
+                    self.assertEqual(len(run.unclosed), 0 if closes else 1)
+                    self.assertEqual(run.cleaner.quiet(), closes)
+
+    def test_cancelled_start_with_unclosed_group_cannot_publish_closed_cleanup(self):
+        world = self.world
+
+        class CancelledMaster(CloneFakeMaster):
+            def start(self, window):
+                super().start(window)
+                raise host.HostCancelled(signal.SIGTERM)
+
+        world.close_ok = False
+        self.deps.master_factory = lambda *a, **k: CancelledMaster(world, *a, **k)
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (143, 'cancelled'))
+        self.assertIn('master-close', world.events)
+        self.assertFalse(result['cleanup']['closed'])
+        self.assertFalse(self.store.has('closed'))
+        self.assertEqual(self.count('reset'), 0)
+
+    def test_late_remote_answers_do_not_publish_checkpoint_or_stop_or_reset(self):
+        for boundary in ('readiness', 'stop', 'offline'):
+            with self.subTest(boundary=boundary):
+                self.fresh_world()
+                world, crossed = self.world, []
+
+                class LateMaster(CloneFakeMaster):
+                    def remote(self, key, window, cap=30):
+                        raw = super().remote(key, window, cap)
+                        hit = ((boundary == 'readiness' and key == 'summary')
+                               or (boundary == 'stop' and key == 'stop-verified')
+                               or (boundary == 'offline' and key == 'summary'
+                                   and 'stop-verified' in world.events))
+                        if hit and not crossed:
+                            crossed.append(True)
+                            world.wall_offset += 1201  # access expires; overall 45m still has time
+                        return raw
+
+                self.deps.master_factory = lambda *a, **k: LateMaster(world, *a, **k)
+                code, result = self.execute()
+                self.assertTrue(crossed)
+                self.assertEqual((code, result['failure']), (1, 'Uncertain'), result)
+                self.assertFalse(self.store.has('stopped-1'))
+                if boundary == 'readiness':
+                    self.assertFalse(self.store.has('checkpoint-1'))
+                self.assertEqual(self.count('reset'), 0)
+                self.assert_disposed(result)
+
+    def test_real_remote_rechecks_original_access_window_after_command(self):
+        for clock in ('wall_offset', 'mono_offset'):
+            with self.subTest(clock=clock):
+                self.fresh_world()
+                budget = clone.Budget(self.manifest, self.deps)
+                window = clone.Window(self.deps, budget, self.world.wall() + 1200)
+                master = clone.CloneMaster(self.world.tmp, self.manifest['name'], '123', 'ubuntu', self.deps)
+
+                def remote_result(*args, **kwargs):
+                    setattr(self.world, clock, getattr(self.world, clock) + 1201)
+                    return b'late answer'
+
+                self.deps.runner = remote_result
+                with patch.object(master, 'check'):
+                    with self.assertRaises(clone.Uncertain):
+                        master.remote('summary', window)

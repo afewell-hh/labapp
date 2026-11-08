@@ -2114,9 +2114,13 @@ Two loaded system services, named from the manifest name (last 12 chars `X`):
 - Watch `labapp-clone-watch-X.service` runs `watchdog_exec_start` (verb `watch`) with the same
   user, working directory, `Restart=no` and `Type=simple`, and no extra Exec lines. It is a
   SEPARATE unit/cgroup from the owner and must be active before `run`.
-- The watch user must be allowed to `systemctl stop` exactly the owner unit (for example a
-  polkit rule scoped to that single unit); the module runs `/usr/bin/systemctl stop <owner>` and
-  trusts nothing but the post-stop proof.
+- Root derives the owner's `RuntimeMaxSec` from the ORIGINAL work deadline minus 60 seconds,
+  retaining `TimeoutStopSec=30s`. The service manager stops the owner and kills any remaining
+  cgroup members before the watch's work deadline. Root verifies these actual loaded bounds,
+  the owner inactivity and the empty cgroup; an early manual cancellation uses the owner's
+  existing administrative access to stop the exact owner unit before invoking cleanup.
+  This composition needs no new polkit rule or privilege grant. The watch uses the supported
+  already-inactive branch of `Units.quiesce`; it never assumes a failed stop proves absence.
 
 Verification reads typed `systemctl show -p` properties (`Id LoadState ActiveState SubState
 MainPID ControlGroup InvocationID Type User WorkingDirectory Restart KillMode SendSIGKILL
@@ -2151,7 +2155,7 @@ Root obligations BEFORE `run` (none is inferred by the module):
 2. A trusted private `W`, then `arm`, then the two installed units above with exactly the
    printed argv lists, with the watch active and the owner started by the reviewed Ops wrapper
    (`systemctl start`) so that `run` is its MainPID. Root prepares and reviews the concrete
-   unit files, polkit rule and inert wrappers after source acceptance.
+   unit files, original-deadline expiry bounds and inert wrappers after source acceptance.
 3. After `run`, retain `W` (public evidence only: records, no private keys, tokens or profile
    keys) and verify exact VM and boot disk `404`, own-key absence and the owner cgroup empty
    before disabling the units.
@@ -2212,7 +2216,7 @@ Root obligations BEFORE `run` (none is inferred by the module):
 
 Residual limits: a dropped (never-delivered) mutation stays open for the lead; the ExecStart
 `argv[]=` text is space-joined by systemd, so reviewed arguments contain no whitespace; the
-polkit rule, unit files, wrappers and the source tree layout under the protected source are
+unit files, earlier owner expiry, wrappers and the source tree layout under the protected source are
 Root's to supply and verify; DELETE has no work-budget gate.
 
 ### Tests (offline, no cloud)
