@@ -584,8 +584,38 @@ production acceptance.
 
 Output is ONE closed JSON line (fixed keys, enums, counters and a UID; never kubectl output, config,
 certificate, key or token bytes, or guest strings); child output is captured internally and bounded,
-and exit status is 0 whenever a report was printed. There is no rollback after a publication or a
+and exit status is 0 whenever a report was printed. Two closed pre-apply diagnostics (#552) are part of
+the report: `step`, the last lesson substep the acceptance child entered (`-`, `binary`, `context`,
+`contexts`, `plugin`, `fabric`, `jq`, `vpc-absent`, `ipv4-read`, `vlan-read`, `namespaces`, `conflicts`,
+then `manifest`, `apply`, `post-apply` at or after the first possible mutation boundary), and `capacity`,
+exactly the five booleans `ipv4_web`, `ipv4_worker`, `vlan_web`, `vlan_worker`, `no_conflict`, each
+`true`/`false` only when actually computed from a parsed read and `null` when not observed (a malformed
+namespace stays `null`). They never replace the primary `code`, the owned cleanup or the sticky
+uncertainty; a `done` event with a missing, unknown or non-boolean field is not accepted (the worker
+counts as unfinished) and the host refuses the same report. No exception text or CLI output is matched
+or stored. The native cause of the #550 refusal remains unproved; these fields only localize a future one. There is no rollback after a publication or a
 dpkg install; failures are reported and good state is preserved, not repaired.
+
+#### Course wiring input (#552)
+
+`build/provision/course-wiring.yaml` is the exact root `wiringd.yaml` bytes (10048 bytes, SHA256
+`c522c64d...8806a`, unchanged and still the input of `hhfab_test.py`, Packer/`stage_tools`, the inspection
+catalog and the zero-topology generator checks) with ONE line appended after its sole `10.0.0.0/16`
+subnet: `  - 10.10.0.0/16` (expected 10065 bytes, SHA256
+`3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060`, computed by Root and supplied in #552;
+this author did not run any hash). The lesson needs `10.10.10.0/24` and `10.10.20.0/24`, which the root
+`10.0.0.0/16`-only default IPv4 namespace cannot hold; the VLAN range 1000-2999 already covers 1010/1020.
+The fixed `vlab_trial.py:SOURCES['wiringd.yaml']` repository path is the course file while the logical
+staging and guest name stays `wiringd.yaml`; `vlab_core.WIRING_SHA` is the course hash, and the strict
+source, contract and installer-object checks are unchanged. Old cached core or image state is not migrated.
+Pinned Fabricator 0.43.1 honors an imported wiring
+([`importFabricGateway`](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/cmdconfig.go),
+[`loadHydrateValidate`](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/hhfab/hydrate.go),
+[`ControlInstallBuilder`](https://github.com/githedgehog/fabricator/blob/v0.43.1/pkg/fab/recipe/control_build.go));
+the VLABBuilder `10.0.0.0/16` is a generator default, not an override of a supplied import. Per #552 these
+upstream files were cited by the lead, not read by this author. Root's own isolated tests and actual pinned
+`hhfab` 0.43.1 `init --wiring`/`validate --hydrate-mode if-not-present` runs (twice, public invented fixtures,
+no network/credentials/socket, verifying the namespace is preserved) are still required and not claimed here.
 
 ```bash
 # Offline synthetic tests (no guest, kubectl, dpkg or cluster; small local children only):
@@ -2211,7 +2241,7 @@ unknown fields or ambient credential lookup. Its exact fields are:
 | --- | --- |
 | `schema`, `dedicated_guest`, `nonce` | `1`, `true`, 32 lowercase hex characters identifying this appliance |
 | `fab`, `fab_sha256` | Absolute private FAB file and exact SHA256; mode0600; no development credentials |
-| `wiring`, `wiring_sha256` | Absolute canonical `wiringd.yaml` and `c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a` |
+| `wiring`, `wiring_sha256` | Absolute staged `wiringd.yaml` (its bytes are the fixed course input `build/provision/course-wiring.yaml`, see [Course wiring input](#course-wiring-input-552)) and `3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060`; the root `wiringd.yaml` hash `c522c64d...8806a` is refused |
 | `package_receipt`, `package_receipt_sha256` | Absolute private receipt and its exact SHA256 |
 | `candidate_policy` | Exactly `{"bridge":"172.30.0.2/21","netfilter":"all-three-off","forwarded_ports":"0.0.0.0-isolated-by-route","build":"iso","controls_restricted":true,"servers_restricted":true}` |
 

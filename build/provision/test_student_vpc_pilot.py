@@ -27,6 +27,24 @@ CANONICAL = ['leaf-01', 'leaf-02', 'leaf-03', 'leaf-04', 'leaf-05', 'spine-01', 
 OWNED_FILE = Path(__file__).with_name('owned_process.py')
 
 
+REPO = Path(__file__).resolve().parents[2]
+COURSE_WIRING = REPO / 'build/provision/course-wiring.yaml'
+ROOT_WIRING = REPO / 'wiringd.yaml'
+EMPTY = {key: None for key in pilot.CAPACITY_KEYS}
+CLOSED = {'step': '-', 'capacity': EMPTY}
+
+
+def real_namespaces(path):
+    """The default IPv4Namespace and VLANNamespace objects PARSED from a real repository wiring file (not hand-made)."""
+    import yaml
+    found = {}
+    for doc in yaml.safe_load_all(path.read_bytes()):
+        if isinstance(doc, dict) and doc.get('kind') in ('IPv4Namespace', 'VLANNamespace') \
+                and doc['metadata']['name'] == 'default':
+            found[doc['kind']] = doc
+    return found['IPv4Namespace'], found['VLANNamespace']
+
+
 def reset_sticky(test):
     """Sticky state is process-global: every test starts and ends with it clear."""
     pilot.STICKY.clear()
@@ -74,8 +92,8 @@ class Cluster:
         self.apply_state, self.keep_on_delete, self.deleted = 'ok', False, 0
         self.apply_creates, self.apply_mutate, self.deletes = True, None, []
         self.agent_count, self.output_state, self.on_call = 7, None, {}
-        self.ipv4 = {'spec': {'subnets': ['10.10.0.0/16']}}
-        self.vlans = {'spec': {'ranges': [{'from': 1000, 'to': 1999}]}}
+        # The happy world serves the REAL parsed course wiring namespaces, never a hand-made alternate.
+        self.ipv4, self.vlans = real_namespaces(COURSE_WIRING)
 
     def __call__(self, argv, seconds, *, env, limit=65536, stdin=None, account=None):
         self.calls.append((list(argv), env, stdin))
@@ -272,6 +290,42 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(pilot.agents_state(agents(names=CANONICAL[:6] + ['leaf-01'])), (7, False))
         self.assertEqual(pilot.agents_state(agents(names=list(reversed(CANONICAL)))), (7, True))
 
+    def test_real_input_canonical_fails_capacity_and_course_passes(self):
+        canon_ipv4, canon_vlan = real_namespaces(ROOT_WIRING)
+        course_ipv4, course_vlan = real_namespaces(COURSE_WIRING)
+        self.assertEqual(canon_ipv4['spec']['subnets'], ['10.0.0.0/16'])
+        self.assertEqual(course_ipv4['spec']['subnets'], ['10.0.0.0/16', '10.10.0.0/16'])
+        self.assertEqual(canon_vlan, course_vlan)
+        self.assertFalse(pilot.namespaces_ok(canon_ipv4, canon_vlan))
+        self.assertEqual(pilot.ipv4_capacity(canon_ipv4), {'ipv4_web': False, 'ipv4_worker': False})
+        self.assertEqual(pilot.vlan_capacity(canon_vlan), {'vlan_web': True, 'vlan_worker': True})
+        self.assertTrue(pilot.namespaces_ok(course_ipv4, course_vlan))
+        self.assertEqual(pilot.ipv4_capacity(course_ipv4), {'ipv4_web': True, 'ipv4_worker': True})
+
+    def test_course_wiring_is_the_root_wiring_plus_exactly_one_namespace_prefix(self):
+        import hashlib
+        root, course = ROOT_WIRING.read_bytes(), COURSE_WIRING.read_bytes()
+        marker = b'  - 10.0.0.0/16\n'
+        self.assertEqual(root.count(marker), 1)
+        self.assertEqual(course, root.replace(marker, marker + b'  - 10.10.0.0/16\n'))
+        self.assertEqual((len(root), len(course)), (10048, 10065))
+        self.assertEqual(hashlib.sha256(root).hexdigest(),
+                         'c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a')
+        # Expected value supplied by Root in issue #552 (not independently derived or verified by this author).
+        self.assertEqual(hashlib.sha256(course).hexdigest(),
+                         '3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060')
+
+    def test_capacity_helpers_are_closed_and_report_only_observed_booleans(self):
+        self.assertIsNone(pilot.ipv4_capacity({'spec': {'subnets': ['not-a-cidr']}}))
+        self.assertIsNone(pilot.vlan_capacity({'spec': {'ranges': [{'from': 1}]}}))
+        self.assertIsNone(pilot.ipv4_capacity('x'))
+        self.assertTrue(pilot.capacity_valid(dict(EMPTY)))
+        self.assertTrue(pilot.capacity_valid({k: True for k in pilot.CAPACITY_KEYS}))
+        for bad in (None, {}, dict(EMPTY, extra=True), dict(EMPTY, ipv4_web=1), dict(EMPTY, ipv4_web='true'),
+                    {k: None for k in pilot.CAPACITY_KEYS[:-1]}):
+            with self.subTest(bad=bad):
+                self.assertFalse(pilot.capacity_valid(bad))
+
     def test_namespace_and_conflict_checks(self):
         ipv4, vlan = {'spec': {'subnets': ['10.10.0.0/16']}}, {'spec': {'ranges': [{'from': 1000, 'to': 1999}]}}
         self.assertTrue(pilot.namespaces_ok(ipv4, vlan))
@@ -286,7 +340,7 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(pilot.cidr_conflict(other('10.30.0.0/24', 1020)))
 
     def test_events_are_closed_and_ignore_everything_else(self):
-        good = json.dumps({'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 7})
+        good = json.dumps({'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 7, **CLOSED})
         raw = '\n'.join([CANARY, '{"event":"uid","uid":"%s"}' % UID, '{"event":"uid","uid":"%s","x":1}' % 'bad',
                          '{"event":"uid","uid":"not-a-uid"}', '{"event":"config","status":"-"}', good,
                          '{"event":"done","code":"nope","cleanup":"removed","agents":7}',
@@ -296,6 +350,28 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(events['done']['cleanup'], 'removed')
         self.assertNotIn('config', events)
         self.assertEqual(set(events), {'uid', 'done'})
+
+    def test_done_event_with_missing_unknown_or_malformed_diagnostics_is_refused(self):
+        base = {'event': 'done', 'code': 'refused', 'cleanup': 'not-needed', 'agents': 0, **CLOSED}
+        self.assertIn('done', pilot.parse_events(json.dumps(base).encode()))
+        ok_caps = dict(EMPTY, ipv4_web=False)
+        self.assertEqual(pilot.parse_events(json.dumps(dict(base, step='namespaces', capacity=ok_caps)).encode())
+                         ['done']['capacity'], ok_caps)
+        bad = [{k: v for k, v in base.items() if k != 'step'}, {k: v for k, v in base.items() if k != 'capacity'},
+               dict(base, step='bogus'), dict(base, step=CANARY), dict(base, step=3), dict(base, step=None),
+               dict(base, extra=1), dict(base, capacity=None), dict(base, capacity=dict(EMPTY, ipv4_web='yes')),
+               dict(base, capacity=dict(EMPTY, other=True)), dict(base, capacity={'ipv4_web': True}),
+               dict(base, capacity=dict(EMPTY, ipv4_web=CANARY))]
+        for event in bad:
+            with self.subTest(event=event):
+                self.assertNotIn('done', pilot.parse_events(json.dumps(event).encode()))
+
+    def test_every_step_name_is_a_short_closed_token(self):
+        self.assertEqual(len(set(pilot.STEPS)), len(pilot.STEPS))
+        for step in pilot.STEPS:
+            self.assertRegex(step, r'\A(-|[a-z]+(-[a-z0-9]+)*)\Z')
+        self.assertEqual(set(pilot.RESULT_KEYS) - {'agents', 'cleanup', 'code', 'config', 'packages', 'phase',
+                                                   'plugin', 'status', 'vpc_uid'}, {'capacity', 'step'})
 
 
 class PackageTests(unittest.TestCase):
@@ -704,6 +780,110 @@ class LessonTests(LessonHarness):
         pilot.accept()
         self.assertEqual(self.done()['code'], 'refused')
 
+    def intercept(self, prefix, reply):
+        cluster = self.cluster
+
+        def child(argv, seconds, **kw):
+            if tuple(argv[:len(prefix)]) == prefix:
+                return reply
+            return cluster(argv, seconds, **kw)
+        patcher = patch.object(pilot, 'run_child', child)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_refused_before_mutation(self, code, step, capacity=None):
+        done = self.done()
+        self.assertEqual((done['code'], done['step'], done['cleanup'], done['agents']), (code, step, 'not-needed', 0))
+        self.assertEqual(done['capacity'], dict(EMPTY, **(capacity or {})))
+        self.assertTrue(pilot.capacity_valid(done['capacity']) and done['step'] in pilot.STEPS)
+        self.assertEqual(set(done), {'event', 'code', 'cleanup', 'agents', 'step', 'capacity'})
+        # Closed round trip through the host-side parser: a free string could never survive it.
+        self.assertEqual(pilot.parse_events(json.dumps(done).encode())['done'], done)
+        argvs = self.cluster.argvs()
+        self.assertFalse([a for a in argvs if a[1:2] in (['apply'], ['delete'], ['create'], ['patch'])])
+        self.assertIsNone(self.cluster.vpc)
+        self.assertEqual((self.cluster.deleted, self.cluster.deletes), (0, []))
+        self.assertNotIn(CANARY, json.dumps(done))
+
+    def test_every_pre_apply_refusal_reports_its_closed_step_and_observed_capacity_without_mutation(self):
+        kubectl, bad = 'kubectl', lambda data: (0, data, 'ok')
+        cases = (
+            ('context', (kubectl, 'config', 'current-context'), bad(CANARY.encode() + b'\n'), 'refused', {}),
+            ('contexts', (kubectl, 'config', 'get-contexts'), bad(b'vlab\nother\n'), 'refused', {}),
+            ('plugin', (kubectl, 'plugin', 'list'), bad(b'unrelated\n'), 'refused', {}),
+            ('fabric', (kubectl, 'fabric', '--version'), bad(b'  \n'), 'refused', {}),
+            ('jq', ('jq', '--version'), bad(b'jq-1.6\n'), 'refused', {}),
+            ('vpc-absent', (kubectl, 'get', 'vpc', 'webapp-prod', '-o', 'name'), bad(b'vpc.vpc/webapp-prod\n'),
+             'refused', {}),
+            ('ipv4-read', (kubectl, 'get', 'ipv4namespace'), bad(CANARY.encode()), 'refused', {}),
+            ('vlan-read', (kubectl, 'get', 'vlannamespace'), bad(b'[]'), 'refused', {'ipv4_web': True, 'ipv4_worker': True}),
+            ('context', (kubectl, 'config', 'current-context'), (-9, b'', 'timeout'), 'timeout', {}),
+        )
+        for step, prefix, reply, code, capacity in cases:
+            with self.subTest(step=step, code=code):
+                self.setUp()
+                self.intercept(prefix, reply)
+                pilot.accept()
+                self.assert_refused_before_mutation(code, step, capacity)
+
+    def test_binary_refusal_is_a_closed_step(self):
+        with patch.object(pilot, 'verify_kubectl', side_effect=pilot.Refused(CANARY)):
+            pilot.accept()
+        self.assert_refused_before_mutation('refused', 'binary')
+
+    def test_real_canonical_input_refuses_at_namespaces_with_observed_capacity_and_course_input_does_not(self):
+        self.cluster.ipv4, self.cluster.vlans = real_namespaces(ROOT_WIRING)
+        pilot.accept()
+        self.assert_refused_before_mutation('refused', 'namespaces',
+                                            {'ipv4_web': False, 'ipv4_worker': False,
+                                             'vlan_web': True, 'vlan_worker': True})
+        self.setUp()
+        pilot.accept()      # the cluster now serves the REAL course wiring namespaces
+        done = self.done()
+        self.assertEqual((done['code'], done['cleanup'], done['agents']), ('ok', 'removed', 7))
+        self.assertEqual(done['capacity'], {'ipv4_web': True, 'ipv4_worker': True, 'vlan_web': True,
+                                            'vlan_worker': True, 'no_conflict': True})
+        self.assertEqual(done['step'], 'post-apply')
+
+    def test_vlan_and_ipv4_capacity_each_reported_separately(self):
+        self.cluster.vlans = {'spec': {'ranges': [{'from': 1000, 'to': 1005}, {'from': 1020, 'to': 1020}]}}
+        pilot.accept()
+        self.assert_refused_before_mutation('refused', 'namespaces',
+                                            {'ipv4_web': True, 'ipv4_worker': True,
+                                             'vlan_web': False, 'vlan_worker': True})
+
+    def test_conflict_reports_the_conflicts_step_and_false_no_conflict(self):
+        self.cluster.others = [{'spec': {'ipv4Namespace': 'default', 'vlanNamespace': 'default',
+                                         'subnets': {'x': {'subnet': '10.10.10.0/24', 'vlan': 5}}}}]
+        pilot.accept()
+        self.assert_refused_before_mutation('conflict', 'conflicts',
+                                            {'ipv4_web': True, 'ipv4_worker': True, 'vlan_web': True,
+                                             'vlan_worker': True, 'no_conflict': False})
+
+    def test_malformed_namespace_leaves_capacity_unobserved_null(self):
+        self.cluster.ipv4 = {'spec': {'subnets': ['not-a-cidr']}}
+        pilot.accept()
+        self.assert_refused_before_mutation('refused', 'namespaces', {'vlan_web': True, 'vlan_worker': True})
+
+    def test_diagnostics_never_replace_the_primary_failure_or_cleanup(self):
+        self.cluster.on_call[('describe',)] = lambda: setattr(self.cluster, 'vpc', vpc(uid='99999999-2222-3333-4444-555555555555'))
+        pilot.accept()
+        done = self.done()
+        self.assertEqual((done['code'], done['cleanup'], done['step']), ('refused', 'preserved', 'post-apply'))
+        self.assertEqual(self.cluster.deleted, 0)
+        # An unexpected step/capacity in state degrades to the empty closed form and never raises or leaks.
+        self.events.clear()
+        self.cluster.vpc = None
+
+        def corrupt(clock, state):
+            state['step'], state['capacity'] = CANARY, {'ipv4_web': CANARY}
+            raise pilot.Refused(CANARY)
+        with patch.object(pilot, 'lesson', corrupt):
+            pilot.accept()
+        done = self.done()
+        self.assertEqual((done['code'], done['step'], done['capacity']), ('refused', '-', EMPTY))
+        self.assertNotIn(CANARY, json.dumps(done))
+
     def test_foreign_replacement_after_create_is_preserved(self):
         def swap():
             self.cluster.vpc = vpc(uid='99999999-2222-3333-4444-555555555555')
@@ -848,8 +1028,9 @@ class RunTests(unittest.TestCase):
         self.out, self.children = [], []
         self.plan = {'configure': (0, {'config': 'installed'}, 'ok'),
                      'accept': (0, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed',
-                                                         'agents': 7}}, 'ok'),
-                     'teardown': (0, {'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 0}}, 'ok')}
+                                                         'agents': 7, **CLOSED}}, 'ok'),
+                     'teardown': (0, {'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 0,
+                                               **CLOSED}}, 'ok')}
 
         def child(mode, seconds, source, extra=()):
             self.children.append((mode, tuple(extra)))
@@ -903,11 +1084,35 @@ class RunTests(unittest.TestCase):
 
     def test_child_failure_codes_pass_through(self):
         self.plan['accept'] = (0, {'uid': UID, 'done': {'event': 'done', 'code': 'timeout', 'cleanup': 'removed',
-                                                         'agents': 3}}, 'ok')
+                                                         'agents': 3, **CLOSED}}, 'ok')
         pilot.run()
         result = self.out[-1]
         self.assertEqual((result['status'], result['code'], result['agents'], result['cleanup']),
                          ('failed', 'timeout', 3, 'removed'))
+
+    def test_child_pre_apply_diagnostics_reach_the_report_and_keep_the_primary_code(self):
+        caps = dict(EMPTY, ipv4_web=False, ipv4_worker=False, vlan_web=True, vlan_worker=True)
+        self.plan['accept'] = (0, {'done': {'event': 'done', 'code': 'refused', 'cleanup': 'not-needed', 'agents': 0,
+                                            'step': 'namespaces', 'capacity': caps}}, 'ok')
+        pilot.run()
+        result = self.out[-1]
+        self.assertEqual((result['status'], result['phase'], result['code'], result['cleanup'], result['vpc_uid']),
+                         ('failed', 'accept', 'refused', 'not-needed', ''))
+        self.assertEqual((result['step'], result['capacity']), ('namespaces', caps))
+        self.assertEqual(set(result), set(pilot.RESULT_KEYS))
+        self.assertLessEqual(len(json.dumps(result)), pilot.OUTPUT_LIMIT)
+        self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])     # no teardown, no further mutation
+
+    def test_non_accept_failures_and_malformed_child_diagnostics_stay_empty_or_refuse(self):
+        pilot.run()
+        self.assertEqual((self.out[-1]['step'], self.out[-1]['capacity']), ('-', EMPTY))
+        self.plan['configure'] = (3, {}, 'ok')
+        pilot.run()
+        self.assertEqual((self.out[-1]['code'], self.out[-1]['step'], self.out[-1]['capacity']), ('conflict', '-', EMPTY))
+        # A done event with a free-string step never reaches parse_events' result, so the worker is "unfinished".
+        raw = json.dumps({'event': 'done', 'code': 'refused', 'cleanup': 'not-needed', 'agents': 0,
+                          'step': CANARY, 'capacity': EMPTY}).encode()
+        self.assertEqual(pilot.parse_events(raw), {})
         self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])     # finished child: no safety net
 
     def test_a_worker_that_exited_by_itself_without_done_gets_the_teardown_safety_net_for_its_reported_uid(self):
@@ -933,7 +1138,7 @@ class RunTests(unittest.TestCase):
         # a worker that finished AND reported a clean removal is still never a pass once it was forcibly stopped
         pilot.STICKY.clear()
         self.plan['accept'] = (-9, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed',
-                                                          'agents': 7}}, 'timeout')
+                                                          'agents': 7, **CLOSED}}, 'timeout')
         pilot.run()
         self.assertEqual((self.out[-1]['status'], self.out[-1]['cleanup']), ('failed', 'uncertain'))
 
@@ -960,7 +1165,7 @@ class RunTests(unittest.TestCase):
         for cleanup in ('uncertain', 'preserved', 'absent', 'not-needed'):
             with self.subTest(cleanup):
                 self.plan['accept'] = (0, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': cleanup,
-                                                                 'agents': 7}}, 'ok')
+                                                                 'agents': 7, **CLOSED}}, 'ok')
                 pilot.run()
                 self.assertEqual(self.out[-1]['status'], 'failed')
         self.plan['accept'] = (-9, {'uid': UID}, 'timeout')

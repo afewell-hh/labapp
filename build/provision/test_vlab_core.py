@@ -176,7 +176,10 @@ class GuestEnvironment:
         self.fab_path = self.base / 'private-fab.yaml'
         self.fab_path.write_bytes(yaml.safe_dump_all(self.fab, sort_keys=False).encode())
         self.fab_path.chmod(0o600)
-        self.wiring = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
+        # Fixed course input (#552): fresh prepared fixtures use the REAL course wiring; the unchanged root wiring
+        # remains available only to prove it is now refused by the strict hash check.
+        self.wiring = Path(__file__).resolve().parent / 'course-wiring.yaml'
+        self.root_wiring = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
         self.receipt = self.base / 'packages.json'
         self.receipt.write_text('{"public":"synthetic-only"}')
         self.receipt.chmod(0o600)
@@ -442,6 +445,39 @@ class GuestFixture(GuestEnvironment, unittest.TestCase):
         self.assertTrue(all('--wait-applied-for' in c[0] and c[0][-1] == '30' for c in inspections))
         self.assertTrue(all(c[3] for c in self.calls if c[0][0] in (core.HHFAB, core.KUBECTL)))
         self.assertNotIn('PUBLIC_SYNTHETIC', self.stdout.getvalue() + self.stderr.getvalue())
+
+    def test_fresh_core_is_pinned_to_the_course_wiring_and_rejects_every_other_wiring(self):
+        course, root = self.wiring.read_bytes(), self.root_wiring.read_bytes()
+        # Expected hash supplied by Root in issue #552 (not independently verified by the author).
+        self.assertEqual(core.WIRING_SHA, '3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060')
+        self.assertEqual(core.digest(course), core.WIRING_SHA)
+        self.assertEqual(core.digest(root), 'c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a')
+        self.assertNotEqual(core.digest(root), core.WIRING_SHA)
+        docs = core.yaml_documents(course)
+        namespaces = [d for d in docs if d['kind'] == 'IPv4Namespace']
+        self.assertEqual([n['spec']['subnets'] for n in namespaces], [['10.0.0.0/16', '10.10.0.0/16']])
+        self.assertEqual([d for d in core.yaml_documents(root) if d['kind'] != 'IPv4Namespace'],
+                         [d for d in docs if d['kind'] != 'IPv4Namespace'])
+        altered = self.base / 'altered-wiring.yaml'
+        old_hash = core.digest(root)
+        variants = {'old-root': (root, old_hash), 'old-root-with-new-hash': (root, core.WIRING_SHA),
+                    'course-with-old-hash': (course, old_hash),
+                    'altered-namespace': (course.replace(b'10.10.0.0/16', b'10.11.0.0/16'), core.WIRING_SHA),
+                    'dropped-namespace': (course.replace(b'  - 10.10.0.0/16\n', b''), core.WIRING_SHA)}
+        for label, (raw, claimed) in variants.items():
+            with self.subTest(label):
+                altered.write_bytes(raw)
+                altered.chmod(0o600)
+                self.contract.update(wiring=str(altered), wiring_sha256=claimed)
+                self.write_contract()
+                self.assertEqual(self.call('prepare', '--input', str(self.input)), 1)
+                self.assertFalse(core.ROOT.exists())
+                self.assertFalse(core.WORK.exists())
+                self.assertFalse(self.calls)
+        self.contract.update(wiring=str(self.wiring), wiring_sha256=core.WIRING_SHA)
+        self.write_contract()
+        self.prepared()       # the real course input still prepares with every strict check enabled
+        self.assertEqual(core.state()['contract']['wiring_sha256'], core.WIRING_SHA)
 
     def test_existing_work_is_never_adopted(self):
         core.WORK.mkdir(mode=0o700)

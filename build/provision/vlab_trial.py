@@ -51,7 +51,9 @@ SOURCES = {
         'install-qemu.py', 'qemu_offline.py', 'qemu_acquire.py',
         'prepare-qemu-offline.sh', 'install-docker.py', 'install-hhfab.py',
         'hhfab_release.py', 'install-kubectl.py')}
-SOURCES['wiringd.yaml'] = 'wiringd.yaml'
+# Fixed course input (#552): the logical staging/guest name stays wiringd.yaml, the repository
+# source is the course copy (root wiringd.yaml plus the one 10.10.0.0/16 namespace prefix).
+SOURCES['wiringd.yaml'] = 'build/provision/course-wiring.yaml'
 PAYLOADS = {
     'hhfab.tar.gz': (93055151, 'b1387342191a329772c2595504ec6ff129eb45980727c1c86d9901ef4d9f37a4'),
     'kubectl': (58597560, 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989')}
