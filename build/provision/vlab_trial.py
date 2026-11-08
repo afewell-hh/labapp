@@ -335,9 +335,36 @@ def regular(path, limit, uid=None, mode=None):
                         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_uid, after.st_gid,
                          after.st_mode)
                     and info.st_nlink == 1 and after.st_nlink == 0 and info.st_ctime_ns != after.st_ctime_ns)
+        if not replaced and len(raw) == info.st_size and _mixed_observation(info, after):
+            replaced = _retirement_confirmed(fd, path, info)
         raise (_ReplacedState if replaced else Failure)('file changed', 1, 'policy')
     finally:
         os.close(fd)
+
+
+_PROTECTED = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_uid', 'st_gid', 'st_mode')
+
+
+def _mixed_observation(initial, after):
+    """Issue #555: the closed mixed signature: every protected field unchanged, link count 1 on
+    both observations, only ctime differing (stat fields may reflect different moments)."""
+    return (all(getattr(initial, name) == getattr(after, name) for name in _PROTECTED)
+            and initial.st_nlink == 1 and after.st_nlink == 1
+            and initial.st_ctime_ns != after.st_ctime_ns)
+
+
+def _retirement_confirmed(fd, path, initial):
+    """ONE extra fstat of the SAME descriptor (no sleep, no byte read, no loop). True only if it
+    shows link count 0, a ctime different from the initial one and every protected field
+    unchanged, and ``path`` now names a different regular inode. A failed confirmation, OSError
+    included, keeps the original refusal; signals and other BaseException propagate."""
+    try:
+        confirm = os.fstat(fd)
+    except OSError:
+        return False
+    return (all(getattr(initial, name) == getattr(confirm, name) for name in _PROTECTED)
+            and confirm.st_nlink == 0 and confirm.st_ctime_ns != initial.st_ctime_ns
+            and _fresh_name(path, initial))
 
 
 def _fresh_name(path, opened):

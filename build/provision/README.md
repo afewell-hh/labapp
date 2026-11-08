@@ -2442,6 +2442,25 @@ Strict readers (`result.json`, auth/credential, contract, writer sequence,
 `auth_publish_check`) never recover. This proves neither legitimate publication, ordering
 nor interference-free history, and does not establish the cause of canonical13.
 
+Mixed stat observation (#555). `stat(2)` fields may reflect different moments, so a public
+real-publisher probe (elevated rate, credential-free container, tmpfs) recorded a read whose
+initial and post-read `fstat` both showed link count 1 with only ctime changed, while one more
+`fstat` of the SAME descriptor showed link count 0 and the path named a different regular
+inode. `regular()` now takes ONE extra `fstat` of that descriptor (no sleep, no byte read, no
+loop) ONLY when both valid observations have identical dev/ino/size/mtime/uid/gid/full mode,
+the byte count equals the size, both link counts are 1 and ctime differs. The same private
+`Failure` subtype (same "file changed" message, code 1, category `policy`) is raised only if
+the confirmation shows link count 0, a ctime different from the initial one, every protected
+field unchanged and the path now naming a different regular inode. Any other confirmation
+(still linked, changed field, missing/symlink/same-inode name, `OSError`) keeps the plain
+refusal; signals and other exceptions propagate. This is an extra METADATA observation, not
+byte-read recovery: strict callers still refuse the changed read, and only `guardian_state()`
+discards the old bytes and permits its existing ONE complete reread under the original
+`Clock` checks (no third read, no renewal, no blanket ctime tolerance). The new tests stage the
+signature from real OS operations (temporary hardlink, real replace, link removed at
+confirmation); that is not the actual publisher protocol, and the native initiating predicate
+of the failed run remains UNKNOWN.
+
 Initial-open race and read-site labels (#527). A replacement published between `open()` and
 `regular()`'s FIRST `fstat` leaves the opened inode at link count 0. `regular()` stays strict
 for every caller (same "file type/owner/size refused" message, code 1, category `policy`), but

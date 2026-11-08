@@ -241,6 +241,79 @@ class ReplaceTap(DescriptorTap):
         return self.stack.__exit__(*exc)
 
 
+class MixedTap:
+    """Issue #555 STAGED mixed-observation signature, built from REAL filesystem operations only.
+
+    Per read of ``target`` (zero-based) ``plans[read] = (mid, confirm)``: ``mid`` runs before that
+    read's second (post-read) fstat, ``confirm`` before the third fstat of the same descriptor
+    (the new confirmation). Every returned stat is the real result of the real os.fstat; nothing
+    is mocked or replayed. This is NOT the actual publisher protocol and NOT the native cause:
+    the old inode is retained by a temporary hardlink and that link is removed at confirmation.
+    ``fault`` maps (read, call number) to an exception raised instead of calling fstat."""
+    def __init__(self, target, plans, fault=None, after=None):
+        self.target, self.plans, self.fault = Path(target), plans, fault or {}
+        self.after = after or {}  # (read, call) -> action(fd) run right after that REAL fstat
+        self.reads, self.fstats, self.fd, self.calls = 0, [], None, 0
+        self.real_open, self.real_fstat = os.open, os.fstat
+
+    def __enter__(self):
+        self.stack = ExitStack()
+        self.stack.enter_context(patch.object(os, 'open', self.open))
+        self.stack.enter_context(patch.object(os, 'fstat', self.fstat))
+        return self
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+    def open(self, path, *args, **kwargs):
+        fd = self.real_open(path, *args, **kwargs)
+        if Path(path) == self.target:
+            self.fd, self.calls, self.reads = fd, 0, self.reads + 1
+        return fd
+
+    def fstat(self, fd):
+        if fd != self.fd:
+            return self.real_fstat(fd)
+        self.calls += 1
+        read = self.reads - 1
+        if (read, self.calls) in self.fault:
+            raise self.fault[(read, self.calls)]
+        if self.calls in (2, 3) and read in self.plans:
+            action = self.plans[read][self.calls - 2]
+            if action is not None:
+                REAL_SLEEP(0.05)  # coarse kernel timestamp separation, as in the other taps
+                action()
+        info = self.real_fstat(fd)
+        self.fstats.append((read, self.calls, info))
+        if (read, self.calls) in self.after:
+            self.after[(read, self.calls)](fd)
+        return self.observe(read, info)
+
+    def observe(self, read, info):
+        return info
+
+
+class SyntheticConfirmTap(MixedTap):
+    """SYNTHETIC control (NOT a kernel observation): the third fstat of ``read`` is returned as a
+    copy of the REAL result with ``override`` fields replaced (a callable value receives the REAL
+    first stat), for identity/ctime/link metadata that cannot be physically staged.
+    ``self.fstats`` keeps the REAL stat results."""
+    FIELDS = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_uid', 'st_gid', 'st_mode',
+              'st_nlink', 'st_ctime_ns')
+
+    def __init__(self, target, plans, override, read=0, **kwargs):
+        super().__init__(target, plans, **kwargs)
+        self.override, self.synth_read = override, read
+
+    def observe(self, read, info):
+        if self.calls != 3 or read != self.synth_read:
+            return info
+        fields = {name: getattr(info, name) for name in self.FIELDS}
+        for name, value in self.override.items():
+            fields[name] = value(self.fstats[0][2]) if callable(value) else value
+        return SimpleNamespace(**fields)
+
+
 class OpenTap:
     """Issue #527: runs one REAL action right after the REAL os.open of the target and BEFORE
     regular()'s first fstat. Always calls the original open; never fakes a stat or a read.
@@ -1378,6 +1451,263 @@ class SharedTrial(unittest.TestCase):
                              ('ctime only', {'st_ctime_ns': lambda v: v + 1})):
             with self.subTest(name):
                 self.assertIs(type(run(**change)), trial.Failure)
+
+    # ---- issue #555: ONE same-descriptor confirmation after the mixed (nlink 1, ctime-only) signature ----
+    # STAGED signature from real OS operations (see MixedTap); not the actual publisher protocol and
+    # not the native cause. The root-run public publisher probe is the separate real-protocol evidence.
+    def staged(self, path, raw, then=None, published=None):
+        """(mid, confirm) actions: keep the old inode by a temporary hardlink, really replace the
+        name, and remove that link only at the confirmation (optionally after ``then(keep)``).
+        ``raw`` may be a callable (e.g. fresh_beat()); it is resolved to bytes HERE, at the
+        publication point, and the published bytes are appended to ``published`` if given."""
+        path, keep = Path(path), Path(str(path) + '.keep')
+        def mid():
+            body = raw() if callable(raw) else raw
+            os.link(path, keep)
+            self.publish_raw(path, body)
+            if published is not None:
+                published.append(body)
+        def confirm():
+            if then is not None:
+                then(keep)
+            os.unlink(keep)
+        return mid, confirm
+
+    def mixed_run(self, plans, fault=None, name='mixed.json', raw=b'{"old":1}'):
+        path = self.base / name
+        path.write_bytes(raw)
+        os.chmod(path, 0o600)
+        with MixedTap(path, plans, fault) as tap:
+            try:
+                result = REAL_REGULAR(path, 4096)
+            except trial.Failure as error:
+                result = error
+        return result, tap, path
+
+    def test_regular_confirms_retirement_on_same_descriptor_for_the_mixed_signature(self):
+        path = self.base / 'mixed.json'
+        error, tap, _ = self.mixed_run({0: self.staged(path, b'{"new":1}')})
+        self.assertIs(type(error), trial._ReplacedState)
+        self.assertEqual((str(error), error.code, error.category), ('file changed', 1, 'policy'))
+        self.assertEqual(tap.reads, 1)  # strict regular(): the refusal stays, no reread here
+        (_, _, first), (_, _, post), (_, third_call, confirm) = tap.fstats
+        self.assertEqual(third_call, 3)  # exactly one extra fstat
+        self.assertEqual((first.st_nlink, post.st_nlink, confirm.st_nlink), (1, 1, 0))  # real kernel values
+        self.assertNotEqual(first.st_ctime_ns, post.st_ctime_ns)
+        self.assertEqual(len(tap.fstats), 3)
+        self.assertEqual(path.read_bytes(), b'{"new":1}')
+
+    def test_regular_mixed_signature_controls_keep_the_plain_refusal(self):
+        path = self.base / 'mixed.json'
+        def plain(plans, fault=None):
+            error, tap, _ = self.mixed_run(plans, fault)
+            self.assertIs(type(error), trial.Failure)
+            self.assertEqual((str(error), error.code, error.category), ('file changed', 1, 'policy'))
+            return tap
+        def gone(keep):
+            os.unlink(path)
+        def to_symlink(keep):
+            os.unlink(path)
+            os.symlink(self.base / 'elsewhere', path)
+        def touch_mode(keep):
+            os.chmod(keep, 0o640)
+        def touch_mtime(keep):
+            os.utime(keep, ns=(1, 1))
+        def shrink(keep):
+            os.truncate(keep, 1)
+        cases = {
+            'ctime-only mutation stays linked': ({0: (lambda: os.chmod(path, 0o600), None)}, None),
+            'observed extra hardlink never retired': ({0: (self.staged(path, b'{"new":1}')[0], None)}, None),
+            'protected mode changed at confirmation': ({0: self.staged(path, b'{"new":1}', touch_mode)}, None),
+            'protected mtime changed at confirmation': ({0: self.staged(path, b'{"new":1}', touch_mtime)}, None),
+            'protected size changed at confirmation': ({0: self.staged(path, b'{"new":1}', shrink)}, None),
+            'current name missing': ({0: self.staged(path, b'{"new":1}', gone)}, None),
+            'current name symlink': ({0: self.staged(path, b'{"new":1}', to_symlink)}, None),
+            'confirmation OSError (synthetic fault)': ({0: self.staged(path, b'{"new":1}')}, {(0, 3): OSError(5, 'io')}),
+        }
+        for name, (plans, fault) in cases.items():
+            with self.subTest(name):
+                plain(plans, fault)
+                for leftover in self.base.glob('mixed.json*'):
+                    leftover.unlink()
+        with self.subTest('size changed before the post-read observation'):
+            def grow_and_replace():
+                with open(path, 'ab') as stream:
+                    stream.write(b' ')
+            tap = plain({0: (grow_and_replace, None)})
+            self.assertEqual(len(tap.fstats), 2)  # no confirmation: not the mixed signature
+        for leftover in self.base.glob('mixed.json*'):
+            leftover.unlink()
+
+    def test_same_inode_current_name_is_not_fresh(self):
+        path = self.base / 'same.json'
+        path.write_bytes(b'{}')
+        self.assertFalse(trial._fresh_name(path, os.lstat(path)))
+
+    def test_mixed_confirmation_never_swallows_cancellation(self):
+        path = self.base / 'mixed.json'
+        for name, signal in (('KeyboardInterrupt', KeyboardInterrupt()),
+                             ('interrupted Failure', trial.Failure('interrupted', 130, 'interrupted'))):
+            with self.subTest(name):
+                path.write_bytes(b'{"old":1}')
+                os.chmod(path, 0o600)
+                with MixedTap(path, {0: self.staged(path, b'{"new":1}')}, {(0, 3): signal}):
+                    with self.assertRaises(type(signal)) as caught:
+                        REAL_REGULAR(path, 4096)
+                self.assertIs(caught.exception, signal)
+                for leftover in self.base.glob('mixed.json*'):
+                    leftover.unlink()
+
+    def test_guardian_state_recovers_confirmed_mixed_retirement_with_one_reread(self):
+        for name in ('phase.json', 'heartbeat.json'):
+            with self.subTest(name):
+                path = self.private_state(name, b'{"old":"OLD-BYTES"}')
+                os.chmod(path, 0o600)
+                checks, seen = [], []
+                def reader(p, n, uid=None):
+                    raw = REAL_REGULAR(p, n)
+                    seen.append(raw)
+                    return raw
+                with MixedTap(path, {0: self.staged(path, b'{"new":1}')}) as tap, \
+                        patch.object(trial, 'regular', side_effect=reader):
+                    self.assertEqual(trial.guardian_state(path, lambda: checks.append(1)), b'{"new":1}')
+                self.assertEqual((tap.reads, len(checks), seen), (2, 2, [b'{"new":1}']))  # old bytes discarded
+                shutil.rmtree(self.root)
+
+    def test_guardian_state_mixed_retirement_second_time_and_expiry_are_terminal(self):
+        for name in ('phase.json', 'heartbeat.json'):
+            with self.subTest(name):
+                path = self.private_state(name, b'{"old":1}')
+                os.chmod(path, 0o600)
+                checks = []
+                plans = {0: self.staged(path, b'{"n":1}'), 1: self.staged(path, b'{"n":2}')}
+                with MixedTap(path, plans) as tap, patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)):
+                    with self.assertRaises(trial._ReplacedState) as caught:
+                        trial.guardian_state(path, lambda: checks.append(1))
+                self.assertEqual((tap.reads, len(checks)), (2, 1))  # no third read
+                self.assertTrue(caught.exception.guardian_read_site)
+                shutil.rmtree(self.root)
+                path = self.private_state(name, b'{"old":1}')
+                os.chmod(path, 0o600)
+                def expire():
+                    raise trial.Failure('absolute phase cutoff', 124, 'phase-cutoff')
+                with MixedTap(path, {0: self.staged(path, b'{"n":1}')}) as tap, patch.object(trial, 'regular', side_effect=lambda p, n, uid=None: REAL_REGULAR(p, n)):
+                    with self.assertRaises(trial.Failure) as caught:
+                        trial.guardian_state(path, expire)
+                self.assertEqual((tap.reads, caught.exception.category), (1, 'phase-cutoff'))  # no reread after expiry
+                shutil.rmtree(self.root)
+
+    def test_guardian_mixed_retirement_consumes_only_the_new_bytes_for_both_fixed_files(self):
+        old_beat = self.old_beat()
+        phase_body = trial.encoded({'phase': 'fresh'})
+        for name, old, expected_reads in (('heartbeat.json', old_beat, 3), ('phase.json', b'{"phase":"stage"}', 2)):
+            with self.subTest(name):
+                published, seen = [], []
+                body = self.fresh_beat() if name == 'heartbeat.json' else phase_body
+                target = self.root / name
+                mid, confirm = self.staged(target, body, published=published)  # body resolved at publication
+                tap = MixedTap(target, {0: (mid, confirm)})
+                code, result, mocks = self.guardian_fault(spawn=self.popen_child(), files={name: old},
+                                                          overrides=self.recorded_state_bytes(seen), around=tap)
+                self.assertEqual((code, tap.reads), (17, expected_reads))
+                self.assertEqual(len(published), 1)
+                self.assertIsInstance(published[0], bytes)
+                self.assertNotIn(old, seen)  # no byte of the discarded read was parsed
+                self.assertIn(published[0], seen)
+                self.host_accepts(result, 17)
+
+    def test_regular_confirmation_rejects_synthetic_identity_ctime_and_link_controls(self):
+        """SYNTHETIC controls (SyntheticConfirmTap): the third fstat is a labelled copy of the real
+        one with fields replaced; these are not kernel observations. Each must keep the plain
+        refusal after exactly one confirmation fstat."""
+        path = self.base / 'mixed.json'
+        controls = {
+            'synthetic st_dev changed': {'st_dev': lambda i: i.st_dev + 1},
+            'synthetic st_ino changed': {'st_ino': lambda i: i.st_ino + 1},
+            'synthetic st_uid changed': {'st_uid': lambda i: i.st_uid + 1},
+            'synthetic st_gid changed': {'st_gid': lambda i: i.st_gid + 1},
+            'synthetic ctime equal to initial': {'st_ctime_ns': lambda i: i.st_ctime_ns},
+            'synthetic link count still 1': {'st_nlink': 1},
+            'synthetic link count 2': {'st_nlink': 2},
+        }
+        for name, override in controls.items():
+            with self.subTest(name):
+                path.write_bytes(b'{"old":1}')
+                os.chmod(path, 0o600)
+                with SyntheticConfirmTap(path, {0: self.staged(path, b'{"new":1}')}, override) as tap:
+                    with self.assertRaises(trial.Failure) as caught:
+                        REAL_REGULAR(path, 4096)
+                self.assertIs(type(caught.exception), trial.Failure)
+                self.assertEqual((str(caught.exception), caught.exception.code, caught.exception.category),
+                                 ('file changed', 1, 'policy'))
+                self.assertEqual((len(tap.fstats), tap.reads), (3, 1))  # one confirmation, no reread
+                for leftover in self.base.glob('mixed.json*'):
+                    leftover.unlink()
+
+    def test_regular_confirmation_requires_the_pathname_witness_in_the_integrated_path(self):
+        """Link count 0 is SYNTHETIC here (labelled) so that only the pathname witness can decide;
+        the name itself is changed by REAL operations. A same-inode or unusable name must refuse."""
+        path = self.base / 'mixed.json'
+        def same_inode(keep):
+            os.unlink(path)
+            os.link(keep, path)  # path names the originally opened inode again
+        def directory(keep):
+            os.unlink(path)
+            os.mkdir(path)
+        def gone(keep):
+            os.unlink(path)
+        control = {'st_nlink': 0}
+        for name, then in (('same inode', same_inode), ('directory', directory), ('missing', gone)):
+            with self.subTest(name):
+                path.write_bytes(b'{"old":1}')
+                os.chmod(path, 0o600)
+                with SyntheticConfirmTap(path, {0: self.staged(path, b'{"new":1}', then)}, control) as tap:
+                    with self.assertRaises(trial.Failure) as caught:
+                        REAL_REGULAR(path, 4096)
+                self.assertIs(type(caught.exception), trial.Failure)
+                self.assertEqual(len(tap.fstats), 3)
+                if path.is_dir():
+                    path.rmdir()
+                for leftover in self.base.glob('mixed.json*'):
+                    leftover.unlink()
+        with self.subTest('positive control: synthetic nlink 0 with a really different inode'):
+            path.write_bytes(b'{"old":1}')
+            os.chmod(path, 0o600)
+            with SyntheticConfirmTap(path, {0: self.staged(path, b'{"new":1}')}, control):
+                with self.assertRaises(trial._ReplacedState):
+                    REAL_REGULAR(path, 4096)
+
+    def test_regular_short_byte_count_never_reaches_the_confirmation(self):
+        """STAGED offset fault (real os.lseek right after the first real fstat): the real stream
+        read returns size-1 bytes while the rest of the mixed signature is staged normally."""
+        path = self.base / 'mixed.json'
+        path.write_bytes(b'{"old":1}')
+        os.chmod(path, 0o600)
+        mid, confirm = self.staged(path, b'{"new":1}')
+        offset = {(0, 1): lambda fd: os.lseek(fd, 1, os.SEEK_SET)}
+        with MixedTap(path, {0: (mid, confirm)}, after=offset) as tap:
+            with self.assertRaises(trial.Failure) as caught:
+                REAL_REGULAR(path, 4096)
+        self.assertIs(type(caught.exception), trial.Failure)  # original policy, not _ReplacedState
+        self.assertEqual((str(caught.exception), caught.exception.code, caught.exception.category),
+                         ('file changed', 1, 'policy'))
+        self.assertEqual(len(tap.fstats), 2)  # no third (confirmation) fstat
+        self.assertEqual(tap.reads, 1)  # no recovery reread
+        self.assertTrue(Path(str(path) + '.keep').exists())  # the confirmation action never ran
+
+    def test_regular_foreign_requested_uid_is_refused_before_any_confirmation(self):
+        """Real foreign-owner rejection without chown: request a uid that is not the owner."""
+        path = self.base / 'mixed.json'
+        path.write_bytes(b'{"old":1}')
+        os.chmod(path, 0o600)
+        with MixedTap(path, {0: self.staged(path, b'{"new":1}')}) as tap:
+            with self.assertRaises(trial.Failure) as caught:
+                REAL_REGULAR(path, 4096, os.getuid() + 1)
+        self.assertIs(type(caught.exception), trial.Failure)
+        self.assertEqual((str(caught.exception), caught.exception.code, caught.exception.category),
+                         ('file type/owner/size refused', 1, 'policy'))
+        self.assertEqual(len(tap.fstats), 1)  # no post-read or confirmation fstat, nothing staged
+        self.assertFalse(Path(str(path) + '.keep').exists())
 
     def test_strict_regular_and_other_paths_never_use_the_guardian_recovery(self):
         path = self.base / 'result.json'
