@@ -295,9 +295,14 @@ def trusted_source(snapshot, *, initial=False):
 
 class OwnerRegistration:
     """One explicit registration operation; no controller method selector."""
-    def __init__(self, store, cloud, records, snapshot, outcome=None):
+    def __init__(self, store, cloud, records, snapshot, outcome=None, *, periodic_factory=None):
         self.expected = expected_snapshot(snapshot)
-        self.snapshot, self.store, self.cloud, self.records = snapshot, store, ReadCloud(cloud, outcome), records
+        self.snapshot = snapshot
+        self._clients(store, cloud, records, outcome)
+        self.periodic_factory = periodic_factory
+
+    def _clients(self, store, cloud, records, outcome):
+        self.store, self.cloud, self.records = store, ReadCloud(cloud, outcome), records
         self.__controller = Controller(store, self.cloud,
                                        Config(boot_image=spec.COMPONENT_IMAGE, profile=spec.UBUNTU_VLAB_CORE),
                                        access_records=records)
@@ -364,48 +369,197 @@ RECHECK_MIN_SECONDS = 5.0          # least budget worth starting another complet
 TRANSIENT_READS = (ReadUnavailable, TransientRead)
 
 
+class _ReadCutoff(BaseException):
+    """Private deadline control flow; adapter Exception handlers must not launder it."""
+
+
+class PeriodicReadEnvelope:
+    """One periodic recheck allowance, never a cross-attempt token/state cache.
+
+    Pre/post checks bound acceptance. urllib's socket timeout is not a hard total
+    response deadline, so this does not promise physical termination within30s.
+    """
+    STAGES = frozenset({'entry', 'auth', 'ledger-metadata', 'ledger-media',
+                        'insert-operation', 'instance', 'disk', 'disk-provenance', 'other-read'})
+
+    def __init__(self, clock, failed, monotonic):
+        self.clock, self.failed, self.monotonic = clock, failed, monotonic
+        self.started = monotonic()
+        self.end = self.started + RECHECK_ALLOWANCE_SECONDS
+        self.original_end = None
+        self.attempt = 0
+        self.stage, self.cause, self.last_error = 'entry', None, None
+        self.token = None
+        self.disk_reads = 0
+
+    def left(self):
+        try:
+            original = self.clock.remaining('persistence')
+        except guest.Failure as error:
+            if error.code == 124:
+                self.cause = 'original-clock'
+                raise _ReadCutoff() from None
+            raise
+        guest.require(not self.failed.is_set(), 'heartbeat failed')
+        if original <= 0:
+            self.cause = 'original-clock'
+            raise _ReadCutoff()
+        now = self.monotonic()
+        if self.original_end is None:
+            self.original_end = now + original
+        # Earlier captured ceiling wins if both are observed expired;
+        # original-work wins equality. This classifies observed bounds, not
+        # the physical order of wall-clock changes during a blocking call.
+        if now >= min(self.original_end, self.end):
+            self.cause = 'original-clock' if self.original_end <= self.end else 'allowance'
+            raise _ReadCutoff()
+        return min(original, self.original_end - now, self.end - now)
+
+    def begin_attempt(self, attempt):
+        self.attempt, self.stage, self.token, self.disk_reads = attempt, 'entry', None, 0
+
+    def clear_token(self):
+        self.token = None
+
+    def credential(self):
+        self.left()
+        if self.token is None:
+            stage = self.stage
+            self.stage = 'auth'
+            # Definitive auth failures retain the existing adapter mapping,
+            # even if they arrive late. Only a positive token is post-checked.
+            self.token = gcloud_token(timeout=min(30, self.left()))
+            self.left()
+            self.stage = stage
+        return self.token
+
+    def metadata(self):
+        error = self.last_error
+        status = None if error is None else error.status
+        return {'attempt': self.attempt, 'stage': self.stage, 'cutoff': self.cause,
+                'elapsed_ms': min(86400000, max(0, int((self.monotonic()-self.started)*1000))),
+                'last_error': ('ledger-transient' if isinstance(error, ReadUnavailable)
+                               else 'compute-transient' if isinstance(error, TransientRead) else None),
+                'last_status': status}
+
+    def failure(self):
+        result = guest.Failure('periodic registration read cutoff', 124)
+        result.recheck_detail = self.metadata()
+        return result
+
+
+class PeriodicReadHTTP:
+    """GET-only composition for a single attempt's real adapters."""
+    def __init__(self, envelope, http=None):
+        self.envelope = envelope
+        self.http = HttpTransport() if http is None else http
+
+    def request(self, method, url, **kwargs):
+        envelope = self.envelope
+        if method != 'GET' or kwargs.get('body') is not None:
+            raise ForbiddenOperation('periodic envelope permits reads only')
+        if url.startswith('https://storage.googleapis.com/storage/v1/'):
+            envelope.stage = 'ledger-media' if 'alt=media' in url else 'ledger-metadata'
+        elif '/operations/' in url:
+            envelope.stage = 'insert-operation'
+        elif '/instances/' in url:
+            envelope.stage = 'instance'
+        elif '/disks/' in url:
+            envelope.disk_reads += 1
+            envelope.stage = 'disk' if envelope.disk_reads == 1 else 'disk-provenance'
+        else:
+            envelope.stage = 'other-read'
+        kwargs['timeout'] = min(kwargs.get('timeout', 20), envelope.left())
+        try:
+            response = self.http.request(method, url, **kwargs)
+        except Exception as error:
+            if isinstance(error, NetworkUnavailable):
+                envelope.last_error = (ReadUnavailable(None) if url.startswith('https://storage.googleapis.com/')
+                                       else TransientRead(None))
+                envelope.left()
+            raise
+        status = getattr(response, 'status', None)
+        if transient_status(status):
+            envelope.last_error = (ReadUnavailable(response.status) if url.startswith('https://storage.googleapis.com/')
+                                   else TransientRead(response.status))
+        elif type(status) is int and not 200 <= status < 300:
+            # Preserve definitive permanent HTTP failures for the actual
+            # adapter to classify; never turn a late401/403 into a cutoff.
+            return response
+        # For positive responses, acceptance cutoff precedes body decoding.
+        # Thus late200 malformed data is refused as a cutoff, never authority.
+        envelope.left()
+        return response
+
+
+def periodic_registration(registration, envelope):
+    """Fresh clients/token per attempt; only unchanged current() is invoked."""
+    http = PeriodicReadHTTP(envelope)
+    token = envelope.credential
+    records = GcsAccessRecords(BUCKET, token_provider=token, transport=http)
+    outcome = ReadOutcome(http)
+    # Carry the already admitted expectation; re-running initial preflight-age
+    # admission would incorrectly expire it after15min during a long build.
+    fresh = object.__new__(OwnerRegistration)
+    fresh.expected, fresh.snapshot = registration.expected, registration.snapshot
+    fresh.periodic_factory = None
+    fresh._clients(GcsSlotStore(BUCKET, token_provider=token, transport=http),
+                   PolicyCloud(ComputeRestTransport(outcome, token_provider=token), spec.PROJECT, spec.ZONE),
+                   records, outcome)
+    return fresh
+
+
 def recheck_registration(registration, clock, failed, *, monotonic=None, wait=None):
     """-> ``registration.current()`` result; retries ONLY the two typed transient READ errors.
 
     At most RECHECK_ATTEMPTS complete attempts run in total. Before and after EVERY attempt the
     ORIGINAL ``persistence`` window, heartbeat and one allowance from entry are enforced, so
-    a late positive read is refused (never authority). Everything else (foreign/changed lease, identity,
-    deadline, 401/403/404, malformed, accounting, refusal, Failure/signal) propagates untouched. When
+    a late positive read is refused (never authority), before decoding its body. Definitive auth and
+    permanent HTTP errors retain existing adapter classification even when late. Within budget,
+    foreign/changed identity, malformed data, accounting, refusal and signals stay hard. When
     retrying stops, the last typed error is re-raised with ``recheck_attempts`` for the closed record.
     ``wait`` returns True if the heartbeat failed, which ends the pause and refuses.
     """
     monotonic = owned_process.monotonic if monotonic is None else monotonic
     wait = failed.wait if wait is None else wait
-    attempts, started = 0, monotonic()
-
-    def left():
-        original = clock.remaining('persistence')
-        guest.require(not failed.is_set(), 'heartbeat failed')
-        result = min(original, started + RECHECK_ALLOWANCE_SECONDS - monotonic())
-        if result <= 0:
-            raise guest.Failure('registration recheck exceeded its allowance', 124)
-        return result
-
-    while True:
-        left()
-        attempts += 1
-        try:
-            current = registration.current()
-        except TRANSIENT_READS as error:
-            error.recheck_attempts = attempts
-            available = left()
-            if attempts >= RECHECK_ATTEMPTS:
-                raise
-            pause = RECHECK_PAUSES[attempts - 1]
-            if available < pause + RECHECK_MIN_SECONDS:
-                raise
-            if wait(pause) or failed.is_set():
-                raise guest.Failure('heartbeat failed') from None
-            if left() < RECHECK_MIN_SECONDS:
-                raise
-            continue
-        left()
-        return current
+    envelope = PeriodicReadEnvelope(clock, failed, monotonic)
+    try:
+        # Capture one original-work ceiling on the first boundary check.
+        envelope.left()
+        while True:
+            envelope.left()
+            envelope.begin_attempt(envelope.attempt + 1)
+            try:
+                attempt = (registration.periodic_factory(registration, envelope)
+                           if type(registration) is OwnerRegistration and registration.periodic_factory is not None
+                           else registration)
+                current = attempt.current()
+            except TRANSIENT_READS as error:
+                envelope.last_error = error
+                error.recheck_attempts = envelope.attempt
+                available = envelope.left()
+                if envelope.attempt >= RECHECK_ATTEMPTS:
+                    raise
+                pause = RECHECK_PAUSES[envelope.attempt - 1]
+                if available < pause + RECHECK_MIN_SECONDS:
+                    raise
+                if wait(pause) or failed.is_set():
+                    raise guest.Failure('heartbeat failed') from None
+                if envelope.left() < RECHECK_MIN_SECONDS:
+                    raise
+                continue
+            finally:
+                envelope.clear_token()
+            envelope.left()
+            return current
+    except _ReadCutoff:
+        raise envelope.failure() from None
+    except BaseException as error:
+        # Preserve the original exception/cancellation object and its code.
+        error.recheck_detail = envelope.metadata()
+        raise
+    finally:
+        envelope.clear_token()
 
 
 def public_source(snapshot, path, *, blob=False):
@@ -1171,12 +1325,22 @@ def host_failure_record(initial, phase, operation, category, code, error):
     name = next((token for kind, token in HOST_EXCEPTIONS if isinstance(error, kind)), 'other')
     status = getattr(error, 'status', None) if isinstance(error, (StoreError, TransientRead, ApiError)) else None
     attempts = getattr(error, 'recheck_attempts', None) if isinstance(error, TRANSIENT_READS) else None
-    return {'schema': 1, 'kind': 'host-failure', 'source_sha': initial['source_sha'], 'nonce': initial['nonce'],
+    record = {'schema': 1, 'kind': 'host-failure', 'source_sha': initial['source_sha'], 'nonce': initial['nonce'],
             'lease': initial['lease'], 'epoch': initial['epoch'], 'run_id': initial['run_id'],
             'attempt': initial['attempt'], 'phase': phase, 'host_operation': operation,
             'failure_category': category, 'code': code, 'exception': name,
             'http_status': status if type(status) is int and 100 <= status <= 599 else None,
             'recheck_attempts': attempts if type(attempts) is int and 1 <= attempts <= RECHECK_ATTEMPTS else None}
+    detail = getattr(error, 'recheck_detail', None)
+    if (type(detail) is dict and set(detail) == {'attempt', 'stage', 'cutoff', 'elapsed_ms', 'last_error', 'last_status'}
+            and type(detail['attempt']) is int and 0 <= detail['attempt'] <= RECHECK_ATTEMPTS
+            and type(detail['stage']) is str and detail['stage'] in PeriodicReadEnvelope.STAGES
+            and detail['cutoff'] in (None, 'original-clock', 'allowance')
+            and type(detail['elapsed_ms']) is int and 0 <= detail['elapsed_ms'] <= 86400000
+            and detail['last_error'] in (None, 'ledger-transient', 'compute-transient')
+            and (detail['last_status'] is None or transient_status(detail['last_status']))):
+        record['recheck'] = dict(detail)
+    return record
 
 
 def retain_host_failure(directory, record):
@@ -1646,7 +1810,7 @@ def main(argv=None):
     outcome = ReadOutcome()
     registration = OwnerRegistration(GcsSlotStore(BUCKET, token_provider=token),
                      PolicyCloud(ComputeRestTransport(outcome, token_provider=token), spec.PROJECT, spec.ZONE), records, snapshot,
-                     outcome)
+                     outcome, periodic_factory=periodic_registration)
     login = SelfLogin.for_owner(snapshot['self_user'], token_provider=token)
     return trial(snapshot, args.payloads, output, registration=registration, records=records, login=login,
                  private=private, ghcr=ghcr, handoff_on_success=args.handoff_on_success,

@@ -1750,6 +1750,44 @@ every 5-second poll, and any single adapter exception disposed the build.
   write it is swallowed and cannot change the primary result, cleanup or the receipt,
   whose shape is unchanged. A guest-reported failure with no host exception writes none.
 
+Periodic registration reads use one fresh in-memory token per complete attempt,
+discarded before a retry or return. The six normal fresh GETs (generation-pinned
+ledger metadata/media, insert operation, VM, disk and disk-provenance reread) and
+all validation remain; no observed resource state is cached. Initial admission,
+registration, access/key/CAS mutations and cleanup retain their existing clients
+and auth behavior. The periodic factory carries the already admitted expectation;
+it does not reapply the initial preflight-age gate during a long build.
+
+One immutable ceiling begins at recheck entry: the lesser of the original work
+allowance and30 seconds. Token acquisition and every GET check it before and
+after, with existing per-call caps clipped to remaining time. Each retry creates
+fresh read clients and acquires a fresh token; neither the ceiling nor original
+phase clock is reset. Late positive results are refused. A private control-flow
+cutoff survives adapters' ordinary Exception handlers and becomes failure124 at
+the recheck boundary. Cancellation and hard failures remain hard, without a
+mutation retry. urllib socket timeouts and postchecks bound acceptance, not a
+hard total-response duration under trickling replies.
+
+The captured original-work ceiling is never renewed by a later larger
+remaining-time observation. When both captured ceilings are observed expired,
+the earlier deadline determines the cause; original-work wins equal deadlines.
+A direct failure124 from the original Clock is recorded as the observed
+`original-clock` branch. These labels do not establish the physical order of
+wall-clock changes during a blocking call. Definitive auth exceptions
+and permanent non2xx HTTP responses retain their existing adapter failure/status
+even when late, without a retry or a following GET. Late positive responses
+are refused before decoding, including a late200 with malformed JSON; that case
+is deliberately cutoff-first, not a claim that the body was validated. Typed
+transient responses/exchange failures at cutoff retain their closed kind/status.
+
+Only periodic terminal failures may add a closed `recheck` object to the private
+host record: attempt0-3, fixed stage, cutoff (`allowance`, `original-clock`, or
+null), elapsed milliseconds capped at86400000, last typed transient kind and
+closed HTTP status/null. It retains a transient observation even when a cutoff
+replaces that exception; it stores no text, URL, token or response bytes. Existing
+public receipt fields and guest diagnostics are unchanged. Source/fixture proof
+of reduced token launches is not evidence of a native timeout's initiating cause.
+
 The owner Cloud SDK pin is575.0.0; workflow SDK remains540.0.0. The fixed IAP
 proxy uses `compute start-iap-tunnel ... 22 --listen-on-stdin`. Local installed
 SDK575 source declares this hidden flag and chooses `IapTunnelStdinHelper`;

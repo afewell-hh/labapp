@@ -39,16 +39,19 @@ class HttpResponse:
     body: bytes
 
 
-def gcloud_token() -> str:
+def gcloud_token(*, timeout: float = 30) -> str:
     """Obtain a short-lived token from the trusted runner's existing identity.
 
     No shell, login, account switching, token files or token logging. Captured
     subprocess diagnostics are deliberately excluded from raised errors.
     """
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not 0 < timeout <= 30):
+        raise TransportError("invalid credential acquisition timeout")
     try:
         result = subprocess.run(
             ["gcloud", "auth", "print-access-token", "--quiet"],
-            capture_output=True, text=True, timeout=30, check=True)
+            capture_output=True, text=True, timeout=timeout, check=True)
         token = result.stdout.strip()
         _check_token(token)
         return token
