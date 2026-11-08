@@ -545,8 +545,11 @@ kubeconfig) is modified; the kubeconfig is only read.
 Phases (closed vocabulary): `preflight`, `packages`, `plugin`, `config`, `accept`, `teardown`, `done`.
 `packages`: guest libc6 >= 2.39 is checked; absent packages are installed offline with one
 `dpkg --install --refuse-downgrade` of exactly the missing pinned files (no force, no network, no
-dependency upgrade); equal state is `unchanged`; any other version/state of a wanted package, or a
-foreign `/usr/bin/jq`, is refused and preserved. `plugin`: the unchanged installer with `--archive`
+dependency upgrade); equal state is `unchanged`; the `dpkg-query` rows of all requested packages are
+parsed completely (any dpkg status such as `iU`, `iF`, `iHR`, `rc`), and only DEFINITE absence (dpkg's
+"no packages found" line, or an `un` row without version) is installable; every other version or
+non-`ii` state of a wanted package, an unaccounted package or an unknown line, or a foreign
+`/usr/bin/jq`, is refused and preserved before any dpkg mutation. `plugin`: the unchanged installer with `--archive`
 (`installed`/`unchanged`/`mode-repaired`; a differing existing `kubectl-fabric` is refused and kept).
 `config` (child as the real `ubuntu` uid/gid/groups): the single real binding of
 `/home/ubuntu/hhfab/vlab/kubeconfig` (strictly shaped, API `https://127.0.0.1:6443`) is exposed as
@@ -555,15 +558,26 @@ renamed `vlab` (default). Published by no-clobber link from a private stage; an 
 `unchanged`; a different, symlinked or wide-mode file is refused and preserved. It does not use
 `configure-student-kubeconfig.py` (which needs two real sources) and fabricates no management binding.
 `accept` (child as `ubuntu`, normal `HOME`/`PATH`, no `KUBECONFIG`, no `--kubeconfig`/`--context`):
-native discovery (`kubectl plugin list`, `kubectl fabric --help`, read-only
-`kubectl fabric switch ip --name leaf-01`, `jq --version`), refusal of a preexisting
+native discovery (`kubectl plugin list`, `kubectl fabric --help`, `kubectl fabric --version`, read-only
+`kubectl fabric switch ip --name leaf-01`, `jq --version` which the signed 1.7.1 package prints as
+`jq-1.7`), refusal of a preexisting
 `webapp-prod`, missing/insufficient default IPv4/VLAN namespaces or an overlapping CIDR/VLAN, then
 the five Lab Steps of hh-learn `0a62674` VPC Provisioning Essentials v1.0.0 with ordinary kubectl
 (apply the exact default/webapp-prod YAML, get/describe, all 7 agents `lastAppliedGen` ==
-`generation` with `Applied=True` observed twice, and the JSONPath-to-`jq` DHCP view). The created UID
-is recorded and ONLY that UID is deleted afterwards as harness teardown (not a lesson step); a
-foreign or replaced object is preserved and reported. An ambiguous apply adopts an object only if it
-carries exactly the requested spec. The Agent/namespace field names (`status.lastAppliedGen`,
+`generation` with `Applied=True` observed twice for exactly the canonical seven names `leaf-01..05`,
+`spine-01..02` from `wiringd.yaml`, and the JSONPath-to-`jq` DHCP view). The apply is the lesson's
+`kubectl apply -f` with `-o json`; the created UID is taken ONLY from that successful response
+(kind/name/namespace/spec, generation 1). An ambiguous or unproven create stays unresolved
+(`cleanup: uncertain`) and is never adopted or deleted, even if an object with the requested spec
+exists. After the end-state checkpoint, the harness (not a lesson step) deletes only that UID with one
+native `kubectl delete --raw` carrying `DeleteOptions.preconditions.uid`, so the API server refuses it
+atomically if the name was replaced; a replaced or foreign object is preserved and reported.
+The accepted `owned_process.py` (guest `/usr/local/lib/labapp`, SHA256 `873c77d8...6e599`) is loaded
+unmodified from its hashed bytes and closes every normal child group with positive absence; a child group
+that is not proven closed, or a forcibly stopped student worker (whose nested kubectl children live in
+other sessions), makes the run sticky uncertain: no further guest mutation or teardown and no pass, and
+the existing exact whole-VM disposal owns the rest. Query output is bounded at the accepted core's finite
+1 MiB allowance (a full seven-agent query is unmeasured). The Agent/namespace field names (`status.lastAppliedGen`,
 `metadata.generation`, `spec.ranges`, `spec.subnets`) are source-assumed and need Root's native
 check. The lesson has no server attachment, dataplane or GUI step: this is not dataplane, course or
 production acceptance.

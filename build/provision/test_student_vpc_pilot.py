@@ -23,6 +23,26 @@ import student_vpc_pilot as pilot
 UID = '11111111-2222-3333-4444-555555555555'
 CANARY = 'CANARY-SECRET-BYTES'
 ORIGINAL_PACKAGE_STATE, ORIGINAL_STUDENT_CHILD = pilot.package_state, pilot.student_child
+CANONICAL = ['leaf-01', 'leaf-02', 'leaf-03', 'leaf-04', 'leaf-05', 'spine-01', 'spine-02']
+OWNED_FILE = Path(__file__).with_name('owned_process.py')
+
+
+def reset_sticky(test):
+    """Sticky state is process-global: every test starts and ends with it clear."""
+    pilot.STICKY.clear()
+    test.addCleanup(pilot.STICKY.clear)
+
+
+def use_sibling_owned(test):
+    """Load the pinned owned_process.py from the repository copy (same SHA256 as the guest asset). Only the
+    root-ownership check is replaced, because a source checkout is not root-owned; the pin check stays real."""
+    for name, value in (('OWNED_PROCESS', OWNED_FILE), ('regular', lambda *a, **k: SimpleNamespace(st_mode=0o100644))):
+        patcher = patch.object(pilot, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    pilot.OWNED.clear()
+    test.addCleanup(pilot.OWNED.clear)
+    reset_sticky(test)
 
 
 def good_spec():
@@ -34,15 +54,16 @@ def good_spec():
 
 def vpc(uid=UID, spec=None):
     return {'apiVersion': 'vpc.githedgehog.com/v1beta1', 'kind': 'VPC',
-            'metadata': {'name': 'webapp-prod', 'namespace': 'default', 'uid': uid},
+            'metadata': {'name': 'webapp-prod', 'namespace': 'default', 'uid': uid, 'generation': 1},
             'spec': spec if spec is not None else good_spec()}
 
 
-def agents(count=7, applied=True, condition='True'):
-    return {'items': [{'metadata': {'name': 'leaf-%02d' % n, 'generation': 3},
+def agents(count=7, applied=True, condition='True', names=None):
+    names = names or (CANONICAL + ['leaf-%02d' % n for n in range(6, 20)])[:count]
+    return {'items': [{'metadata': {'name': name, 'generation': 3},
                        'status': {'lastAppliedGen': 3 if applied else 2,
                                   'conditions': [{'type': 'Applied', 'status': condition}]}}
-                      for n in range(count)]}
+                      for name in names]}
 
 
 class Cluster:
@@ -51,6 +72,7 @@ class Cluster:
         self.calls, self.vpc, self.others = [], None, []
         self.polls, self.converge_after = 0, 2
         self.apply_state, self.keep_on_delete, self.deleted = 'ok', False, 0
+        self.apply_creates, self.apply_mutate, self.deletes = True, None, []
         self.agent_count, self.output_state, self.on_call = 7, None, {}
         self.ipv4 = {'spec': {'subnets': ['10.10.0.0/16']}}
         self.vlans = {'spec': {'ranges': [{'from': 1000, 'to': 1999}]}}
@@ -59,7 +81,7 @@ class Cluster:
         self.calls.append((list(argv), env, stdin))
         if argv[0] == 'jq':
             if argv[1:] == ['--version']:
-                return 0, b'jq-1.7.1\n', 'ok'
+                return 0, b'jq-1.7\n', 'ok'      # what the signed 1.7.1-3ubuntu0.24.04.2 binary prints
             return 0, json.dumps(json.loads(stdin), indent=2).encode(), 'ok'
         assert argv[0] == 'kubectl', argv
         a = tuple(argv[1:])
@@ -76,19 +98,35 @@ class Cluster:
         if a == ('plugin', 'list'):
             return ok(b'The following compatible plugins are available:\n\n' + pilot.PLUGIN.encode() + b'\n')
         if a[0] == 'fabric':
+            if a[1:] == ('--version',):
+                return ok(b'v0.96.2\n')
             return ok(b'10.0.0.1\n' if a[1:] == ('switch', 'ip', '--name', 'leaf-01') else b'usage\n')
         if a[0] == 'apply':
+            assert a[1] == '-f' and a[3:] == ('-o', 'json'), a
             assert Path(a[2]).read_text() == pilot.VPC_YAML
-            self.vpc = vpc()
-            return (0, b'vpc.vpc.githedgehog.com/webapp-prod created\n', 'ok') if self.apply_state == 'ok' \
-                else (-9, b'', self.apply_state)
+            if self.apply_creates:
+                self.vpc = vpc()
+            if self.apply_state != 'ok':    # ambiguous: the object may or may not exist, the response is lost
+                return -9, b'', self.apply_state
+            response = json.loads(json.dumps(self.vpc))
+            replaced = self.apply_mutate(response) if self.apply_mutate else None
+            return ok(response if replaced is None else replaced)
         if a[0] == 'describe':
             return ok(b'Name: webapp-prod\n10.10.10.0/24 1010\n10.10.20.0/24 1020\n')
         if a[0] == 'delete':
+            # Harness teardown only: one raw DELETE with DeleteOptions preconditions.uid, never a name-only delete.
+            assert a[1:4] == ('--raw', pilot.VPC_PATH, '-f') and len(a) == 5, a
+            body = json.loads(Path(a[4]).read_text())
+            assert body == {'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': {'uid': body['preconditions']['uid']}}
+            self.deletes.append(body['preconditions']['uid'])
+            if self.vpc is None:
+                return 1, b'NotFound', 'ok'
+            if self.vpc['metadata']['uid'] != body['preconditions']['uid']:   # the server refuses atomically
+                return 1, b'Conflict: precondition failed', 'ok'
             self.deleted += 1
             if not self.keep_on_delete:
                 self.vpc = None
-            return ok(b'deleted\n')
+            return ok(b'{}')
         assert a[0] == 'get', a
         if a[1:] == ('ipv4namespace', 'default', '-o', 'json'):
             return ok(self.ipv4)
@@ -118,6 +156,7 @@ class Cluster:
 
 class LessonHarness(unittest.TestCase):
     def setUp(self):
+        reset_sticky(self)
         self.cluster = Cluster()
         self.events = []
         for name, value in (('run_child', self.cluster), ('verify_kubectl', lambda: None), ('SLEEP', lambda s: None),
@@ -155,11 +194,28 @@ class PinTests(unittest.TestCase):
                 (172336, '605f42287d2bcb6c84f5a02377c7cd777090c5e857259a4030a571989f19dde2')})
         self.assertEqual(len(pilot.CACHE_PINS), 4)
 
-    def test_budget_keeps_the_teardown_reserve(self):
-        phases = (pilot.PREFLIGHT_SECONDS + pilot.PACKAGE_SECONDS + pilot.PLUGIN_SECONDS + pilot.CONFIG_SECONDS
-                  + pilot.ACCEPT_SECONDS + pilot.TEARDOWN_SECONDS)
+    def test_budget_is_short_and_keeps_the_teardown_reserve(self):
+        # The host pilot cap is 240 s including 70 s of transfer/staging; the guest total must be well inside it.
+        self.assertLessEqual(pilot.TOTAL_SECONDS, 150)
         self.assertLessEqual(pilot.ACCEPT_SECONDS + 5 + pilot.TEARDOWN_SECONDS, pilot.TOTAL_SECONDS)
-        self.assertGreater(phases, 0)
+        self.assertLess(pilot.TEARDOWN_SECONDS, pilot.ACCEPT_SECONDS)
+        for phase in (pilot.PREFLIGHT_SECONDS, pilot.PACKAGE_SECONDS, pilot.PLUGIN_SECONDS, pilot.CONFIG_SECONDS):
+            self.assertLess(phase, pilot.TOTAL_SECONDS - pilot.TEARDOWN_SECONDS)
+        self.assertLess(pilot.AGENT_WAIT_SECONDS, pilot.ACCEPT_SECONDS - pilot.TEARDOWN_SECONDS)
+        self.assertLess(pilot.CHILD_CLOSE_SECONDS, pilot.TEARDOWN_SECONDS)
+
+    def test_bounds_and_pins_of_the_reused_closure_module_and_agent_names(self):
+        self.assertEqual(pilot.KUBE_LIMIT, 1 << 20)              # the accepted core's finite allowance, unmeasured fit
+        self.assertEqual(pilot.OWNED_PROCESS, Path('/usr/local/lib/labapp/owned_process.py'))
+        import hashlib
+        self.assertEqual(hashlib.sha256(OWNED_FILE.read_bytes()).hexdigest(), pilot.OWNED_PROCESS_SHA256)
+        self.assertEqual(pilot.OWNED_PROCESS_SHA256, '873c77d857d62280fbf9202a3544102f83e6cab39de0ddb05cd37107ca56e599')
+        self.assertEqual(pilot.AGENT_NAMES, frozenset(CANONICAL))
+        wiring = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
+        if wiring.exists():     # the repository's own canonical VLAB wiring names exactly these seven switches
+            import re
+            names = set(re.findall(r'^  name: ((?:leaf|spine)-\d\d)$', wiring.read_text(), re.M))
+            self.assertEqual(names, set(CANONICAL))
 
     def test_manifest_text_is_exactly_the_lesson_spec(self):
         text = pilot.VPC_YAML
@@ -211,6 +267,10 @@ class ParsingTests(unittest.TestCase):
         generation = agents()
         generation['items'][0]['metadata']['generation'] = '3'
         self.assertEqual(pilot.agents_state(generation), (7, False))
+        # Exactly the seven canonical names: seven agents with a wrong or duplicated name are not the fabric.
+        self.assertEqual(pilot.agents_state(agents(names=CANONICAL[:6] + ['leaf-06'])), (7, False))
+        self.assertEqual(pilot.agents_state(agents(names=CANONICAL[:6] + ['leaf-01'])), (7, False))
+        self.assertEqual(pilot.agents_state(agents(names=list(reversed(CANONICAL)))), (7, True))
 
     def test_namespace_and_conflict_checks(self):
         ipv4, vlan = {'spec': {'subnets': ['10.10.0.0/16']}}, {'spec': {'ranges': [{'from': 1000, 'to': 1999}]}}
@@ -318,11 +378,101 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(pilot.Refused):
             pilot.install_packages(pilot.Clock(60))
 
-    def test_package_state_parses_status_lines_and_ignores_noise(self):
-        out = b'ii |libc6|2.39-0ubuntu8.6\ndpkg-query: no packages found matching jq\nii |libonig5|6.9.9-1build1\n'
+    def test_package_state_parses_status_lines_and_definite_absence(self):
+        out = (b'ii |libc6|2.39-0ubuntu8.6\ndpkg-query: no packages found matching jq\n'
+               b'ii |libonig5|6.9.9-1build1\ndpkg-query: no packages found matching libjq1\n')
         with patch.object(pilot, 'run_child', lambda *a, **k: (1, out, 'ok')):
             self.assertEqual(ORIGINAL_PACKAGE_STATE(), {'libc6': ('ii', '2.39-0ubuntu8.6'),
                                                         'libonig5': ('ii', '6.9.9-1build1')})
+
+
+class PackageParserThroughInstallTests(unittest.TestCase):
+    """The REAL ``package_state`` parser feeding the REAL ``install_packages``; only the child runner is synthetic."""
+    GOOD = {'libc6': ('ii ', '2.39-0ubuntu8.6'), 'libonig5': ('ii ', '6.9.9-1build1'),
+            'libjq1': ('ii ', '1.7.1-3ubuntu0.24.04.2'), 'jq': ('ii ', '1.7.1-3ubuntu0.24.04.2')}
+
+    def setUp(self):
+        self.calls = []
+        self.query = (0, b'', 'ok')
+        self.jq = Path(tempfile.mkdtemp()) / 'jq'
+        self.addCleanup(shutil.rmtree, self.jq.parent, True)
+        for name, value in (('run_child', self.child), ('JQ', str(self.jq))):
+            patcher = patch.object(pilot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def rows(self, **change):
+        rows = dict(self.GOOD, **change)
+        out = b''
+        for name, value in rows.items():
+            out += (b'dpkg-query: no packages found matching %s\n' % name.encode()) if value is None else \
+                ('%s|%s|%s\n' % (value[0], name, value[1])).encode()
+        return out
+
+    def child(self, argv, seconds, **kwargs):
+        self.calls.append(argv)
+        if argv[0] == pilot.DPKG_QUERY:
+            return self.query
+        if argv[1] == '--compare-versions':
+            return 0, b'', 'ok'
+        return 0, b'', 'ok'
+
+    def installs(self):
+        return [c for c in self.calls if len(c) > 1 and c[1] == '--install']
+
+    def test_equal_state_and_definite_absence_still_work(self):
+        self.query = (0, self.rows(), 'ok')
+        self.assertEqual(pilot.install_packages(pilot.Clock(60)), 'unchanged')
+        self.assertEqual(self.installs(), [])
+        # absent (dpkg's own message, or an 'un' row with no version) is repaired by installing only that package
+        states = [self.rows(libonig5=None), self.rows()]
+        self.child_query = None
+
+        def child(argv, seconds, **kwargs):
+            if argv[0] == pilot.DPKG_QUERY:
+                return 0 if len(self.installs()) else 1, states[1 if self.installs() else 0], 'ok'
+            return self.child(argv, seconds, **kwargs)
+        with patch.object(pilot, 'run_child', child):
+            self.assertEqual(pilot.install_packages(pilot.Clock(60)), 'installed')
+        self.assertEqual([Path(p).name for p in self.installs()[0][3:]], ['libonig5_6.9.9-1build1_amd64.deb'])
+        unpacked_absent = self.rows().replace(b'ii |libonig5|6.9.9-1build1', b'un |libonig5|')
+        self.assertEqual(self.parse(unpacked_absent).get('libonig5'), None)
+
+    def parse(self, out):
+        with patch.object(pilot, 'run_child', lambda *a, **k: (0, out, 'ok')):
+            return ORIGINAL_PACKAGE_STATE()
+
+    def test_real_dpkg_partial_unknown_and_error_states_are_refused_before_any_dpkg_mutation(self):
+        for status in ('iU ', 'iF ', 'iH ', 'iW ', 'it ', 'iHR', 'iUR', 'ri ', 'rc ', 'hi ', 'pn ', 'un ', 'in ', 'ic '):
+            for name in ('libonig5', 'libjq1', 'jq'):
+                with self.subTest(status=status, name=name):
+                    self.calls.clear()
+                    version = '6.9.9-1build1' if name == 'libonig5' else '1.7.1-3ubuntu0.24.04.2'
+                    self.query = (0, self.rows(**{name: (status, version)}), 'ok')
+                    with self.assertRaises(pilot.Conflict):
+                        pilot.install_packages(pilot.Clock(60))
+                    self.assertEqual(self.installs(), [])
+
+    def test_a_missing_jq_cannot_hide_a_partially_installed_library(self):
+        # jq absent -> would install; the partially configured libjq1 row must still stop everything first.
+        self.query = (1, self.rows(jq=None, libjq1=('iU ', '1.7.1-3ubuntu0.24.04.2')), 'ok')
+        with self.assertRaises(pilot.Conflict):
+            pilot.install_packages(pilot.Clock(60))
+        self.assertEqual(self.installs(), [])
+
+    def test_incomplete_duplicated_foreign_or_failed_queries_are_refused(self):
+        good = self.rows()
+        for query in ((0, good.replace(b'ii |jq|1.7.1-3ubuntu0.24.04.2\n', b''), 'ok'),     # jq unaccounted for
+                      (0, good + good.splitlines(True)[0], 'ok'),                             # duplicate row
+                      (0, good + b'ii |bash|5.2\n', 'ok'),                                    # foreign package
+                      (0, good + b'garbage line\n', 'ok'),                                    # unknown line
+                      (0, good.replace(b'ii |jq|1.7.1-3ubuntu0.24.04.2', b'ii |jq|'), 'ok'), # installed, no version
+                      (2, good, 'ok'), (0, good, 'timeout'), (0, good, 'overflow')):
+            with self.subTest(query[0], query[2]):
+                self.query = query
+                with self.assertRaises(pilot.Refused):
+                    pilot.install_packages(pilot.Clock(60))
+                self.assertEqual(self.installs(), [])
 
 
 class PluginTests(unittest.TestCase):
@@ -506,6 +656,8 @@ class LessonTests(LessonHarness):
         self.assertIn({'event': 'uid', 'uid': UID}, self.events)
         self.assertIsNone(self.cluster.vpc)
         self.assertEqual(self.cluster.deleted, 1)
+        self.assertEqual(self.cluster.deletes, [UID])                  # one atomic UID-preconditioned harness delete
+        self.assertEqual(self.events[-1]['agents'], 7)
         for argv, env, _ in self.cluster.calls:
             self.assertEqual(env, pilot.STUDENT_ENV)                       # normal HOME/PATH, no KUBECONFIG
             self.assertNotIn('KUBECONFIG', env)
@@ -513,8 +665,17 @@ class LessonTests(LessonHarness):
         kube = [a for a in self.cluster.argvs() if a[0] == 'kubectl']
         for step in (['apply', '-f'], ['describe', 'vpc', 'webapp-prod'], ['get', 'agents'],
                      ['get', 'agent', 'leaf-01', '-o', 'yaml'], ['plugin', 'list'], ['fabric', '--help'],
-                     ['fabric', 'switch', 'ip', '--name', 'leaf-01']):
+                     ['fabric', '--version'], ['fabric', 'switch', 'ip', '--name', 'leaf-01']):
             self.assertTrue(any(a[1:1 + len(step)] == step for a in kube), step)
+        self.assertEqual([a for a in kube if a[1:2] == ['apply']][0][-2:], ['-o', 'json'])
+        self.assertTrue(any(c[0] == ['jq', '--version'] for c in self.cluster.calls))    # real jq modality
+        # The only delete is the harness raw DELETE, issued after every lesson command including the end state.
+        names = [a[1] for a in kube]
+        self.assertEqual(names.count('delete'), 1)
+        last_lesson = max(i for i, a in enumerate(kube)
+                          if a[1:4] == ['get', 'vpc', 'webapp-prod'] and '--ignore-not-found' not in a)
+        self.assertLess(last_lesson, names.index('delete'))
+        self.assertFalse([a for a in kube if a[1:3] == ['delete', 'vpc']])
         jq = [c for c in self.cluster.calls if c[0] == ['jq', '.']]
         self.assertEqual(len(jq), 1)                                    # kubectl JSONPath piped to jq
         self.assertEqual(json.loads(jq[0][2])['range']['end'], '10.10.20.250')
@@ -549,9 +710,25 @@ class LessonTests(LessonHarness):
         self.cluster.on_call[('describe',)] = swap
         pilot.accept()
         done = self.done()
-        self.assertEqual(done['cleanup'], 'preserved')
+        self.assertEqual((done['code'], done['cleanup']), ('refused', 'preserved'))   # end-state checkpoint failed
         self.assertEqual(self.cluster.deleted, 0)
-        self.assertIsNotNone(self.cluster.vpc)
+        self.assertEqual(self.cluster.deletes, [])
+        self.assertEqual(self.cluster.vpc['metadata']['uid'], '99999999-2222-3333-4444-555555555555')
+
+    def test_replacement_between_the_observation_and_the_delete_is_refused_atomically(self):
+        other = '99999999-2222-3333-4444-555555555555'
+        self.cluster.on_call[('delete',)] = lambda: setattr(self.cluster, 'vpc', vpc(uid=other))
+        pilot.accept()
+        done = self.done()
+        self.assertEqual((done['code'], done['cleanup']), ('ok', 'preserved'))
+        self.assertEqual(self.cluster.deletes, [UID])              # the delete carried the observed UID...
+        self.assertEqual(self.cluster.deleted, 0)                  # ...and the server refused it for the new object
+        self.assertEqual(self.cluster.vpc['metadata']['uid'], other)
+
+    def test_vanished_before_the_delete_is_absent_not_removed(self):
+        self.cluster.on_call[('delete',)] = lambda: setattr(self.cluster, 'vpc', None)
+        pilot.accept()
+        self.assertEqual(self.done()['cleanup'], 'absent')
 
     def test_agents_that_never_converge_time_out_and_still_clean_up(self):
         self.cluster.converge_after = 10 ** 9
@@ -567,20 +744,61 @@ class LessonTests(LessonHarness):
         done = self.done()
         self.assertEqual((done['code'], done['cleanup']), ('refused', 'removed'))
 
-    def test_ambiguous_apply_is_adopted_by_exact_spec_and_removed(self):
-        self.cluster.apply_state = 'timeout'
-        pilot.accept()
-        done = self.done()
-        self.assertEqual((done['code'], done['cleanup']), ('timeout', 'removed'))
-        self.assertIsNone(self.cluster.vpc)
+    def test_ambiguous_apply_with_a_matching_object_is_never_adopted_or_deleted(self):
+        # The create response was lost; an object with exactly the requested spec exists. A matching spec is NOT
+        # ownership: nothing is read back, adopted or deleted, and the result stays unresolved.
+        for state in ('timeout', 'overflow'):
+            with self.subTest(state):
+                self.setUp()
+                self.cluster.apply_state = state
+                pilot.accept()
+                done = self.done()
+                self.assertEqual((done['code'], done['cleanup']), ('timeout' if state == 'timeout' else 'refused',
+                                                                    'uncertain'))
+                self.assertEqual((self.cluster.deleted, self.cluster.deletes), (0, []))
+                self.assertIsNotNone(self.cluster.vpc)
+                self.assertFalse([e for e in self.events if e.get('event') == 'uid'])
+                after = [a for a in self.cluster.argvs()[self.apply_index():]]
+                self.assertEqual(after, [])                          # no kubectl call at all after the ambiguous apply
 
-    def test_ambiguous_apply_with_a_different_spec_is_never_adopted(self):
-        self.cluster.apply_state = 'timeout'
-        self.cluster.on_call[('get', 'vpc', 'webapp-prod', '-o', 'json', '--ignore-not-found')] = \
-            lambda: setattr(self.cluster, 'vpc', vpc(spec=dict(good_spec(), ipv4Namespace='other')))
-        pilot.accept()
-        self.assertEqual(self.done()['cleanup'], 'preserved')
-        self.assertEqual(self.cluster.deleted, 0)
+    def apply_index(self):
+        return [a[1:2] == ['apply'] for a in self.cluster.argvs()].index(True) + 1
+
+    def test_unproven_apply_responses_leave_the_object_unresolved(self):
+        def foreign_uid(r):
+            r['metadata']['uid'] = 'not-a-uid'
+
+        def configured(r):
+            r['metadata']['generation'] = 2          # an existing object was reconfigured, not created
+
+        def other_spec(r):
+            r['spec']['ipv4Namespace'] = 'other'
+        def no_uid(r):
+            r['metadata'].pop('uid')
+        for mutate in (foreign_uid, configured, other_spec, lambda r: b'vpc.vpc.githedgehog.com/webapp-prod created\n',
+                       lambda r: b'', no_uid):
+            with self.subTest(mutate):
+                self.setUp()
+                self.cluster.apply_mutate = mutate
+                pilot.accept()
+                done = self.done()
+                self.assertEqual((done['code'], done['cleanup']), ('refused', 'uncertain'))
+                self.assertEqual((self.cluster.deleted, self.cluster.deletes), (0, []))
+                self.assertIsNotNone(self.cluster.vpc)
+                self.assertFalse([e for e in self.events if e.get('event') == 'uid'])
+
+    def test_the_uid_comes_only_from_the_create_response_and_is_published_immediately(self):
+        early, original = [], self.cluster.__call__
+
+        def spy(argv, seconds, **kw):
+            if argv[1:2] == ['get'] and argv[2:4] == ['vpc', 'webapp-prod'] and '--ignore-not-found' not in argv \
+                    and {'event': 'uid', 'uid': UID} not in self.events:
+                early.append(argv)          # a follow-up read before the UID was published
+            return original(argv, seconds, **kw)
+        with patch.object(pilot, 'run_child', spy):
+            pilot.accept()
+        self.assertEqual(early, [])
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('ok', 'removed'))
 
     def test_cancellation_preserves_the_primary_code_and_runs_teardown(self):
         def cancel():
@@ -593,9 +811,11 @@ class LessonTests(LessonHarness):
 
     def test_cleanup_uncertainty_is_reported_not_hidden(self):
         self.cluster.keep_on_delete = True
-        pilot.accept()
+        with patch.object(pilot, 'TEARDOWN_SECONDS', 1.0):       # the object never disappears: bounded polling
+            pilot.accept()
         done = self.done()
         self.assertEqual((done['code'], done['cleanup']), ('ok', 'uncertain'))
+        self.assertEqual(self.cluster.deletes, [UID])
 
     def test_overflowing_kubectl_output_is_refused(self):
         self.cluster.output_state = 'overflow'
@@ -606,8 +826,14 @@ class LessonTests(LessonHarness):
     def test_teardown_only_preserves_unknown_ownership(self):
         self.cluster.vpc = vpc()
         self.assertEqual(pilot.teardown_only('-'), 0)
+        self.assertEqual(self.done()['cleanup'], 'uncertain')       # unknown ownership: nothing is read or deleted
+        self.assertEqual((self.cluster.deleted, self.cluster.calls), (0, []))
+        self.events.clear()
+        self.cluster.vpc = vpc(uid='99999999-2222-3333-4444-555555555555')
+        pilot.teardown_only(UID)
         self.assertEqual(self.done()['cleanup'], 'preserved')
         self.assertEqual(self.cluster.deleted, 0)
+        self.cluster.vpc = vpc()
         self.events.clear()
         pilot.teardown_only(UID)
         self.assertEqual(self.done()['cleanup'], 'removed')
@@ -618,6 +844,7 @@ class LessonTests(LessonHarness):
 
 class RunTests(unittest.TestCase):
     def setUp(self):
+        reset_sticky(self)
         self.out, self.children = [], []
         self.plan = {'configure': (0, {'config': 'installed'}, 'ok'),
                      'accept': (0, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed',
@@ -683,19 +910,51 @@ class RunTests(unittest.TestCase):
                          ('failed', 'timeout', 3, 'removed'))
         self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])     # finished child: no safety net
 
-    def test_unfinished_acceptance_runs_the_teardown_safety_net_with_the_actual_uid(self):
-        self.plan['accept'] = (-9, {'uid': UID}, 'timeout')
+    def test_a_worker_that_exited_by_itself_without_done_gets_the_teardown_safety_net_for_its_reported_uid(self):
+        self.plan['accept'] = (1, {'uid': UID}, 'ok')
         pilot.run()
         result = self.out[-1]
         self.assertEqual((result['status'], result['cleanup'], result['vpc_uid']), ('failed', 'removed', UID))
         self.assertEqual(self.children[-1], ('teardown', (UID,)))
+        self.assertFalse(pilot.STICKY)
 
-    def test_unfinished_acceptance_without_a_uid_uses_the_unknown_marker(self):
-        self.plan['accept'] = (1, {}, 'ok')
-        self.plan['teardown'] = (0, {'done': {'event': 'done', 'code': 'ok', 'cleanup': 'absent', 'agents': 0}}, 'ok')
+    def test_a_forcibly_stopped_worker_is_sticky_uncertain_with_no_further_guest_work(self):
+        for plan in ((-9, {'uid': UID}, 'timeout'), (-9, {'uid': UID}, 'ok'), (0, {'uid': UID}, 'overflow'),
+                     (-15, {}, 'timeout')):
+            with self.subTest(plan[2], plan[0]):
+                pilot.STICKY.clear()
+                self.children.clear()
+                self.plan['accept'] = plan
+                pilot.run()
+                result = self.out[-1]
+                self.assertEqual((result['status'], result['code'], result['cleanup']), ('failed', 'uncertain', 'uncertain'))
+                self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])   # no teardown, nothing after
+                self.assertTrue(pilot.STICKY)
+        # a worker that finished AND reported a clean removal is still never a pass once it was forcibly stopped
+        pilot.STICKY.clear()
+        self.plan['accept'] = (-9, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed',
+                                                          'agents': 7}}, 'timeout')
         pilot.run()
-        self.assertEqual(self.children[-1], ('teardown', ('-',)))
-        self.assertEqual((self.out[-1]['cleanup'], self.out[-1]['status']), ('not-needed', 'failed'))
+        self.assertEqual((self.out[-1]['status'], self.out[-1]['cleanup']), ('failed', 'uncertain'))
+
+    def test_a_forcibly_stopped_configure_worker_is_sticky_and_stops_everything(self):
+        self.plan['configure'] = (-9, {}, 'timeout')
+        pilot.run()
+        self.assertEqual((self.out[-1]['status'], self.out[-1]['code'], self.out[-1]['config']),
+                         ('failed', 'uncertain', '-'))
+        self.assertEqual([c[0] for c in self.children], ['configure'])
+        self.assertTrue(pilot.STICKY)
+
+    def test_an_unreported_possibly_created_object_is_never_touched(self):
+        self.plan['accept'] = (1, {}, 'ok')
+        pilot.run()
+        self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])      # no teardown child, no '-' marker
+        self.assertEqual((self.out[-1]['cleanup'], self.out[-1]['status']), ('uncertain', 'failed'))
+
+    def test_sticky_state_can_never_pass(self):
+        pilot.STICKY.append('earlier child not proven closed')
+        pilot.run()
+        self.assertEqual(self.out[-1]['status'], 'failed')
 
     def test_cleanup_uncertainty_can_never_pass(self):
         for cleanup in ('uncertain', 'preserved', 'absent', 'not-needed'):
@@ -735,8 +994,97 @@ class RunTests(unittest.TestCase):
 class RunChildTests(unittest.TestCase):
     ENV = {'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
 
+    def setUp(self):
+        use_sibling_owned(self)
+
     def python(self, code, seconds=10, **kwargs):
-        return pilot.run_child([sys.executable, '-c', code], seconds, env=self.ENV, **kwargs)
+        try:
+            return pilot.run_child([sys.executable, '-c', code], seconds, env=self.ENV, **kwargs)
+        except pilot.Uncertain:
+            if pilot.STICKY and 'sleep(60)' in code:
+                # Positive group absence needs an init that reaps orphaned zombies of killed descendants; a
+                # container without one cannot show it. That is NOT passing evidence for this test.
+                self.skipTest('orphan zombies are not reaped here; group absence cannot be shown')
+            raise
+
+    def test_the_pinned_closure_module_is_loaded_from_exactly_the_hashed_bytes(self):
+        module = pilot.load_owned()
+        self.assertTrue(hasattr(module, 'OwnedGroup'))
+        self.assertIs(pilot.load_owned(), module)
+        pilot.OWNED.clear()
+        tampered = Path(tempfile.mkdtemp()) / 'owned_process.py'
+        self.addCleanup(shutil.rmtree, tampered.parent, True)
+        tampered.write_bytes(OWNED_FILE.read_bytes() + b'\n# tampered\n')
+        with patch.object(pilot, 'OWNED_PROCESS', tampered), self.assertRaises(pilot.Refused):
+            pilot.load_owned()
+        self.assertEqual(pilot.OWNED, [])
+
+    def test_an_unproven_closure_is_sticky_and_refuses_every_later_child(self):
+        class Lost:
+            def __init__(self, proc):
+                self.proc = proc
+
+            def status(self):
+                return None
+
+            def close(self, term_grace, final=3.0, *, until=None):
+                os.killpg(self.proc.pid, 9)       # the test's own child; the owner reports closure NOT proven
+                self.proc.wait(timeout=5)
+                return False
+        module = pilot.load_owned()
+        with patch.object(module, 'OwnedGroup', Lost):
+            with self.assertRaises(pilot.Uncertain):
+                self.python('import time;time.sleep(30)', seconds=.3)
+        self.assertTrue(pilot.STICKY)
+        spawned = []
+        with patch.object(pilot.subprocess, 'Popen', lambda *a, **k: spawned.append(a)), \
+                self.assertRaises(pilot.Uncertain):
+            self.python('print(1)')
+        self.assertEqual(spawned, [])             # refused before any process (hence any mutation) is started
+
+    def test_a_primary_exception_is_preserved_when_closure_is_unproven(self):
+        class Lost:
+            def __init__(self, proc):
+                self.proc = proc
+
+            def status(self):
+                raise KeyboardInterrupt('primary')
+
+            def close(self, term_grace, final=3.0, *, until=None):
+                os.killpg(self.proc.pid, 9)
+                self.proc.wait(timeout=5)
+                return False
+        module = pilot.load_owned()
+        with patch.object(module, 'OwnedGroup', Lost), self.assertRaises(KeyboardInterrupt):
+            self.python('import time;time.sleep(30)')
+        self.assertTrue(pilot.STICKY)
+
+    def test_a_nested_child_in_its_own_session_outlives_the_forced_stop_of_its_worker(self):
+        """Why a forcibly stopped worker is sticky uncertain: the group kill of the outer child does not reach the
+        nested kubectl-like child that the worker's own run_child put in a separate session."""
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        marker = work / 'nested.pid'
+        script = (
+            'import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n'
+            'sys.path.insert(0,%r)\nimport student_vpc_pilot as p\n'
+            'p.OWNED_PROCESS=Path(%r)\np.regular=lambda *a,**k: SimpleNamespace(st_mode=0o100644)\n'
+            'nested="import os,time;open(%r,\'w\').write(str(os.getpid()));time.sleep(120)"\n'
+            'p.run_child([sys.executable,"-c",nested],120,env={"PATH":os.environ["PATH"]})\n'
+            % (str(Path(__file__).parent), str(OWNED_FILE), str(marker)))
+        started = time.monotonic()
+        code, out, state = pilot.run_child([sys.executable, '-c', script], 3, env=self.ENV)
+        self.assertEqual(state, 'timeout')                     # the worker was forcibly stopped by its parent
+        self.assertLess(time.monotonic() - started, 15)
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        pid = int(marker.read_text())
+        self.assertGreater(pid, 1)
+        self.addCleanup(lambda: os.kill(pid, 9) if os.path.exists('/proc/%d' % pid) else None)   # the test's own child
+        stat_text = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()[0]
+        self.assertNotIn(stat_text, ('Z', 'X'))                # still alive: outside the group the parent killed
+        self.assertNotEqual(os.getpgid(pid), 0)
 
     def test_output_exit_code_and_stdin(self):
         self.assertEqual(self.python('print("hi")'), (0, b'hi\n', 'ok'))

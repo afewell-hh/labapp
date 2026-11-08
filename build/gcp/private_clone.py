@@ -90,19 +90,25 @@ BOOTSTRAP = ('__import__("sys").path.insert(0,"' + PROTECTED_SOURCE + '");'
              '__import__("sys").exit(__import__("build.gcp.private_clone",fromlist=["main"]).main())')
 # Opt-in student CLI pilot (#550), DEFAULT OFF: only a manifest armed with ``--student-pilot`` runs it, once, after the
 # FIRST strict ready checkpoint and before the verified stop, inside the ORIGINAL access window. The pilot budget is
-# clipped so the stop cap and teardown reserve always remain. Inputs are fixed public files only.
-PILOT_SECONDS = 8 * 60          # explicit finite cap (transfer + stage + guest run)
-PILOT_MIN_SECONDS = 7 * 60      # least pilot budget worth starting
-PILOT_INCOMING_SECONDS = 15
-PILOT_TRANSFER_SECONDS = 90
-PILOT_STAGE_SECONDS = 30
-PILOT_RUN_SECONDS = pilot_guest.TOTAL_SECONDS + 15
+# clipped so the ORIGINAL stop minimum and teardown reserve always remain (no key, readiness, work or DELETE clock is
+# extended and no stop gate is weakened). Inputs are fixed public files only. The measured startup is 11-13 min of the
+# 20 min key, so only 7-9 min remain at the first ready checkpoint; the pilot therefore asks for at most 240 s and
+# refuses BEFORE any staging when its feasible minimum does not fit. All numbers are finite assumptions, not
+# measured fit: the guest run (``pilot_guest.TOTAL_SECONDS``) is shorter than its host run cap, and the sequential
+# caps below sum to the feasible minimum, which is inside the cap.
+PILOT_SECONDS = 240             # explicit finite cap (transfer + stage + guest run)
+PILOT_INCOMING_SECONDS = 10
+PILOT_TRANSFER_SECONDS = 45
+PILOT_STAGE_SECONDS = 15
+PILOT_RUN_SECONDS = pilot_guest.TOTAL_SECONDS + 10
+PILOT_MIN_SECONDS = (PILOT_INCOMING_SECONDS + PILOT_TRANSFER_SECONDS + PILOT_STAGE_SECONDS + PILOT_RUN_SECONDS)
+PILOT_RESERVE_SECONDS = STOP_MIN_SECONDS + TEARDOWN_SECONDS      # the original stop minimum + teardown
 PILOT_REPORT_LIMIT = 2048
 PILOT_CACHE = '/home/ubuntu/.local/share/labapp-student-pilot'
 PILOT_INCOMING = 'labapp-student-pilot-in'     # relative to the OS Login home, created 0700 by the user
 PILOT_SOURCE_LIMIT = 262144
 PILOT_STAGED = b'student pilot staged'
-PILOT_STAGE = r'''import hashlib,json,os,pwd,re,stat,sys
+PILOT_STAGE_TEMPLATE = r'''import hashlib,json,os,pwd,re,stat,sys
 PINS=json.loads('@PINS@')
 SRC=json.loads('@SRC@')
 U=os.environ.get('SUDO_USER','')
@@ -140,10 +146,19 @@ finally:
 for w in want: os.unlink(w[0],dir_fd=inc)
 os.rmdir('@INCOMING@',dir_fd=home)
 print('student pilot staged')
-'''.replace('@PINS@', json.dumps([list(p) for p in pilot_guest.CACHE_PINS], separators=(',', ':'))) \
-   .replace('@SRC@', json.dumps(list(pilot_guest.SOURCE_NAMES), separators=(',', ':'))) \
-   .replace('@LIMIT@', str(PILOT_SOURCE_LIMIT)).replace('@INCOMING@', PILOT_INCOMING) \
-   .replace('@DEST@', str(pilot_guest.PAYLOAD))
+'''
+
+
+def pilot_stage_script(pins, dest):
+    """The staging program for exact ``pins`` into ``dest``. Production uses the real pins and payload directory;
+    tests build it with synthetic bounded pins under a temporary destination and RUN it."""
+    return PILOT_STAGE_TEMPLATE.replace('@PINS@', json.dumps([list(p) for p in pins], separators=(',', ':'))) \
+        .replace('@SRC@', json.dumps(list(pilot_guest.SOURCE_NAMES), separators=(',', ':'))) \
+        .replace('@LIMIT@', str(PILOT_SOURCE_LIMIT)).replace('@INCOMING@', PILOT_INCOMING).replace('@DEST@', str(dest))
+
+
+PILOT_STAGE_PINS = pilot_guest.CACHE_PINS
+PILOT_STAGE = pilot_stage_script(PILOT_STAGE_PINS, pilot_guest.PAYLOAD)
 UNIT_PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlGroup', 'InvocationID', 'Type',
                    'User', 'WorkingDirectory', 'Restart', 'KillMode', 'SendSIGKILL', 'TimeoutStopUSec',
                    'RemainAfterExit', 'ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost',
@@ -1579,7 +1594,8 @@ class Run:
         self.phase = 'pilot'
         inputs = pilot_inputs(self.deps)
         require(inputs['sha256'] == m['student_pilot']['inputs_sha256'], 'pilot inputs differ from the manifest binding')
-        budget = int(window.remaining()) - STOP_SECONDS - TEARDOWN_SECONDS
+        # Gate BEFORE any staging: keep the ORIGINAL stop minimum + teardown reserve (not the 360 s stop cap).
+        budget = int(window.remaining()) - PILOT_RESERVE_SECONDS
         require(budget >= PILOT_MIN_SECONDS, 'insufficient time for the pilot and the stop reserve')
         budget = min(budget, PILOT_SECONDS)
         pilot = window.sub(budget)

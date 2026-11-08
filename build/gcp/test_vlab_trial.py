@@ -6104,15 +6104,21 @@ def pilot_report(**change):
 
 class PilotFakeMaster(CloneFakeMaster):
     def remote(self, key, window, cap=30, extra=()):
+        world = self.world
         if not key.startswith('pilot-'):
+            if key == 'summary' and getattr(world, 'ready_delay', 0) and not getattr(world, 'ready_applied', False):
+                world.ready_applied = True
+                world.t += world.ready_delay      # slow first-boot startup: BOTH clocks advance
             return super().remote(key, window, cap)
         window.remaining()
-        world = self.world
         world.events.append(key)
         world.pilot_calls.append({'key': key, 'cap': cap, 'extra': tuple(extra), 'window': window,
                                   'wall': world.wall()})
         if world.pilot_raise and world.pilot_raise[0] == key:
             raise world.pilot_raise[1]
+        hook = getattr(world, 'pilot_after', {}).get(key)
+        if hook:
+            hook()
         return {'pilot-incoming': b'', 'pilot-stage': clone.PILOT_STAGED + b'\n',
                 'pilot-run': world.pilot_report}[key]
 
@@ -6121,6 +6127,9 @@ class PilotFakeMaster(CloneFakeMaster):
         self.world.events.append('pilot-transfer')
         self.world.pilot_calls.append({'key': 'pilot-transfer', 'cap': cap, 'names': list(names), 'window': window,
                                        'wall': self.world.wall()})
+        hook = getattr(self.world, 'pilot_after', {}).get('pilot-transfer')
+        if hook:
+            hook()
 
 
 class PilotCase(CloneCase):
@@ -6245,8 +6254,80 @@ class StudentPilotHost(PilotCase):
         self.assertGreaterEqual(intent['budget'], clone.PILOT_MIN_SECONDS)
         for call in self.world.pilot_calls:
             self.assertLessEqual(call['window'].end_wall - call['wall'], clone.PILOT_SECONDS)
-            self.assertLessEqual(call['window'].end_wall + clone.STOP_SECONDS + clone.TEARDOWN_SECONDS, access_end + 1)
-        self.assertEqual(self.calls('pilot-run')[0]['cap'], clone.pilot_guest.TOTAL_SECONDS + 15)
+            # the ORIGINAL stop minimum (not the 360 s cap) plus teardown always remain after the pilot window
+            self.assertLessEqual(call['window'].end_wall + clone.PILOT_RESERVE_SECONDS, access_end + 1)
+        self.assertEqual(self.calls('pilot-run')[0]['cap'], clone.PILOT_RUN_SECONDS)
+
+    def test_the_budget_constants_are_coherent_and_shorter_than_the_host_cap(self):
+        g = pilot_guest = clone.pilot_guest
+        self.assertLessEqual(clone.PILOT_SECONDS, 240)
+        self.assertEqual(clone.PILOT_RESERVE_SECONDS, 120 + 30)             # original STOP_MIN_SECONDS + TEARDOWN
+        self.assertEqual((clone.STOP_MIN_SECONDS, clone.TEARDOWN_SECONDS, clone.STOP_SECONDS), (120, 30, 360))
+        self.assertEqual((clone.KEY_SECONDS, clone.READY_SECONDS), (20 * 60, 13 * 60))
+        self.assertLess(g.TOTAL_SECONDS, clone.PILOT_RUN_SECONDS)             # guest total inside the host run cap
+        self.assertLessEqual(clone.PILOT_INCOMING_SECONDS + clone.PILOT_TRANSFER_SECONDS + clone.PILOT_STAGE_SECONDS
+                             + clone.PILOT_RUN_SECONDS, clone.PILOT_SECONDS)   # sequential caps fit the cap
+        self.assertEqual(clone.PILOT_MIN_SECONDS, clone.PILOT_INCOMING_SECONDS + clone.PILOT_TRANSFER_SECONDS
+                         + clone.PILOT_STAGE_SECONDS + clone.PILOT_RUN_SECONDS)
+        self.assertLessEqual(clone.PILOT_MIN_SECONDS, clone.PILOT_SECONDS)
+        # at the SLOWEST allowed readiness the 20 min key still leaves room for the minimum pilot and the reserve
+        self.assertGreaterEqual(clone.KEY_SECONDS - clone.READY_SECONDS - clone.PILOT_RESERVE_SECONDS,
+                                clone.PILOT_MIN_SECONDS)
+
+    def readiness(self, delay):
+        """First strict ready checkpoint ``delay`` s after the key import (both clocks); the fake's two 10 s polls
+        are part of that time."""
+        self.world.ready_delay = delay - 20
+        return self.execute()
+
+    def test_realistic_eleven_and_thirteen_minute_readiness_still_fit_the_capped_pilot(self):
+        for minutes_seconds in (11 * 60, 12 * 60, 13 * 60 - 30):
+            with self.subTest(ready_after=minutes_seconds):
+                self.fresh_world()
+                code, result = self.readiness(minutes_seconds)
+                self.assertEqual((code, result['status']), (0, 'passed'), result)
+                access_end = int(self.store.read('a1-intent')['expiration_usec']) / 1_000_000
+                intent = self.store.read('pilot-intent')
+                self.assertEqual(intent['budget'], clone.PILOT_SECONDS)
+                for call in self.world.pilot_calls:
+                    self.assertLessEqual(call['window'].end_wall + clone.PILOT_RESERVE_SECONDS, access_end + 1)
+                    self.assertLessEqual(call['window'].end_wall - call['wall'], clone.PILOT_SECONDS)
+                self.assertEqual(self.world.events.count('stop-verified'), 2)       # the unchanged stop gates still ran
+                self.assert_disposed(result)
+
+    def test_late_readiness_refuses_before_any_staging_or_guest_mutation(self):
+        # Only extended readiness (patched here) can reach a first-ready point this late; the pilot gate must hold.
+        late = clone.KEY_SECONDS - clone.PILOT_RESERVE_SECONDS - clone.PILOT_MIN_SECONDS + 5
+        with patch.object(clone, 'READY_SECONDS', clone.KEY_SECONDS - 10):
+            code, result = self.readiness(late)
+        self.assertEqual((code, result['status'], result['phase']), (1, 'failed', 'pilot'))
+        self.assertFalse([e for e in self.world.events if e.startswith('pilot-')])    # no incoming dir, no transfer
+        self.assertEqual(self.world.pilot_calls, [])
+        self.assertFalse(self.store.has('pilot-intent'))
+        self.assertNotIn('stop-verified', self.world.events)
+        self.assert_disposed(result)
+        # five seconds earlier the minimum still fits and the pilot proceeds
+        self.fresh_world()
+        with patch.object(clone, 'READY_SECONDS', clone.KEY_SECONDS - 10):
+            code, result = self.readiness(late - 60)
+        self.assertEqual((code, result['status']), (0, 'passed'), result)
+        self.assertGreaterEqual(self.store.read('pilot-intent')['budget'], clone.PILOT_MIN_SECONDS)
+
+    def test_wall_or_monotonic_crossing_during_the_pilot_stops_the_next_step(self):
+        for clock in ('wall_offset', 'mono_offset'):
+            for after in ('pilot-incoming', 'pilot-transfer'):
+                with self.subTest(clock=clock, after=after):
+                    self.fresh_world()
+                    world = self.world
+                    world.pilot_after = {after: lambda: setattr(world, clock, getattr(world, clock) + 1300)}
+                    code, result = self.execute()
+                    self.assertEqual((code, result['status']), (1, 'failed'))
+                    later = {'pilot-incoming': ('pilot-transfer', 'pilot-stage', 'pilot-run'),
+                             'pilot-transfer': ('pilot-stage', 'pilot-run')}[after]
+                    self.assertFalse([e for e in world.events if e in later], world.events)
+                    self.assertNotIn('stop-verified', world.events)
+                    self.assertEqual(self.store.read('pilot-result')['status'], 'failed')
+                    self.assert_disposed(result)
 
     def test_insufficient_time_for_the_reserve_refuses_before_the_pilot_and_stop(self):
         with patch.object(clone, 'PILOT_MIN_SECONDS', 10 * 60 + 600):
@@ -6378,18 +6459,131 @@ class StudentPilotHost(PilotCase):
         self.assertEqual(master.check.call_count, 2)
         self.assertFalse(list(Path(self.world.tmp).glob('*batch*')))
 
-    def test_stage_script_is_pinned_exclusive_and_cleans_on_failure(self):
-        script = clone.PILOT_STAGE
-        compile(script, 'stage', 'exec')
-        self.assertNotIn('@', script)
-        for name, size, sha in clone.pilot_guest.CACHE_PINS:
-            self.assertIn(name, script)
-            self.assertIn(sha, script)
-        for text in ("os.mkdir('/run/labapp-student-pilot',0o700)", "'labapp-student-pilot-in'", 'O_NOFOLLOW',
-                     'O_EXCL', 'SUDO_USER', 'st_nlink!=1', 'os.rmdir'):
-            self.assertIn(text, script)
-        self.assertIn('student pilot staged', script)
+    def test_production_stage_script_is_built_from_the_real_pins_not_the_fixture(self):
+        # The fixture patches CACHE_PINS with fake names; the shipped program keeps the import-time real pins.
+        real = clone.PILOT_STAGE_PINS
+        self.assertNotEqual(real, clone.pilot_guest.CACHE_PINS)
+        self.assertEqual(clone.PILOT_STAGE, clone.pilot_stage_script(real, clone.pilot_guest.PAYLOAD))
+        compile(clone.PILOT_STAGE, 'stage', 'exec')
+        self.assertNotIn('@', clone.PILOT_STAGE)
         self.assertEqual(clone.PILOT_STAGED, b'student pilot staged')
+        self.assertEqual(clone.REMOTE['pilot-stage'][-1], clone.PILOT_STAGE)
+
+    # ---- the REAL staging program, run under synthetic bounded IO (temporary home/destination, small files)
+    STAGE_PINS_CONTENT = {'pin-archive.bin': b'a' * 300, 'pin-one.deb': b'one', 'pin-two.deb': b'two',
+                          'pin-three.deb': b'three'}
+
+    def stage_world(self):
+        root = Path(tempfile.mkdtemp(prefix='stg', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, root, True)
+        uid = os.getuid() or 12345                       # the program refuses root; a root test run chowns instead
+        home, dest = root / 'home', root / 'dest'
+        incoming = home / clone.PILOT_INCOMING
+        incoming.mkdir(parents=True)
+        os.chmod(incoming, 0o700)
+        pins = [(n, len(raw), hashlib.sha256(raw).hexdigest()) for n, raw in self.STAGE_PINS_CONTENT.items()]
+        sources = {n: ('# source ' + n + '\n').encode() for n in clone.pilot_guest.SOURCE_NAMES}
+        for name, raw in {**self.STAGE_PINS_CONTENT, **sources}.items():
+            (incoming / name).write_bytes(raw)
+            os.chmod(incoming / name, 0o644)
+        if os.getuid() == 0:
+            for path in (incoming, *incoming.iterdir()):
+                os.chown(path, uid, uid)
+        digests = [hashlib.sha256(sources[n]).hexdigest() for n in clone.pilot_guest.SOURCE_NAMES]
+        script = clone.pilot_stage_script(pins, dest)
+        return SimpleNamespace(root=root, home=home, dest=dest, incoming=incoming, pins=pins, sources=sources,
+                               digests=digests, script=script, uid=uid)
+
+    def run_stage(self, world, digests=None, uid=None):
+        """-> (exit code | exception, stdout). Executes the shipped program text in-process."""
+        user = SimpleNamespace(pw_uid=world.uid if uid is None else uid, pw_dir=str(world.home))
+        out = io.StringIO()
+        argv = ['stage', *(world.digests if digests is None else digests)]
+        with patch.dict(os.environ, {'SUDO_USER': 'pilotuser'}), patch('pwd.getpwnam', lambda name: user), \
+                patch.object(sys, 'argv', argv), patch('sys.stdout', out):
+            try:
+                exec(compile(world.script, 'stage', 'exec'), {'__name__': '__stage__'})
+                return 0, out.getvalue()
+            except SystemExit as error:
+                return error.code, out.getvalue()
+            except Exception as error:     # the program itself failed closed (e.g. a conflicting destination)
+                return error, out.getvalue()
+
+    def test_stage_program_stages_exactly_the_pinned_set_and_consumes_the_incoming_directory(self):
+        world = self.stage_world()
+        code, out = self.run_stage(world)
+        self.assertEqual((code, out.strip().encode()), (0, clone.PILOT_STAGED))
+        self.assertEqual(stat.S_IMODE(world.dest.stat().st_mode), 0o700)
+        staged = {p.name: p.read_bytes() for p in world.dest.iterdir()}
+        self.assertEqual(staged, {**self.STAGE_PINS_CONTENT, **world.sources})
+        for path in world.dest.iterdir():
+            self.assertEqual((stat.S_IMODE(path.stat().st_mode), path.stat().st_nlink), (0o600, 1))
+        self.assertFalse(world.incoming.exists())                         # consumed only after full verification
+
+    def test_stage_program_mismatch_conflict_and_failure_preserve_inputs_and_leave_no_partial_stage(self):
+        def tamper_pin(w):
+            (w.incoming / 'pin-one.deb').write_bytes(b'ONE')                      # same size, different hash
+        def oversize_pin(w):
+            (w.incoming / 'pin-archive.bin').write_bytes(b'a' * 301)
+        def short_pin(w):
+            (w.incoming / 'pin-archive.bin').write_bytes(b'a' * 299)
+        def extra_file(w):
+            (w.incoming / 'unexpected.txt').write_bytes(b'x')
+        def missing_file(w):
+            (w.incoming / 'pin-two.deb').unlink()
+        def hardlink(w):
+            os.link(w.incoming / 'pin-three.deb', w.root / 'second-link')
+        cases = [('pin hash', tamper_pin), ('pin larger than pinned', oversize_pin), ('pin smaller than pinned', short_pin),
+                 ('unexpected file', extra_file), ('missing file', missing_file), ('extra hard link', hardlink)]
+        for label, mutate in cases:
+            with self.subTest(label):
+                world = self.stage_world()
+                mutate(world)
+                before = {p.name: p.read_bytes() for p in world.incoming.iterdir()}
+                code, out = self.run_stage(world)
+                self.assertEqual(code, 3, label)
+                self.assertNotIn('staged', out)
+                self.assertFalse(world.dest.exists(), label)                     # no partial stage
+                self.assertEqual({p.name: p.read_bytes() for p in world.incoming.iterdir()}, before)  # inputs preserved
+        for label, digests in (('source digest', ['0' * 64] * 3), ('digest count', ['0' * 64]),
+                               ('digest shape', ['G' * 64] * 3)):
+            with self.subTest(label):
+                world = self.stage_world()
+                digests = digests if len(digests) != 3 or label != 'source digest' else \
+                    [world.digests[0], '0' * 64, world.digests[2]]
+                code, _ = self.run_stage(world, digests)
+                self.assertEqual(code, 3)
+                self.assertFalse(world.dest.exists())
+                self.assertEqual(len(list(world.incoming.iterdir())), 4 + len(world.sources))
+        with self.subTest('root user'):
+            world = self.stage_world()
+            self.assertEqual(self.run_stage(world, uid=0)[0], 3)
+            self.assertFalse(world.dest.exists())
+        with self.subTest('symlinked input'):
+            world = self.stage_world()
+            (world.incoming / 'pin-one.deb').unlink()
+            (world.incoming / 'pin-one.deb').symlink_to(world.incoming / 'pin-two.deb')
+            code, _ = self.run_stage(world)
+            self.assertIsInstance(code, OSError)                                # O_NOFOLLOW refuses; nothing published
+            self.assertFalse(world.dest.exists())
+            self.assertTrue((world.incoming / 'pin-two.deb').exists())
+
+    def test_stage_program_refuses_an_existing_destination_without_touching_it(self):
+        world = self.stage_world()
+        world.dest.mkdir(mode=0o700)
+        (world.dest / 'keep').write_bytes(b'prior stage')
+        code, out = self.run_stage(world)
+        self.assertIsInstance(code, FileExistsError)
+        self.assertEqual({p.name: p.read_bytes() for p in world.dest.iterdir()}, {'keep': b'prior stage'})
+        self.assertEqual(len(list(world.incoming.iterdir())), 4 + len(world.sources))   # inputs preserved
+        self.assertEqual(out, '')
+
+    @unittest.skipUnless(os.getuid() == 0, 'needs root to create a file owned by another uid')
+    def test_stage_program_refuses_input_owned_by_someone_else(self):
+        world = self.stage_world()
+        os.chown(world.incoming / 'pin-one.deb', world.uid + 1, world.uid + 1)
+        self.assertEqual(self.run_stage(world)[0], 3)
+        self.assertFalse(world.dest.exists())
 
     def test_independent_cleanup_after_a_pilot_failure_is_unchanged(self):
         self.world.pilot_raise = ('pilot-run', clone.Expired('synthetic'))

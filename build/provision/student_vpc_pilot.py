@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 PAYLOAD = Path('/run/labapp-student-pilot')
 USER, HOME = 'ubuntu', Path('/home/ubuntu')
@@ -61,17 +62,30 @@ CACHE_PINS = tuple([ARCHIVE] + [d[:3] for d in DEBS])
 SOURCE_NAMES = ('student_vpc_pilot.py', 'install-kubectl-fabric.py', 'hhfab_release.py')
 LIBC_MINIMUM = '2.39'
 
-# Finite assumptions, not measured fit. Work phases are clipped to the remaining total minus the teardown reserve.
-TOTAL_SECONDS = 310
-TEARDOWN_SECONDS = 25
-PREFLIGHT_SECONDS, PACKAGE_SECONDS, PLUGIN_SECONDS, CONFIG_SECONDS = 15, 45, 45, 25
-ACCEPT_SECONDS = 150
-AGENT_WAIT_SECONDS, AGENT_POLL_SECONDS = 75, 5
-CALL_SECONDS = 30
+# Finite assumptions, NOT measured fit. The host caps the whole pilot (transfer + staging + this run) at 240 s inside
+# the original access window (#550), so this guest run is deliberately SHORTER than that cap: the host's non-run steps
+# (10 + 45 + 15 s) plus ``TOTAL_SECONDS`` plus the 10 s margin of the host run cap stay under it. Work phases are
+# clipped to the remaining total minus the teardown reserve; the accept child's own total (ACCEPT_SECONDS) is inside
+# the root total and itself holds back TEARDOWN_SECONDS for the harness teardown.
+TOTAL_SECONDS = 150
+TEARDOWN_SECONDS = 20
+PREFLIGHT_SECONDS, PACKAGE_SECONDS, PLUGIN_SECONDS, CONFIG_SECONDS = 10, 30, 25, 15
+ACCEPT_SECONDS = 70
+AGENT_WAIT_SECONDS, AGENT_POLL_SECONDS = 30, 5
+CALL_SECONDS = 15
+CHILD_CLOSE_SECONDS = 3.0      # owned_process final reap + group-convergence budget per child
 OUTPUT_LIMIT = 2048
-KUBE_LIMIT = 262144
+KUBE_LIMIT = 1 << 20     # the accepted core's known finite 1 MiB allowance; a full seven-agent query is unmeasured
 SOURCE_LIMIT = 262144
 AGENTS = 7
+# Canonical VLAB switch agents of this repo's wiring (wiringd.yaml): exactly these seven names.
+AGENT_NAMES = frozenset({'spine-01', 'spine-02', 'leaf-01', 'leaf-02', 'leaf-03', 'leaf-04', 'leaf-05'})
+# Accepted immutable process-group closure (#365), already installed in the guest; reused unmodified.
+OWNED_PROCESS = Path('/usr/local/lib/labapp/owned_process.py')
+OWNED_PROCESS_SHA256 = '873c77d857d62280fbf9202a3544102f83e6cab39de0ddb05cd37107ca56e599'
+OWNED_LIMIT = 65536
+# Harness-only raw DELETE (NOT a lesson step): preconditions.uid makes the delete atomic with the observed object.
+VPC_PATH = '/apis/vpc.githedgehog.com/v1beta1/namespaces/default/vpcs/' + 'webapp-prod'
 
 PHASES = ('preflight', 'packages', 'plugin', 'config', 'accept', 'teardown', 'done')
 CODES = ('ok', 'refused', 'conflict', 'timeout', 'failed', 'cancelled', 'uncertain')
@@ -83,7 +97,9 @@ RESULT_KEYS = ('agents', 'cleanup', 'code', 'config', 'packages', 'phase', 'plug
 
 UID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:@-]{0,252}\Z')
-STATUS_RE = re.compile(r'([a-z]{2}) ?\|([a-z0-9+.-]+)\|(.*)\Z')
+# dpkg-query ${db:Status-Abbrev}: desired, status and error flag (any dpkg letter: ii, iU, iF, iHR, rc, un ...).
+STATUS_RE = re.compile(r'([a-z ][A-Za-z ][A-Z ])\|([a-z0-9+.-]+)\|(.*)\Z')
+ABSENT_RE = re.compile(r'dpkg-query: no packages found matching ([a-z0-9+.-]+)\Z')
 
 ROOT_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'LANG': 'C', 'DEBIAN_FRONTEND': 'noninteractive'}
 # Ordinary Ubuntu login values for the student identity: HOME, PATH and no KUBECONFIG.
@@ -119,6 +135,10 @@ SUBNETS = {'web-servers': ('10.10.10.0/24', '10.10.10.1', 1010),
            'worker-nodes': ('10.10.20.0/24', '10.10.20.1', 1020)}
 DHCP_RANGE = {'start': '10.10.20.10', 'end': '10.10.20.250'}
 SLEEP = time.sleep
+# Sticky: once a child group could not be positively closed, or a student worker was forcibly stopped, nothing
+# further is mutated, torn down or passed in this process; the exact whole-VM disposal owns the rest.
+STICKY = []
+OWNED = []
 
 
 class Refused(Exception):
@@ -190,8 +210,13 @@ def shield():
 def run_child(argv, seconds, *, env, limit=65536, stdin=None, account=None):
     """-> (returncode, output, state) with state 'ok'|'timeout'|'overflow'; partial output is kept.
 
-    Own session; the unreaped leader anchors the group, which is SIGKILLed before the single reap.
-    ``account`` drops to that real user (uid, gid, supplementary groups) in the child."""
+    Own session; the accepted ``owned_process.OwnedGroup`` anchors the group with the unreaped leader, SIGKILLs it,
+    reaps once and needs positive ESRCH absence. A closure that is not proven makes the process STICKY uncertain:
+    every later child (so any mutation or teardown) is refused. Only this child's own session is covered; a nested
+    child a worker started in ITS session is outside it, which is why a forcibly stopped worker is never followed by
+    further guest work (see ``run``). ``account`` drops to that real user (uid, gid, supplementary groups) in the child."""
+    require_certain()
+    owned = load_owned()
     extra = {}
     if account is not None:
         extra = {'user': account.pw_uid, 'group': account.pw_gid,
@@ -199,6 +224,11 @@ def run_child(argv, seconds, *, env, limit=65536, stdin=None, account=None):
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd='/',
                             start_new_session=True, **extra)
+    try:
+        group = owned.OwnedGroup(proc)
+    except BaseException:
+        STICKY.append('unanchored child')
+        raise
     output, state = bytearray(), 'ok'
     deadline = time.monotonic() + seconds
     try:
@@ -214,14 +244,11 @@ def run_child(argv, seconds, *, env, limit=65536, stdin=None, account=None):
             elif proc.stdin is not None:
                 proc.stdin.close()
             while select.get_map() and state == 'ok':
-                if not exited and os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                if group.status() is not None:
                     # The leader (still unreaped, so it anchors the group) exited: no descendant may keep the pipe
-                    # open. Already-written output is still read before EOF.
+                    # open. The group is closed below and already-written output is drained afterwards.
                     exited = True
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    break
                 left = deadline - time.monotonic()
                 if left <= 0:
                     state = 'timeout'
@@ -250,33 +277,70 @@ def run_child(argv, seconds, *, env, limit=65536, stdin=None, account=None):
                         break
                     else:
                         output.extend(block)
-        while state == 'ok':   # non-reaping completion observation; the leader stays the group anchor
-            info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            if info is not None:
+        while state == 'ok' and not exited:   # non-reaping completion observation; the leader stays the group anchor
+            if group.status() is not None:
                 break
             if time.monotonic() >= deadline:
                 state = 'timeout'
             else:
                 time.sleep(.01)
+    except owned.OwnershipUncertain:
+        raise Uncertain('child ownership could not be shown') from None
     finally:
+        primary = sys.exc_info()[0] is not None
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        reaped = True
-        try:
-            proc.wait(timeout=5)
+            closed = group.close(0, CHILD_CLOSE_SECONDS)   # SIGKILL while anchored, one reap, positive ESRCH absence
         except BaseException:
-            reaped = False
+            closed = False
+        if not closed:
+            STICKY.append('child group not proven closed')
+        elif state == 'ok' and not primary:
+            state = drain(proc.stdout, output, limit)
         for pipe in (proc.stdin, proc.stdout):
             try:
                 if pipe is not None:
                     pipe.close()
             except OSError:
                 pass
-        if not reaped and sys.exc_info()[0] is None:
-            raise Uncertain('child was not reaped')
+        if not closed and not primary:
+            raise Uncertain('child group was not proven closed')
     return proc.returncode, bytes(output), state
+
+
+def drain(stream, output, limit):
+    """Read what a closed group left in the pipe (writers are gone, so EOF or EAGAIN ends it)."""
+    while True:
+        try:
+            block = os.read(stream.fileno(), 65536)
+        except OSError:
+            return 'ok'
+        if not block:
+            return 'ok'
+        if len(output) + len(block) > limit:
+            output.extend(block[:max(0, limit - len(output))])
+            return 'overflow'
+        output.extend(block)
+
+
+def require_certain():
+    if STICKY:
+        raise Uncertain('an earlier child was not proven closed')
+
+
+def load_owned():
+    """The accepted immutable owned_process.py (#365): size/owner/mode checked, SHA256 pinned, executed from the
+    exact bytes that were hashed. Never modified or copied; no sibling import."""
+    if OWNED:
+        return OWNED[0]
+    info = regular(OWNED_PROCESS, owner=0, limit=OWNED_LIMIT, private=False)
+    require(not info.st_mode & 0o022, 'process closure module is writable')
+    raw = OWNED_PROCESS.read_bytes()
+    require(len(raw) <= OWNED_LIMIT and hashlib.sha256(raw).hexdigest() == OWNED_PROCESS_SHA256,
+            'process closure module does not match the pin')
+    module = types.ModuleType('owned_process')
+    exec(compile(raw, str(OWNED_PROCESS), 'exec'), module.__dict__)
+    OWNED.append(module)
+    return module
 
 
 class Clock:
@@ -376,6 +440,7 @@ def preflight():
     user = account()
     verify_payload()
     verify_kubectl()
+    load_owned()
     require(os.path.isfile('/usr/local/bin/hhfab'), 'hhfab absent')
     real_directory(HOME, owner=user.pw_uid, private=False)
     regular(SOURCE_KUBECONFIG, owner=user.pw_uid, limit=65536)
@@ -384,16 +449,27 @@ def preflight():
 
 # ------------------------------------------------------------------------------ packages ------------
 def package_state():
-    """-> {package: (status abbreviation, version)} for the wanted packages plus libc6; absent = missing key."""
+    """-> {package: (status, version)} for the wanted packages plus libc6, parsed COMPLETELY.
+
+    ``status`` is the dpkg abbreviation without padding ('ii', 'iU', 'iF', 'iHR', 'rc' ...). Only DEFINITE absence is
+    omitted: dpkg's exact "no packages found" line or an 'un' row without a version. Every requested package must be
+    accounted for exactly once and every non-blank line must be understood, otherwise the query is refused."""
     names = [d[3] for d in DEBS] + ['libc6']
-    _, out, state = run_child([DPKG_QUERY, '-W', '-f', '${db:Status-Abbrev}|${Package}|${Version}\n', *names],
-                              15, env=ROOT_ENV, limit=8192)
-    require(state == 'ok', 'package query failed')
-    found = {}
+    code, out, state = run_child([DPKG_QUERY, '-W', '-f', '${db:Status-Abbrev}|${Package}|${Version}\n', *names],
+                                 15, env=ROOT_ENV, limit=8192)
+    require(state == 'ok' and code in (0, 1), 'package query failed')
+    found, seen = {}, set()
     for line in out.decode('utf-8', 'replace').splitlines():
-        match = STATUS_RE.match(line)
-        if match and match.group(2) in names:
-            found[match.group(2)] = (match.group(1), match.group(3))
+        if not line.strip():
+            continue
+        row, absent = STATUS_RE.match(line), ABSENT_RE.match(line)
+        name = row.group(2) if row else absent.group(1) if absent else None
+        require(name in names and name not in seen, 'package query output refused')
+        seen.add(name)
+        if row and not (row.group(1).rstrip() == 'un' and not row.group(3)):
+            require(row.group(3), 'package query output refused')
+            found[name] = (row.group(1).rstrip(), row.group(3))
+    require(seen == set(names), 'package query output incomplete')
     return found
 
 
@@ -406,7 +482,7 @@ def install_packages(clock):
     missing = []
     for name, _, _, package, version in DEBS:
         have = found.get(package)
-        if have is None or (have[0] == 'un' and not have[1]):
+        if have is None:   # definite absence only; every partial/unknown/error state is a conflict below
             missing.append(name)
         elif have != ('ii', version):
             raise Conflict('existing package state conflicts')
@@ -572,7 +648,8 @@ def vpc_spec_ok(obj):
 def agents_state(document):
     """-> (agent count, all APPLIEDG == CURRENTG with Applied=True). Exactly seven agents are required."""
     agents = items(document)
-    good = True
+    names = [(a.get('metadata') or {}).get('name') if isinstance(a.get('metadata'), dict) else None for a in agents]
+    good = len(set(names)) == len(names) and set(names) == AGENT_NAMES
     for agent in agents:
         meta, status = agent.get('metadata'), agent.get('status')
         if not isinstance(meta, dict) or not isinstance(status, dict):
@@ -615,19 +692,53 @@ def namespaces_ok(ipv4, vlan):
             and all(any(lo <= v[2] <= hi for lo, hi in ranges) for v in SUBNETS.values()))
 
 
-def remove_owned(uid, clock):
-    """Harness teardown of ONLY the test-owned VPC. -> 'removed' | 'absent' | 'preserved' | 'uncertain'."""
+def observe(clock):
+    """-> None (definitely absent) or the present object's UID (a string, possibly not a valid UID -> refused)."""
+    _, out = kube(['get', 'vpc', VPC_NAME, '-o', 'json', '--ignore-not-found'], clock)
+    if not out.strip():
+        return None
+    uid = (parse_json(out).get('metadata') or {}).get('uid')
+    require(isinstance(uid, str) and UID_RE.fullmatch(uid), 'observed UID refused')
+    return uid
+
+
+def remove_owned(uid, clock, work):
+    """HARNESS teardown (not a lesson step) of ONLY the VPC whose UID the successful create response gave.
+
+    -> 'removed' | 'absent' | 'preserved' | 'uncertain'. With no known UID nothing is read or deleted ('uncertain').
+    The delete is one native ``kubectl delete --raw`` whose DeleteOptions carry ``preconditions.uid``, so the API
+    server refuses it atomically if the name was replaced after the observation; it is never a name-only delete."""
+    if uid is None:
+        return 'uncertain'
     try:
-        _, out = kube(['get', 'vpc', VPC_NAME, '-o', 'json', '--ignore-not-found'], clock)
-        if not out.strip():
+        seen = observe(clock)
+        if seen is None:
             return 'absent'
-        obj = parse_json(out)
-        meta = obj.get('metadata') if isinstance(obj.get('metadata'), dict) else {}
-        if uid is None or meta.get('uid') != uid:   # only the actual created UID proves ownership
+        if seen != uid:
             return 'preserved'
-        kube(['delete', 'vpc', VPC_NAME, '--wait=true', '--timeout=20s'], clock, seconds=30)
-        _, out = kube(['get', 'vpc', VPC_NAME, '-o', 'json', '--ignore-not-found'], clock)
-        return 'removed' if not out.strip() else 'uncertain'
+        body = Path(work) / 'delete-options.json'
+        fd = os.open(body, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(json.dumps({'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': {'uid': uid}},
+                                    sort_keys=True))
+        accepted = True
+        try:
+            kube(['delete', '--raw', VPC_PATH, '-f', str(body)], clock, seconds=20)
+        except Timeout:
+            return 'uncertain'
+        except Refused:
+            accepted = False   # precondition refusal or transport failure: decided by the observation below
+        while True:
+            seen = observe(clock)
+            if seen is None:
+                return 'removed' if accepted else 'absent'   # a refused delete never claims the removal
+            if seen != uid:
+                return 'preserved'   # the name now belongs to something else; it was not touched
+            try:
+                clock.left()
+            except Timeout:
+                return 'uncertain'
+            SLEEP(1)
     except Refused:
         return 'uncertain'
 
@@ -641,8 +752,10 @@ def lesson(clock, state):
     require(kube(['config', 'get-contexts', '-o', 'name'], clock)[1].decode().split() == [CONTEXT], 'single context required')
     require(PLUGIN in kube(['plugin', 'list'], clock)[1].decode('utf-8', 'replace').split(), 'plugin not discovered')
     kube(['fabric', '--help'], clock)
-    code, out, _ = run_child(['jq', '--version'], 10, env=STUDENT_ENV, limit=256)
-    require(code == 0 and re.fullmatch(rb'jq-1\.7\.1\n?', out), 'jq is not the pinned version')
+    require(kube(['fabric', '--version'], clock)[1].strip(), 'fabric version was empty')
+    # The signed Ubuntu 1.7.1-3ubuntu0.24.04.2 package reports its binary as "jq-1.7" (confirmed native check).
+    code, out, _ = run_child(['jq', '--version'], min(10, clock.left()), env=STUDENT_ENV, limit=256)
+    require(code == 0 and re.fullmatch(rb'jq-1\.7\n?', out), 'jq is not the pinned version')
     # Refuse conflicts before mutating: preexisting webapp-prod, missing namespaces, overlapping CIDR/VLAN.
     require(not kube(['get', 'vpc', VPC_NAME, '-o', 'name', '--ignore-not-found'], clock)[1].strip(), 'webapp-prod preexists')
     ipv4 = kube_json(['get', 'ipv4namespace', 'default', '-o', 'json'], clock)
@@ -660,14 +773,21 @@ def lesson(clock, state):
     text = manifest.read_text(encoding='utf-8')
     require(text == VPC_YAML and text.count('subnet:') == 2, 'manifest check failed')
     # Step 2: apply and confirm creation.
+    # The same lesson action as ``kubectl apply -f``; ``-o json`` additionally returns the object the server CREATED,
+    # whose UID is the only proof of ownership. An ambiguous result (timeout, overflow, failure, unparseable or
+    # unproven response) leaves the UID unknown: the object is then unresolved and is never adopted or deleted.
     state['attempted'] = True
-    _, applied = kube(['apply', '-f', str(manifest)], clock)
-    require(applied.decode('utf-8', 'replace').strip().endswith('created'), 'apply did not create the VPC')
-    obj = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
-    uid = (obj.get('metadata') or {}).get('uid')
-    require(isinstance(uid, str) and UID_RE.fullmatch(uid), 'created UID refused')
+    _, applied = kube(['apply', '-f', str(manifest), '-o', 'json'], clock)
+    created = parse_json(applied)
+    meta = created.get('metadata') if isinstance(created.get('metadata'), dict) else {}
+    uid = meta.get('uid')
+    require(created.get('kind') == 'VPC' and meta.get('name') == VPC_NAME and meta.get('namespace') == 'default'
+            and isinstance(uid, str) and UID_RE.fullmatch(uid) and meta.get('generation') == 1
+            and vpc_spec_ok(created), 'apply response did not prove a created VPC')
     state['uid'] = uid
     emit({'event': 'uid', 'uid': uid})
+    obj = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
+    require((obj.get('metadata') or {}).get('uid') == uid, 'created VPC was replaced')
     kube(['get', 'vpcs'], clock)
     kube(['get', 'agents'], clock)
     # Step 3: inspect.
@@ -700,40 +820,34 @@ def lesson(clock, state):
     dhcp = parse_json(piped)
     require(dhcp.get('enable') is True and dhcp.get('range') == DHCP_RANGE, 'jq DHCP view differs')
     require(kube(['fabric', 'switch', 'ip', '--name', 'leaf-01'], clock)[1].strip(), 'read-only fabric query was empty')
-
-
-def adopt(clock):
-    """UID of a VPC left by an ambiguous apply. Absence was proven just before the apply, so a present object
-    that carries exactly the requested spec is the test's own; anything else is never adopted."""
-    try:
-        _, out = kube(['get', 'vpc', VPC_NAME, '-o', 'json', '--ignore-not-found'], clock)
-        obj = parse_json(out) if out.strip() else {}
-        uid = (obj.get('metadata') or {}).get('uid')
-        return uid if isinstance(uid, str) and UID_RE.fullmatch(uid) and vpc_spec_ok(obj) else None
-    except Refused:
-        return None
+    # End-state checkpoint: the lesson is complete BEFORE (and separately from) the harness teardown.
+    final = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
+    require((final.get('metadata') or {}).get('uid') == state['uid'] and vpc_spec_ok(final), 'end state refused')
+    state['endstate'] = True
 
 
 def accept():
     """Child as ubuntu (`-I -` stdin program). Prints uid/done events only; always tears down what it created."""
     student_identity()
-    state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None}
+    state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None, 'endstate': False}
     code = 'ok'
     work = Clock(ACCEPT_SECONDS, TEARDOWN_SECONDS)
     try:
         lesson(work, state)
     except BaseException as error:
-        code = classify(error)
+        code = classify(error)   # the primary outcome; nothing below may replace it
     shield()
     cleanup = 'not-needed'
     try:
         if state['attempted']:
-            owned = Clock(TEARDOWN_SECONDS)
-            cleanup = remove_owned(state['uid'] or adopt(owned), owned)
+            # Only the UID from the successful create response is owned; an ambiguous create stays unresolved.
+            cleanup = remove_owned(state['uid'], Clock(TEARDOWN_SECONDS), state['work'])
         if state['work'] is not None:
             shutil.rmtree(state['work'], ignore_errors=True)
     except BaseException:
         cleanup = 'uncertain'
+    if STICKY and code == 'ok':
+        code = 'uncertain'
     emit({'event': 'done', 'code': code, 'cleanup': cleanup, 'agents': state['agents']})
     return 0
 
@@ -741,7 +855,15 @@ def accept():
 def teardown_only(uid):
     student_identity()
     shield()
-    verdict = remove_owned(uid if uid != '-' else None, Clock(TEARDOWN_SECONDS))
+    verdict = 'uncertain'
+    if uid != '-':
+        work = Path(tempfile.mkdtemp(prefix='labapp-student-pilot-'))
+        try:
+            verdict = remove_owned(uid, Clock(TEARDOWN_SECONDS), work)
+        except BaseException:
+            verdict = 'uncertain'
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     emit({'event': 'done', 'code': 'ok', 'cleanup': verdict, 'agents': 0})
     return 0
 
@@ -798,7 +920,8 @@ def run():
         result['plugin'] = install_plugin(clock)
         result['phase'] = 'config'
         code, events, state = student_child('configure', min(CONFIG_SECONDS, clock.left()), source)
-        if state != 'ok':
+        if state != 'ok' or code is None or code < 0:
+            STICKY.append('configure worker forcibly stopped')   # its nested kubectl runs in other sessions
             raise Uncertain('configure child did not finish')
         if code != 0 or 'config' not in events:
             raise Conflict('student config refused') if code == 3 else Refused('student config failed')
@@ -810,7 +933,14 @@ def run():
         done = events.get('done')
         if done is not None:
             result['agents'], result['cleanup'] = done['agents'], done['cleanup']
-        if state != 'ok' or done is None or code != 0:
+        if state != 'ok' or code is None or code < 0:
+            # Forcibly stopped worker: its nested kubectl children run in their OWN sessions and may outlive the
+            # killed group, so its state is unprovable. Sticky uncertain: no teardown, no further guest mutation,
+            # no pass; the existing exact whole-VM disposal owns the rest.
+            STICKY.append('acceptance worker forcibly stopped')
+            result['cleanup'], unfinished = 'uncertain', False
+            raise Uncertain('acceptance child was forcibly stopped')
+        if done is None or code != 0:
             raise Uncertain('acceptance child did not finish')
         unfinished = False
         if done['code'] != 'ok':
@@ -821,17 +951,18 @@ def run():
     except BaseException as error:
         result['code'] = classify(error)
     if unfinished and source:
-        # The acceptance child may have been killed after creating the VPC but before its own teardown.
+        # The acceptance worker exited by itself (so it closed its own nested children) without its teardown. Only a
+        # UID it reported is owned; with none, the possibly-created object is unresolved and never touched.
         shield()
-        try:
-            _, events, _ = student_child('teardown', TEARDOWN_SECONDS, source, (result['vpc_uid'] or '-',))
-            done = events.get('done')
-            result['cleanup'] = 'uncertain' if done is None else done['cleanup']
-            if result['cleanup'] == 'absent' and not result['vpc_uid']:
-                result['cleanup'] = 'not-needed'
-        except BaseException:
-            result['cleanup'] = 'uncertain'
-    if result['status'] == 'passed' and result['cleanup'] != 'removed':
+        result['cleanup'] = 'uncertain'
+        if result['vpc_uid']:
+            try:
+                _, events, _ = student_child('teardown', TEARDOWN_SECONDS, source, (result['vpc_uid'],))
+                done = events.get('done')
+                result['cleanup'] = 'uncertain' if done is None else done['cleanup']
+            except BaseException:
+                result['cleanup'] = 'uncertain'
+    if result['status'] == 'passed' and (result['cleanup'] != 'removed' or STICKY):
         result['status'], result['code'] = 'failed', 'uncertain'
     emit(result)
     return 0   # the closed report is the verdict; a nonzero exit would hide it from the host (crash only)

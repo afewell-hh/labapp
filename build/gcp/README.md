@@ -2246,7 +2246,7 @@ Root's to supply and verify; DELETE has no work-budget gate.
 and behavior are exactly the historical ones (the pilot code is never entered, and historical
 manifests remain valid). With it, `arm` first verifies the fixed public inputs on the owner host
 (`pilot_inputs`) and records only a closed `student_pilot` object in the manifest
-(`schema`, `inputs_sha256`, `cap_seconds` = 480). Root prepares, BEFORE `arm`, an owner-only (0700)
+(`schema`, `inputs_sha256`, `cap_seconds` = 240). Root prepares, BEFORE `arm`, an owner-only (0700)
 cache `/home/ubuntu/.local/share/labapp-student-pilot/` holding exactly the pinned public
 `hhfctl-linux-amd64-v0.96.2.tar.gz` (13620070 bytes, SHA256 `379b7ae4...aabca`) and the three pinned
 jq packages (`jq`, `libjq1`, `libonig5`), each a single-link regular file whose size and SHA256 are
@@ -2262,10 +2262,16 @@ re-hashes every byte while copying into the exclusive root-private `/run/labapp-
 an existing directory, removes the incoming files) and `pilot-run` (the guest recipe, see
 [provision README](../provision/README.md#student-vpc-pilot-recipe-550)). The only remote arguments are
 the three verified source digests for `pilot-stage`; there is no command, path or ref selector and no
-auth material is sent. The pilot budget is `min(480 s, window left - stop cap 360 s - teardown 30 s)`
-and must be at least 420 s, so the verified-stop cap and teardown reserve always remain; the 20 minute
-key TTL, 13 minute readiness, 45 minute work, 60 minute DELETE, two-boot flow, watchdog, work lock,
-mutation reconciliation and cleanup-uncertainty rules are unchanged. The pilot runs only on boot 1.
+auth material is sent. Measured startup is 11-13 minutes of the 20 minute key, so only about 7-9 minutes
+remain at the first ready checkpoint. The pilot budget is therefore `min(240 s, window left - 150 s)`,
+where 150 s is the ORIGINAL `STOP_MIN_SECONDS` 120 + `TEARDOWN_SECONDS` 30 (the 360 s stop cap is not
+reserved and no stop gate is weakened), and it must be at least the feasible minimum of 230 s, the sum of
+the sequential caps (incoming 10 + transfer 45 + stage 15 + run 160). That gate runs BEFORE `pilot-intent`
+and before any staging mutation; a late readiness refuses with no remote command. The guest total
+(`TOTAL_SECONDS` 150 s, teardown reserve 20 s, shorter phase caps, 3 s per-child group closure) is inside
+the 160 s run cap. All of these are finite assumptions, not measured fit. The 20 minute key TTL, 13 minute
+readiness, 45 minute work, 60 minute DELETE, two-boot flow, watchdog, work lock, mutation reconciliation
+and cleanup-uncertainty rules are unchanged. The pilot runs only on boot 1.
 
 A pass needs the exact closed guest report (`status` passed, phase done, code ok, `cleanup` removed,
 exactly 7 agents, packages/plugin/config not `-`, a created UID). Any other report, a malformed or
@@ -2279,6 +2285,10 @@ the test-owned VPC is harness cleanup, not a lesson step. Source delivery grants
 run or spend; Root's isolated tests, independent review and admission come first.
 
 ### Tests (offline, no cloud)
+
+`pilot-stage` is built by `pilot_stage_script(pins, dest)`; its tests run the real program text under
+synthetic bounded pins and a temporary destination (valid stage, hash/size/link/extra-file mismatch,
+existing destination, symlink, root user), not a source-substring mirror.
 
 The pilot classes `StudentPilotHost` and `StudentPilotDefaultOff` (same file, author-written, NOT run)
 cover binding, default-off, window/reserve, failure/cancel/malformed-report cleanup and channel limits.
