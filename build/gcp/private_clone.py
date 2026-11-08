@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from urllib.parse import urlencode
@@ -1243,9 +1243,11 @@ class Run:
         self.store = Store(directory)
         self.budget = Budget(manifest, deps)
         self.cloud = CloneCompute(deps.http, deps.token_provider)
-        self.units = Units(directory, sha, manifest, deps)
+        self.command_uncertain = False
+        self.units = Units(directory, sha, manifest, replace(deps, runner=self.command))
         self.unclosed = []     # masters whose OwnedGroup closure was not proven
-        self.cleaner = Cleaner(self.store, manifest, deps, quiet=lambda: not self.unclosed)
+        self.cleaner = Cleaner(self.store, manifest, deps,
+                               quiet=lambda: not (self.unclosed or self.command_uncertain))
         self.phase = 'start'
         self.ids = None
         self.boots = {}
@@ -1261,8 +1263,19 @@ class Run:
         self.login = SelfLogin.for_owner(SELF_USER, token_provider=gated_token, transport=deps.http)
 
     # --- guards
+    def command(self, *args, **kwargs):
+        """Retain the accepted runner's sticky child-group uncertainty, even across caught errors."""
+        try:
+            return self.deps.runner(*args, **kwargs)
+        except BaseException as error:
+            if getattr(error, 'cleanup_uncertain', False):
+                self.command_uncertain = True
+            raise
+
     def gate(self):
         """Original wall+monotonic work budget, and no work once disposal has begun."""
+        if self.command_uncertain:
+            raise Uncertain('host child containment is not proven')
         if self.store.has('disposal'):
             raise Expired('disposal has begun')
         return self.budget.work()
@@ -1305,10 +1318,10 @@ class Run:
     # --- preflight and create
     def preflight(self):
         self.phase = 'preflight'
-        account = self.deps.runner(['gcloud', 'auth', 'list', '--filter=status:ACTIVE',
+        account = self.command(['gcloud', 'auth', 'list', '--filter=status:ACTIVE',
                                     '--format=value(account)'], 15).decode().strip()
         require(account == OWNER, 'active account differs')
-        imp = self.deps.runner(['gcloud', 'config', 'get-value', 'auth/impersonate_service_account',
+        imp = self.command(['gcloud', 'config', 'get-value', 'auth/impersonate_service_account',
                                 '--quiet'], 15).decode().strip()
         require(imp in ('', '(unset)') and not self.deps.env.get('CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'),
                 'impersonation unsupported')
@@ -1401,7 +1414,7 @@ class Run:
 
     def generate_key(self, directory):
         os.mkdir(directory, 0o700)
-        self.deps.runner(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(directory / 'oslogin')], 10)
+        self.command(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(directory / 'oslogin')], 10)
         text = host.guest.regular(directory / 'oslogin.pub', 4096, os.geteuid()).decode().strip()
         return public_key(text)[0]
 
@@ -1413,8 +1426,10 @@ class Run:
             window.remaining()
             self.identity()
             try:
-                line = extract_ed25519(self.deps.runner(command, min(20, window.remaining()), limit=4096))
+                line = extract_ed25519(self.command(command, min(20, window.remaining()), limit=4096))
             except (ValueError, host.guest.Failure):
+                if self.command_uncertain:
+                    raise
                 self.deps.sleep(10)
                 continue
             self.identity()
@@ -1422,6 +1437,7 @@ class Run:
 
     def start_master(self, n, directory, username, window):
         for k in range(1, MASTER_ATTEMPTS + 1):
+            self.gate()
             window.remaining()
 
             def record(pid, k=k):
@@ -1429,7 +1445,8 @@ class Run:
                 self.store.create(f'master-{n}-{k}', {'pid': pid, 'start': seen[0] if seen else None,
                                                        'control': str(directory / 'master.sock')})
             factory = self.deps.master_factory or CloneMaster
-            master = factory(directory, self.m['name'], self.ids['vm_id'], username, self.deps, record=record)
+            master = factory(directory, self.m['name'], self.ids['vm_id'], username,
+                             replace(self.deps, runner=self.command), record=record)
             try:
                 master.start(window)
                 self.accept_remote(window)
@@ -1444,6 +1461,8 @@ class Run:
                 # Cancellation is control flow, including during startup/closure. Preserve it
                 # after recording whether the original group was positively closed.
                 if not isinstance(error, Exception):
+                    raise
+                if self.command_uncertain:
                     raise
                 if not closed:
                     raise Uncertain('master process cleanup uncertain') from None
@@ -1479,7 +1498,7 @@ class Run:
         line = self.capture_hostkey(ready_window)
         known = directory / 'known_hosts'
         host.guest.exclusive(known, ('labapp-trial-' + self.ids['vm_id'] + ' ' + line).encode())
-        self.deps.runner(['/usr/bin/ssh-keygen', '-l', '-f', str(known), '-E', 'sha256'], 10)
+        self.command(['/usr/bin/ssh-keygen', '-l', '-f', str(known), '-E', 'sha256'], 10)
         master = self.start_master(n, directory, username, ready_window)
         try:
             summary = self.await_ready(master, ready_window, prior)

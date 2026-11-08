@@ -5720,3 +5720,68 @@ class PrivateCloneLeadIntegration(CloneCase):
                 del missing[required]
                 with self.assertRaises(clone.Refused):
                     clone.parse_unit_show(show(missing))
+
+    def test_uncertain_guest_attribute_child_is_not_retried_or_reported_closed(self):
+        original, attempts = self.deps.runner, []
+        error = guest.Failure('synthetic child closure unresolved', 1)
+        error.cleanup_uncertain = True
+
+        def runner(argv, *args, **kwargs):
+            if 'get-guest-attributes' in argv and not attempts:
+                attempts.append(True)
+                raise error
+            return original(argv, *args, **kwargs)
+
+        self.deps.runner = runner
+        code, result = self.execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['cleanup']['closed'])
+        self.assertFalse(self.store.has('closed'))
+        self.assertEqual(attempts, [True])
+        self.assertNotIn('master-start', self.world.events)
+        self.assertEqual(self.count('reset'), 0)
+        # The obligation can close only through the separate owner-unit containment proof.
+        self.world.owner_state = dict(self.world.INACTIVE_FIELDS)
+        self.world.cgroup_procs([])
+        self.assertTrue(self.independent().run()['closed'])
+
+    def test_uncertain_startup_check_is_sticky_after_the_master_itself_closes(self):
+        import socket
+        directory = Path(self.world.tmp) / 'b1'
+        directory.mkdir(mode=0o700)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(str(directory / 'master.sock'))
+        original, attempts = self.deps.runner, []
+        error = guest.Failure('synthetic subordinate SSH closure unresolved', 1)
+        error.cleanup_uncertain = True
+
+        def runner(argv, *args, **kwargs):
+            if argv[0] == '/usr/bin/ssh' and '-O' in argv:
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise error
+            return original(argv, *args, **kwargs)
+
+        self.deps.runner = runner
+        self.deps.master_factory = None
+        self.deps.popen = Mock(return_value=SimpleNamespace(pid=999999))
+        run = clone.Run(self.world.tmp, self.manifest, self.sha, self.deps, self.unit)
+        run.ids = {'vm_id': '123', 'boot_id': '456'}
+        group = Mock(outcome=None)
+        group.status.return_value = None
+        group.close.return_value = True
+        window = clone.Window(self.deps, run.budget, self.world.wall() + 1200, self.deps.mono() + 1200)
+        with patch.object(clone.owned_process, 'OwnedGroup', return_value=group):
+            with self.assertRaises(guest.Failure) as caught:
+                run.start_master(1, directory, 'ubuntu', window)
+        self.assertIs(caught.exception, error)
+        self.deps.popen.assert_called_once()
+        group.close.assert_called_once()
+        self.assertEqual(attempts, [True])
+        self.assertEqual(run.unclosed, [])             # main master closure alone is insufficient
+        self.assertTrue(run.command_uncertain)
+        self.assertFalse(run.cleaner.quiet())
+        with self.assertRaises(clone.Uncertain):
+            run.gate()

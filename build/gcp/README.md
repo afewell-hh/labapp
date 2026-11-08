@@ -2139,6 +2139,10 @@ record. The check is repeated immediately before the INSERT.
 - Live caller: closes its own masters with the unchanged `OwnedGroup` (sole child/group
   reaper) and then disposes IN-PROCESS; it never stops its own owner service (no self-stop
   deadlock). It holds `work.lock` shared for its whole life.
+  Any accepted runner error marked `cleanup_uncertain` remains sticky across every command,
+  including a caught guest-attribute read or subordinate SSH check. It prevents further work,
+  retries and an in-process `closed` result; closing the main SSH master cannot clear it.
+  Only the independent owner-unit cgroup proof can supply the missing containment evidence.
 - Independent disposal (`cleanup`, `watch`): (1) verify the owner config, `systemctl stop` it
   unless already inactive, then re-read and require `ActiveState` inactive/failed, `SubState`
   dead/failed, `MainPID=0`, empty `ControlGroup` AND an empty/removed
