@@ -824,8 +824,15 @@ erasure or old-producer-quiescence claim is made.
 #### Finite inline schema2
 
 `lifecycle/inline_history.py` provides a separate inline ledger version, with
-**24 completed access entries as a ceiling, not a capacity promise**. Schema1
-retains its sixteen-entry limit. There is no automatic conversion, additional
+**32 completed access entries as a ceiling, not a capacity promise** (raised
+from 24; every byte, depth, new-entry, live, evidence and proof bound is
+unchanged). Schema1 retains its sixteen-entry limit. Readers built with the old
+24 ceiling are not forward compatible with more than 24 entries and fail
+closed; there is no downgrade or automatic format migration. Before the first
+25th-entry release, pin/upgrade the creator, owner, cleanup and recovery
+readers and drain old queued/in-flight jobs. The 33rd admission is refused
+before reservation, cloud census or insert. Earlier byte/depth/accounting
+refusal remains possible. There is no automatic conversion, additional
 storage namespace, segment upload, pruning or history reset. Existing schema1
 inspector, component, base-build and capture cleanup remain supported. New
 schema2 execution is restricted to the canonical VLAB profile, without capture
@@ -851,7 +858,7 @@ as is the larger occupied-slot-plus-failed-proof continuation. Conservative
 framing allowance overcounts rather than omitting keys/separators. The exact
 formulas and field partition are documented in the codec. A near-limit legacy
 prefix or retained inventory can refuse the very next admission, even below
-24. Evidence is not shortened to make a schema2 transition fit.
+32. Evidence is not shortened to make a schema2 transition fit.
 
 Schema2 producers additionally reserve the actual old evidence plus every
 still-possible distinct cleanup fact before reservation, submission and access

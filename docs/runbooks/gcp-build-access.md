@@ -644,8 +644,12 @@ independent mandatory gates; this recovery authorizes no new trial.
 
 Schema1 retains its sixteen-entry access-history ceiling and refuses further
 admission before RESERVED/VM creation. Schema2 is a distinct, finite inline
-format restricted to canonical VLAB without capture; 24 completed entries is
-only a ceiling. Actual serialized history/inventory and worst permitted
+format restricted to canonical VLAB without capture; 32 completed entries is
+only a ceiling (raised from 24, all other bounds unchanged). Old-24 readers are
+not forward compatible with more than 24 entries and fail closed. Deployment
+condition: pin/upgrade creator, owner, cleanup and recovery readers and drain
+old queued/in-flight jobs before the first 25th-entry release. The 33rd
+admission is refused before reservation, cloud census or insert. Actual serialized history/inventory and worst permitted
 occupied, normal FREE, failed FREE and embedded-proof continuations must fit
 before admission, submission and registration. See the
 [inline schema2 contract](../../build/gcp/README.md#finite-inline-schema2).

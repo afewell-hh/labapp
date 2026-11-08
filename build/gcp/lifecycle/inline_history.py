@@ -55,9 +55,13 @@ failed-proof upper bounds each sum to <= ``RECORD_BYTES``; ``_reserve`` refuses
 before any paid side effect when they would not. They differ from the draft
 figures sketched in issue #455 (new-entry 1536 / fixed 7168 / proof-extra 4096);
 only ROOT accepts which figures govern. A count ceiling is therefore NOT a promise
-of 24 usable entries: byte/depth/count refusal happens before the side effect, so a
-near-limit legacy prefix or long escaped data fails closed rather than producing an
-unusable VM. No capacity PASS is claimed here.
+of 32 usable entries (schema 2; schema 1 stays 16): byte/depth/count refusal happens
+before the side effect, so a near-limit legacy prefix or long escaped data fails
+closed rather than producing an unusable VM. No capacity PASS is claimed here.
+The schema-2 count ceiling was raised from 24 to 32 with every byte/depth bound
+unchanged. Readers built with the old 24 constant are NOT forward compatible with
+a record holding more than 24 entries and fail closed on it ('exceeds retention
+limit'); pin/upgrade all readers and drain old jobs before the 25th release.
 
 Canonical JSON and binding/timestamp validators are reused from ``access_records``
 through a lazy, function-local import so that ``access_records.Context.from_slot``
@@ -72,7 +76,7 @@ from datetime import timedelta
 from . import spec
 
 LEGACY_LIMIT = 16
-HISTORY_LIMIT = 24
+HISTORY_LIMIT = 32      # schema-2 count ceiling only (was 24); schema 1 stays 16
 NEW_ENTRY_BYTES = 2048
 LIVE_BYTES = 8192
 EVIDENCE_BYTES = 4096
@@ -317,7 +321,7 @@ def _legacy_meta(record, entries) -> int:
 def history(record, *, adding=False) -> list:
     """Validate and return the retained access-history list of ``record``.
 
-    Works for both schemas. Enforces the retained cap (16 for schema 1, 24 for
+    Works for both schemas. Enforces the retained cap (16 for schema 1, 32 for
     schema 2), ``validate_binding`` on every entry, no reused lease UUID or key
     digest across the FULL history (and against the current ``access`` binding if
     present), the immutable grandfathered prefix for schema 2, and the per-entry

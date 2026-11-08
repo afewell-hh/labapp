@@ -988,7 +988,10 @@ class Controller:
         """B registers one A producer/key before access; no runner is enabled.
 
         History is retained and never pruned here. At 16 access leases admission
-        of another access producer stops for the later retention/accounting gate.
+        of another access producer stops for the later retention/accounting gate
+        in schema 1 (``inline_history.LEGACY_LIMIT``, 16); schema 2 uses the
+        separate finite ``inline_history.HISTORY_LIMIT`` (32), still subject to
+        the byte/depth/accounting refusals.
         The key is consumed at registration, even if import never happens.
         """
         from .access_records import validate_binding

@@ -147,7 +147,7 @@ class InlineFlows(unittest.TestCase):
         self.assertEqual(plan['replacement']['last_release'], before['last_release'])
         self.assertEqual(plan['replacement']['access_history'], before['access_history'])
         prefix = canonical(before['access_history'])
-        for number in range(17, 25):
+        for number in range(17, 33):
             f.trial(number, failed=number % 2 == 0)
             rec = f.w.record()
             self.assertEqual(rec['schema'], 2)
@@ -156,11 +156,19 @@ class InlineFlows(unittest.TestCase):
             self.assertEqual(len(rec['access_history']), number)
             self.assertLessEqual(len(canonical(rec)), MAX_RECORD_BYTES)
         rec, generation = f.w.store.read(f.w.cfg.key)
-        self.assertEqual(len({h['binding']['lease'] for h in rec['access_history']}), 24)
-        self.assertEqual(len({h['binding']['key_sha256'] for h in rec['access_history']}), 24)
-        self.assertEqual(sum(h.get('import_status') == 'UNKNOWN' for h in rec['access_history']), 12)
+        self.assertEqual(inline.HISTORY_LIMIT, 32)
+        self.assertEqual(inline.LEGACY_LIMIT, 16)
+        self.assertEqual(rec['state'], 'FREE')
+        self.assertEqual(len({h['binding']['lease'] for h in rec['access_history']}), 32)
+        self.assertEqual(len({h['binding']['key_sha256'] for h in rec['access_history']}), 32)
+        self.assertEqual(sum(h.get('import_status') == 'UNKNOWN' for h in rec['access_history']), 16)
+        # Simulated old constant (honest label: patched value, not the old source):
+        # a 32-entry record must fail closed for a reader limited to 24.
+        with patch.object(inline, 'HISTORY_LIMIT', 24):
+            with self.assertRaises(inline.HistoryError):
+                inline.history(rec)
         calls = len(f.w.raw.calls)
-        with self.assertRaises(Refused): f.w.ctl.admit(25, 1, lease(25))
+        with self.assertRaises(Refused): f.w.ctl.admit(33, 1, lease(33))
         self.assertEqual(len(f.w.raw.calls), calls)
         self.assertEqual(f.w.store.read(f.w.cfg.key), (rec, generation))
         self.assertEqual((f.w.raw.instances, f.w.raw.disks), ({}, {}))
