@@ -596,6 +596,9 @@ counts as unfinished) and the host refuses the same report. No exception text or
 or stored. The native cause of the #550 refusal remains unproved; these fields only localize a future one. There is no rollback after a publication or a
 dpkg install; failures are reported and good state is preserved, not repaired.
 
+Both the guest and host require `step=post-apply` and all five capacity values exactly `true`
+before success. A failed report retains its observed `false` and unobserved `null` values.
+
 #### Course wiring input (#552)
 
 `build/provision/course-wiring.yaml` is the exact root `wiringd.yaml` bytes (10048 bytes, SHA256

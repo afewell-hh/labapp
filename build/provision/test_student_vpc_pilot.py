@@ -32,6 +32,7 @@ COURSE_WIRING = REPO / 'build/provision/course-wiring.yaml'
 ROOT_WIRING = REPO / 'wiringd.yaml'
 EMPTY = {key: None for key in pilot.CAPACITY_KEYS}
 CLOSED = {'step': '-', 'capacity': EMPTY}
+COMPLETE = {'step': 'post-apply', 'capacity': dict.fromkeys(pilot.CAPACITY_KEYS, True)}
 
 
 def real_namespaces(path):
@@ -369,7 +370,7 @@ class ParsingTests(unittest.TestCase):
     def test_every_step_name_is_a_short_closed_token(self):
         self.assertEqual(len(set(pilot.STEPS)), len(pilot.STEPS))
         for step in pilot.STEPS:
-            self.assertRegex(step, r'\A(-|[a-z]+(-[a-z0-9]+)*)\Z')
+            self.assertRegex(step, r'\A(-|[a-z][a-z0-9]*(-[a-z0-9]+)*)\Z')
         self.assertEqual(set(pilot.RESULT_KEYS) - {'agents', 'cleanup', 'code', 'config', 'packages', 'phase',
                                                    'plugin', 'status', 'vpc_uid'}, {'capacity', 'step'})
 
@@ -1028,7 +1029,7 @@ class RunTests(unittest.TestCase):
         self.out, self.children = [], []
         self.plan = {'configure': (0, {'config': 'installed'}, 'ok'),
                      'accept': (0, {'uid': UID, 'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed',
-                                                         'agents': 7, **CLOSED}}, 'ok'),
+                                                         'agents': 7, **COMPLETE}}, 'ok'),
                      'teardown': (0, {'done': {'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 0,
                                                **CLOSED}}, 'ok')}
 
@@ -1051,6 +1052,23 @@ class RunTests(unittest.TestCase):
                          ('passed', 'done', 'ok', 'removed', 7, UID, 'installed', 'installed', 'installed'))
         self.assertLessEqual(len(json.dumps(result)), pilot.OUTPUT_LIMIT)
         self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])
+
+    def test_success_requires_completed_step_and_every_capacity_observed_true(self):
+        cases = [(step, dict(COMPLETE['capacity'])) for step in pilot.STEPS if step != 'post-apply']
+        cases.extend(('post-apply', dict(COMPLETE['capacity'], **{key: value}))
+                     for key in pilot.CAPACITY_KEYS for value in (False, None))
+        for step, capacity in cases:
+            with self.subTest(step=step, capacity=capacity):
+                self.children.clear()
+                self.plan['accept'] = (0, {'uid': UID, 'done': {
+                    'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 7,
+                    'step': step, 'capacity': capacity}}, 'ok')
+                pilot.run()
+                result = self.out[-1]
+                self.assertEqual((result['status'], result['phase'], result['code']),
+                                 ('failed', 'accept', 'refused'))
+                self.assertEqual((result['step'], result['capacity']), (step, capacity))
+                self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])
 
     def test_failed_phases_report_phase_and_code_without_text(self):
         def boom(clock):
@@ -1105,7 +1123,8 @@ class RunTests(unittest.TestCase):
 
     def test_non_accept_failures_and_malformed_child_diagnostics_stay_empty_or_refuse(self):
         pilot.run()
-        self.assertEqual((self.out[-1]['step'], self.out[-1]['capacity']), ('-', EMPTY))
+        self.assertEqual((self.out[-1]['step'], self.out[-1]['capacity']),
+                         (COMPLETE['step'], COMPLETE['capacity']))
         self.plan['configure'] = (3, {}, 'ok')
         pilot.run()
         self.assertEqual((self.out[-1]['code'], self.out[-1]['step'], self.out[-1]['capacity']), ('conflict', '-', EMPTY))
@@ -1113,7 +1132,7 @@ class RunTests(unittest.TestCase):
         raw = json.dumps({'event': 'done', 'code': 'refused', 'cleanup': 'not-needed', 'agents': 0,
                           'step': CANARY, 'capacity': EMPTY}).encode()
         self.assertEqual(pilot.parse_events(raw), {})
-        self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])     # finished child: no safety net
+        self.assertEqual([c[0] for c in self.children], ['configure', 'accept', 'configure'])
 
     def test_a_worker_that_exited_by_itself_without_done_gets_the_teardown_safety_net_for_its_reported_uid(self):
         self.plan['accept'] = (1, {'uid': UID}, 'ok')

@@ -518,7 +518,8 @@ def pilot_passed(v):
     g = pilot_guest
     return (v['status'] == 'passed' and v['phase'] == 'done' and v['code'] == 'ok' and v['cleanup'] == 'removed'
             and v['agents'] == g.AGENTS and v['packages'] != '-' and v['plugin'] != '-' and v['config'] != '-'
-            and v['vpc_uid'] != '')
+            and v['vpc_uid'] != '' and v['step'] == 'post-apply'
+            and all(v['capacity'][key] is True for key in g.CAPACITY_KEYS))
 
 
 # ------------------------------------------------------------------------------ Compute -------

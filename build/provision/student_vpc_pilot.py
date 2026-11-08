@@ -1004,6 +1004,8 @@ def run():
         unfinished = False
         if done['code'] != 'ok':
             raise Coded(done['code'])
+        require(done['step'] == 'post-apply' and all(done['capacity'][key] is True for key in CAPACITY_KEYS),
+                'student acceptance checks incomplete')
         result['phase'] = 'teardown'
         require(result['cleanup'] == 'removed', 'test-owned VPC was not removed')
         result['phase'], result['status'], result['code'] = 'done', 'passed', 'ok'

@@ -28,6 +28,9 @@ NAMES = ('expected.yaml', 'observed.json', 'meta.json')
 COUNTS = {'Fabricator': 1, 'ControlNode': 1, 'Switch': 7, 'Server': 10,
           'Connection': 21, 'SwitchGroup': 3, 'VLANNamespace': 1, 'IPv4Namespace': 1}
 WIRING_COUNTS = {k: v for k, v in COUNTS.items() if k not in ('Fabricator', 'ControlNode')}
+CANONICAL_WIRING = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
+CANONICAL_WIRING_BYTES = 10048
+CANONICAL_WIRING_SHA = 'c522c64d80515c7484a67c27646acebf86073192f0f6ff9597497b990548806a'
 
 # Independent endpoint/type tables for the canonical objects.
 SWITCH_GROUPS = {'leaf-01': ['mclag-1'], 'leaf-02': ['mclag-1'], 'leaf-03': ['eslag-1'],
@@ -146,9 +149,8 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
         cls.defaulted = observed['canonical']
         cls.syn_defaulted = observed['synthetic']
         cls.syn_printed = core.yaml_documents(cls.meta['synthetic']['printed'].encode())
-        wiring = Path(__file__).resolve().parents[2] / 'wiringd.yaml'
-        raw = wiring.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != core.WIRING_SHA:
+        raw = CANONICAL_WIRING.read_bytes()
+        if len(raw) != CANONICAL_WIRING_BYTES or hashlib.sha256(raw).hexdigest() != CANONICAL_WIRING_SHA:
             raise AssertionError('canonical wiring differs from pinned value')
         cls.raw = core.yaml_documents(raw)
         if Counter(d['kind'] for d in cls.raw) != Counter(WIRING_COUNTS):
@@ -475,8 +477,8 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
     # ---- complete canonical objects -------------------------------------------
 
     def test_canonical_source_and_per_kind_coverage(self):
-        self.assertEqual(self.meta['source']['wiringBytes'], len(self.wiring.read_bytes()))
-        self.assertEqual(self.meta['source']['wiringSHA256'], core.WIRING_SHA)
+        self.assertEqual(self.meta['source']['wiringBytes'], CANONICAL_WIRING_BYTES)
+        self.assertEqual(self.meta['source']['wiringSHA256'], CANONICAL_WIRING_SHA)
         self.assertEqual(self.meta['source']['fabricator'], 'v0.43.1')
         self.assertEqual(self.meta['source']['fabric'], 'v0.96.2')
         self.assertEqual(self.meta['canonical']['typedDefaultInvoked'], WIRING_COUNTS)

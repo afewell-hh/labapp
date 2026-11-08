@@ -6349,7 +6349,10 @@ class StudentPilotHost(PilotCase):
                        pilot_report(**dict(refusal, step='vpc-absent',
                                            capacity=dict.fromkeys(clone.pilot_guest.CAPACITY_KEYS))),
                        pilot_report(cleanup='preserved'), pilot_report(cleanup='uncertain'),
-                       pilot_report(agents=6), pilot_report(vpc_uid=''), pilot_report(plugin='-')):
+                       pilot_report(agents=6), pilot_report(vpc_uid=''), pilot_report(plugin='-'),
+                       *(pilot_report(step=step) for step in clone.pilot_guest.STEPS if step != 'post-apply'),
+                       *(pilot_report(capacity=dict.fromkeys(clone.pilot_guest.CAPACITY_KEYS, True) | {key: value})
+                         for key in clone.pilot_guest.CAPACITY_KEYS for value in (False, None))):
             with self.subTest(report=report):
                 self.fresh_world()
                 self.world.pilot_report = report

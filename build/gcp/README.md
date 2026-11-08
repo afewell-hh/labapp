@@ -2256,6 +2256,7 @@ re-verified; the three source files (`student_vpc_pilot.py`, `install-kubectl-fa
 
 The guest report is validated by `check_pilot_report` against the guest module's closed vocabulary,
 including (#552) the closed pre-apply `step` and the five-boolean `capacity` object (`true`/`false`/`null`);
+success additionally requires `step=post-apply` and every capacity value exactly `true` in both guest and host;
 a missing, unknown, wrongly typed or free-string value is refused and never echoed. The fixed
 `wiringd.yaml` guest source is the repository's `build/provision/course-wiring.yaml` (see the
 [provision README](../provision/README.md#course-wiring-input-552)); the host fetch map is read dynamically
