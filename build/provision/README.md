@@ -530,6 +530,57 @@ SHA256, the target path, hash and mode, and the status. It does not verify signa
 compatibility, plugin discovery or student access (all UNRUN). Standalone component success is not
 course, image, service or efficiency proof.
 
+### Student VPC pilot recipe (#550)
+
+`student_vpc_pilot.py` is an internal, self-contained guest recipe and proof (Python 3.12 stdlib,
+Ubuntu 24.04 amd64), not a student command or wrapper, and it adds no RBAC, service account,
+management cluster/context, impersonation or controller SSH shortcut. The private-clone host
+([gcp README](../gcp/README.md)) stages it with the unchanged `install-kubectl-fabric.py` and
+`hhfab_release.py`, the pinned hhfctl archive and three pinned jq packages (`jq`/`libjq1`
+1.7.1-3ubuntu0.24.04.2, `libonig5` 6.9.9-1build1; sizes/SHA256 are constants in the module) into the
+exclusive root-private `/run/labapp-student-pilot` and runs `run` once as root. Nothing under
+`/usr/local/lib/labapp` or `/home/ubuntu/hhfab` (core contract, critical assets, the generated
+kubeconfig) is modified; the kubeconfig is only read.
+
+Phases (closed vocabulary): `preflight`, `packages`, `plugin`, `config`, `accept`, `teardown`, `done`.
+`packages`: guest libc6 >= 2.39 is checked; absent packages are installed offline with one
+`dpkg --install --refuse-downgrade` of exactly the missing pinned files (no force, no network, no
+dependency upgrade); equal state is `unchanged`; any other version/state of a wanted package, or a
+foreign `/usr/bin/jq`, is refused and preserved. `plugin`: the unchanged installer with `--archive`
+(`installed`/`unchanged`/`mode-repaired`; a differing existing `kubectl-fabric` is refused and kept).
+`config` (child as the real `ubuntu` uid/gid/groups): the single real binding of
+`/home/ubuntu/hhfab/vlab/kubeconfig` (strictly shaped, API `https://127.0.0.1:6443`) is exposed as
+`~/.kube/config` with cluster/user names, CA and client credentials preserved and the one context
+renamed `vlab` (default). Published by no-clobber link from a private stage; an equal existing file is
+`unchanged`; a different, symlinked or wide-mode file is refused and preserved. It does not use
+`configure-student-kubeconfig.py` (which needs two real sources) and fabricates no management binding.
+`accept` (child as `ubuntu`, normal `HOME`/`PATH`, no `KUBECONFIG`, no `--kubeconfig`/`--context`):
+native discovery (`kubectl plugin list`, `kubectl fabric --help`, read-only
+`kubectl fabric switch ip --name leaf-01`, `jq --version`), refusal of a preexisting
+`webapp-prod`, missing/insufficient default IPv4/VLAN namespaces or an overlapping CIDR/VLAN, then
+the five Lab Steps of hh-learn `0a62674` VPC Provisioning Essentials v1.0.0 with ordinary kubectl
+(apply the exact default/webapp-prod YAML, get/describe, all 7 agents `lastAppliedGen` ==
+`generation` with `Applied=True` observed twice, and the JSONPath-to-`jq` DHCP view). The created UID
+is recorded and ONLY that UID is deleted afterwards as harness teardown (not a lesson step); a
+foreign or replaced object is preserved and reported. An ambiguous apply adopts an object only if it
+carries exactly the requested spec. The Agent/namespace field names (`status.lastAppliedGen`,
+`metadata.generation`, `spec.ranges`, `spec.subnets`) are source-assumed and need Root's native
+check. The lesson has no server attachment, dataplane or GUI step: this is not dataplane, course or
+production acceptance.
+
+Output is ONE closed JSON line (fixed keys, enums, counters and a UID; never kubectl output, config,
+certificate, key or token bytes, or guest strings); child output is captured internally and bounded,
+and exit status is 0 whenever a report was printed. There is no rollback after a publication or a
+dpkg install; failures are reported and good state is preserved, not repaired.
+
+```bash
+# Offline synthetic tests (no guest, kubectl, dpkg or cluster; small local children only):
+python3 -m unittest discover -s build/provision -p test_student_vpc_pilot.py -v
+```
+
+Author-written, NOT run. Not covered here (Root's native checks): the real pinned kubectl/plugin/jq,
+dpkg on a real guest, root-owned payload identity, `ubuntu` privilege drop and live Fabric CRDs.
+
 ### Native kubectl install and rerun proof
 
 `kubectl_native_proof.py` runs the unchanged `install-kubectl.py` CLI twice

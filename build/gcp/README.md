@@ -2240,7 +2240,48 @@ Residual limits: a dropped (never-delivered) mutation stays open for the lead; t
 unit files, earlier owner expiry, wrappers and the source tree layout under the protected source are
 Root's to supply and verify; DELETE has no work-budget gate.
 
+### Opt-in student CLI pilot (#550, DEFAULT OFF, source only, not activated)
+
+`arm --student-pilot` is the only switch. Without it the manifest, units, remote commands, bounds
+and behavior are exactly the historical ones (the pilot code is never entered, and historical
+manifests remain valid). With it, `arm` first verifies the fixed public inputs on the owner host
+(`pilot_inputs`) and records only a closed `student_pilot` object in the manifest
+(`schema`, `inputs_sha256`, `cap_seconds` = 480). Root prepares, BEFORE `arm`, an owner-only (0700)
+cache `/home/ubuntu/.local/share/labapp-student-pilot/` holding exactly the pinned public
+`hhfctl-linux-amd64-v0.96.2.tar.gz` (13620070 bytes, SHA256 `379b7ae4...aabca`) and the three pinned
+jq packages (`jq`, `libjq1`, `libonig5`), each a single-link regular file whose size and SHA256 are
+re-verified; the three source files (`student_vpc_pilot.py`, `install-kubectl-fabric.py`,
+`hhfab_release.py`) come from the protected source tree. `run` re-verifies the same digest at preflight
+(before any cloud mutation) and again at use; any difference refuses.
+
+After the FIRST strict ready checkpoint and `compare_boots` of boot 1, and BEFORE the verified stop, the
+run executes the fixed sequence inside the ORIGINAL access window (it never renews or extends any
+deadline): `pilot-incoming` (user-owned 0700 `~/labapp-student-pilot-in`), one SFTP batch over the
+original master (batch via stdin, no local file; destination only that directory), `pilot-stage` (root
+re-hashes every byte while copying into the exclusive root-private `/run/labapp-student-pilot`, refuses
+an existing directory, removes the incoming files) and `pilot-run` (the guest recipe, see
+[provision README](../provision/README.md#student-vpc-pilot-recipe-550)). The only remote arguments are
+the three verified source digests for `pilot-stage`; there is no command, path or ref selector and no
+auth material is sent. The pilot budget is `min(480 s, window left - stop cap 360 s - teardown 30 s)`
+and must be at least 420 s, so the verified-stop cap and teardown reserve always remain; the 20 minute
+key TTL, 13 minute readiness, 45 minute work, 60 minute DELETE, two-boot flow, watchdog, work lock,
+mutation reconciliation and cleanup-uncertainty rules are unchanged. The pilot runs only on boot 1.
+
+A pass needs the exact closed guest report (`status` passed, phase done, code ok, `cleanup` removed,
+exactly 7 agents, packages/plugin/config not `-`, a created UID). Any other report, a malformed or
+oversized one, a remote failure, timeout or cancellation is a primary failure: the verified stop is
+skipped and the unchanged in-process cleanup disposes the VM; cleanup uncertainty can never become a
+pass. Retained records: `pilot-intent`, `pilot-result` (closed report or a fixed failure type only).
+The guest report contains fixed vocabulary and counters only, never kubectl output or config bytes.
+Qualifications: the lesson has no server attachment, dataplane or GUI step, so a pass is control-plane
+reconciliation evidence only (not dataplane, course or production acceptance); the guest teardown of
+the test-owned VPC is harness cleanup, not a lesson step. Source delivery grants no permission to arm,
+run or spend; Root's isolated tests, independent review and admission come first.
+
 ### Tests (offline, no cloud)
+
+The pilot classes `StudentPilotHost` and `StudentPilotDefaultOff` (same file, author-written, NOT run)
+cover binding, default-off, window/reserve, failure/cancel/malformed-report cleanup and channel limits.
 
 The tests are classes `PrivateCloneContracts`, `PrivateCloneOrchestration`,
 `PrivateCloneRecovery` and `PrivateCloneCorrection` in `build/gcp/test_vlab_trial.py`, wired

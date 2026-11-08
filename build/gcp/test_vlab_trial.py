@@ -4248,9 +4248,11 @@ class GuestDiagnostics(unittest.TestCase):
 # orchestration, cleaner and watchdog code run against an in-memory Compute/OS Login/guest world.
 # Authored without execution in a credential-bearing job; the lead runs these in isolated Docker.
 import hashlib
+import shlex
 import shutil
 import struct
 import urllib.parse
+from dataclasses import replace
 from uuid import uuid4
 
 from build.gcp import private_clone as clone
@@ -6086,3 +6088,347 @@ class PrivateCloneLeadIntegration(CloneCase):
         self.assertFalse(run.cleaner.quiet())
         with self.assertRaises(clone.Uncertain):
             run.gate()
+
+
+# ------------------------------------------------------------------------------ student pilot (#550) ---
+# AUTHOR TESTS: NOT RUN by the author. Synthetic cache/source/guest only; no cloud, SSH, kubectl or credential access.
+PILOT_UID = '11111111-2222-3333-4444-555555555555'
+
+
+def pilot_report(**change):
+    value = {'agents': 7, 'cleanup': 'removed', 'code': 'ok', 'config': 'installed', 'packages': 'installed',
+             'phase': 'done', 'plugin': 'installed', 'status': 'passed', 'vpc_uid': PILOT_UID}
+    value.update(change)
+    return json.dumps(value, sort_keys=True).encode() + b'\n'
+
+
+class PilotFakeMaster(CloneFakeMaster):
+    def remote(self, key, window, cap=30, extra=()):
+        if not key.startswith('pilot-'):
+            return super().remote(key, window, cap)
+        window.remaining()
+        world = self.world
+        world.events.append(key)
+        world.pilot_calls.append({'key': key, 'cap': cap, 'extra': tuple(extra), 'window': window,
+                                  'wall': world.wall()})
+        if world.pilot_raise and world.pilot_raise[0] == key:
+            raise world.pilot_raise[1]
+        return {'pilot-incoming': b'', 'pilot-stage': clone.PILOT_STAGED + b'\n',
+                'pilot-run': world.pilot_report}[key]
+
+    def transfer(self, window, names, cap):
+        window.remaining()
+        self.world.events.append('pilot-transfer')
+        self.world.pilot_calls.append({'key': 'pilot-transfer', 'cap': cap, 'names': list(names), 'window': window,
+                                       'wall': self.world.wall()})
+
+
+class PilotCase(CloneCase):
+    """Armed with ``--student-pilot`` over a synthetic cache and protected source."""
+    NAMES = ('hhfctl.tar.gz', 'libonig5.deb', 'libjq1.deb', 'jq.deb')
+
+    def setUp(self):
+        self.cache = tempfile.mkdtemp(prefix='pcache', dir='/tmp')
+        self.source = tempfile.mkdtemp(prefix='psrc', dir='/tmp')
+        os.chmod(self.cache, 0o700)
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        self.addCleanup(shutil.rmtree, self.source, True)
+        self.write_cache()
+        provision = Path(self.source, 'build', 'provision')
+        provision.mkdir(parents=True)
+        for name in clone.pilot_guest.SOURCE_NAMES:
+            (provision / name).write_text('# public source ' + name + '\n')
+            os.chmod(provision / name, 0o644)
+        paths = dict(pilot_cache=self.cache, pilot_source=self.source)
+        original = clone.arm
+        patcher = patch.object(clone, 'arm', lambda directory, deps: original(directory, replace(deps, **paths), pilot=True))
+        patcher.start()
+        super().setUp()
+        patcher.stop()
+        world = self.world
+        world.pilot_calls, world.pilot_raise, world.pilot_report = [], None, pilot_report()
+        self.deps = replace(self.deps, master_factory=lambda *a, **k: PilotFakeMaster(world, *a, **k), **paths)
+
+    def write_cache(self):
+        pins = []
+        for name in self.NAMES:
+            raw = (name + '-synthetic-bytes').encode()
+            Path(self.cache, name).write_bytes(raw)
+            os.chmod(Path(self.cache, name), 0o600)
+            pins.append((name, len(raw), hashlib.sha256(raw).hexdigest()))
+        patcher = patch.object(clone.pilot_guest, 'CACHE_PINS', tuple(pins))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fresh_world(self):
+        """Re-arm a new world/workdir; the synthetic cache and source stay as the test left them."""
+        shutil.rmtree(self.world.tmp, True)
+        shutil.rmtree(self.world.proc, True)
+        shutil.rmtree(self.world.cgroups, True)
+        paths = dict(pilot_cache=self.cache, pilot_source=self.source)
+        original = clone.arm
+        with patch.object(clone, 'arm', lambda directory, deps: original(directory, replace(deps, **paths), pilot=True)):
+            CloneCase.setUp(self)
+        world = self.world
+        world.pilot_calls, world.pilot_raise, world.pilot_report = [], None, pilot_report()
+        self.deps = replace(self.deps, master_factory=lambda *a, **k: PilotFakeMaster(world, *a, **k), **paths)
+
+    def sources(self):
+        return {n: hashlib.sha256(Path(self.source, 'build', 'provision', n).read_bytes()).hexdigest()
+                for n in clone.pilot_guest.SOURCE_NAMES}
+
+    def calls(self, key):
+        return [c for c in self.world.pilot_calls if c['key'] == key]
+
+
+class StudentPilotHost(PilotCase):
+    def test_arm_binds_the_inputs_and_keeps_every_other_bound(self):
+        self.assertEqual(self.info['student_pilot']['cap_seconds'], clone.PILOT_SECONDS)
+        self.assertEqual(self.manifest['student_pilot'], self.info['student_pilot'])
+        self.assertEqual(self.manifest['student_pilot']['inputs_sha256'], clone.pilot_inputs(self.deps)['sha256'])
+        admitted = clone.stamp(self.manifest['admitted_at'])
+        self.assertEqual((clone.stamp(self.manifest['work_deadline']) - admitted,
+                          clone.stamp(self.manifest['termination']) - admitted), (45 * 60, 60 * 60))
+        self.assertEqual((clone.KEY_SECONDS, clone.READY_SECONDS), (20 * 60, 13 * 60))
+
+    def test_manifest_binding_is_closed(self):
+        m = self.manifest
+        for change in ({'cap_seconds': clone.PILOT_SECONDS + 1}, {'cap_seconds': True}, {'inputs_sha256': 'z' * 64},
+                       {'inputs_sha256': 'a' * 63}, {'schema': 2}, {'extra': 1}):
+            with self.subTest(change), self.assertRaises(clone.Refused):
+                clone.check_manifest(dict(m, student_pilot=dict(m['student_pilot'], **change)))
+        with self.assertRaises(clone.Refused):
+            clone.check_manifest(dict(m, student_pilot=None))
+        with self.assertRaises(clone.Refused):
+            clone.check_manifest(dict(m, other=1))
+        pilotless = {k: v for k, v in m.items() if k != 'student_pilot'}
+        self.assertIs(clone.check_manifest(pilotless), pilotless)       # historical manifests stay valid
+
+    def test_happy_pilot_runs_once_after_ready_and_before_the_first_stop(self):
+        code, result = self.execute()
+        self.assertEqual((code, result['status']), (0, 'passed'), result)
+        events = self.world.events
+        order = ['pilot-incoming', 'pilot-transfer', 'pilot-stage', 'pilot-run']
+        for key in order:
+            self.assertEqual(events.count(key), 1, key)
+        positions = [events.index(k) for k in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(events.index('master-start'), positions[0])
+        self.assertLess(positions[-1], events.index('stop-verified'))
+        self.assertLess(positions[-1], events.index('reset'))
+        self.assertEqual(events.count('stop-verified'), 2)
+        self.assertEqual(result['pilot'], json.loads(pilot_report()))
+        self.assertTrue(self.store.has('pilot-intent'))
+        self.assertEqual(self.store.read('pilot-result')['status'], 'passed')
+        self.assertEqual(self.world.mutations,
+                         ['insert', 'import', 'delete-key', 'reset', 'import', 'delete-key', 'delete-vm'])
+        self.assert_disposed(result)
+
+    def test_only_fixed_inputs_and_digests_cross_the_channel(self):
+        self.execute()
+        (transfer,) = self.calls('pilot-transfer')
+        names = [n for n, _ in transfer['names']]
+        self.assertEqual(names, [p[0] for p in clone.pilot_guest.CACHE_PINS] + list(clone.pilot_guest.SOURCE_NAMES))
+        self.assertEqual([str(p) for _, p in transfer['names'][:4]], [str(Path(self.cache, n)) for n in names[:4]])
+        self.assertEqual([str(p) for _, p in transfer['names'][4:]],
+                         [str(Path(self.source, 'build', 'provision', n)) for n in names[4:]])
+        (stage,) = self.calls('pilot-stage')
+        self.assertEqual(stage['extra'], tuple(self.sources()[n] for n in clone.pilot_guest.SOURCE_NAMES))
+        for key in ('pilot-incoming', 'pilot-run'):
+            self.assertEqual(self.calls(key)[0]['extra'], ())
+
+    def test_pilot_uses_the_original_window_and_keeps_the_stop_reserve(self):
+        self.execute()
+        access_end = int(self.store.read('a1-intent')['expiration_usec']) / 1_000_000
+        intent = self.store.read('pilot-intent')
+        self.assertLessEqual(intent['budget'], clone.PILOT_SECONDS)
+        self.assertGreaterEqual(intent['budget'], clone.PILOT_MIN_SECONDS)
+        for call in self.world.pilot_calls:
+            self.assertLessEqual(call['window'].end_wall - call['wall'], clone.PILOT_SECONDS)
+            self.assertLessEqual(call['window'].end_wall + clone.STOP_SECONDS + clone.TEARDOWN_SECONDS, access_end + 1)
+        self.assertEqual(self.calls('pilot-run')[0]['cap'], clone.pilot_guest.TOTAL_SECONDS + 15)
+
+    def test_insufficient_time_for_the_reserve_refuses_before_the_pilot_and_stop(self):
+        with patch.object(clone, 'PILOT_MIN_SECONDS', 10 * 60 + 600):
+            code, result = self.execute()
+        self.assertEqual((code, result['status'], result['phase']), (1, 'failed', 'pilot'))
+        self.assertFalse([e for e in self.world.events if e.startswith('pilot-')])
+        self.assertNotIn('stop-verified', self.world.events)
+        self.assert_disposed(result)
+
+    def test_a_failed_pilot_is_a_primary_failure_with_exact_cleanup(self):
+        for report in (pilot_report(status='failed', code='refused', phase='config', cleanup='not-needed'),
+                       pilot_report(cleanup='preserved'), pilot_report(cleanup='uncertain'),
+                       pilot_report(agents=6), pilot_report(vpc_uid=''), pilot_report(plugin='-')):
+            with self.subTest(report=report):
+                self.fresh_world()
+                self.world.pilot_report = report
+                code, result = self.execute()
+                self.assertEqual((code, result['status'], result['failure'], result['phase']),
+                                 (1, 'failed', 'Refused', 'pilot'))
+                self.assertNotIn('stop-verified', self.world.events)
+                self.assertEqual(result['pilot'], json.loads(report))
+                self.assertTrue(self.store.has('pilot-result'))
+                self.assert_disposed(result)
+
+    def test_malformed_or_oversized_reports_are_refused_and_not_echoed(self):
+        extra = json.loads(pilot_report())
+        extra['note'] = 'x'
+        for report in (b'', b'not json', b'{"event":"done"}', json.dumps(extra).encode(),
+                       pilot_report(code='zzz'), pilot_report(vpc_uid='not-a-uid'), pilot_report(agents=True),
+                       b'x' * (clone.PILOT_REPORT_LIMIT + 1), pilot_report().replace(b'ok', b'\xc3\xa9'),
+                       b'{"status":"passed","status":"passed"}'):
+            with self.subTest(report=report[:40]):
+                self.fresh_world()
+                self.world.pilot_report = report
+                code, result = self.execute()
+                self.assertEqual((code, result['status']), (1, 'failed'))
+                self.assertEqual(self.store.read('pilot-result')['status'], 'failed')
+                self.assertNotIn('not json', json.dumps(result))
+                self.assert_disposed(result)
+
+    def test_remote_failure_timeout_and_cancellation_preserve_the_primary_outcome(self):
+        cases = (('pilot-run', guest.Failure('stop refused', 17), 'Failure', 1),
+                 ('pilot-stage', clone.Expired('synthetic'), 'Expired', 1),
+                 ('pilot-incoming', clone.Uncertain('synthetic'), 'Uncertain', 1),
+                 ('pilot-run', host.HostCancelled(signal.SIGTERM), 'cancelled', 143))
+        for key, error, failure, exit_code in cases:
+            with self.subTest(key=key, failure=failure):
+                self.fresh_world()
+                self.world.pilot_raise = (key, error)
+                code, result = self.execute()
+                self.assertEqual((code, result['status'], result['failure']), (exit_code, 'failed', failure))
+                self.assertNotIn('stop-verified', self.world.events)
+                self.assertIn('master-close', self.world.events)
+                self.assertEqual(self.store.read('pilot-result')['status'], 'failed')
+                self.assert_disposed(result)
+
+    def test_changed_inputs_after_arm_refuse_before_any_cloud_mutation(self):
+        Path(self.cache, 'jq.deb').write_bytes(b'tampered')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.world.mutations, [])
+        self.assertFalse(self.store.has('insert-intent'))
+        Path(self.cache, 'jq.deb').write_bytes(b'jq.deb-synthetic-bytes')
+        self.fresh_world()
+        Path(self.source, 'build', 'provision', 'student_vpc_pilot.py').write_text('# changed after arm\n')
+        code, result = self.execute()
+        self.assertEqual((code, result['failure']), (1, 'Refused'))
+        self.assertEqual(self.world.mutations, [])
+
+    def test_cache_identity_refusals(self):
+        jq, other = Path(self.cache, 'jq.deb'), Path(self.cache, 'libjq1.deb')
+        saved = {n: Path(self.cache, n).read_bytes() for n in self.NAMES}
+        for mutate in (lambda: os.chmod(self.cache, 0o755), lambda: os.chmod(jq, 0o666),
+                       lambda: (jq.unlink(), jq.symlink_to(other)), lambda: (jq.unlink(), os.link(other, jq)),
+                       lambda: other.unlink()):
+            with self.subTest(mutate=mutate):
+                for entry in Path(self.cache).iterdir():
+                    entry.unlink()
+                os.chmod(self.cache, 0o700)
+                for name, raw in saved.items():
+                    Path(self.cache, name).write_bytes(raw)
+                    os.chmod(Path(self.cache, name), 0o600)
+                mutate()
+                with self.assertRaises((clone.Refused, FileNotFoundError, guest.Failure)):
+                    clone.pilot_inputs(self.deps)
+
+    def test_arm_refuses_without_the_verified_cache_and_leaves_the_workdir_fresh(self):
+        directory = tempfile.mkdtemp(prefix='pa', dir='/tmp')
+        os.chmod(directory, 0o700)
+        self.addCleanup(shutil.rmtree, directory, True)
+        Path(self.cache, 'jq.deb').unlink()
+        with self.assertRaises((clone.Refused, FileNotFoundError)):
+            clone.arm(directory, self.deps, pilot=True)
+        self.assertEqual(os.listdir(directory), [])
+
+    def test_remote_commands_are_fixed_and_take_only_hex_digests(self):
+        master = clone.CloneMaster(self.world.tmp, self.manifest['name'], '1234', 'sa_user', self.deps)
+        digests = tuple('ab' * 32 for _ in clone.pilot_guest.SOURCE_NAMES)
+        argv = master.remote_argv('pilot-stage', digests)
+        self.assertEqual(shlex.split(argv[-1])[-3:], list(digests))
+        self.assertIn('ProxyCommand=/usr/bin/false', argv)
+        self.assertEqual(shlex.split(master.remote_argv('pilot-run')[-1])[-2:],
+                         [str(clone.pilot_guest.PAYLOAD / 'student_vpc_pilot.py'), 'run'])
+        self.assertEqual(shlex.split(master.remote_argv('pilot-incoming')[-1]),
+                         ['/usr/bin/mkdir', '-m', '0700', '--', 'labapp-student-pilot-in'])
+        for key, extra in (('summary', digests), ('pilot-run', digests), ('pilot-stage', digests[:2]),
+                           ('pilot-stage', ('x' * 64,) * 3), ('pilot-stage', ('; id',) * 3),
+                           ('pilot-stage', tuple('AB' * 32 for _ in range(3)))):
+            with self.subTest(key=key, extra=extra[:1]), self.assertRaises(clone.Refused):
+                master.remote_argv(key, extra)
+        self.assertEqual({k for k in clone.REMOTE if k.startswith('pilot-')},
+                         {'pilot-incoming', 'pilot-stage', 'pilot-run'})
+
+    def test_transfer_is_one_sftp_batch_over_the_original_master_with_no_local_file(self):
+        calls = []
+        deps = replace(self.deps, runner=lambda argv, seconds, **kw: calls.append((argv, seconds, kw)) or b'')
+        master = clone.CloneMaster(self.world.tmp, self.manifest['name'], '1234', 'sa_user', deps)
+        master.check = Mock()
+        window = clone.Window(deps, clone.Budget(self.manifest, deps), deps.wall() + 600, deps.mono() + 600)
+        master.transfer(window, [('a.deb', Path('/cache/a.deb')), ('b.py', Path('/src/b.py'))], 60)
+        ((argv, seconds, kw),) = calls
+        self.assertEqual(argv[:3], ['/usr/bin/sftp', '-b', '-'])
+        self.assertIn('ControlMaster=no', argv)
+        self.assertIn('ProxyCommand=/usr/bin/false', argv)
+        self.assertEqual(argv[-1], 'labapp-trial-1234')
+        self.assertEqual(kw['input_bytes'], b'put /cache/a.deb labapp-student-pilot-in/a.deb\n'
+                                            b'put /src/b.py labapp-student-pilot-in/b.py\n')
+        self.assertLessEqual(seconds, 60)
+        self.assertEqual(master.check.call_count, 2)
+        self.assertFalse(list(Path(self.world.tmp).glob('*batch*')))
+
+    def test_stage_script_is_pinned_exclusive_and_cleans_on_failure(self):
+        script = clone.PILOT_STAGE
+        compile(script, 'stage', 'exec')
+        self.assertNotIn('@', script)
+        for name, size, sha in clone.pilot_guest.CACHE_PINS:
+            self.assertIn(name, script)
+            self.assertIn(sha, script)
+        for text in ("os.mkdir('/run/labapp-student-pilot',0o700)", "'labapp-student-pilot-in'", 'O_NOFOLLOW',
+                     'O_EXCL', 'SUDO_USER', 'st_nlink!=1', 'os.rmdir'):
+            self.assertIn(text, script)
+        self.assertIn('student pilot staged', script)
+        self.assertEqual(clone.PILOT_STAGED, b'student pilot staged')
+
+    def test_independent_cleanup_after_a_pilot_failure_is_unchanged(self):
+        self.world.pilot_raise = ('pilot-run', clone.Expired('synthetic'))
+        code, result = self.execute()
+        self.assertNotEqual(result['status'], 'passed')
+        again = self.independent().run()
+        self.assertTrue(again['closed'], again)
+        self.assertEqual(self.count('delete-vm'), 1)
+
+
+class StudentPilotDefaultOff(CloneCase):
+    def test_default_arm_has_no_pilot_and_the_run_never_touches_the_pilot_surface(self):
+        self.assertNotIn('student_pilot', self.info)
+        self.assertNotIn('student_pilot', self.manifest)
+        self.assertEqual(set(self.manifest), clone.MANIFEST_FIELDS)
+        with patch.object(clone, 'pilot_inputs', side_effect=AssertionError('pilot touched')):
+            code, result = self.execute()
+        self.assertEqual((code, result['status']), (0, 'passed'), result)
+        self.assertNotIn('pilot', result)
+        self.assertFalse([e for e in self.world.events if e.startswith('pilot-')])
+        self.assertFalse(self.store.has('pilot-intent'))
+        self.assertEqual(self.world.events.count('stop-verified'), 2)
+
+    def test_cli_flag_is_arm_only_and_opt_in(self):
+        for action in ('run', 'cleanup', 'watch'):
+            with self.subTest(action), self.assertRaises(SystemExit), patch('sys.stderr', io.StringIO()):
+                clone.main([action, '--workdir', '/x', '--manifest-sha256', '0' * 64, '--owner-unit', 'u',
+                            '--student-pilot'], self.deps)
+        directory = tempfile.mkdtemp(prefix='pd', dir='/tmp')
+        os.chmod(directory, 0o700)
+        self.addCleanup(shutil.rmtree, directory, True)
+        out = io.StringIO()
+        with patch('sys.stdout', out):
+            self.assertEqual(clone.main(['arm', '--workdir', directory], self.deps), 0)
+        self.assertNotIn('student_pilot', json.loads(out.getvalue()))
+
+    def test_report_vocabulary_matches_the_guest_module(self):
+        good = json.loads(pilot_report())
+        self.assertEqual(clone.check_pilot_report(pilot_report()), good)
+        self.assertTrue(clone.pilot_passed(good))
+        self.assertEqual(set(good), set(clone.pilot_guest.RESULT_KEYS))
+        self.assertTrue(clone.pilot_guest.UID_RE.fullmatch(good['vpc_uid']))
