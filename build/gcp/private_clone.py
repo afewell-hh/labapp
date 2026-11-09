@@ -49,9 +49,9 @@ from .lifecycle.oslogin import SelfLogin, _identity, _match, _wire
 PROJECT, ZONE, REGION = spec.PROJECT, spec.ZONE, spec.REGION
 OWNER = host.OWNER
 SELF_USER = 'users/110405050082684214272'
-IMAGE_NAME = 'labapp-private-r42446688327-a1'
-IMAGE_ID = '1649408968157411841'
-SOURCE_DISK_ID = '7292285895271663486'
+IMAGE_NAME = 'labapp-private-r42546122725-a1'
+IMAGE_ID = '8978294162224615600'
+SOURCE_DISK_ID = '6318848999497178161'
 MACHINE, DISK_GB, DISK_TYPE = 'n2-standard-32', '500', 'pd-balanced'
 LABEL_OWNER, LABEL_UUID, OWNER_VALUE = 'labapp-manual-clone', 'labapp-manual-clone-uuid', 'private-clone-v1'
 BASE = 'https://compute.googleapis.com/compute/v1'

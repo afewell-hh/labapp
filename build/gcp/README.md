@@ -2104,11 +2104,11 @@ and must wait for the native build against frozen `4e9254f` to finish. The recei
 check validates claimed content only. No native or positive proof exists; the tests
 were authored unrun.
 
-## Manual private-image clone caller (#546, source only, not activated)
+## Manual private-image clone caller (#546; current #564 tuple, no new clone execution)
 
 `build/gcp/private_clone.py` is a standalone owner caller for ONE manual VM cloned from
-the pinned private image `labapp-private-r42446688327-a1` (immutable ID
-`1649408968157411841`, source disk `7292285895271663486`). It performs a real two-boot
+the pinned private image `labapp-private-r42546122725-a1` (immutable ID
+`8978294162224615600`, source disk `6318848999497178161`). It performs a real two-boot
 acceptance (auto-start, stop-verified, ONE provider reset, auto-start again) and exact
 disposal. It is NOT the managed lifecycle: it never reads or writes the ledger, slot,
 `Context`, `OwnerRegistration`, `Master` or managed access records, and its disposal is
@@ -2116,6 +2116,21 @@ never a canonical FREE (FREE36 cannot prove it). Code grants no operational perm
 Historical image/capture/disposal facts (#519 comments 6717641772 and 6717679812) are
 not fresh admission. Access-material provenance, generalization, shared lab identity,
 managed capture, course parity, publication and cutover remain unmet.
+
+The current tuple comes from the [complete #563 native build/capture/disposal
+receipt](https://github.com/afewell-hh/labapp/issues/563#issuecomment-6730818815):
+fresh startup, controlled stop/resume and persistence completed; one READY private
+image was captured with terminal INSERT `3642375090305011855`, and the builder,
+boot disk, own key and temporary network were independently disposed. The image's
+BUILD source is `8d4ebd4890a7f913411b59d5d5acf3581c26abbb`; a later clone-caller
+pin commit does not change that identity. The caller checks the image tuple and
+READY status, not a build-source label. This native-candidate evidence is not
+clone/student acceptance or fresh operational admission.
+
+The earlier image `labapp-private-r42446688327-a1` / `1649408968157411841` /
+source disk `7292285895271663486` stays preserved with its historical evidence.
+Only the fixed caller tuple changes; manifests, gates and all original bounds
+remain unchanged. Source acceptance precedes a separately admitted clone pilot.
 
 ### Interfaces (fixed protected-source bootstrap, Python 3.12 stdlib)
 
@@ -2300,8 +2315,9 @@ a missing, unknown, wrongly typed or free-string value is refused and never echo
 [provision README](../provision/README.md#course-wiring-input-552)); the host fetch map is read dynamically
 from `vlab_trial.SOURCES`, so no host trial change or profile selector exists. The inspection catalog above
 keeps the unchanged root `wiringd.yaml` identity. Previously captured clone image
-`1649408968157411841` stays preserved and is known to be incompatible with this lesson; no new image or VM
-identity is recorded or repinned here.
+`1649408968157411841` stays preserved and is known to be incompatible with this lesson;
+the current #564 tuple above selects the new #563 candidate instead. No new clone
+VM identity or successful student result is asserted by this source pin.
 
 After the FIRST strict ready checkpoint and `compare_boots` of boot 1, and BEFORE the verified stop, the
 run executes the fixed sequence inside the ORIGINAL access window (it never renews or extends any
