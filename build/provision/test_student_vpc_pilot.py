@@ -870,7 +870,7 @@ class LessonTests(LessonHarness):
         self.cluster.on_call[('describe',)] = lambda: setattr(self.cluster, 'vpc', vpc(uid='99999999-2222-3333-4444-555555555555'))
         pilot.accept()
         done = self.done()
-        self.assertEqual((done['code'], done['cleanup'], done['step']), ('refused', 'preserved', 'post-apply'))
+        self.assertEqual((done['code'], done['cleanup'], done['step']), ('refused', 'preserved', 'endstate'))
         self.assertEqual(self.cluster.deleted, 0)
         # An unexpected step/capacity in state degrades to the empty closed form and never raises or leaks.
         self.events.clear()
@@ -924,6 +924,77 @@ class LessonTests(LessonHarness):
         pilot.accept()
         done = self.done()
         self.assertEqual((done['code'], done['cleanup']), ('refused', 'removed'))
+
+    def timed_accept(self, *, latency=0, converge_at=None, deadline=225, late_poll=None, late_positive=False):
+        """Actual lesson/Clock/cleanup, synthetic child latency and independent elapsed time."""
+        now, calls = [100.0], []
+        cluster = self.cluster
+
+        def child(argv, seconds, **kw):
+            poll = argv == ['kubectl', 'get', 'agents', '-o', 'json']
+            delay = late_poll if poll and late_poll is not None else latency
+            calls.append((list(argv), seconds))
+            now[0] += delay if late_positive and poll else min(delay, seconds)
+            if delay > seconds and not (late_positive and poll):
+                return -9, b'', 'timeout'
+            reply = cluster(argv, seconds, **kw)
+            if poll and converge_at is not None:
+                return 0, json.dumps(agents(applied=now[0] - 100 >= converge_at)).encode(), 'ok'
+            return reply
+
+        def sleep(seconds):
+            now[0] += seconds
+        with patch.object(pilot.time, 'monotonic', lambda: now[0]), \
+                patch.object(pilot, 'SLEEP', sleep), patch.object(pilot, 'run_child', child):
+            pilot.accept(deadline)
+        return now[0] - 100, calls
+
+    def test_healthy_real_lesson_over_old_fifty_second_work_budget_fits_parent(self):
+        elapsed, calls = self.timed_accept(latency=2)
+        self.assertGreater(elapsed, 50)
+        self.assertLess(elapsed, 125)
+        self.assertEqual((self.done()['code'], self.done()['cleanup'], self.done()['step']),
+                         ('ok', 'removed', 'post-apply'))
+        self.assertEqual(self.cluster.deletes, [UID])
+        self.assertTrue(all(seconds <= 15 for argv, seconds in calls if argv[1] != 'delete'))
+
+    def test_declared_sixty_second_agent_policy_allows_forty_second_convergence(self):
+        elapsed, _ = self.timed_accept(latency=0.1, converge_at=40)
+        self.assertEqual(pilot.AGENT_WAIT_SECONDS, 60)
+        self.assertGreater(elapsed, 40)
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('ok', 'removed'))
+
+    def test_late_second_good_poll_cannot_pass_and_cleans_the_captured_uid(self):
+        self.cluster.converge_after = 0
+        with patch.object(pilot, 'AGENT_WAIT_SECONDS', 20):
+            _, calls = self.timed_accept(late_poll=14.9)
+        self.assertEqual((self.done()['code'], self.done()['cleanup'], self.done()['step']),
+                         ('timeout', 'removed', 'agents-query'))
+        polls = [seconds for argv, seconds in calls if argv == ['kubectl', 'get', 'agents', '-o', 'json']]
+        self.assertEqual(len(polls), 2)
+        self.assertLess(polls[1], 1)
+        self.assertEqual(self.cluster.deletes, [UID])
+
+    def test_late_positive_second_poll_is_rejected_at_original_agent_end(self):
+        self.cluster.converge_after = 0
+        with patch.object(pilot, 'AGENT_WAIT_SECONDS', 20):
+            self.timed_accept(late_poll=14.9, late_positive=True)
+        self.assertEqual((self.done()['code'], self.done()['cleanup'], self.done()['step']),
+                         ('timeout', 'removed', 'agent-budget'))
+        self.assertEqual(self.cluster.polls, 2)
+
+    def test_parent_clipped_acceptance_cleans_up_without_renewing_work_budget(self):
+        elapsed, _ = self.timed_accept(latency=2, deadline=145)
+        self.assertLess(elapsed, 45)
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('timeout', 'removed'))
+        self.assertEqual(self.cluster.deletes, [UID])
+
+    def test_clock_cutoff_reports_closed_site_and_uses_separate_uid_teardown(self):
+        self.cluster.converge_after = 10 ** 9
+        _, _ = self.timed_accept(latency=0, deadline=145)
+        self.assertEqual((self.done()['code'], self.done()['cleanup'], self.done()['step']),
+                         ('timeout', 'removed', 'agent-budget'))
+        self.assertEqual(pilot.parse_events(json.dumps(self.done()).encode())['done'], self.done())
 
     def test_ambiguous_apply_with_a_matching_object_is_never_adopted_or_deleted(self):
         # The create response was lost; an object with exactly the requested spec exists. A matching spec is NOT
@@ -1052,6 +1123,36 @@ class RunTests(unittest.TestCase):
                          ('passed', 'done', 'ok', 'removed', 7, UID, 'installed', 'installed', 'installed'))
         self.assertLessEqual(len(json.dumps(result)), pilot.OUTPUT_LIMIT)
         self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])
+
+    def test_delegation_carries_original_root_end_after_setup_elapsed(self):
+        now, delegated = [100.0], []
+
+        def packages(clock):
+            now[0] += 80
+            return 'unchanged'
+
+        def child(mode, seconds, source, extra=()):
+            if mode == 'accept':
+                delegated.append((seconds, float(extra[0])))
+            return self.plan[mode]
+        with patch.object(pilot.time, 'monotonic', lambda: now[0]), \
+                patch.object(pilot, 'install_packages', packages), patch.object(pilot, 'student_child', child):
+            pilot.run()
+        self.assertEqual(delegated, [(50, 225)])  # 45 child total, including its unchanged 20s UID reserve
+        self.assertEqual(self.out[-1]['status'], 'passed')
+
+    def test_insufficient_original_root_budget_refuses_before_accept_or_apply(self):
+        now = [100.0]
+
+        def packages(clock):
+            now[0] += 109
+            return 'unchanged'
+        with patch.object(pilot.time, 'monotonic', lambda: now[0]), \
+                patch.object(pilot, 'install_packages', packages):
+            pilot.run()
+        self.assertEqual([mode for mode, extra in self.children], ['configure'])
+        self.assertEqual((self.out[-1]['code'], self.out[-1]['step'], self.out[-1]['cleanup']),
+                         ('timeout', 'accept-budget', 'not-needed'))
 
     def test_success_requires_completed_step_and_every_capacity_observed_true(self):
         cases = [(step, dict(COMPLETE['capacity'])) for step in pilot.STEPS if step != 'post-apply']
@@ -1213,6 +1314,15 @@ class RunTests(unittest.TestCase):
             self.assertEqual(pilot.main(['x', 'run', 'extra']), 2)
             self.assertEqual(pilot.main(['x', 'teardown', 'not-a-uid']), 2)
             self.assertEqual(pilot.main(['x', 'accept', '--kubeconfig', '/x']), 2)
+
+    def test_accept_deadline_dispatch_is_numeric_bounded_and_not_renewed(self):
+        with patch.object(pilot.signal, 'signal'), patch.object(pilot.os, 'umask'), \
+                patch.object(pilot.time, 'monotonic', lambda: 100), patch.object(pilot, 'accept', return_value=0) as accept:
+            for bad in ('nan', 'inf', '-1', '226', '200x', '200.1234567890'):
+                self.assertEqual(pilot.main(['x', 'accept', bad]), 2)
+            accept.assert_not_called()
+            self.assertEqual(pilot.main(['x', 'accept', '145.000000000']), 0)
+            accept.assert_called_once_with(145.0)
 
 
 class RunChildTests(unittest.TestCase):
