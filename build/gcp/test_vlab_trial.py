@@ -6111,7 +6111,8 @@ PILOT_UID = '11111111-2222-3333-4444-555555555555'
 
 
 def pilot_report(**change):
-    value = {'agents': 7, 'capacity': {'ipv4_web': True, 'ipv4_worker': True, 'no_conflict': True,
+    value = {'agent_snapshot': clone.pilot_guest.empty_agent_snapshot(),
+             'agents': 7, 'capacity': {'ipv4_web': True, 'ipv4_worker': True, 'no_conflict': True,
                                        'vlan_web': True, 'vlan_worker': True},
              'cleanup': 'removed', 'code': 'ok', 'config': 'installed', 'packages': 'installed',
              'phase': 'done', 'plugin': 'installed', 'status': 'passed', 'step': 'post-apply', 'vpc_uid': PILOT_UID}
@@ -6361,6 +6362,9 @@ class StudentPilotHost(PilotCase):
                                  'vlan_web': True, 'vlan_worker': True})
         for report in (pilot_report(status='failed', code='refused', phase='config', cleanup='not-needed'),
                        pilot_report(**refusal),
+                       pilot_report(status='failed', code='timeout', phase='accept', step='agent-budget',
+                                    agent_snapshot={'shape': 'complete', 'rows': [
+                                        [n, 3, 3, 'missing'] for n in sorted(clone.pilot_guest.AGENT_NAMES)]}),
                        pilot_report(**dict(refusal, step='vpc-absent',
                                            capacity=dict.fromkeys(clone.pilot_guest.CAPACITY_KEYS))),
                        pilot_report(cleanup='preserved'), pilot_report(cleanup='uncertain'),
@@ -6673,6 +6677,34 @@ class StudentPilotDefaultOff(CloneCase):
                                                     'vlan_web': True, 'vlan_worker': True}))
         self.assertEqual(clone.check_pilot_report(json.dumps(refusal).encode()), refusal)
         self.assertFalse(clone.pilot_passed(refusal))
+
+    def test_agent_snapshot_transport_is_bounded_strict_and_never_a_success_gate(self):
+        g = clone.pilot_guest
+        snapshot = {'shape': 'complete', 'rows': [[n, (1 << 63) - 1, (1 << 63) - 1, 'missing']
+                                                 for n in sorted(g.AGENT_NAMES)]}
+        raw = pilot_report(agent_snapshot=snapshot)
+        self.assertGreater(len(raw), 512)
+        self.assertLessEqual(len(raw), clone.PILOT_REPORT_LIMIT)
+        report = clone.check_pilot_report(raw)
+        self.assertEqual(report['agent_snapshot'], snapshot)
+        self.assertTrue(clone.pilot_passed(report))  # diagnostics add no new success criterion
+        failed = clone.check_pilot_report(pilot_report(agent_snapshot=snapshot, status='failed', code='timeout'))
+        self.assertFalse(clone.pilot_passed(failed))
+        bad = [None, {}, dict(snapshot, shape='CANARY'), dict(snapshot, rows=[]),
+               dict(snapshot, extra='CANARY'), dict(snapshot, rows=snapshot['rows'][:-1]),
+               dict(snapshot, rows=list(reversed(snapshot['rows']))),
+               {'shape': 'unobserved', 'rows': snapshot['rows']}]
+        for column, value in ((0, 'CANARY'), (1, True), (1, -1), (2, 1 << 63), (3, 'CANARY')):
+            rows = [list(row) for row in snapshot['rows']]
+            rows[0][column] = value
+            bad.append(dict(snapshot, rows=rows))
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(clone.Refused):
+                clone.check_pilot_report(pilot_report(agent_snapshot=value))
+        historical = json.loads(pilot_report())
+        historical.pop('agent_snapshot')
+        with self.assertRaises(clone.Refused):
+            clone.check_pilot_report(json.dumps(historical).encode())
 
     def test_course_wiring_is_the_fixed_source_behind_the_logical_wiringd_name(self):
         root = Path(__file__).resolve().parents[2]

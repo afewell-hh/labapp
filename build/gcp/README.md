@@ -2357,6 +2357,35 @@ keep their original precedence. Closed `step` values now distinguish post-apply
 operations and `accept-budget`/`agent-budget`; successful completion still reports
 `post-apply`, with no new report fields.
 
+#570 adds exactly one diagnostic field, `agent_snapshot: {shape, rows}`, to
+child done events and guest/host reports. It projects only the last existing
+decoded agent poll before the unchanged acceptance predicate; there is no new
+query, retry, wait, mutation or success gate. Rows use sorted canonical seven
+names and `[name, current_generation, last_applied_generation, Applied_CLASS]`.
+Generations are strict integers in 0..2^63-1 or null. Applied_CLASS is one of
+`True`, `False`, `Unknown`, `missing`, `duplicate`, `malformed`; invalid condition
+structure/status wins over duplicates, and structurally valid other condition
+types are ignored. No condition reason/message or other untrusted field survives.
+Shapes are `unobserved` (zero rows), `complete` (exact membership, not convergence),
+`names-invalid` (missing/duplicate/foreign names), and `malformed` (invalid
+document/items/member metadata/name structure, taking precedence over names-invalid).
+An observed items list projects seven rows; invalid document/list input or a
+projection exception yields malformed with no rows. Duplicate canonical names
+produce null generations/duplicate, never selecting an input object. Projection
+exceptions cannot replace the primary outcome or prevent UID cleanup;
+BaseException cancellation remains interrupting. All boundaries validate the
+exact shape, order, bounds and vocabulary. Exact done events may occupy up to
+2048 bytes internally; UID/config events retain 512 bytes and final reports
+retain 2048 bytes. Historical reports missing the field are schema-incompatible
+and must be preserved unchanged, without invented backfills.
+
+This diagnostic addresses #569's missing native generation/condition vector;
+that attempt failed at `agent-budget` and was fully retired without boot 2.
+Pinned Fabric v0.96.2 can initialize current/applied generations equally with
+empty conditions; this is a public compatibility risk, not #569's proven cause.
+The pinned lesson still requires Applied=True, all seven agents and two good
+observations. No criteria waiver, timeout increase, rebuild or new VM is implied.
+
 The public #567 offline latency counterexamples use actual guest orchestration,
 lesson and cleanup with synthetic I/O and virtual clocks. They demonstrate the
 source budget gaps and compare the same frozen probe/helper across versions;
