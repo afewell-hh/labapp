@@ -95,7 +95,7 @@ PACKAGE_RESULTS = ('-', 'installed', 'unchanged')
 PLUGIN_RESULTS = ('-', 'installed', 'unchanged', 'mode-repaired')
 CONFIG_RESULTS = ('-', 'installed', 'unchanged')
 CLEANUP_RESULTS = ('not-needed', 'removed', 'absent', 'preserved', 'uncertain')
-RESULT_KEYS = ('agents', 'capacity', 'cleanup', 'code', 'config', 'packages', 'phase', 'plugin', 'status', 'step',
+RESULT_KEYS = ('agent_snapshot', 'agents', 'capacity', 'cleanup', 'code', 'config', 'packages', 'phase', 'plugin', 'status', 'step',
                'vpc_uid')
 # Closed lesson substep last ENTERED by the acceptance child (the failing one on a refusal; '-' when none ran).
 # Pre-apply substeps come first; 'manifest' onward are at or after the first possible mutation boundary.
@@ -680,6 +680,76 @@ def agents_state(document):
     return len(agents), good and len(agents) == AGENTS
 
 
+def empty_agent_snapshot(shape='unobserved'):
+    return {'shape': shape, 'rows': []}
+
+
+def agent_generation(value):
+    return type(value) is int and 0 <= value <= (1 << 63) - 1
+
+
+def applied_class(status):
+    if not isinstance(status, dict):
+        return 'malformed'
+    conditions = status.get('conditions')
+    if conditions is None:
+        return 'missing'
+    if not isinstance(conditions, list) or any(
+            not isinstance(c, dict) or not isinstance(c.get('type'), str)
+            or c.get('status') not in ('True', 'False', 'Unknown') for c in conditions):
+        return 'malformed'
+    flags = [c['status'] for c in conditions if c['type'] == 'Applied']
+    return 'duplicate' if len(flags) > 1 else flags[0] if flags else 'missing'
+
+
+def project_agent_snapshot(document):
+    """Diagnostic-only projection: no untrusted strings or changes to the decoded input."""
+    if not isinstance(document, dict) or not isinstance(document.get('items'), list):
+        return empty_agent_snapshot('malformed')
+    found = {name: [] for name in AGENT_NAMES}
+    malformed, foreign = False, False
+    for item in document['items']:
+        meta = item.get('metadata') if isinstance(item, dict) else None
+        name = meta.get('name') if isinstance(meta, dict) else None
+        if not isinstance(name, str):
+            malformed = True
+        elif name not in found:
+            foreign = True
+        else:
+            found[name].append(item)
+    shape = 'malformed' if malformed else 'names-invalid' if foreign or any(
+        len(matches) != 1 for matches in found.values()) else 'complete'
+    rows = []
+    for name in sorted(AGENT_NAMES):
+        matches = found[name]
+        if len(matches) != 1:
+            rows.append([name, None, None, 'duplicate' if matches else 'missing'])
+            continue
+        item = matches[0]
+        current = item['metadata'].get('generation')
+        status = item.get('status')
+        applied = status.get('lastAppliedGen') if isinstance(status, dict) else None
+        rows.append([name, current if agent_generation(current) else None,
+                     applied if agent_generation(applied) else None, applied_class(status)])
+    return {'shape': shape, 'rows': rows}
+
+
+def agent_snapshot_valid(value):
+    if not isinstance(value, dict) or set(value) != {'shape', 'rows'}:
+        return False
+    shape, rows = value['shape'], value['rows']
+    if shape not in ('unobserved', 'complete', 'names-invalid', 'malformed') or not isinstance(rows, list):
+        return False
+    if not rows:
+        return shape in ('unobserved', 'malformed')
+    if shape == 'unobserved' or len(rows) != AGENTS:
+        return False
+    return all(isinstance(row, list) and len(row) == 4 and row[0] == name
+               and all(v is None or agent_generation(v) for v in row[1:3])
+               and row[3] in ('True', 'False', 'Unknown', 'missing', 'duplicate', 'malformed')
+               for name, row in zip(sorted(AGENT_NAMES), rows))
+
+
 def cidr_conflict(document):
     wanted = [ipaddress.ip_network(c[0]) for c in SUBNETS.values()]
     vlans = {c[2] for c in SUBNETS.values()}
@@ -873,7 +943,12 @@ def lesson(clock, state):
     while True:
         poll_clock.left()
         state['step'] = 'agents-query'
-        count, good = agents_state(kube_json(['get', 'agents', '-o', 'json'], poll_clock))
+        document = kube_json(['get', 'agents', '-o', 'json'], poll_clock)
+        try:
+            state['agent_snapshot'] = project_agent_snapshot(document)
+        except Exception:
+            state['agent_snapshot'] = empty_agent_snapshot('malformed')
+        count, good = agents_state(document)
         poll_clock.left()
         require(count == AGENTS, 'agent count is not seven')
         state['agents'] = count
@@ -909,7 +984,7 @@ def accept(deadline=None):
     """Child as ubuntu (`-I -` stdin program). Prints uid/done events only; always tears down what it created."""
     student_identity()
     state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None, 'endstate': False,
-             'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)}
+             'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS), 'agent_snapshot': empty_agent_snapshot()}
     code = 'ok'
     work = Clock(ACCEPT_SECONDS, TEARDOWN_SECONDS, deadline=deadline, site='accept-budget')
     try:
@@ -933,8 +1008,9 @@ def accept(deadline=None):
     # Diagnostics are closed by construction; anything unexpected degrades to the empty form, never a free string.
     step = state['step'] if state['step'] in STEPS else '-'
     capacity = state['capacity'] if capacity_valid(state['capacity']) else dict.fromkeys(CAPACITY_KEYS)
+    snapshot = state['agent_snapshot'] if agent_snapshot_valid(state['agent_snapshot']) else empty_agent_snapshot('malformed')
     emit({'event': 'done', 'code': code, 'cleanup': cleanup, 'agents': state['agents'],
-          'step': step, 'capacity': capacity})
+          'step': step, 'capacity': capacity, 'agent_snapshot': snapshot})
     return 0
 
 
@@ -951,7 +1027,7 @@ def teardown_only(uid):
         finally:
             shutil.rmtree(work, ignore_errors=True)
     emit({'event': 'done', 'code': 'ok', 'cleanup': verdict, 'agents': 0,
-          'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)})
+          'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS), 'agent_snapshot': empty_agent_snapshot()})
     return 0
 
 
@@ -962,25 +1038,35 @@ def configure_main():
 
 
 # ------------------------------------------------------------------------------ root orchestration ---
+def event_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('duplicate event field')
+        value[key] = item
+    return value
+
+
 def parse_events(raw):
     """Closed events from a child's output; anything not an exact event is ignored, never echoed."""
     events = {}
-    for line in raw.decode('utf-8', 'replace').splitlines():
-        if len(line) > 512 or not line.startswith('{'):
+    for line in raw.splitlines():
+        if len(line) > OUTPUT_LIMIT or not line.startswith(b'{'):
             continue
         try:
-            value = json.loads(line)
-        except ValueError:
+            value = json.loads(line.decode('utf-8'), object_pairs_hook=event_object)
+        except (ValueError, UnicodeError, RecursionError):
             continue
         kind = value.get('event') if isinstance(value, dict) else None
-        if kind == 'uid' and set(value) == {'event', 'uid'} and isinstance(value['uid'], str) \
+        if len(line) <= 512 and kind == 'uid' and set(value) == {'event', 'uid'} and isinstance(value['uid'], str) \
                 and UID_RE.fullmatch(value['uid']):
             events['uid'] = value['uid']
-        elif kind == 'config' and set(value) == {'event', 'status'} and value['status'] in CONFIG_RESULTS[1:]:
+        elif len(line) <= 512 and kind == 'config' and set(value) == {'event', 'status'} and value['status'] in CONFIG_RESULTS[1:]:
             events['config'] = value['status']
-        elif kind == 'done' and set(value) == {'event', 'code', 'cleanup', 'agents', 'step', 'capacity'} \
+        elif kind == 'done' and set(value) == {'event', 'code', 'cleanup', 'agents', 'step', 'capacity', 'agent_snapshot'} \
                 and value['code'] in CODES and value['cleanup'] in CLEANUP_RESULTS \
                 and isinstance(value['step'], str) and value['step'] in STEPS and capacity_valid(value['capacity']) \
+                and agent_snapshot_valid(value['agent_snapshot']) \
                 and type(value['agents']) is int and 0 <= value['agents'] <= 99:
             events['done'] = value
     return events
@@ -996,7 +1082,7 @@ def student_child(mode, seconds, source, extra=()):
 def run():
     result = {'status': 'failed', 'phase': 'preflight', 'code': 'failed', 'packages': '-', 'plugin': '-',
               'config': '-', 'vpc_uid': '', 'agents': 0, 'cleanup': 'not-needed',
-              'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)}
+              'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS), 'agent_snapshot': empty_agent_snapshot()}
     clock = Clock(TOTAL_SECONDS, TEARDOWN_SECONDS)
     source, unfinished = b'', False
     try:
@@ -1031,6 +1117,7 @@ def run():
         if done is not None:
             result['agents'], result['cleanup'] = done['agents'], done['cleanup']
             result['step'], result['capacity'] = done['step'], done['capacity']   # closed diagnostics; primary code unchanged
+            result['agent_snapshot'] = done['agent_snapshot']
         if state != 'ok' or code is None or code < 0:
             # Forcibly stopped worker: its nested kubectl children run in their OWN sessions and may outlive the
             # killed group, so its state is unprovable. Sticky uncertain: no teardown, no further guest mutation,

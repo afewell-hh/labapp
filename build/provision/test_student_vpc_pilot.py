@@ -31,8 +31,9 @@ REPO = Path(__file__).resolve().parents[2]
 COURSE_WIRING = REPO / 'build/provision/course-wiring.yaml'
 ROOT_WIRING = REPO / 'wiringd.yaml'
 EMPTY = {key: None for key in pilot.CAPACITY_KEYS}
-CLOSED = {'step': '-', 'capacity': EMPTY}
-COMPLETE = {'step': 'post-apply', 'capacity': dict.fromkeys(pilot.CAPACITY_KEYS, True)}
+CLOSED = {'step': '-', 'capacity': EMPTY, 'agent_snapshot': pilot.empty_agent_snapshot()}
+COMPLETE = {'step': 'post-apply', 'capacity': dict.fromkeys(pilot.CAPACITY_KEYS, True),
+            'agent_snapshot': pilot.empty_agent_snapshot()}
 
 
 def real_namespaces(path):
@@ -372,7 +373,91 @@ class ParsingTests(unittest.TestCase):
         for step in pilot.STEPS:
             self.assertRegex(step, r'\A(-|[a-z][a-z0-9]*(-[a-z0-9]+)*)\Z')
         self.assertEqual(set(pilot.RESULT_KEYS) - {'agents', 'cleanup', 'code', 'config', 'packages', 'phase',
-                                                   'plugin', 'status', 'vpc_uid'}, {'capacity', 'step'})
+                                                   'plugin', 'status', 'vpc_uid'}, {'capacity', 'step', 'agent_snapshot'})
+
+
+class AgentSnapshotTests(unittest.TestCase):
+    def test_bootstrap_current_generation_empty_conditions_is_observed_but_still_fails(self):
+        document = agents()
+        for item in document['items']:
+            item['status']['conditions'] = []  # pinned v0.96.2 bootstrap-compatible status
+        before = json.dumps(document, sort_keys=True)
+        snapshot = pilot.project_agent_snapshot(document)
+        self.assertEqual(snapshot, {'shape': 'complete', 'rows': [[name, 3, 3, 'missing'] for name in CANONICAL]})
+        self.assertEqual(pilot.agents_state(document), (7, False))
+        self.assertEqual(json.dumps(document, sort_keys=True), before)
+
+    def test_generation_sanitization_and_condition_precedence(self):
+        # Invalid structure wins over duplicate Applied entries; valid other conditions are ignored.
+        cases = [(None, 'missing'), ([], 'missing'),
+                 ([{'type': 'Other', 'status': 'True'}], 'missing'),
+                 *[([{'type': 'Applied', 'status': v}], v) for v in ('True', 'False', 'Unknown')],
+                 ([{'type': 'Applied', 'status': 'True'}] * 2, 'duplicate'),
+                 ([{'type': 'Applied', 'status': 'True'}] * 2 + [CANARY], 'malformed'),
+                 ([{'type': 'Applied', 'status': CANARY}] * 2, 'malformed'),
+                 ({}, 'malformed'), ([{}], 'malformed'), ([{'type': [], 'status': 'True'}], 'malformed')]
+        for conditions, expected in cases:
+            with self.subTest(expected=expected, conditions=conditions):
+                document = agents()
+                document['items'][0]['status']['conditions'] = conditions
+                document['items'][0]['metadata']['generation'] = True
+                document['items'][0]['status']['lastAppliedGen'] = 1 << 63
+                snapshot = pilot.project_agent_snapshot(document)
+                self.assertEqual(snapshot['shape'], 'complete')
+                self.assertEqual(snapshot['rows'][0], ['leaf-01', None, None, expected])
+                self.assertNotIn(CANARY, json.dumps(snapshot))
+                self.assertTrue(pilot.agent_snapshot_valid(snapshot))
+        for value in (-1, '3', 3.0, False, 1 << 63):
+            self.assertFalse(pilot.agent_generation(value))
+        for value in (0, (1 << 63) - 1):
+            self.assertTrue(pilot.agent_generation(value))
+
+    def test_membership_shape_precedence_and_never_selecting_duplicate_input(self):
+        document = agents(names=CANONICAL[:6] + ['leaf-01'])
+        snapshot = pilot.project_agent_snapshot(document)
+        self.assertEqual(snapshot['shape'], 'names-invalid')
+        self.assertEqual(snapshot['rows'][0], ['leaf-01', None, None, 'duplicate'])
+        self.assertEqual(snapshot['rows'][-1], ['spine-02', None, None, 'missing'])
+        document['items'].append({'metadata': {'name': CANARY}})
+        self.assertEqual(pilot.project_agent_snapshot(document)['shape'], 'names-invalid')
+        document['items'].append({'metadata': {'name': []}})
+        snapshot = pilot.project_agent_snapshot(document)
+        self.assertEqual(snapshot['shape'], 'malformed')
+        self.assertEqual(len(snapshot['rows']), 7)
+        self.assertNotIn(CANARY, json.dumps(snapshot))
+        for document in (None, [], {}, {'items': None}):
+            self.assertEqual(pilot.project_agent_snapshot(document), {'shape': 'malformed', 'rows': []})
+        self.assertEqual(pilot.project_agent_snapshot({'items': [None]})['shape'], 'malformed')
+
+    def test_worst_integer_snapshot_roundtrips_above_old_line_limit(self):
+        snapshot = {'shape': 'complete', 'rows': [[n, (1 << 63) - 1, (1 << 63) - 1, 'Unknown'] for n in CANONICAL]}
+        event = {'event': 'done', 'code': 'timeout', 'cleanup': 'removed', 'agents': 7,
+                 **dict(COMPLETE, agent_snapshot=snapshot)}
+        raw = json.dumps(event).encode()
+        self.assertGreater(len(raw), 512)
+        self.assertLessEqual(len(raw), 2048)
+        self.assertEqual(pilot.parse_events(raw), {'done': event})
+        self.assertEqual(pilot.parse_events(raw + b' ' * (2048 - len(raw))), {'done': event})
+        self.assertEqual(pilot.parse_events(raw + b' ' * (2049 - len(raw))), {})
+        self.assertEqual(pilot.parse_events(b'{"event":"done",' + raw[1:]), {})
+        for kind in ({'event': 'uid', 'uid': UID}, {'event': 'config', 'status': 'installed'}):
+            raw = json.dumps(kind).encode()
+            self.assertEqual(pilot.parse_events(raw + b' ' * (513 - len(raw))), {})
+
+    def test_snapshot_validator_rejects_open_or_malformed_values(self):
+        valid = pilot.project_agent_snapshot(agents())
+        bad = [None, {}, dict(valid, extra=CANARY), dict(valid, shape=CANARY), dict(valid, rows=[]),
+               dict(valid, rows=valid['rows'][:-1]), {'shape': 'unobserved', 'rows': valid['rows']},
+               dict(valid, rows=list(reversed(valid['rows'])))]
+        for column, value in ((0, CANARY), (1, True), (1, -1), (2, 1 << 63), (3, CANARY)):
+            rows = [list(r) for r in valid['rows']]
+            rows[0][column] = value
+            bad.append(dict(valid, rows=rows))
+        base = {'event': 'done', 'code': 'timeout', 'cleanup': 'removed', 'agents': 7, **COMPLETE}
+        for snapshot in bad:
+            self.assertFalse(pilot.agent_snapshot_valid(snapshot))
+            self.assertEqual(pilot.parse_events(json.dumps(dict(base, agent_snapshot=snapshot)).encode()), {})
+        self.assertEqual(pilot.parse_events(json.dumps({k: v for k, v in base.items() if k != 'agent_snapshot'}).encode()), {})
 
 
 class PackageTests(unittest.TestCase):
@@ -726,6 +811,74 @@ class IdentityTests(unittest.TestCase):
 
 
 class LessonTests(LessonHarness):
+    def test_last_poll_snapshot_survives_cleanup_and_decoded_document_is_unchanged(self):
+        documents = []
+        cluster = self.cluster
+        original = pilot.agents_state
+
+        def predicate(document):
+            documents.append(json.loads(json.dumps(document)))
+            return original(document)
+        with patch.object(pilot, 'agents_state', predicate):
+            pilot.accept()
+        self.assertGreater(len(documents), 1)
+        self.assertEqual(self.done()['agent_snapshot'], pilot.project_agent_snapshot(documents[-1]))
+        self.assertEqual(self.done()['agent_snapshot']['rows'], [[n, 3, 3, 'True'] for n in CANONICAL])
+        self.assertEqual(cluster.deleted, 1)
+
+    def test_projection_failure_preserves_primary_refusal_and_uid_cleanup(self):
+        self.cluster.agent_count = 6
+        with patch.object(pilot, 'project_agent_snapshot', side_effect=RuntimeError(CANARY)):
+            pilot.accept()
+        done = self.done()
+        self.assertEqual((done['code'], done['cleanup']), ('refused', 'removed'))
+        self.assertEqual(done['agent_snapshot'], {'shape': 'malformed', 'rows': []})
+        self.assertEqual(self.cluster.deletes, [UID])
+        self.assertNotIn(CANARY, json.dumps(self.events))
+
+    def test_projection_cancellation_is_not_suppressed_and_uid_cleanup_still_runs(self):
+        with patch.object(pilot, 'project_agent_snapshot', side_effect=pilot.Interrupted):
+            pilot.accept()
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('cancelled', 'removed'))
+        self.assertEqual(self.done()['agent_snapshot'], pilot.empty_agent_snapshot())
+        self.assertEqual(self.cluster.deletes, [UID])
+
+    def test_later_projection_cancellation_retains_last_closed_observation(self):
+        project = pilot.project_agent_snapshot
+        snapshots = []
+
+        def cancel_second(document):
+            if snapshots:
+                raise pilot.Interrupted
+            snapshots.append(project(document))
+            return snapshots[-1]
+        with patch.object(pilot, 'project_agent_snapshot', cancel_second):
+            pilot.accept()
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('cancelled', 'removed'))
+        self.assertEqual(self.done()['agent_snapshot'], snapshots[0])
+        self.assertEqual(self.cluster.deletes, [UID])
+
+    def test_bootstrap_condition_snapshot_does_not_make_lesson_pass(self):
+        cluster = self.cluster
+        now = [100.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        def child(argv, seconds, **kw):
+            if argv == ['kubectl', 'get', 'agents', '-o', 'json']:
+                document = agents()
+                for item in document['items']:
+                    item['status']['conditions'] = []
+                return 0, json.dumps(document).encode(), 'ok'
+            return cluster(argv, seconds, **kw)
+        with patch.object(pilot, 'run_child', child), patch.object(pilot, 'AGENT_WAIT_SECONDS', 10), \
+                patch.object(pilot.time, 'monotonic', lambda: now[0]), patch.object(pilot, 'SLEEP', sleep):
+            pilot.accept()
+        self.assertEqual((self.done()['code'], self.done()['cleanup']), ('timeout', 'removed'))
+        self.assertEqual(self.done()['agent_snapshot'],
+                         {'shape': 'complete', 'rows': [[n, 3, 3, 'missing'] for n in CANONICAL]})
+
     def test_happy_path_uses_ordinary_kubectl_and_removes_only_the_owned_vpc(self):
         self.assertEqual(pilot.accept(), 0)
         done = self.done()
@@ -797,7 +950,7 @@ class LessonTests(LessonHarness):
         self.assertEqual((done['code'], done['step'], done['cleanup'], done['agents']), (code, step, 'not-needed', 0))
         self.assertEqual(done['capacity'], dict(EMPTY, **(capacity or {})))
         self.assertTrue(pilot.capacity_valid(done['capacity']) and done['step'] in pilot.STEPS)
-        self.assertEqual(set(done), {'event', 'code', 'cleanup', 'agents', 'step', 'capacity'})
+        self.assertEqual(set(done), {'event', 'code', 'cleanup', 'agents', 'step', 'capacity', 'agent_snapshot'})
         # Closed round trip through the host-side parser: a free string could never survive it.
         self.assertEqual(pilot.parse_events(json.dumps(done).encode())['done'], done)
         argvs = self.cluster.argvs()
@@ -1156,6 +1309,17 @@ class RunTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(result)), pilot.OUTPUT_LIMIT)
         self.assertEqual([c[0] for c in self.children], ['configure', 'accept'])
 
+    def test_snapshot_is_carried_to_root_without_overriding_child_primary_failure(self):
+        snapshot = pilot.project_agent_snapshot(agents(applied=False))
+        done = {'event': 'done', 'code': 'timeout', 'cleanup': 'removed', 'agents': 7,
+                **dict(COMPLETE, agent_snapshot=snapshot)}
+        self.plan['accept'] = (0, {'uid': UID, 'done': done}, 'ok')
+        pilot.run()
+        result = self.out[-1]
+        self.assertEqual((result['status'], result['code'], result['cleanup']), ('failed', 'timeout', 'removed'))
+        self.assertEqual(result['agent_snapshot'], snapshot)
+        self.assertLessEqual(len(json.dumps(result).encode()), pilot.OUTPUT_LIMIT)
+
     def test_delegation_carries_original_root_end_after_setup_elapsed(self):
         now, delegated = [100.0], []
 
@@ -1223,7 +1387,7 @@ class RunTests(unittest.TestCase):
                 self.children.clear()
                 self.plan['accept'] = (0, {'uid': UID, 'done': {
                     'event': 'done', 'code': 'ok', 'cleanup': 'removed', 'agents': 7,
-                    'step': step, 'capacity': capacity}}, 'ok')
+                    'step': step, 'capacity': capacity, 'agent_snapshot': pilot.empty_agent_snapshot()}}, 'ok')
                 pilot.run()
                 result = self.out[-1]
                 self.assertEqual((result['status'], result['phase'], result['code']),
@@ -1272,7 +1436,8 @@ class RunTests(unittest.TestCase):
     def test_child_pre_apply_diagnostics_reach_the_report_and_keep_the_primary_code(self):
         caps = dict(EMPTY, ipv4_web=False, ipv4_worker=False, vlan_web=True, vlan_worker=True)
         self.plan['accept'] = (0, {'done': {'event': 'done', 'code': 'refused', 'cleanup': 'not-needed', 'agents': 0,
-                                            'step': 'namespaces', 'capacity': caps}}, 'ok')
+                                            'step': 'namespaces', 'capacity': caps,
+                                            'agent_snapshot': pilot.empty_agent_snapshot()}}, 'ok')
         pilot.run()
         result = self.out[-1]
         self.assertEqual((result['status'], result['phase'], result['code'], result['cleanup'], result['vpc_uid']),
