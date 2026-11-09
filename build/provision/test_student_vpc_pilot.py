@@ -996,6 +996,38 @@ class LessonTests(LessonHarness):
                          ('timeout', 'removed', 'agent-budget'))
         self.assertEqual(pilot.parse_events(json.dumps(self.done()).encode())['done'], self.done())
 
+    def test_actual_cli_expired_absolute_end_never_applies_or_deletes(self):
+        with patch.object(pilot.time, 'monotonic', lambda: 100), \
+                patch.object(pilot.signal, 'signal'), patch.object(pilot.os, 'umask'):
+            self.assertEqual(pilot.main(['x', 'accept', '99.000000000']), 0)
+        self.assertEqual((self.done()['code'], self.done()['step'], self.done()['cleanup']),
+                         ('timeout', 'accept-budget', 'not-needed'))
+        self.assertEqual(self.cluster.calls, [])
+        self.assertEqual(self.cluster.deletes, [])
+
+    def test_actual_cli_delayed_entry_keeps_delegated_end_and_never_restarts_allowance(self):
+        # Parent delegated end=145 at t=100; child starts at t=120. With its
+        # unchanged 20s UID reserve, only 5s of lesson work remains, not 105s.
+        now, caps = [120.0], []
+        cluster = self.cluster
+
+        def child(argv, seconds, **kw):
+            caps.append(seconds)
+            now[0] += min(2, seconds)
+            if seconds < 2:
+                return -9, b'', 'timeout'
+            return cluster(argv, seconds, **kw)
+        with patch.object(pilot.time, 'monotonic', lambda: now[0]), \
+                patch.object(pilot, 'run_child', child), patch.object(pilot.signal, 'signal'), \
+                patch.object(pilot.os, 'umask'):
+            self.assertEqual(pilot.main(['x', 'accept', '145.000000000']), 0)
+        self.assertEqual(caps, [5, 3, 1])
+        self.assertEqual(now[0], 125)
+        self.assertEqual((self.done()['code'], self.done()['step'], self.done()['cleanup']),
+                         ('timeout', 'plugin', 'not-needed'))
+        self.assertFalse([a for a in self.cluster.argvs() if a[1] in ('apply', 'delete')])
+        self.assertEqual(self.cluster.deletes, [])
+
     def test_ambiguous_apply_with_a_matching_object_is_never_adopted_or_deleted(self):
         # The create response was lost; an object with exactly the requested spec exists. A matching spec is NOT
         # ownership: nothing is read back, adopted or deleted, and the result stays unresolved.
@@ -1153,6 +1185,34 @@ class RunTests(unittest.TestCase):
         self.assertEqual([mode for mode, extra in self.children], ['configure'])
         self.assertEqual((self.out[-1]['code'], self.out[-1]['step'], self.out[-1]['cleanup']),
                          ('timeout', 'accept-budget', 'not-needed'))
+
+    def test_late_child_success_cannot_pass_but_primary_failures_and_safety_survive(self):
+        for verdict in ('ok', 'cancelled', 'refused', 'uncertain', 'forced'):
+            with self.subTest(verdict=verdict):
+                pilot.STICKY.clear()
+                now, calls = [100.0], []
+
+                def child(mode, seconds, source, extra=()):
+                    calls.append(mode)
+                    if mode == 'configure':
+                        return self.plan[mode]
+                    self.assertEqual(mode, 'accept')
+                    now[0] = 231  # original root work end=230 (150 total minus 20 reserve)
+                    done = {'event': 'done', 'code': 'ok' if verdict == 'forced' else verdict,
+                            'cleanup': 'removed', 'agents': 7, **COMPLETE}
+                    return (-9 if verdict == 'forced' else 0), {'uid': UID, 'done': done}, 'ok'
+
+                with patch.object(pilot.time, 'monotonic', lambda: now[0]), \
+                        patch.object(pilot, 'student_child', child):
+                    pilot.run()
+                result = self.out[-1]
+                expected = 'timeout' if verdict == 'ok' else 'uncertain' if verdict == 'forced' else verdict
+                self.assertEqual((result['status'], result['code']), ('failed', expected))
+                self.assertEqual(result['vpc_uid'], UID)
+                self.assertEqual((result['agents'], result['capacity']), (7, COMPLETE['capacity']))
+                self.assertEqual(result['cleanup'], 'uncertain' if verdict == 'forced' else 'removed')
+                self.assertEqual(bool(pilot.STICKY), verdict == 'forced')
+                self.assertEqual(calls, ['configure', 'accept'])
 
     def test_success_requires_completed_step_and_every_capacity_observed_true(self):
         cases = [(step, dict(COMPLETE['capacity'])) for step in pilot.STEPS if step != 'post-apply']

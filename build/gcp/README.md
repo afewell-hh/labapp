@@ -2350,7 +2350,10 @@ changes from 30 s to **at most 60 s**, clipped once to available lesson work min
 are checked before/after each poll, sleep and second good poll; each native call
 retains its existing cap (15 s for lesson kubectl calls). All seven exact agents, applied
 generation checks, two consecutive good polls, lesson commands and final strict
-success gate remain required. Closed `step` values now distinguish post-apply
+success gate remain required. The root checks its original work clock again after
+validating the returned child verdict and cleanup, before declaring success;
+late success fails while primary cancellation/refusal and unsafe-worker evidence
+keep their original precedence. Closed `step` values now distinguish post-apply
 operations and `accept-budget`/`agent-budget`; successful completion still reports
 `post-apply`, with no new report fields.
 

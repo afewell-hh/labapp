@@ -1047,6 +1047,9 @@ def run():
                 'student acceptance checks incomplete')
         result['phase'] = 'teardown'
         require(result['cleanup'] == 'removed', 'test-owned VPC was not removed')
+        # Preserve the child's primary verdict and safety evidence above. Only
+        # otherwise valid success is subject to this ORIGINAL root-clock guard.
+        clock.left()
         result['phase'], result['status'], result['code'] = 'done', 'passed', 'ok'
     except BaseException as error:
         result['code'] = classify(error)
