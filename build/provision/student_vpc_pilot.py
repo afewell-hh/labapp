@@ -70,8 +70,10 @@ LIBC_MINIMUM = '2.39'
 TOTAL_SECONDS = 150
 TEARDOWN_SECONDS = 20
 PREFLIGHT_SECONDS, PACKAGE_SECONDS, PLUGIN_SECONDS, CONFIG_SECONDS = 10, 30, 25, 15
-ACCEPT_SECONDS = 70
-AGENT_WAIT_SECONDS, AGENT_POLL_SECONDS = 30, 5
+ACCEPT_MARGIN_SECONDS = 5      # child startup/report/closure margin inside the original root work clock
+ACCEPT_SECONDS = TOTAL_SECONDS - TEARDOWN_SECONDS - ACCEPT_MARGIN_SECONDS  # maximum, never a fresh parent budget
+AGENT_WAIT_SECONDS, AGENT_POLL_SECONDS = 60, 5  # declared new inner maximum; always clipped below
+FINAL_WORK_SECONDS = 20       # keep lesson-end native queries out of the agent-wait allocation
 CALL_SECONDS = 15
 CHILD_CLOSE_SECONDS = 3.0      # owned_process final reap + group-convergence budget per child
 OUTPUT_LIMIT = 2048
@@ -98,7 +100,9 @@ RESULT_KEYS = ('agents', 'capacity', 'cleanup', 'code', 'config', 'packages', 'p
 # Closed lesson substep last ENTERED by the acceptance child (the failing one on a refusal; '-' when none ran).
 # Pre-apply substeps come first; 'manifest' onward are at or after the first possible mutation boundary.
 STEPS = ('-', 'binary', 'context', 'contexts', 'plugin', 'fabric', 'jq', 'vpc-absent', 'ipv4-read', 'vlan-read',
-         'namespaces', 'conflicts', 'manifest', 'apply', 'post-apply')
+         'namespaces', 'conflicts', 'manifest', 'apply', 'post-apply', 'vpc-readback', 'vpc-list',
+         'agents-list', 'vpc-describe', 'vpc-yaml', 'vpc-spec', 'agent-detail', 'agents-query',
+         'desired-state', 'dhcp-view', 'dhcp-jq', 'fabric-query', 'endstate', 'accept-budget', 'agent-budget')
 # Observed capacity booleans only: true/false when actually computed from a parsed read, null when not observed.
 CAPACITY_KEYS = ('ipv4_web', 'ipv4_worker', 'no_conflict', 'vlan_web', 'vlan_worker')
 CAPACITY_SUBNETS = (('web-servers', 'ipv4_web'), ('worker-nodes', 'ipv4_worker'))
@@ -158,7 +162,9 @@ class Conflict(Refused):
 
 
 class Timeout(Refused):
-    pass
+    def __init__(self, message, *, site=None):
+        super().__init__(message)
+        self.site = site
 
 
 class Uncertain(Refused):
@@ -353,13 +359,16 @@ def load_owned():
 
 class Clock:
     """Monotonic budget; ``reserve`` is held back for the teardown that must still run."""
-    def __init__(self, seconds, reserve=0):
+    def __init__(self, seconds, reserve=0, *, deadline=None, site=None):
         self.end, self.reserve = time.monotonic() + seconds, reserve
+        if deadline is not None:
+            self.end = min(self.end, deadline)
+        self.site = site
 
     def left(self):
         left = self.end - time.monotonic() - self.reserve
         if left <= 0:
-            raise Timeout('pilot budget exhausted')
+            raise Timeout('pilot budget exhausted', site=self.site)
         return left
 
 
@@ -621,6 +630,7 @@ def kube(args, clock, *, seconds=CALL_SECONDS, ok=(0,)):
         raise Timeout('kubectl call timed out')
     require(state == 'ok', 'kubectl output bound')
     require(code in ok, 'kubectl call refused')
+    clock.left()  # a positive response/child closure cannot outlive its original clock
     return code, out
 
 
@@ -836,57 +846,78 @@ def lesson(clock, state):
     state['uid'] = uid
     state['step'] = 'post-apply'
     emit({'event': 'uid', 'uid': uid})
+    state['step'] = 'vpc-readback'
     obj = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
     require((obj.get('metadata') or {}).get('uid') == uid, 'created VPC was replaced')
+    state['step'] = 'vpc-list'
     kube(['get', 'vpcs'], clock)
+    state['step'] = 'agents-list'
     kube(['get', 'agents'], clock)
     # Step 3: inspect.
+    state['step'] = 'vpc-describe'
     described = kube(['describe', 'vpc', VPC_NAME], clock)[1].decode('utf-8', 'replace')
     require(all(t in described for t in (VPC_NAME, '10.10.10.0/24', '10.10.20.0/24', '1010', '1020')), 'describe refused')
+    state['step'] = 'vpc-yaml'
     kube(['get', 'vpc', VPC_NAME, '-o', 'yaml'], clock)
+    state['step'] = 'vpc-spec'
     require(vpc_spec_ok(kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)), 'VPC spec differs from the request')
     # Step 4: reconciliation through all seven agents.
+    state['step'] = 'agents-list'
     kube(['get', 'agents'], clock)
+    state['step'] = 'agent-detail'
     require(b'conditions:' in kube(['get', 'agent', 'leaf-01', '-o', 'yaml'], clock)[1], 'leaf-01 conditions absent')
-    wait = Clock(min(AGENT_WAIT_SECONDS, clock.left()))
+    wait = Clock(min(AGENT_WAIT_SECONDS, clock.left() - FINAL_WORK_SECONDS), site='agent-budget')
+    # This window is clipped once and every boundary checks BOTH clocks.
+    poll_clock = types.SimpleNamespace(left=lambda: min(clock.left(), wait.left()))
     streak = 0
     while True:
-        count, good = agents_state(kube_json(['get', 'agents', '-o', 'json'], clock))
+        poll_clock.left()
+        state['step'] = 'agents-query'
+        count, good = agents_state(kube_json(['get', 'agents', '-o', 'json'], poll_clock))
+        poll_clock.left()
         require(count == AGENTS, 'agent count is not seven')
         state['agents'] = count
         streak = streak + 1 if good else 0
         if streak >= 2:
+            poll_clock.left()
             break
-        try:
-            wait.left()
-        except Timeout:
-            raise Timeout('agents did not converge') from None
-        SLEEP(AGENT_POLL_SECONDS)
+        SLEEP(min(AGENT_POLL_SECONDS, poll_clock.left()))
+        poll_clock.left()
     # Step 5: desired versus applied state; the lesson's kubectl JSONPath piped to jq.
+    state['step'] = 'desired-state'
     kube(['get', 'vpc', VPC_NAME, '-o', 'yaml'], clock)
+    state['step'] = 'dhcp-view'
     _, path = kube(['get', 'vpc', VPC_NAME, '-o', "jsonpath={.spec.subnets.worker-nodes.dhcp}"], clock)
+    state['step'] = 'dhcp-jq'
     code, piped, pstate = run_child(['jq', '.'], min(10, clock.left()), env=STUDENT_ENV, limit=4096, stdin=path or b'null')
     require(pstate == 'ok' and code == 0, 'jq pipe failed')
+    clock.left()
     dhcp = parse_json(piped)
     require(dhcp.get('enable') is True and dhcp.get('range') == DHCP_RANGE, 'jq DHCP view differs')
+    state['step'] = 'fabric-query'
     require(kube(['fabric', 'switch', 'ip', '--name', 'leaf-01'], clock)[1].strip(), 'read-only fabric query was empty')
     # End-state checkpoint: the lesson is complete BEFORE (and separately from) the harness teardown.
+    state['step'] = 'endstate'
     final = kube_json(['get', 'vpc', VPC_NAME, '-o', 'json'], clock)
     require((final.get('metadata') or {}).get('uid') == state['uid'] and vpc_spec_ok(final), 'end state refused')
     state['endstate'] = True
+    clock.left()
+    state['step'] = 'post-apply'  # successful final checkpoint retains the unchanged host gate
 
 
-def accept():
+def accept(deadline=None):
     """Child as ubuntu (`-I -` stdin program). Prints uid/done events only; always tears down what it created."""
     student_identity()
     state = {'uid': None, 'attempted': False, 'agents': 0, 'work': None, 'endstate': False,
              'step': '-', 'capacity': dict.fromkeys(CAPACITY_KEYS)}
     code = 'ok'
-    work = Clock(ACCEPT_SECONDS, TEARDOWN_SECONDS)
+    work = Clock(ACCEPT_SECONDS, TEARDOWN_SECONDS, deadline=deadline, site='accept-budget')
     try:
         lesson(work, state)
     except BaseException as error:
         code = classify(error)   # the primary outcome; nothing below may replace it
+        if isinstance(error, Timeout) and error.site in ('accept-budget', 'agent-budget'):
+            state['step'] = error.site
     shield()
     cleanup = 'not-needed'
     try:
@@ -985,8 +1016,16 @@ def run():
             raise Conflict('student config refused') if code == 3 else Refused('student config failed')
         result['config'] = events['config']
         result['phase'] = 'accept'
+        # Delegate an absolute end inside the ORIGINAL root work clock. Child
+        # startup cannot renew it, and the root keeps its original reserve.
+        allowance = min(ACCEPT_SECONDS + ACCEPT_MARGIN_SECONDS, clock.left())
+        accept_end = min(time.monotonic() + ACCEPT_SECONDS,
+                         clock.end - clock.reserve - ACCEPT_MARGIN_SECONDS)
+        if accept_end - time.monotonic() <= TEARDOWN_SECONDS:
+            result['step'] = 'accept-budget'
+            raise Timeout('no acceptance work budget remains')
         unfinished = True
-        code, events, state = student_child('accept', min(ACCEPT_SECONDS + 5, clock.left()), source)
+        code, events, state = student_child('accept', allowance, source, (format(accept_end, '.9f'),))
         result['vpc_uid'] = events.get('uid', '')
         done = events.get('done')
         if done is not None:
@@ -1008,6 +1047,9 @@ def run():
                 'student acceptance checks incomplete')
         result['phase'] = 'teardown'
         require(result['cleanup'] == 'removed', 'test-owned VPC was not removed')
+        # Preserve the child's primary verdict and safety evidence above. Only
+        # otherwise valid success is subject to this ORIGINAL root-clock guard.
+        clock.left()
         result['phase'], result['status'], result['code'] = 'done', 'passed', 'ok'
     except BaseException as error:
         result['code'] = classify(error)
@@ -1040,8 +1082,15 @@ def main(argv):
             return run()
         if mode == 'configure' and not extra:
             return configure_main()
-        if mode == 'accept' and not extra:
-            return accept()
+        if mode == 'accept' and len(extra) <= 1:
+            if not extra:
+                return accept()
+            if not re.fullmatch(r'[0-9]{1,12}(?:\.[0-9]{1,9})?', extra[0]):
+                return 2
+            deadline = float(extra[0])
+            if deadline > time.monotonic() + ACCEPT_SECONDS:
+                return 2
+            return accept(deadline)
         if mode == 'teardown' and len(extra) == 1 and (extra[0] == '-' or UID_RE.fullmatch(extra[0])):
             return teardown_only(extra[0])
     except Conflict:

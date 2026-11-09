@@ -2338,6 +2338,34 @@ the 160 s run cap. All of these are finite assumptions, not measured fit. The 20
 readiness, 45 minute work, 60 minute DELETE, two-boot flow, watchdog, work lock, mutation reconciliation
 and cleanup-uncertainty rules are unchanged. The pilot runs only on boot 1.
 
+The #567 guest composition delegates an absolute monotonic acceptance end from
+the remaining ORIGINAL 150 s root clock, keeping the root's 20 s teardown reserve
+and a 5 s child startup/report/closure margin. The acceptance child also holds
+back its unchanged 20 s UID-cleanup reserve; setup elapsed time is never replaced
+by a fresh allowance. Insufficient remaining time refuses before acceptance/apply.
+The former fixed 70 s child cap (50 s lesson work) is replaced by this clipped
+delegation, with maximum child total 125 s. The agent convergence policy deliberately
+changes from 30 s to **at most 60 s**, clipped once to available lesson work minus
+20 s for final lesson commands. The original parent end and the captured agent end
+are checked before/after each poll, sleep and second good poll; each native call
+retains its existing cap (15 s for lesson kubectl calls). All seven exact agents, applied
+generation checks, two consecutive good polls, lesson commands and final strict
+success gate remain required. The root checks its original work clock again after
+validating the returned child verdict and cleanup, before declaring success;
+late success fails while primary cancellation/refusal and unsafe-worker evidence
+keep their original precedence. Closed `step` values now distinguish post-apply
+operations and `accept-budget`/`agent-budget`; successful completion still reports
+`post-apply`, with no new report fields.
+
+The public #567 offline latency counterexamples use actual guest orchestration,
+lesson and cleanup with synthetic I/O and virtual clocks. They demonstrate the
+source budget gaps and compare the same frozen probe/helper across versions;
+they do not identify #566's initiating timeout or measure native performance.
+The native #566 publication interval (39.893 s) is not a guest monotonic-clock
+measurement. #566 failed and was fully retired; no boot-2/student success follows
+from that attempt. Source delivery requires Root's isolated validation and review
+before any separately admitted clone trial; it requires no new image build.
+
 A pass needs the exact closed guest report (`status` passed, phase done, code ok, `cleanup` removed,
 exactly 7 agents, packages/plugin/config not `-`, a created UID). Any other report, a malformed or
 oversized one, a remote failure, timeout or cancellation is a primary failure: the verified stop is
