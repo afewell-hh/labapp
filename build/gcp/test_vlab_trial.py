@@ -4676,7 +4676,8 @@ class PrivateCloneContracts(CloneCase):
         self.assertGreaterEqual(clone.stamp(m['termination']) - clone.stamp(m['work_deadline']), 15 * 60)
         self.assertRegex(m['name'], r'labapp-clone-[0-9a-f]{12}\Z')
         self.assertEqual(self.unit, 'labapp-clone-watch-' + m['name'][-12:] + '.service')
-        for field, value in (('image_id', '1'), ('source_disk_id', '2'), ('zone', 'us-east1-b'),
+        for field, value in (('image_name', 'labapp-private-r42446688327-a1'),
+                             ('image_id', '1'), ('source_disk_id', '2'), ('zone', 'us-east1-b'),
                              ('termination', clone.iso(clone.stamp(m['termination']) + 60)),
                              ('name', 'labapp-clone-000000000000')):
             with self.subTest(field), self.assertRaises(clone.Refused):
@@ -4698,7 +4699,7 @@ class PrivateCloneContracts(CloneCase):
         self.assertEqual((disk['boot'], disk['autoDelete'], disk['initializeParams']['diskSizeGb']), (True, True, '500'))
         self.assertTrue(disk['initializeParams']['diskType'].endswith('/pd-balanced'))
         self.assertEqual(disk['initializeParams']['sourceImage'],
-                         'projects/teched-473722/global/images/labapp-private-r42446688327-a1')
+                         'projects/teched-473722/global/images/labapp-private-r42546122725-a1')
         self.assertFalse({'labapp-lease', 'labapp-owner', 'labapp-run'} & set(body['labels']))
         self.assertNotIn('startup-script', {i['key'] for i in body['metadata']['items']})
 
@@ -4800,13 +4801,26 @@ class PrivateCloneOrchestration(CloneCase):
         self.assertFalse(self.store.has('insert-intent'))
 
     def test_image_preflight_before_intent(self):
-        for change in ({'sourceDiskId': '1'}, {'id': '2'}, {'status': 'PENDING'}):
-            with self.subTest(change):
+        # Exercise the real orchestration preflight: a preserved old READY image
+        # is not the new candidate, even when its entire old tuple is coherent.
+        cases = (
+            ('complete old tuple', {'name': 'labapp-private-r42446688327-a1',
+                                    'id': '1649408968157411841',
+                                    'sourceDiskId': '7292285895271663486', 'status': 'READY'}),
+            ('wrong name', {'name': 'labapp-private-r42446688327-a1'}),
+            ('wrong immutable ID', {'id': '1649408968157411841'}),
+            ('wrong source disk', {'sourceDiskId': '7292285895271663486'}),
+            ('not READY', {'status': 'PENDING'}),
+        )
+        for label, change in cases:
+            with self.subTest(label=label):
                 self.fresh_world()
                 self.world.image = dict(self.world.image, **change)
                 code, result = self.execute()
                 self.assertEqual((code, result['failure']), (1, 'Refused'))
+                self.assertEqual(result['phase'], 'preflight')
                 self.assertEqual((self.world.mutations, self.store.has('insert-intent')), ([], False))
+                self.assertEqual((self.world.vms, self.world.disks), ({}, {}))
 
     def test_unrelated_same_name_disk_is_never_deleted(self):
         foreign = self.world.make_disk(clone.build_body(self.manifest))
