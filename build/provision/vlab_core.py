@@ -1522,17 +1522,49 @@ def initial_readyz_failed(raw):
             or not raw.startswith(prefix) or not raw.endswith(suffix)):
         return False
     body = raw[len(prefix):-len(suffix)]
+    if b'\n' in body or b'\r' in body:
+        return False  # Go %q emits escaped newlines, never literal line breaks.
     lines = body.split(b'\\n')
-    if (len(lines) < 2 or lines[-1] != b'readyz check failed'
-            or len(body) - (len(lines) - 1) + 1 > 2048):
-        return False
-    failed = False
-    for line in lines[:-1]:
-        if not re.fullmatch(rb'(?:\[\+\][A-Za-z0-9][A-Za-z0-9._/-]* ok|'
-                            rb'\[-\][A-Za-z0-9][A-Za-z0-9._/-]* failed: reason withheld)', line):
+    plaintext = b'\n'.join(lines)
+    if plaintext.endswith((b' ', b'\n')):
+        return False  # These bytes would already have been removed by TrimSpace.
+    complete = re.compile(rb'(?:\[\+\][A-Za-z0-9][A-Za-z0-9._/-]* ok|'
+                          rb'\[-\][A-Za-z0-9][A-Za-z0-9._/-]* failed: reason withheld)')
+    if (len(lines) >= 2 and lines[-1] == b'readyz check failed'
+            and len(plaintext) + 1 <= 2048):
+        return all(complete.fullmatch(line) for line in lines[:-1]) and any(
+            line.startswith(b'[-]') for line in lines[:-1])
+
+    def health_prefix(value):
+        """Known full lines, then at most one valid partial health line/footer."""
+        parts = value.split(b'\n')
+        if not all(complete.fullmatch(line) for line in parts[:-1]):
             return False
-        failed |= line.startswith(b'[-]')
-    return failed
+        last = parts[-1]
+        # A partial failed marker alone proves no failed health check.
+        if not (any(line.startswith(b'[-]') for line in parts[:-1])
+                or complete.fullmatch(last) and last.startswith(b'[-]')):
+            return False
+        if not last or b'readyz check failed'.startswith(last):
+            return True
+        for marker, ending in ((b'[+]', b'ok'), (b'[-]', b'failed: reason withheld')):
+            if marker.startswith(last):
+                return True
+            if last.startswith(marker):
+                name, separator, rest = last[len(marker):].partition(b' ')
+                if not separator:
+                    return not name or bool(re.fullmatch(rb'[A-Za-z0-9][A-Za-z0-9._/-]*', name))
+                return bool(re.fullmatch(rb'[A-Za-z0-9][A-Za-z0-9._/-]*', name)) and ending.startswith(rest)
+        return False
+
+    # Source-supported cap compatibility, not proof the server body was longer.
+    # The restricted ASCII grammar has no adjacent whitespace: TrimSpace can
+    # remove only one trailing LF or space from its exact2048-byte prefix.
+    if len(plaintext) == 2048:
+        return health_prefix(plaintext)
+    if len(plaintext) == 2047:
+        return any(health_prefix(plaintext + end) for end in (b'\n', b' '))
+    return False
 
 
 # Pinned kubectl v0.35.0 client-side request timeout text (exact bytes, README).

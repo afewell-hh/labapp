@@ -864,10 +864,33 @@ quoted body, request-failure suffix and terminal newline. Within that body, one 
 exact `readyz check failed` footer, with at least one failed check. Names are restricted to ASCII
 alphanumeric-leading tokens containing alphanumerics, `.`, `_`, `/`, `-`; the checker inventory,
 order and failed subset are not hardcoded to the two-line fixture. Exclusions, warning lines,
-arbitrary reasons, quotes/other escapes, missing footer, mixed output and generic InternalError
-are not accepted. The reconstructed plaintext including its terminal newline must fit the pinned
-client-go **2048-byte pre-trim limit**; oversized or incomplete forms fail closed. This bound is
-derived from `rest/request.go::maxUnstructuredResponseTextBytes`, not a new output/runtime allowance.
+arbitrary reasons, quotes/other escapes, mixed output and generic InternalError are not accepted.
+Complete forms retain the footer and fit the pinned client-go **2048-byte pre-trim limit**.
+
+The pinned client caps plaintext at2048 bytes BEFORE `TrimSpace` and `%q`; a normal
+long health500 body can therefore lose its footer or stop inside a known health line.
+Only a cap-compatible prefix may additionally become Pending: the exact whole formatter,
+one or more complete known health lines with at least one complete failed line, followed
+by at most one valid prefix of the same health-line grammar or fixed footer. The decoded
+prefix must be exactly2048 bytes, or2047 when appending ONE LF or space reconstructs a
+valid2048-byte prefix. The restricted ASCII grammar has no adjacent whitespace, so no
+larger trimming allowance is used. Literal newlines inside `%q`, untrimmed trailing
+whitespace, unknown/mixed lines and all-positive prefixes remain fatal. This recognizes
+cap-compatible bytes, not proof that an unseen server body was longer or valid.
+
+Root's credential-free actual pinned-client/real-executor TLS fixture reproduced the
+gap: response2047/2048 retains the footer and was Pending;2049 retained the footer but
+failed the old decoded-plus-final-newline guard;2050/3200 lost the footer and failed.
+An actual healthy `ok` succeeded under the same original deadline. The extended fixture
+defines cap-at-LF/space, permanent HTTP/authentication failures, nonhealth/mixed text,
+wrong CA and final-read refusal controls; Root must execute them against the final head.
+Only source/path/test-data adaptation is used; this is
+not native initiating-byte provenance. Native560's observed truncated context is not
+proven inner-child output. Fixture execution/results belong to Root, not the source author.
+No new output/runtime allowance, route or command is introduced. All executed-child,
+exit1, original-message and confirmed-cleanup guards remain, final strict reads never
+retry, and Pending grants no readiness. Original fresh45min/resume15min,5s initial
+client/10s process caps and the existing readiness loop remain unchanged.
 
 This recognizes only observable formatter semantics, not raw HTTP headers or deployed server identity:
 apimachinery uses the same generic InternalError framing for several ≥500 status codes, and kubectl
