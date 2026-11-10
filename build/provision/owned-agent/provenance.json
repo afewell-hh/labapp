@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "ownership": "Labapp experimental unpublished derivative; not an official Hedgehog release or vendor-supported backport",
+  "version": "v0.96.2-labapp.576",
+  "upstream": {
+    "repository": "https://github.com/githedgehog/fabric",
+    "commit": "8b0aefa0937a95e51cc04ec3ea33fadb06782a99",
+    "tag": "v0.96.2",
+    "archive_sha256": "e9452bd87b619575c54e5d7114fb61e567975441990ebbbe2878e610fb389908",
+    "original_agent_go_sha256": "0741b2e4fd12a0b0bba45a42c360b2f4d8573286a54c5ea8971b13672d1c3721"
+  },
+  "patch": {
+    "path": "agent-startup.patch",
+    "sha256": "eb998c34052c2e134255b082624d7b21053052a3400267ed22b449b6d8f15997",
+    "patched_agent_go_sha256": "8895dc9e7a27f30072dd1c1de51d87cebf10d6c6d9b914bde76b8366b11397d1",
+    "only_modified_upstream_path": "pkg/agent/agent.go",
+    "unchanged": "All other original files, including API/controller/planner/MCLAG implementation, verified against exact archive"
+  },
+  "build": {
+    "image": "golang@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437",
+    "source_directory": "/out/candidate",
+    "environment": {"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64", "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off"},
+    "dependencies": "Exact archive vendor directory; network none",
+    "tags": "containers_image_openpgp,containers_image_storage_stub",
+    "ldflags": "-w -s -X go.githedgehog.com/fabric/pkg/version.Version=v0.96.2-labapp.576",
+    "commands": ["mkdir -p pkg/boot/nosinstall/bin && touch pkg/boot/nosinstall/bin/fabric-nos-install", "go build -p=2 -mod=vendor -tags containers_image_openpgp,containers_image_storage_stub -ldflags '<ldflags above>' -o pkg/boot/nosinstall/bin/fabric-nos-install ./cmd/fabric-nos-install", "go build -p=2 -mod=vendor -tags containers_image_openpgp,containers_image_storage_stub -ldflags '<ldflags above>' -o /out/bin/agent ./cmd/agent"],
+    "embedded_nos_install_bytes": 9240760,
+    "embedded_nos_install_sha256": "acf61bcb5dc0a2a323d44e31385798203c5866b441eb2fe58393a43093f04c42"
+  },
+  "parts": {
+    "owned-agent.bin": {"bytes": 102420664, "sha256": "aaa840f881672a7fe3a417ea433c56b8f72f752511baed543bef6e80d005e668"},
+    "owned-agent-manifest.json": {"bytes": 826, "sha256": "fd4edb6e86cb8285891f8d41cf57d282cb11a115bed9aca1e3e033018a70e80c"},
+    "owned-agent-config.json": {"bytes": 2, "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
+    "owned-agent-index.json": {"bytes": 315, "sha256": "b11ef59ec109d0abe557f5c3e05b3e807e0f5a20d8271df387251f90c3c5a3e9"},
+    "owned-agent-layout.json": {"bytes": 30, "sha256": "18f0797eab35a4597c1e9624aa4f15fd91f6254e5538c1e0d193b2a95dd4acc6"}
+  },
+  "artifact": {"format": "Genuine oras-go PackManifest OCI1.1 graph, separate extracted .oras cache", "artifact_type": "application/vnd.labapp.fabric-agent.v1", "manifest_digest": "sha256:fd4edb6e86cb8285891f8d41cf57d282cb11a115bed9aca1e3e033018a70e80c", "created_annotation": "2026-11-10T00:00:00Z", "published": false},
+  "evidence": {"issue": "https://github.com/afewell-hh/labapp/issues/576", "phase_a_freeze_sha256": "f7c41541147cd1cc4c554542d0d02750a39663fb45effb15f8369d4868357476", "phase_a_result_sha256": "6d4d625510b929eb408bd8fe56df2a2ffd37b539a416c8c59dd305c8c3d70300", "agent_version_output": "agent version v0.96.2-labapp.576"},
+  "limits": ["Controlled startup/watch/status mechanism with explicit hardware/file/action mocks; not whole Service.Run or native cause proof", "Representative actual MCLAG helpers; not full planner/VPC/dataplane proof", "No registry publication, control-registry import, deployed identity, VM/image acceptance, vendor support or cutover follows", "Future rebuild must verify resulting bytes against these pins or receive a new owned version/provenance review"]
+}

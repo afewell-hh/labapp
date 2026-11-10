@@ -1397,3 +1397,12 @@ class ScopeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OwnedAgentSealingNamesTests(unittest.TestCase):
+    def test_only_five_fixed_raw_parts_are_added_to_trial_sealing_inventory(self):
+        parts = {'owned-agent.bin', 'owned-agent-manifest.json', 'owned-agent-config.json',
+                 'owned-agent-index.json', 'owned-agent-layout.json'}
+        self.assertEqual({name for name in image.OWNED_NAMES if name.startswith('owned-agent')}, parts)
+        self.assertLessEqual(parts, trial.FILES)
+        self.assertNotIn('owned-agent-other.bin', image.OWNED_NAMES)

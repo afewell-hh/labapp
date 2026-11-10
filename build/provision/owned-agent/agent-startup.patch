@@ -1,0 +1,132 @@
+--- a/pkg/agent/agent.go
++++ b/pkg/agent/agent.go
+@@ -43,6 +43,7 @@
+ 	"go.githedgehog.com/fabric/pkg/version"
+ 	kmeta "k8s.io/apimachinery/pkg/api/meta"
+ 	kmetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	ktypes "k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/watch"
+ 	"k8s.io/client-go/util/retry"
+ 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+@@ -261,11 +262,15 @@
+ 	}
+ 
+ 	currentGen := agent.Generation
++	currentUID := agent.UID
+ 
+ 	err = kube.Get(ctx, kclient.ObjectKey{Name: agent.Name, Namespace: kmetav1.NamespaceDefault}, agent)
+ 	if err != nil {
+ 		return errors.Wrapf(err, "failed to get initial agent config from k8s")
+ 	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 
+ 	// reset observability state
+ 	now := kmetav1.Time{Time: time.Now()}
+@@ -283,6 +288,32 @@
+ 		agent.Status.Conditions = []kmetav1.Condition{}
+ 	}
+ 
++	// The file was processed successfully before this API read. Only attest the
++	// same object/config, including the RoCE state that may require a reboot.
++	inSync := agent.UID == currentUID && agent.Generation == currentGen
++	if inSync {
++		roce, err := svc.processor.GetRoCE(ctx)
++		if err != nil {
++			return errors.Wrap(err, "failed to get startup RoCE state")
++		}
++		if roce != agent.Spec.Switch.RoCE {
++			inSync = false
++			currentGen = 0 // internal watch cursor only; force normal reconciliation
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	condition := kmetav1.Condition{Type: "Applied", Status: kmetav1.ConditionFalse,
++		Reason: "ApplyPending", ObservedGeneration: agent.Generation,
++		LastTransitionTime: now, Message: fmt.Sprintf("Config will be applied, gen=%d", agent.Generation)}
++	if inSync {
++		condition.Status, condition.Reason = kmetav1.ConditionTrue, "ApplySucceeded"
++		condition.ObservedGeneration = currentGen
++		condition.Message = fmt.Sprintf("Config applied, gen=%d", currentGen)
++	}
++	kmeta.SetStatusCondition(&agent.Status.Conditions, condition)
++
+ 	if err := svc.processor.UpdateSwitchState(ctx, agent, svc.reg); err != nil {
+ 		return errors.Wrapf(err, "failed to update switch state")
+ 	}
+@@ -396,7 +427,7 @@
+ 				agent.Status = *svc.lastStatus
+ 			}
+ 
+-			err = svc.processAgentFromKube(ctx, kube, agent, &currentGen)
++			err = svc.processAgentFromKube(ctx, kube, agent, &currentGen, &currentUID)
+ 			if err != nil {
+ 				return errors.Wrap(err, "failed to process agent config from k8s")
+ 			}
+@@ -535,8 +566,11 @@
+ 	return errors.Wrapf(alloy.EnsureInstalled(ctx, agent), "failed to ensure alloy installed")
+ }
+ 
+-func (svc *Service) processAgentFromKube(ctx context.Context, kube kclient.Client, agent *agentapi.Agent, currentGen *int64) error {
+-	if agent.Generation == *currentGen {
++func (svc *Service) processAgentFromKube(ctx context.Context, kube kclient.Client, agent *agentapi.Agent, currentGen *int64, currentUID *ktypes.UID) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if agent.UID == *currentUID && agent.Generation == *currentGen {
+ 		return nil
+ 	}
+ 
+@@ -553,6 +587,7 @@
+ 		Type:               "Applied",
+ 		Status:             kmetav1.ConditionFalse,
+ 		Reason:             "ApplyPending",
++		ObservedGeneration: agent.Generation,
+ 		LastTransitionTime: kmetav1.Time{Time: time.Now()},
+ 		Message:            fmt.Sprintf("Config will be applied, gen=%d", agent.Generation),
+ 	})
+@@ -611,6 +646,7 @@
+ 		Type:               "Applied",
+ 		Status:             kmetav1.ConditionTrue,
+ 		Reason:             "ApplySucceeded",
++		ObservedGeneration: agent.Generation,
+ 		LastTransitionTime: kmetav1.Time{Time: time.Now()},
+ 		Message:            fmt.Sprintf("Config applied, gen=%d", agent.Generation),
+ 	})
+@@ -632,6 +668,7 @@
+ 	}
+ 
+ 	*currentGen = agent.Generation
++	*currentUID = agent.UID
+ 
+ 	return nil
+ }
+@@ -641,16 +678,25 @@
+ 	fetch := false
+ 
+ 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
+ 		if fetch {
+ 			slog.Debug("Fetching latest agent to update status")
+ 			if err := kube.Get(ctx, kclient.ObjectKeyFromObject(ag), ag); err != nil {
+ 				return fmt.Errorf("fetching latest agent: %w", err)
+ 			}
++			if ag.UID != agOrig.UID || ag.Generation != agOrig.Generation {
++				return fmt.Errorf("agent identity or generation changed before status publication")
++			}
+ 		}
+ 		fetch = true
+ 
+ 		ag.Status = agOrig.Status
+ 
++		if err := ctx.Err(); err != nil {
++			return err
++		}
+ 		if err := kube.Status().Update(ctx, ag); err != nil {
+ 			return fmt.Errorf("updating agent status: %w", err)
+ 		}

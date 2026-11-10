@@ -1001,6 +1001,8 @@ def validate_fab(raw):
              for d in docs] == [('Fabricator', 'default', 'fab'), ('ControlNode', 'control-1', 'fab')],
             'FAB object set refused')
     config = docs[0]['spec']['config']
+    require(docs[0]['spec'].get('overrides') == OWNED_OVERRIDE,
+            'owned agent override refused')
     control, fabric = config['control'], config['fabric']
     node = docs[1]['spec']
     require(all(d.get('apiVersion') == 'fabricator.githedgehog.com/v1beta1' for d in docs)
@@ -1090,7 +1092,7 @@ def prepare(input_path):
     yaml_documents(wiring)
     receipt = json_data(receipt_raw)
     tools = verify_prerequisites(receipt, deadline)
-    cache_preflight()
+    cache_preflight(deadline, owned=False)
     no_links(WORK)
     require(not WORK.exists() and not ROOT.exists(), 'existing state refused')
     ROOT.mkdir(mode=0o700)
@@ -1144,6 +1146,7 @@ def prepare(input_path):
         value['stage'] = 'import'
         with locked():
             save(value)
+        seed_owned_agent(Path(contract['fab']).parent, deadline)
         hhfab(['init'], deadline, ['--config', str(WORK / 'fab-input.yaml'),
                                   '--registry-repo', 'ghcr.io', '--registry-prefix', 'githedgehog',
                                   '--wiring', str(WORK / 'wiring-input.yaml')])
@@ -1189,16 +1192,123 @@ def verify_contract(value, deadline):
     require(prepared_snapshot(deadline) == value['static'], 'static inputs changed')
     verify_sources(value)
     require(verify_prerequisites(value['packages'], deadline) == value['tools'], 'tools changed')
-    cache_preflight()
+    cache_preflight(deadline)
 
 
-def cache_preflight():
+OWNED_AGENT_VERSION = 'v0.96.2-labapp.576'
+OWNED_OVERRIDE = {'versions': {'fabric': {'agent': OWNED_AGENT_VERSION}}}
+OWNED_PARTS = {
+    'owned-agent.bin': (102420664, 'aaa840f881672a7fe3a417ea433c56b8f72f752511baed543bef6e80d005e668'),
+    'owned-agent-manifest.json': (826, 'fd4edb6e86cb8285891f8d41cf57d282cb11a115bed9aca1e3e033018a70e80c'),
+    'owned-agent-config.json': (2, '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'),
+    'owned-agent-index.json': (315, 'b11ef59ec109d0abe557f5c3e05b3e807e0f5a20d8271df387251f90c3c5a3e9'),
+    'owned-agent-layout.json': (30, '18f0797eab35a4597c1e9624aa4f15fd91f6254e5538c1e0d193b2a95dd4acc6')}
+
+
+def owned_cache_name(suffix):
+    return 'fabric_agent@' + OWNED_AGENT_VERSION + suffix
+
+
+def owned_file(path, pin, deadline, uid):
+    observed = identity(path, True, deadline, limit=pin[0])
+    require(observed['uid'] == uid and observed['links'] == 1
+            and not observed['mode'] & 0o022
+            and (observed['size'], observed['sha256']) == pin,
+            'owned agent file refused')
+
+
+def owned_directory(path, names, uid):
+    observed = no_links(path).lstat()
+    require(stat.S_ISDIR(observed.st_mode) and observed.st_uid == uid
+            and not observed.st_mode & 0o022 and {p.name for p in path.iterdir()} == set(names),
+            'owned agent inventory refused')
+
+
+def owned_graph_paths():
+    return {'owned-agent-layout.json': 'oci-layout', 'owned-agent-index.json': 'index.json',
+            **{name: 'blobs/sha256/' + OWNED_PARTS[name][1] for name in
+               ('owned-agent.bin', 'owned-agent-manifest.json', 'owned-agent-config.json')}}
+
+
+def verify_owned_graph(path, deadline):
+    user = ubuntu().pw_uid
+    owned_directory(path, ('oci-layout', 'index.json', 'blobs'), user)
+    owned_directory(path / 'blobs', ('sha256',), user)
+    owned_directory(path / 'blobs/sha256',
+                    [OWNED_PARTS[name][1] for name in
+                     ('owned-agent.bin', 'owned-agent-manifest.json', 'owned-agent-config.json')], user)
+    # Exact A-produced JSON bytes bind version, manifest/config/layer descriptors,
+    # payload name, inventory and producer provenance; no untrusted normalization.
+    for name, relative in owned_graph_paths().items():
+        owned_file(path / relative, OWNED_PARTS[name], deadline, user)
+
+
+def seed_owned_agent(source, deadline):
+    """Fixed verified raw parts -> owned cache only. No fetch, unpack or overwrite."""
+    for name, pin in OWNED_PARTS.items():
+        owned_file(source / name, pin, deadline, ROOT_UID)
+    user = ubuntu()
+    for directory in (CACHE.parent, CACHE, CACHE / 'v1'):
+        no_links(directory)
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            os.chown(directory, user.pw_uid, user.pw_gid)
+        observed = directory.lstat()
+        require(stat.S_ISDIR(observed.st_mode) and observed.st_uid == user.pw_uid
+                and not observed.st_mode & 0o022, 'owned cache parent refused')
+
+    def copy_part(name, target):
+        remaining(deadline)
+        src = os.open(no_links(source / name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            dst = os.open(no_links(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchown(dst, user.pw_uid, user.pw_gid)
+                while True:
+                    remaining(deadline)
+                    chunk = os.read(src, LIMIT)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        remaining(deadline)
+                        written = os.write(dst, view)
+                        require(written > 0, 'owned agent copy refused')
+                        view = view[written:]
+            finally:
+                os.close(dst)
+        finally:
+            os.close(src)
+        owned_file(target, OWNED_PARTS[name], deadline, user.pw_uid)
+
+    graph = CACHE / 'v1' / owned_cache_name('.oci')
+    if not os.path.lexists(graph):
+        for directory in (graph, graph / 'blobs', graph / 'blobs/sha256'):
+            directory.mkdir(mode=0o700)
+            os.chown(directory, user.pw_uid, user.pw_gid)
+        for name, relative in owned_graph_paths().items():
+            copy_part(name, graph / relative)
+    verify_owned_graph(graph, deadline)
+    extracted = CACHE / 'v1' / owned_cache_name('.oras')
+    if not os.path.lexists(extracted):
+        extracted.mkdir(mode=0o700)
+        os.chown(extracted, user.pw_uid, user.pw_gid)
+        copy_part('owned-agent.bin', extracted / 'agent')
+    cache_preflight(deadline)
+
+
+def cache_preflight(deadline=None, *, owned=True):
     no_links(CACHE)
-    for directory in (CACHE.parent, CACHE):
+    for directory in (CACHE.parent, CACHE, *((CACHE / 'v1',) if owned else ())):
         if directory.exists():
             observed = directory.lstat()
             require(stat.S_ISDIR(observed.st_mode) and observed.st_uid == ubuntu().pw_uid
                     and not observed.st_mode & 0o022, 'cache directory refused')
+    if owned:
+        verify_owned_graph(CACHE / 'v1' / owned_cache_name('.oci'), deadline)
+        extracted = CACHE / 'v1' / owned_cache_name('.oras')
+        owned_directory(extracted, ('agent',), ubuntu().pw_uid)
+        owned_file(extracted / 'agent', OWNED_PARTS['owned-agent.bin'], deadline, ubuntu().pw_uid)
 
 
 def fresh_preflight(value):
@@ -1270,6 +1380,7 @@ def vm_config():
 def critical_snapshot(deadline):
     """Complete no-rebuild inputs; mutable disk bytes/size/times are intentionally omitted."""
     vm_config()
+    verify_owned_graph(WORK / 'result' / RESULT / owned_cache_name('.oci'), deadline)
     optional_runtime_paths()
     require({p.name for p in WORK.iterdir()} == {'fab.yaml', '.registry.yaml', 'fab-input.yaml',
             'wiring-input.yaml', 'include', 'result', 'vlab'}, 'unexpected work entries')
@@ -1696,6 +1807,8 @@ PROJECTION_FABRIC_VERSION = 'v0.96.2'
 # This is one named typed-empty representation, not recursive empty pruning.
 PROJECTION_EMPTY_OVERRIDES = {'versions': {'platform': {}, 'fabricator': {}, 'fabric': {},
                                           'gateway': {}, 'vlab': {}}}
+PROJECTION_OWNED_OVERRIDES = {'versions': {'platform': {}, 'fabricator': {},
+    'fabric': {'agent': OWNED_AGENT_VERSION}, 'gateway': {}, 'vlab': {}}}
 FABRIC_LABELS = 'fabric.githedgehog.com/'
 CONNECTION_TYPE_LABELS = {'unbundled': 'unbundled', 'bundled': 'bundled', 'mclag': 'mclag',
                           'eslag': 'eslag', 'mclagDomain': 'mclag-domain', 'fabric': 'fabric'}
@@ -1718,13 +1831,15 @@ def projection_binding(expected):
             or type(spec.get('config')) is not dict):
         raise projection_refused()
     overrides = spec.get('overrides', {})
-    if type(overrides) is not dict or overrides not in ({}, {'versions': {}}, PROJECTION_EMPTY_OVERRIDES):
+    if type(overrides) is not dict or overrides not in (OWNED_OVERRIDE, PROJECTION_OWNED_OVERRIDES):
         raise projection_refused()
     status = fab.get('status')
     versions = status.get('versions') if type(status) is dict else None
     fabric = versions.get('fabric') if type(versions) is dict else None
     require(type(fabric) is dict and all(type(fabric.get(key)) is str
-            and fabric[key] == PROJECTION_FABRIC_VERSION for key in ('api', 'controller', 'agent')),
+            and fabric[key] == version for key, version in
+            (('api', PROJECTION_FABRIC_VERSION), ('controller', PROJECTION_FABRIC_VERSION),
+             ('agent', OWNED_AGENT_VERSION))),
             'expected projection version binding refused')
     # Fabricator status strings are not binary identity. In particular the public
     # upstream oracle honestly retains its ordinary Go '(devel)' status; no such

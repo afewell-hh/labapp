@@ -56,9 +56,14 @@ SOURCES = {
 SOURCES['wiringd.yaml'] = 'build/provision/course-wiring.yaml'
 PAYLOADS = {
     'hhfab.tar.gz': (93055151, 'b1387342191a329772c2595504ec6ff129eb45980727c1c86d9901ef4d9f37a4'),
-    'kubectl': (58597560, 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989')}
+    'kubectl': (58597560, 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989'),
+    'owned-agent.bin': (102420664, 'aaa840f881672a7fe3a417ea433c56b8f72f752511baed543bef6e80d005e668'),
+    'owned-agent-manifest.json': (826, 'fd4edb6e86cb8285891f8d41cf57d282cb11a115bed9aca1e3e033018a70e80c'),
+    'owned-agent-config.json': (2, '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'),
+    'owned-agent-index.json': (315, 'b11ef59ec109d0abe557f5c3e05b3e807e0f5a20d8271df387251f90c3c5a3e9'),
+    'owned-agent-layout.json': (30, '18f0797eab35a4597c1e9624aa4f15fd91f6254e5538c1e0d193b2a95dd4acc6')}
 FILES = {*SOURCES, *PAYLOADS, 'fab.yaml', 'contract.json'}
-MAX_TOTAL = 160 * 1024**2  # transfer table, separate from 160GiB guest cache cap
+MAX_TOTAL = 256 * 1024**2  # measured #576 raw parts; all time/cache/resource bounds unchanged
 MAX_SOURCE = 256 * 1024
 AUX = ('sudo', 'socat', 'openssh-client', 'less', 'iproute2', 'systemd',
        'kmod', 'procps', 'python3-minimal', 'python3-yaml', 'ca-certificates',
@@ -249,7 +254,8 @@ def candidate_fab(public_key, password_hash, token):
         'fabricSubnet': '172.30.128.0/17', 'mclagSessionSubnet': '172.30.95.0/31', 'vpcWorkaroundSubnet': '172.30.96.0/19'},
         'observability': {'defaults': ''}}
     docs = [{'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'Fabricator',
-             'metadata': {'name': 'default', 'namespace': 'fab'}, 'spec': {'config': config}},
+             'metadata': {'name': 'default', 'namespace': 'fab'}, 'spec': {'config': config,
+              'overrides': {'versions': {'fabric': {'agent': 'v0.96.2-labapp.576'}}}}},
             {'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'ControlNode',
              'metadata': {'name': 'control-1', 'namespace': 'fab'}, 'spec': {'bootstrap': {'disk': '/dev/sda'},
               # Leave both management/dummy allocation to official if-not-present

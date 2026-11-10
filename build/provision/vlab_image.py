@@ -86,7 +86,9 @@ _SOURCE_NAMES = (
     'ensure-bridge-ipv4.py', 'journald@labapp-vlab.conf', 'labapp-vlab-fresh.service',
     'hhfab-vlab-resume.service', 'install-qemu.py', 'qemu_offline.py', 'qemu_acquire.py',
     'prepare-qemu-offline.sh', 'install-docker.py', 'install-hhfab.py', 'hhfab_release.py',
-    'install-kubectl.py', 'wiringd.yaml', 'hhfab.tar.gz', 'kubectl', 'fab.yaml')
+    'install-kubectl.py', 'wiringd.yaml', 'hhfab.tar.gz', 'kubectl', 'fab.yaml',
+    'owned-agent.bin', 'owned-agent-manifest.json', 'owned-agent-config.json',
+    'owned-agent-index.json', 'owned-agent-layout.json')
 _STATE_NAMES = (
     'phase.json', 'heartbeat.json', 'measurements.json', 'nonce-receipt.json', 'worker-status.json',
     'result.json', 'installer-failure.json')
