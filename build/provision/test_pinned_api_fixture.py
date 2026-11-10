@@ -7,6 +7,11 @@ printers and typed defaults. GuestEnvironment supplies readiness/node/kubeconfig
 VM-config fakes. No native commands, credentials or network are used by this suite.
 Expected metadata below is written from endpoint/type tables, not derived by
 reusing the production matcher.
+
+These unchanged oracle bytes describe the historical official43/96 profile.
+Only its initial projection-binding gate is adapted below, using the exact
+d914 function body; the production projector/matcher still runs. The active
+owned-artifact gate is separately required to reject that historical tuple.
 """
 from collections import Counter
 import copy
@@ -81,6 +86,40 @@ EXPECTED_TYPED_CONTROL = {**PUBLIC_CONTROL, 'dummy': {}}
 TYPED_EMPTY_OVERRIDES = {'versions': {'platform': {}, 'fabricator': {}, 'fabric': {},
                                     'gateway': {}, 'vlab': {}}}
 EMPTY = ('""', '0', 'false', 'null', '[]', '{}')
+
+# Test-only historical d914 profile. No runtime fallback or fixture rewriting.
+ACTIVE_PROJECTION_BINDING = core.projection_binding
+require = core.require
+projection_refused = core.projection_refused
+TOOL_PINS, HHFAB = core.TOOL_PINS, core.HHFAB
+PROJECTION_HHFAB_PIN = (170709176, 'b5c7e0265339b9b95fa1073967bfb6c6fede6086755c85eca24cb80637b04e37')
+PROJECTION_FABRIC_VERSION = 'v0.96.2'
+PROJECTION_EMPTY_OVERRIDES = TYPED_EMPTY_OVERRIDES
+
+
+def historical_projection_binding(expected):
+    """Bind to the trusted hhfab pin and actual affected installer version fields."""
+    require(TOOL_PINS.get(HHFAB) == PROJECTION_HHFAB_PIN, 'expected projection version binding refused')
+    fabricators = [d for d in expected if d.get('kind') == 'Fabricator']
+    if len(fabricators) != 1:
+        raise projection_refused()
+    fab = fabricators[0]
+    spec = fab.get('spec')
+    if (fab.get('apiVersion') != 'fabricator.githedgehog.com/v1beta1' or type(spec) is not dict
+            or type(spec.get('config')) is not dict):
+        raise projection_refused()
+    overrides = spec.get('overrides', {})
+    if type(overrides) is not dict or overrides not in ({}, {'versions': {}}, PROJECTION_EMPTY_OVERRIDES):
+        raise projection_refused()
+    status = fab.get('status')
+    versions = status.get('versions') if type(status) is dict else None
+    fabric = versions.get('fabric') if type(versions) is dict else None
+    require(type(fabric) is dict and all(type(fabric.get(key)) is str
+            and fabric[key] == PROJECTION_FABRIC_VERSION for key in ('api', 'controller', 'agent')),
+            'expected projection version binding refused')
+    # Fabricator status strings are not binary identity. In particular the public
+    # upstream oracle honestly retains its ordinary Go '(devel)' status; no such
+    # string can substitute for the existing verified production binary pin.
 
 
 def flat(value, prefix='', out=None):
@@ -169,6 +208,7 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
         self.actual_docs = None
         self.prepared()
         self.runtime_files()
+        self.stack.enter_context(patch.object(core, 'projection_binding', historical_projection_binding))
         self.assertEqual(len(self.defaulted), 45)
 
     def command(self, argv, deadline, *args, **kwargs):
@@ -274,6 +314,11 @@ class PinnedApiAsymmetry(GuestEnvironment, unittest.TestCase):
         self.assertEqual(set(printed), set(defaulted))
         differing = Counter(i[1] for i in printed if printed[i] != defaulted[i])
         self.assertEqual(differing, Counter({'Switch': 7, 'Connection': 21}))
+
+    def test_unpatched_active_binding_rejects_unchanged_historical_oracle(self):
+        with self.assertRaises(core.Failure):
+            ACTIVE_PROJECTION_BINDING(copy.deepcopy(self.printed))
+        self.assertEqual(core.OWNED_AGENT_VERSION, 'v0.96.2-labapp.576')
 
     def test_independent_printed_projects_to_upstream_observed(self):
         before = copy.deepcopy(self.printed)
