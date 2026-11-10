@@ -3212,3 +3212,36 @@ reconcilers continue. The host work lock does not enforce Kubernetes writer excl
 preflight plus successful `apply -o json` response establishes ownership only under that assumption;
 creation with concurrent writers and shared-cluster ownership safety remain unproven. The later
 UID-conditioned delete protects against a replaced object but does not turn apply into creation proof.
+
+### Experimental owned Fabric96 startup producer (#576)
+
+The current candidate keeps official hhfab/Fabricator 0.43.1, Fabric API/controller
+0.96.2, the course topology and MCLAG planner, and selects only agent
+`v0.96.2-labapp.576`. This is an unpublished Labapp derivative, not an official
+Hedgehog release or a vendor-supported backport. The exact producer patch and
+build/artifact ownership record are in `owned-agent/`. Historical official96
+fixtures and earlier build evidence retain their original meaning.
+
+Supply the five exact public raw parts named in `vlab_trial.PAYLOADS` alongside
+the existing hhfab archive and kubectl. Their aggregate with the two existing
+payloads is 254,074,548 bytes. The explicitly measured transfer-table limit is
+256MiB; each source file remains bounded to 256KiB, the guest cache/staging cap
+remains 160GiB, and all phase, command, cleanup and outer clocks remain unchanged.
+The complete prospective manifest must fit the table limit. Native transfer and
+build timing within those original clocks is still unproved.
+
+Core validates each part before creating the fixed owned-version `.oci` and
+`.oras` cache directories. Existing foreign, changed, linked or extra contents
+are refused rather than overwritten; missing owned inputs cannot fall back to a
+remote owned-version download. Fresh/resume checks bind the exact graph and
+binary, and readiness snapshots require the same graph in the control installer.
+Only the exact agent override and API/controller96.2 plus owned-agent tuple are
+accepted. Other official components and registry configuration remain unchanged.
+
+Phase A proved the real nos-install embed/full agent build, controlled producer
+mechanism, representative MCLAG helper equality, actual43 strict loading/component
+selection and `.oras` cache consumption. The actual43 airgap path separately
+requires `.oci` GetOCI and local OCI parser/copy validation; cache hits alone do
+not authenticate artifacts. No control-registry import, deployed agent identity,
+VM/image readiness, full-course acceptance, release/cutover or hold release is
+implied by these offline source checks.

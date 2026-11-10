@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -74,7 +75,7 @@ def public_fab():
     return [{'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'Fabricator',
              'metadata': {'name': 'default', 'namespace': 'fab'}, 'spec': {'config': {
                  'control': control, 'fabric': fabric, 'registry': {'mode': 'airgap'},
-                 'observability': {'defaults': ''}}}},
+                 'observability': {'defaults': ''}}, 'overrides': copy.deepcopy(core.OWNED_OVERRIDE)}},
             {'apiVersion': 'fabricator.githedgehog.com/v1beta1', 'kind': 'ControlNode',
              'metadata': {'name': 'control-1', 'namespace': 'fab'}, 'spec': {
                  'bootstrap': {'disk': '/dev/sda'}, 'external': {'interface': 'enp2s0', 'ip': 'dhcp'},
@@ -126,7 +127,7 @@ def installer_versions(docs):
     for doc in docs:
         if doc['kind'] == 'Fabricator':
             doc['status'] = {'versions': {'fabric': {'api': 'v0.96.2',
-                'controller': 'v0.96.2', 'agent': 'v0.96.2'}}}
+                'controller': 'v0.96.2', 'agent': core.OWNED_AGENT_VERSION}}}
     return docs
 
 
@@ -155,6 +156,15 @@ class GuestEnvironment:
         self.patch('MOUNTINFO', self.base / 'mountinfo')
         self.patch('CGROUP', self.base / 'cgroup')
         self.patch('ROOT_UID', os.getuid())
+        # Small public raw-part fixtures exercise the real copy/hash/inventory
+        # code. Real A graph/API/OCI compatibility has separate isolated proof.
+        self.owned_parts = {name: ('PUBLIC-SYNTHETIC-' + name).encode() for name in core.OWNED_PARTS}
+        self.patch('OWNED_PARTS', {name: (len(raw), core.digest(raw))
+                                 for name, raw in self.owned_parts.items()})
+        for name, raw in self.owned_parts.items():
+            target = self.base / name
+            target.write_bytes(raw)
+            target.chmod(0o600)
         self.user = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir='/home/ubuntu')
         self.stack.enter_context(patch.object(core, 'ubuntu', return_value=self.user))
         self.stack.enter_context(patch.object(core, 'verify_prerequisites', return_value={'synthetic': 'tools'}))
@@ -260,6 +270,8 @@ class GuestEnvironment:
         target = installer / 'hhfab-recipe'
         target.write_bytes(b'PUBLIC_NOT_EXECUTABLE')
         target.chmod(0o600)
+        shutil.copytree(core.CACHE / 'v1' / core.owned_cache_name('.oci'),
+                        installer / core.owned_cache_name('.oci'))
         installed_fab = installer_versions(copy.deepcopy(self.fab))
         (installer / 'fab.yaml').write_bytes(yaml.safe_dump_all(installed_fab, sort_keys=False).encode())
         (installer / 'fab.yaml').chmod(0o600)
@@ -4203,6 +4215,63 @@ class RegistryCredentialEnvironment(unittest.TestCase):
                 core.unit_run('resume')
         critical.assert_not_called()
         replace.assert_not_called()
+
+
+class OwnedAgentTests(GuestEnvironment, unittest.TestCase):
+    def test_real_seed_is_idempotent_and_preserves_exact_cache_graph(self):
+        end = time.monotonic() + 10
+        core.seed_owned_agent(self.base, end)
+        graph = core.CACHE / 'v1' / core.owned_cache_name('.oci')
+        before = {p: p.stat().st_ino for p in graph.rglob('*')}
+        core.seed_owned_agent(self.base, end)
+        self.assertEqual(before, {p: p.stat().st_ino for p in graph.rglob('*')})
+        core.cache_preflight(end)
+        self.assertFalse(self.calls)
+
+    def test_corrupt_missing_linked_and_expired_parts_refuse_before_cache_creation(self):
+        part = self.base / 'owned-agent.bin'
+        raw = part.read_bytes()
+        for kind in ('corrupt', 'missing', 'symlink', 'hardlink', 'expired'):
+            with self.subTest(kind=kind):
+                part.unlink()
+                if kind == 'corrupt': part.write_bytes(b'bad')
+                elif kind == 'symlink': part.symlink_to(self.base / 'owned-agent-config.json')
+                elif kind == 'hardlink': os.link(self.base / 'owned-agent-config.json', part)
+                elif kind == 'expired': part.write_bytes(raw)
+                with self.assertRaises((core.Failure, FileNotFoundError)):
+                    core.seed_owned_agent(self.base, time.monotonic() + (-1 if kind == 'expired' else 10))
+                self.assertFalse(core.CACHE.exists())
+                if os.path.lexists(part): part.unlink()
+                part.write_bytes(raw)
+                part.chmod(0o600)
+
+    def test_cache_corruption_and_foreign_inventory_are_not_repaired(self):
+        end = time.monotonic() + 10
+        core.seed_owned_agent(self.base, end)
+        binary = core.CACHE / 'v1' / core.owned_cache_name('.oras') / 'agent'
+        binary.write_bytes(b'foreign')
+        with self.assertRaises(core.Failure): core.seed_owned_agent(self.base, end)
+        self.assertEqual(binary.read_bytes(), b'foreign')
+        binary.write_bytes(self.owned_parts['owned-agent.bin'])
+        graph = core.CACHE / 'v1' / core.owned_cache_name('.oci')
+        (graph / 'foreign').write_bytes(b'foreign')
+        with self.assertRaises(core.Failure): core.cache_preflight(end)
+        self.assertFalse(self.calls)
+
+    def test_installer_missing_owned_blob_prevents_critical_authority(self):
+        self.fresh()
+        graph = core.WORK / 'result' / core.RESULT / core.owned_cache_name('.oci')
+        (graph / 'blobs/sha256' / core.OWNED_PARTS['owned-agent.bin'][1]).unlink()
+        with self.assertRaises(core.Failure): core.critical_snapshot(time.monotonic() + 10)
+
+    def test_only_owned_agent_override_and_exact_component_tuple_are_accepted(self):
+        docs = installer_versions(public_fab())
+        core.projection_binding(docs)
+        for change in ('old-agent', 'controller', 'override'):
+            bad = copy.deepcopy(docs)
+            if change == 'override': bad[0]['spec']['overrides']['versions']['fabric']['controller'] = 'v0.96.2'
+            else: bad[0]['status']['versions']['fabric']['agent' if change == 'old-agent' else 'controller'] = 'v0.96.2' if change == 'old-agent' else 'v0.96.3'
+            with self.assertRaises(core.Failure): core.projection_binding(bad)
 
 
 if __name__ == '__main__':

@@ -5030,3 +5030,28 @@ class InstallerFailureEvidence(unittest.TestCase):
         for operation in (['aux-update'], None, b'aux-update'):
             self.assertFalse(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': operation,
                                                        'category': 'child-exit', 'child_status': 100}))
+
+
+class OwnedAgentPayloadTests(unittest.TestCase):
+    def test_measured_payload_pins_whole_manifest_and_exact_override(self):
+        import vlab_core as core
+        self.assertEqual({name: trial.PAYLOADS[name] for name in core.OWNED_PARTS}, core.OWNED_PARTS)
+        self.assertEqual(sum(size for size, _ in trial.PAYLOADS.values()), 254074548)
+        self.assertEqual(trial.MAX_TOTAL, 256 * 1024**2)
+        raw = trial.candidate_fab('ssh-ed25519 AAAAPUBLIC', '$5$public$' + 'A'*43, 'b'*64)
+        contract_raw = trial.encoded(trial.contract(value()))
+        repo = Path(__file__).resolve().parents[2]
+        files = {name: {'bytes': len((repo / source).read_bytes()),
+                        'sha256': trial.sha((repo / source).read_bytes())}
+                 for name, source in trial.SOURCES.items()}
+        files.update({name: {'bytes': size, 'sha256': sha} for name, (size, sha) in trial.PAYLOADS.items()})
+        files.update({name: {'bytes': len(content), 'sha256': trial.sha(content)}
+                      for name, content in (('fab.yaml', raw), ('contract.json', contract_raw))})
+        whole = {'schema': 1, 'source_sha': 'b'*40, 'files': files}
+        trial.manifest(whole)
+        self.assertLess(sum(v['bytes'] for v in files.values()), trial.MAX_TOTAL)
+        with patch.object(trial, 'MAX_TOTAL', sum(v['bytes'] for v in files.values()) - 1):
+            with self.assertRaises(trial.Failure): trial.manifest(whole)
+        import yaml
+        docs = list(yaml.safe_load_all(raw))
+        self.assertEqual(docs[0]['spec']['overrides'], {'versions': {'fabric': {'agent': 'v0.96.2-labapp.576'}}})
