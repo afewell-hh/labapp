@@ -1340,14 +1340,125 @@ student access, Linux boot, full VLAB, networking, reboot or image readiness.
 ```bash
 python3 -m unittest discover -s build/provision -p test_qemu.py -v
 python3 -m unittest discover -s build/provision -p test_qemu_offline.py -v
+python3 -m unittest discover -s build/provision -p test_qemu_auth_control.py -v
 # Separately scoped lead execution only: runs the loopback apt-helper transport
 # fixture (retry/404/digest/deadline; HTTP only, not TLS or signature proof)
-# before any public snapshot request, then strict signature/missing-pin checks.
+# before any public snapshot request, then missing-pin and real install/rerun,
+# followed by the required local authentication stage and runtime witness.
 timeout --kill-after=30s 20m bash build/provision/test-qemu.sh
+# Separate fixed authentication-only entry: no QEMU installer, install/rerun,
+# transport witness or VM. Preparation uses current Ubuntu mirrors, not snapshot.
+# Expected UNQUALIFIED/nonzero pending verified native diagnostic correlation.
+timeout --kill-after=30s 20m env -i PATH=/usr/bin:/bin \
+  bash build/provision/test-qemu.sh --auth-only
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh
 # Separate lead scope required; not activated by ordinary CI:
 timeout --kill-after=30s 20m bash build/provision/test-qemu-offline.sh --selection baseline-20260114
 ```
+
+#### Local signed-metadata authentication controls (#447 Tier 1, test-only)
+
+`qemu_auth_control.py run` replaces only the former *online* empty-key control, so
+that one external dependency (the public snapshot) is removed from it. It does
+**not** fix CI outages: the genuine online install/rerun, the offline controls,
+TCG/KVM refusal, the transport controls and the missing-pin check (still original
+HTTPS) are unchanged. Full `test-qemu.sh` runs it once (lane 1) in a separate
+`--network=none` root container created from the committed prepared image, after
+the network preparation and before the runtime container. A suite pass requires
+that stage to have run and exited 0 (`auth_runs == 1`); package acquisition stays in
+the preparation container. No new overall timeout or retry allowance; the stage has
+a 150 s/170 s bound, 25 s per case and at most 64 requests per case.
+
+For cheap outage-independent fixture diagnosis, the fixed `--auth-only` entry
+prepares only the same pinned Python/CA packages and checks the base distribution
+keyring, then commits that image and runs the disconnected auth container. It
+does **not** call `qemu_container.py install` or `runtime`, launch QEMU or run a
+VM; neither its reports nor a future success count as full-suite qualification.
+Preparation still needs Ubuntu current-mirror availability. No caller-supplied
+commands, executable paths, image tags, daemon endpoints or source overrides are
+accepted. Full mode retains both original online install/rerun lanes, the one
+required auth run, transport/TCG/KVM refusals and the original 20-minute ceiling.
+The separate offline install/rerun launcher is unchanged.
+
+The host launcher uses a fresh owned 0700 Docker config and HOME, a literal empty
+config, an empty Docker-client environment, trusted fixed PATH and `/usr/bin/docker`
+against only `unix:///var/run/docker.sock`. It never reads the real host Docker
+config, credential helpers, contexts or proxy settings. No host configuration is
+copied into a guest. Required caller prerequisites: a reviewed checkout, trusted
+system executables/local daemon, a clean invoking shell (no startup hooks or
+exported function injection), and separately authorized execution. These controls
+are not an OS sandbox or protection against a compromised host/daemon. Synthetic
+sentinel tests exercise client config/environment separation without reading real
+host secrets.
+
+Inside it, a closed-route stdlib loopback HTTP server serves three **unchanged
+public** snapshot `InRelease` files (noble 255850 B, noble-updates 126125 B,
+noble-security 126127 B; total 508102 B; SHA-256 pinned in the module) from
+`fixtures/ubuntu-snapshot-20261024T000000Z/`. The real production
+`qemu_offline.setup()` workspace and `apt-get ... -o APT::Update::Error-Mode=any update`
+are used; the test asserts the exact production three-line `sources.list`, then
+changes only each URI (and `signed-by` for the empty-key cases). Production
+options, pins, freshness, `Error-Mode=any`, retries and `signature_proof` are
+untouched. Every accepted socket has an atomically admitted ledger row before a
+handler can start. Rows retain bounded sanitized method/path/headers/status,
+the **full** intended-body SHA-256 and length, separate write-attempt/completion/
+failure observations and their global event order. A successful socket write
+does **not** prove client receipt; partial/failed writes cannot qualify delivery.
+The ledger allows 64 requests plus one terminal over-budget socket row, then
+stops accepting; concurrent admission cannot keep serving past the limit.
+Unknown verbs, malformed/unfinished requests, unexpected headers and write failures
+also fail qualification. Complete bounded ledgers are printed on success and
+failure, not shortened hashes or only error tails. Only controlled public fixture
+data is reportable; arbitrary header values and unsafe diagnostic lines are
+withheld. Native output is capped at 4 MiB before sanitized JSON serialization.
+Unexplained
+paths, non-GET methods, conditional/range headers, redirects and external fallback
+are failures. Each case uses a fresh workspace; packages and `/etc/apt` must be
+unchanged and no `apt-get install` is ever invoked.
+
+Cases, in order (each later case is not relied on unless the first qualifies):
+
+1. **Native positive probe** (valid keyring, intact releases, fresh lists/cache). It
+   adds two *diagnostic-only* `Debug::` options, so it is a separate probe. Update
+   must exit **nonzero** because index files are deliberately absent (explicit
+   index-absence 404 paths); that is never a successful update. **Currently it
+   ALWAYS refuses UNQUALIFIED**, even with global `GOODSIG`/`VALIDSIG` tokens and
+   later index requests. Those observations cannot associate each suite's genuine
+   verification → metadata-policy acceptance → subsequent authenticated index
+   scheduling. Exact APT 2.8.3 diagnostic semantics are not verified; no speculative
+   parser or synthetic parser pass is provided. One separately authorized bounded
+   auth-only run can capture complete bounded sanitized native diagnostics and
+   delivery ledgers for ROOT's review. A subsequently reviewed exact native
+   correlation (or separately scoped Tier 2 positive) is required before any
+   negative control can be relied upon. Later cases remain gated, not skipped
+   while claiming success.
+2. **Empty key**: genuine `NO_PUBKEY` via the unchanged `signature_proof`, all three
+   releases completely written 200 with exact bytes, no other request, no mixed
+   transport, including transport errors in APT output despite three 200 rows.
+3. **Tampered, valid key**: one signed-cleartext byte flipped in all three releases
+   (armor/signature untouched); requires an explicit bad-signature refusal that is
+   *not* `NO_PUBKEY` and that `signature_proof` rejects.
+4. **Persistent 502** and 5. **503**: real APT retries; both must remain
+   transport-only failures rejected by the unchanged `signature_proof`, with
+   exactly `1 + Acquire::Retries` requests per release.
+
+Limits and open facts: the real fixture bytes are staged and the required offline
+unit test refuses missing/mismatched bytes rather than skipping. The
+`Debug::` option output, the exact error text and whether APT 2.8.3 issues other
+requests (for example `Release`/`Release.gpg` fallback after a 502/503, which is
+allowed only in those two cases) are **not verified**; raw APT 2.8.3 source was
+unavailable and adjacent 2.8.2 reading does not prove runtime behavior. HTTP proves
+neither TLS nor repository trust. The auth container retains only
+`CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID` for APT's sandbox/filesystem setup
+plus **KILL** for the existing supervisor's group kill across `_apt` UID changes;
+`--init` reaps orphan descendants. No broad capability restoration is introduced.
+Accepted sockets have 2-second I/O timeouts. Shutdown first stops/joins admission,
+closes the listener, shuts down every tracked socket and joins every tracked
+non-daemon handler under a 3-second drain deadline; leftover handlers/sockets or
+an open listener refuse. Unit coverage includes partial writes, concurrent admission,
+malformed methods and a deterministically gated accepted-handler shutdown race.
+The capability/reaping behavior and all executable tests remain **UNRUN** here;
+source reasoning is not runtime proof.
 
 The existing offline harness passes the digest printed at the trusted acquisition
 boundary into the disconnected target independently of the copied bundle. The
@@ -1391,9 +1502,10 @@ method children. It fails closed on unknown census/identity, and never kills
 unrelated processes. The helper source change also invalidates earlier hashed
 module identities; existing captures and bundles are not rewritten.
 
-The Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
+The full Docker proof installs Python/CA prerequisites in two fresh pinned Ubuntu
 containers, then runs the unchanged QEMU module twice in each and checks actual
-signature/unavailable-pin/hold/drift refusal and unchanged APT configuration. Base manifest digest is
+unavailable-pin/hold/drift refusal and unchanged APT configuration. Signature
+controls are required separately as described above. Base manifest digest is
 `68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`;
 Python pins are `3.12.3-0ubuntu2.1`/`3.12.3-1ubuntu0.17`, CA certificates
 `20240203`. Bootstrap transitive inputs come from current official mirrors and
