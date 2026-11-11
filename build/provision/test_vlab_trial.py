@@ -2403,14 +2403,18 @@ class SharedTrial(unittest.TestCase):
         self.assertEqual((error.code, error.category, error.child_status), (17, 'child-exit', 17))
         self.assertEqual((status['state'], status['operation']), ('running', 'install-docker'))  # no false terminal
 
-    def test_installer_evidence_hook_is_docker_only_and_failed_capture_never_changes_status(self):
+    def test_installer_evidence_hook_has_exact_qemu_binding_and_preserves_docker_default(self):
         calls = []
-        def capture(value, clock, code, out):
-            calls.append((value['nonce'], code, out))
+        def capture(value, clock, code, out, operation=trial.INSTALLER_OPERATION):
+            calls.append((value['nonce'], code, out, operation))
         with patch.object(trial, 'capture_installer_failure', side_effect=capture):
             error, baseline = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
-            self.assertEqual(calls, [(NONCE, 17, b'native')])
-            for operation in ('install-qemu', 'install-hhfab', 'install-kubectl'):
+            self.assertEqual(calls, [(NONCE, 17, b'native', 'install-docker')])
+            calls.clear()
+            qemu, _ = self.run_worker(self.fake_bounded({'install-qemu': (1, b'qemu private')}, []))
+            self.assertEqual((qemu.code, qemu.category, qemu.child_status), (1, 'child-exit', 1))
+            self.assertEqual(calls, [(NONCE, 1, b'qemu private', 'install-qemu')])
+            for operation in ('install-hhfab', 'install-kubectl'):
                 calls.clear()
                 other, _ = self.run_worker(self.fake_bounded({operation: (5, b'other')}, []))
                 self.assertEqual((other.code, other.category, other.child_status), (5, 'child-exit', 5))
@@ -2428,12 +2432,12 @@ class SharedTrial(unittest.TestCase):
                 self.assertEqual((again.code, again.category, again.child_status), primary)
                 self.assertEqual(status, baseline)  # public worker status identical to the no-capture baseline
 
-    def test_real_installer_writer_io_faults_through_docker_worker_hook_preserve_primary_and_status(self):
-        # Inject only while the real Docker capture runs: checkpoints/terminal status stay real.
+    def installer_writer_io_faults(self, operation):
+        # Inject only while the real capture runs: checkpoints/terminal status stay real.
         original_capture, original_child = trial.capture_installer_failure, trial.child_failure
         real_write, real_close = os.write, os.close
         with patch.object(trial, 'capture_installer_failure', return_value=None):
-            _, baseline = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+            _, baseline = self.run_worker(self.fake_bounded({operation: (17, b'native')}, []))
         for fault in ('open', 'partial-write', 'fsync', 'link', 'close'):
             with self.subTest(fault=fault):
                 built, attempted, writes = [], [], []
@@ -2451,7 +2455,7 @@ class SharedTrial(unittest.TestCase):
                 def closing(fd):
                     real_close(fd)
                     return fail()
-                def capture(v, clock, code, out):
+                def capture(v, clock, code, out, selected=trial.INSTALLER_OPERATION):
                     with ExitStack() as local:
                         # run_worker models root; this private filesystem fixture belongs to its test uid.
                         local.enter_context(patch.object(os, 'geteuid', return_value=os.getuid()))
@@ -2460,10 +2464,10 @@ class SharedTrial(unittest.TestCase):
                                 'link': 'link', 'close': 'close'}[fault]
                         local.enter_context(patch.object(os, name, side_effect=(
                             partial if fault == 'partial-write' else closing if fault == 'close' else fail)))
-                        original_capture(v, clock, code, out)
+                        original_capture(v, clock, code, out, selected)
                 with patch.object(trial, 'child_failure', side_effect=make), \
                      patch.object(trial, 'capture_installer_failure', side_effect=capture):
-                    error, status = self.run_worker(self.fake_bounded({'install-docker': (17, b'native')}, []))
+                    error, status = self.run_worker(self.fake_bounded({operation: (17, b'native')}, []))
                 self.assertEqual(attempted, [fault])  # reached the actual writer, not a preflight refusal
                 self.assertEqual(len(built), 1)
                 self.assertIs(error, built[0])
@@ -2473,6 +2477,65 @@ class SharedTrial(unittest.TestCase):
                 self.assertEqual(status, baseline)
                 self.assertFalse((self.root / trial.INSTALLER_FAILURE).exists())
                 self.assertFalse((self.root / (trial.INSTALLER_FAILURE + '.new')).exists())
+
+    def test_real_installer_writer_io_faults_through_docker_worker_hook_preserve_primary_and_status(self):
+        self.installer_writer_io_faults('install-docker')
+
+    def test_real_installer_writer_io_faults_through_qemu_worker_hook_preserve_primary_and_status(self):
+        self.installer_writer_io_faults('install-qemu')
+
+    def test_actual_qemu_worker_hook_retains_private_bytes_and_exports_without_core_queries(self):
+        original = trial.capture_installer_failure
+        private = SENTINEL.encode() + b'\x00\xff qemu install: stage=update: public fixture\n'
+        operations = []
+        def capture(v, clock, code, out, operation):
+            operations.append(operation)
+            with patch.object(os, 'geteuid', return_value=os.getuid()), \
+                 patch.object(trial, 'kernel_boot', return_value=v['boot_uuid']):
+                original(v, clock, code, out, operation)
+        with patch.object(trial, 'capture_installer_failure', side_effect=capture):
+            error, status = self.run_worker(self.fake_bounded({'install-qemu': (1, private)}, []))
+        self.assertEqual(operations, ['install-qemu'])
+        self.assertEqual((error.code, error.category, error.child_status), (1, 'child-exit', 1))
+        body_path = self.root / trial.INSTALLER_FAILURE
+        item = trial.installer_body(body_path.read_bytes())
+        self.assertEqual((item['operation'], item['status'], base64.b64decode(item['head'])),
+                         ('install-qemu', 1, private))
+        self.assertEqual(stat.S_IMODE(body_path.stat().st_mode), 0o600)
+        self.assertNotIn(SENTINEL, str(error) + json.dumps(status))
+        v = json.loads((self.root / 'contract.json').read_bytes())
+        (self.root / 'result.json').write_bytes(trial.encoded(
+            {'schema': 2, 'code': 1, 'contained': True, 'nonce': NONCE, 'diagnostic': status['diagnostic']}))
+        (self.root / 'result.json').chmod(0o600)
+        reader = trial.regular
+        with patch.object(trial, 'regular', side_effect=lambda p, n, uid=None, mode=None: reader(p, n, None if uid == 0 else uid, mode)), \
+             patch.object(trial, 'kernel_boot', return_value=v['boot_uuid']), \
+             patch.object(trial, 'load_sibling', side_effect=AssertionError('no core query')):
+            exported = trial.export_failure(NONCE)
+        envelope, _, body = exported.partition(b'\n')
+        self.assertEqual(json.loads(envelope)['operation'], 'install-qemu')
+        self.assertEqual(body, body_path.read_bytes())
+
+    def test_qemu_hook_faults_cancellation_and_nonreturned_output_keep_primary(self):
+        original_child = trial.child_failure
+        for fault in (OSError(SENTINEL), KeyboardInterrupt(), SystemExit(143)):
+            built = []
+            def make(code, message):
+                built.append(original_child(code, message))
+                return built[-1]
+            with self.subTest(type(fault).__name__), \
+                 patch.object(trial, 'child_failure', side_effect=make), \
+                 patch.object(trial, 'capture_installer_failure', side_effect=fault):
+                error, status = self.run_worker(self.fake_bounded({'install-qemu': (1, b'private')}, []))
+            self.assertIs(error, built[0])
+            self.assertEqual((status['operation'], status['code']), ('install-qemu', 1))
+        for fault in (KeyboardInterrupt(), hhfab_release.Refusal('command timeout'),
+                      hhfab_release.Refusal('command output overflow')):
+            with self.subTest(type(fault).__name__), patch.object(trial, 'capture_installer_failure') as hook:
+                error, status = self.run_worker(self.fake_bounded({'install-qemu': fault}, []))
+                hook.assert_not_called()
+            self.assertIsNotNone(error)
+            self.assertEqual(status['operation'], 'install-qemu')
 
     def test_worker_claim_collision_and_binding_failure_never_replace_incumbent_checkpoint(self):
         self.worker_inputs()
@@ -4990,7 +5053,7 @@ class InstallerFailureEvidence(unittest.TestCase):
 
     def test_operation_is_a_separate_closed_allowance_bound_identically_by_body_envelope_and_terminal(self):
         self.assertEqual(trial.INSTALLER_OPERATION, 'install-docker')  # scalar default unchanged
-        self.assertEqual(trial.INSTALLER_OPERATIONS, ('install-docker', 'aux-update'))
+        self.assertEqual(trial.INSTALLER_OPERATIONS, ('install-docker', 'aux-update', 'install-qemu'))
         docker, aux = self.record(b'd', 100), trial.installer_record(
             self.v, self.v['boot_uuid'], 100, b'a', time.time(), 'aux-update')
         self.assertEqual(trial.installer_body(docker)['operation'], 'install-docker')
@@ -5030,6 +5093,22 @@ class InstallerFailureEvidence(unittest.TestCase):
         for operation in (['aux-update'], None, b'aux-update'):
             self.assertFalse(trial.installer_terminal({'origin': 'worker', 'phase': 'stage', 'operation': operation,
                                                        'category': 'child-exit', 'child_status': 100}))
+
+    def test_qemu_operation_body_and_export_refuse_docker_or_aux_terminal_substitution(self):
+        raw = trial.installer_record(self.v, self.v['boot_uuid'], 1, b'qemu private', time.time(), 'install-qemu')
+        item = trial.installer_body(raw)
+        self.assertEqual(item['operation'], 'install-qemu')
+        self.final.write_bytes(raw)
+        self.final.chmod(0o600)
+        for operation in ('install-docker', 'aux-update'):
+            with self.subTest(operation=operation):
+                with self.assertRaises(trial.Failure):
+                    trial.installer_bound(item, self.v, self.v['boot_uuid'], operation=operation)
+                self.terminal('child-exit', 1, operation)
+                with self.assertRaises(trial.Failure): trial.export_failure(NONCE)
+        self.terminal('child-exit', 1, 'install-qemu')
+        with patch.object(trial, 'load_sibling', side_effect=AssertionError('no core query')):
+            self.assertEqual(trial.export_failure(NONCE).partition(b'\n')[2], raw)
 
 
 class OwnedAgentPayloadTests(unittest.TestCase):

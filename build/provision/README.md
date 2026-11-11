@@ -2932,8 +2932,8 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   from moved/deleted state. Dangling or live links, wrong type/owner/mode and
   malformed or foreign bindings remain refusals. A host-origin failure still
   permits the existing one-shot export because a guest failure may be concurrent.
-* **Installer failure evidence (issue #439).** `install-docker.py` and the other
-  installers are unchanged. In `provision` only the Docker installer call passes an
+* **Installer failure evidence (issues #439/#584).** Installer code is unchanged.
+  In `provision` the Docker and fixed QEMU installer calls pass an
   `on_failure` hook to `run()`; it receives just the nonzero `(code, output)` tuple that
   `call_bounded` returned, AFTER the exact original `child_failure` object was built.
   Whatever the hook raises (any `BaseException`) is discarded and that same object is
@@ -2944,7 +2944,7 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   exclusive fsynced `installer-failure.json.new`, then `link()` (first writer wins, no
   overwrite) and unlink of the temp; `regular()` later requires owner root, mode 0600,
   one link and a stable descriptor. Exact fields: `schema` 1, `kind` `installer`,
-  `source_sha`, `nonce`, `lease`, `boot`, `phase` `stage`, `operation` `install-docker`,
+  `source_sha`, `nonce`, `lease`, `boot`, `phase` `stage`, a fixed allowed `operation`,
   `captured_at` (integer Unix seconds, never bool), `outcome` (`exit` status 1..255 /
   `signal` -64..-1), `status`,
   `observed`, `kept_head`, `kept_tail`, `omitted`, `output_status`, `head`, `tail`
@@ -2955,7 +2955,7 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
   `clock.remaining('stage')` positive and renews nothing. The record is private, possibly
   credential-bearing, and survives guardian stop until the VM is disposed.
   `export-failure` (same command) switches to this file-only kind only when the
-  independently validated terminal result is a failed worker `stage`/`install-docker`
+  independently validated terminal result is a failed worker `stage` installer
   child exit/signal, and emits `{schema 2, kind, source_sha, nonce, lease, boot, phase,
   operation, outcome, status}\n<record bytes>` built from the contract, live boot and
   that terminal result. It additionally requires `captured_at` within the contract's
@@ -2963,18 +2963,22 @@ single link, at most 32 KiB SERIALIZED including base64/JSON escaping).
 * **Auxiliary `update` failure evidence (issue #471).** The same private record and
   export now also cover exactly one more operation: the `aux-update` invocation inside
   `provision_aux` (`apt ... update`, same command/options/environment and 180 s cap).
-  A separate closed allowance `INSTALLER_OPERATIONS = ('install-docker', 'aux-update')`
+  A separate closed allowance `INSTALLER_OPERATIONS = ('install-docker', 'aux-update', 'install-qemu')`
   sits beside the unchanged scalar `INSTALLER_OPERATION` default, so Docker callers and
   the wire schemas (record schema 1, envelope schema 2) are unchanged. The stored
   `operation`, the export envelope and the independently validated terminal
-  `worker`/`stage` diagnostic must all name the SAME one of the two operations; a
+  `worker`/`stage` diagnostic must all name the SAME fixed operation; a
   mutually consistent body and envelope for the other operation is still refused. The
-  hook is attached only to that `update` call (not `check`, simulate, download, install
+  auxiliary hook is attached only to that `update` call (not `check`, simulate, download, install
   or any other APT call), the original `child_failure` object is built before the hook
   and re-raised unchanged whatever the hook raises, and success, timeout, overflow, spawn
   and cleanup-uncertain paths create no record. Output stays untrusted, possibly
   sensitive and private; nothing about the cause of any failure is inferred, and no
   snapshot, mirror, retry, budget, policy or IAM behavior changed.
+  The QEMU hook binds `install-qemu` explicitly at creation around the existing
+  `install-qemu.py --selection baseline-20260114` call and unchanged 235 s cap.
+  It uses this same private record/export path, with no package or installer change.
+  Retention does not establish the cause of the earlier native QEMU failure.
 * **Mode binding (issue #412).** The remote command is unchanged and takes no mode.
   The expected mode is `fresh` unless the nonce-bound terminal `result.json` (read once
   through the existing `result_record` validator and 4096-byte bound) is a failed
