@@ -3770,7 +3770,7 @@ class GuestDiagnostics(unittest.TestCase):
             if operation == 'aux-update':
                 self.aux_update_failure(contract, code, out)
             else:
-                guest.capture_installer_failure(contract, guest.Clock(contract), code, out)
+                guest.capture_installer_failure(contract, guest.Clock(contract), code, out, operation)
             raw = guest.export_failure(self.nonce)
         return raw, snap, terminal
 
@@ -3938,6 +3938,62 @@ class GuestDiagnostics(unittest.TestCase):
                                         'guest_diagnostic', 'guest_service', 'private_diagnostic'})
         for forbidden in ('native installer output', str(private)):
             self.assertNotIn(forbidden, text)
+
+    def test_qemu_private_export_host_retention_and_closed_receipt_preserve_primary(self):
+        output = SENTINEL.encode() + b'\xff\x00' + b'Q' * (guest.INSTALLER_WHOLE + 7)
+        raw, snap, terminal = self.installer_export(output, 1, operation='install-qemu')
+        args, installer = self.installer_args(snap, terminal)
+        self.assertEqual(host.accept_failure(raw, *args, installer), ('captured', raw))
+        body = guest.installer_body(raw.partition(b'\n')[2])
+        self.assertEqual((body['operation'], body['output_status'], body['observed']),
+                         ('install-qemu', 'truncated', len(output)))
+        self.assertEqual(base64.b64decode(body['head']), output[:guest.INSTALLER_HEAD])
+        with patch.object(guest, 'first_failure_bundle', side_effect=AssertionError('no core bundle')):
+            private, (code, receipt, trace, text) = self.resume_drive(
+                raw, {'phase': 'stage', 'operation': 'install-qemu'}, result_code=1)
+        self.assertEqual((code, receipt['code'], receipt['private_diagnostic']), (1, 1, 'captured'))
+        self.assertEqual(receipt['guest_diagnostic']['operation'], 'install-qemu')
+        kept = list(self.kept(private))
+        self.assertEqual((len(kept), kept[0].read_bytes(), stat.S_IMODE(kept[0].stat().st_mode)), (1, raw, 0o600))
+        self.assertLess(trace.index('export'), trace.index('master-close'))
+        self.assertLess(trace.index('master-close'), trace.index('remove-key'))
+        self.assertNotIn(SENTINEL, text)
+        self.assertNotIn(str(private), text)
+
+    def test_qemu_host_requires_same_operation_in_body_envelope_and_terminal(self):
+        raw, snap, terminal = self.installer_export(b'qemu private', 1, operation='install-qemu')
+        args, installer = self.installer_args(snap, terminal)
+        for operation in ('install-docker', 'aux-update', 'install-hhfab'):
+            with self.subTest(operation=operation):
+                wrong = dict(installer, detail=dict(terminal, operation=operation))
+                self.assertEqual(host.accept_failure(raw, *args, wrong), ('invalid', None))
+                for section in ('envelope', 'body'):
+                    changed = self.remade(raw, **{section: lambda d, op=operation: {**d, 'operation': op}})
+                    self.assertEqual(host.accept_failure(changed, *args, installer), ('invalid', None))
+        self.assertEqual(host.accept_failure(raw + b' ' * host.EXPORT_READ_LIMIT, *args, installer), ('invalid', None))
+
+    def test_qemu_export_cancellation_and_retention_io_fault_preserve_original_failure(self):
+        class Abort(BaseException):
+            cleanup_uncertain = True
+        for reply, expected, absent in ((Abort(SENTINEL), 'unavailable', False),
+                                        (OSError(SENTINEL), 'unavailable', True)):
+            with self.subTest(type(reply).__name__):
+                self.setUp()
+                private, (code, receipt, trace, text) = self.resume_drive(
+                    reply, {'phase': 'stage', 'operation': 'install-qemu'}, result_code=1)
+                self.assertEqual((code, receipt['code'], receipt['private_diagnostic'], receipt['contained']),
+                                 (1, 1, expected, True))
+                self.assertEqual((receipt['process_absent'], receipt['own_key_absent']), (absent, absent))
+                self.assertEqual(list(self.kept(private)), [])
+                self.assertIn('master-close', trace)
+                self.assertNotIn(SENTINEL, text)
+        self.setUp()
+        raw, _, _ = self.installer_export(b'qemu private', 1, operation='install-qemu')
+        with patch.object(host, 'retain_private', side_effect=OSError(SENTINEL)):
+            private, (code, receipt, trace, text) = self.resume_drive(
+                raw, {'phase': 'stage', 'operation': 'install-qemu'}, result_code=1)
+        self.assertEqual((code, receipt['code'], receipt['private_diagnostic']), (1, 1, 'unavailable'))
+        self.assertNotIn(SENTINEL, text)
 
     # -- aux-update uses the SAME private export; operation is bound three ways ------------
     def test_aux_update_actual_orchestration_writer_guest_export_host_accept_extract_and_retention(self):

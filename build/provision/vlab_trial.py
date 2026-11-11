@@ -570,8 +570,8 @@ INSTALLER_FAILURE = 'installer-failure.json'
 INSTALLER_SCHEMA = 1
 INSTALLER_OPERATION = 'install-docker'  # default operation; unchanged Docker call behavior
 # Separate closed allowance (not a replacement of the scalar default). Body, envelope and the
-# host-validated terminal must all name the SAME one of these two operations.
-INSTALLER_OPERATIONS = ('install-docker', 'aux-update')
+# host-validated terminal must all name the SAME fixed operation.
+INSTALLER_OPERATIONS = ('install-docker', 'aux-update', 'install-qemu')
 INSTALLER_HEAD = 1024
 INSTALLER_TAIL = 12288
 INSTALLER_WHOLE = INSTALLER_HEAD + INSTALLER_TAIL
@@ -590,7 +590,7 @@ def exact_int(value):
 
 
 def installer_terminal(detail):
-    """True only for a validated failed worker/stage child exit/signal diagnostic of install-docker or aux-update."""
+    """Validated failed worker/stage child exit/signal for the fixed installer allowance."""
     return (type(detail) is dict and detail.get('category') in ('child-exit', 'child-signal')
             and (detail.get('origin'), detail.get('phase')) == ('worker', 'stage')
             and type(detail.get('operation')) is str and detail['operation'] in INSTALLER_OPERATIONS
@@ -727,7 +727,7 @@ def write_installer_failure(raw, clock):
 
 
 def capture_installer_failure(value, clock, code, out, operation=INSTALLER_OPERATION):
-    """Diagnostic-only hook body for install-docker.py (default) or the aux-update APT call.
+    """Private hook for Docker (default), fixed QEMU CLI, or the aux-update APT call.
     Creates no subprocess and renews nothing."""
     clock.remaining('stage')
     raw = installer_record(value, kernel_boot(), code, out, time.time(), operation)
@@ -2047,9 +2047,12 @@ def provision(value):
             ('install-kubectl.py', ['--version', '1.35.0', '--platform', 'linux/amd64', '--binary', str(ROOT / 'kubectl')], 30)):
         mark('stage', INSTALL_OPERATIONS[script])
         previous = os.umask(0o022)
-        # Evidence hook for the Docker installer only; other installers/calls are unchanged.
+        # Preserve the Docker default; QEMU binds its own fixed operation at creation.
         hook = None if script != 'install-docker.py' else (
             lambda code, raw, value=value, clock=clock: capture_installer_failure(value, clock, code, raw))
+        if script == 'install-qemu.py':
+            hook = lambda code, raw, value=value, clock=clock, operation=INSTALL_OPERATIONS[script]: (
+                capture_installer_failure(value, clock, code, raw, operation))
         try:
             out = run([PYTHON, str(ROOT / script), *args], clock, 'stage', cap, on_failure=hook)
         finally:
