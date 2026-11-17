@@ -99,3 +99,8 @@ Source references: [googlecompute v1.2.9 configuration](https://github.com/hashi
 and [its v1.1.6 upload/execution code](https://github.com/hashicorp/packer-plugin-ansible/blob/v1.1.6/provisioner/ansible-local/provisioner.go).
 Template validation checks schema; it does not establish cloud IAM, IAP
 stability, image sealing or course acceptance.
+
+The `native-r0-source` CI job runs the XRDP helper tests, selected Ansible
+syntax checks, and `packer fmt`/`packer validate` with dummy local inputs and
+no cloud identity. It never invokes `packer build`; candidate boot and course
+evidence remain separate release checks.

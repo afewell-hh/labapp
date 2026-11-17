@@ -121,8 +121,10 @@ bounds and exact owned cleanup are documented in `build/provision/README.md`.
 Historical launch recipes are `gcp_vm_launch_command.txt`, not a runnable script.
 The native private-candidate path is `build/packer-gcp/` with guest configuration
 in `build/ansible/` and pins in `build/releases/`. Its Packer and Ansible checks
-and live image evidence are tracked in #588. The existing CI checks above do
-not independently establish that a new candidate boots or passes the course.
+and live image evidence are tracked in #588. The `native-r0-source` CI job
+checks the XRDP identity helper, Ansible syntax and Packer formatting and
+validation with dummy local inputs. It does not build a VM or establish that
+a candidate boots or passes the course.
 
 New lifecycle/controller code must add its actual offline test command to CI
 in the same PR that introduces it; shell checks alone cannot cover lifecycle
