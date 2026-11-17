@@ -80,7 +80,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='.generate-', dir=TLS) as temp:
             cert, key = Path(temp) / 'cert.pem', Path(temp) / 'key.pem'
             run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:3072', '-sha256',
-                 '-nodes', '-days', '365', '-subj', '/CN=' + name,
+                 '-nodes', '-days', '3650', '-subj', '/CN=labapp-xrdp',
                  '-addext', 'subjectAltName=DNS:' + name,
                  '-keyout', str(key), '-out', str(cert)])
             os.chown(key, 0, gid)

@@ -40,6 +40,8 @@ security key; ordinary reboots retain the VM's generated identity. The Ubuntu
 package's generic snakeoil key remains unused by XRDP and is not removed here.
 Promotion requires a live clone check of boot ordering and distinct TLS public
 keys across two clones, plus diagnosis of the observed later RDP logoffs.
+The self-signed certificate lasts 3650 days; an interrupted pair installation
+fails closed and needs an administrator to remove the incomplete owned pair.
 
 Telemetry finalization waits up to 120 seconds each for `fab/fabricator-ctrl` to
 be Available and `fab/fabricator-webhook-service` to have ready endpoints.

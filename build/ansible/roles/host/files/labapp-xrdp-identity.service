@@ -1,7 +1,7 @@
 [Unit]
 Description=Prepare this instance's XRDP identity
 Before=xrdp.service
-After=systemd-random-seed.service
+After=systemd-random-seed.service cloud-init.service
 
 [Service]
 Type=oneshot
