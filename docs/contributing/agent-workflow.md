@@ -3,7 +3,9 @@
 Stable process for the lead, ephemeral workers and independent reviewers.
 Temporary plans, status, experiments and evidence live only in GitHub issues
 and PRs, never in repo files. Current status and dependencies are in the parent
-issue (#145) and its children; this document describes only stable rules.
+issue (#518 for the current lead handoff, #588 for native R0) and their named
+dependencies; this document describes only stable rules. #145 retains earlier
+project history.
 
 ## Roles
 
@@ -20,7 +22,8 @@ document, or files it links.
 
 1. Read the task issue fully, including its dependencies and acceptance criteria.
 2. Read [`AGENTS.md`](../../AGENTS.md) (entrypoint) and this file.
-3. Read the parent issue's current checkpoint (for #145, its latest status and
+3. Read the parent issue's current checkpoint (for the current R0 work, #518
+   and #588, including their latest status and
    named corrections) and any issue the task cites for the latest lead
    corrections. Newer lead comments supersede older issue text. The lead may
    replace long parent history with that checkpoint plus named corrections; this
@@ -116,6 +119,10 @@ runtime helper in a disposable Ubuntu 24.04 network namespace with NET_ADMIN
 only and no network access. Package preparation is separate; resource/time
 bounds and exact owned cleanup are documented in `build/provision/README.md`.
 Historical launch recipes are `gcp_vm_launch_command.txt`, not a runnable script.
+The native private-candidate path is `build/packer-gcp/` with guest configuration
+in `build/ansible/` and pins in `build/releases/`. Its Packer and Ansible checks
+and live image evidence are tracked in #588. The existing CI checks above do
+not independently establish that a new candidate boots or passes the course.
 
 New lifecycle/controller code must add its actual offline test command to CI
 in the same PR that introduces it; shell checks alone cannot cover lifecycle
@@ -277,17 +284,21 @@ Default VM bounds: 60 minutes for component/inspection work, 120 minutes for a
 full build, no silent extension. Require cloud-side bounds at creation,
 normal/cancelled/failed-job cleanup and independent expiry cleanup, with exact
 ownership and immutable IDs. Check quotas before launch; do not increase them
-implicitly. The fixed serial lifecycle uses its CAS ledger and project census
-for admission, an immutable cloud deadline, and verified VM/all-intended-disk cleanup.
+implicitly. The fixed `build/gcp/` serial lifecycle uses its CAS ledger and
+project census for admission, an immutable cloud deadline, and verified
+VM/all-intended-disk cleanup. The native `build/packer-gcp/` candidate recipe
+has separate reviewed ownership and cleanup; see #588 before treating either
+lifecycle as applicable to it.
 New cloud behavior still requires reviewed/tested lifecycle gates and separately
 reviewed IAM before launch; routine Packer builds and guest recovery are separate
-scope. Overall acceptance and live evidence remain in #153/#161. No production
-changes or broad IAM are implied by build/test authorization.
+scope. Current acceptance and live evidence are in #518/#588; #153/#161 retain
+historical lifecycle results. No production changes or broad IAM are implied by
+build/test authorization.
 
 ## Dispatch, tool access and handoff operations
 
 Current status, permission and CI baselines, and evidence live in GitHub, not
-here: see #145 (parent), #139 and #140.
+here: see #518 (lead handoff), #588 (native R0), and their named dependencies.
 
 - **Dispatch.** The lead dispatches work with an explicit `@claude` comment on
   the issue or PR. Independent reviews are routed as in
@@ -456,8 +467,8 @@ and merges, and no review grants automatic merge or broader permissions.
 A replacement lead (new account, session or crash) needs no prior chat or
 in-memory state. A single prompt suffices: "Read `AGENTS.md` and the lead
 takeover section of `docs/contributing/agent-workflow.md`, then take over."
-Discover the permanent handover hub, [#476](https://github.com/afewell-hh/labapp/issues/476),
-and the parent, [#145](https://github.com/afewell-hh/labapp/issues/145). Their
+Discover the current handoff, [#518](https://github.com/afewell-hh/labapp/issues/518),
+and native R0 record, [#588](https://github.com/afewell-hh/labapp/issues/588). Their
 values are as-of statements on GitHub, never repo prose, and are not live
 evidence. Previously authorized scope stays authorized; no ritual permission
 question or new approval ceremony is needed.
@@ -468,7 +479,7 @@ question or new approval ceremony is needed.
    stale checkout untouched and work in an isolated fresh checkout.
 2. Load the instruction hierarchy (`AGENTS.md`, this file, and the runbooks they
    cite) from the verified default branch.
-3. Read the #476 and #145 BODY checkpoints, then the corrections, active
+3. Read the #518 and #588 BODY checkpoints, then the corrections, active
    issues, PRs, reports and runs they name (see
    [raw reading recipes](#raw-github-reading-recipes)). Record any denied or
    partial read.
@@ -511,7 +522,7 @@ continue independent work.
 
 ### Handover upkeep
 
-Update #476 and the relevant parents after meaningful decisions and before and
+Update #518 and the relevant task issues after meaningful decisions and before and
 after live operations or handoff. Preserve attributable history. Record:
 
 - accepted and candidate SHAs;
