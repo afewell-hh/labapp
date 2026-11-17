@@ -1,0 +1,164 @@
+---
+- name: Require explicit course bootstrap inputs
+  ansible.builtin.assert:
+    that:
+      - gitops_vlab_kubeconfig_path is match('^/')
+      - release.services.gitops.organization is match('^[a-zA-Z0-9_-]+$')
+      - release.services.gitops.repository is match('^[a-zA-Z0-9_.-]+$')
+      - release.course.gitops.application is match('^[a-z][a-z0-9-]*$')
+      - release.course.gitops.repository_path == 'active'
+    fail_msg: Supply the selected course GitOps inputs and target VLAB kubeconfig path.
+
+- name: Wait for the local Gitea API
+  ansible.builtin.uri:
+    url: http://127.0.0.1:3001/api/v1/version
+    status_code: 200
+    timeout: 5
+  register: gitops_gitea_health
+  until: gitops_gitea_health.status | default(0) == 200
+  retries: 30
+  delay: 2
+
+- name: Inspect the course organization
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3001/api/v1/orgs/{{ release.services.gitops.organization }}"
+    url_username: "{{ release.services.gitops.username }}"
+    url_password: "{{ release.services.gitops.password }}"
+    force_basic_auth: true
+    status_code: [200, 404]
+    timeout: 10
+  register: gitops_organization
+  no_log: true
+
+- name: Create the course organization if absent
+  ansible.builtin.uri:
+    url: http://127.0.0.1:3001/api/v1/orgs
+    method: POST
+    url_username: "{{ release.services.gitops.username }}"
+    url_password: "{{ release.services.gitops.password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      username: "{{ release.services.gitops.organization }}"
+      visibility: public
+    status_code: 201
+    timeout: 10
+  when: gitops_organization.status == 404
+  changed_when: true
+  no_log: true
+
+- name: Inspect the course repository
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3001/api/v1/repos/{{ release.services.gitops.organization }}/{{ release.services.gitops.repository }}"
+    url_username: "{{ release.services.gitops.username }}"
+    url_password: "{{ release.services.gitops.password }}"
+    force_basic_auth: true
+    status_code: [200, 404]
+    timeout: 10
+  register: gitops_repository
+  no_log: true
+
+- name: Create the empty public course repository if absent
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3001/api/v1/orgs/{{ release.services.gitops.organization }}/repos"
+    method: POST
+    url_username: "{{ release.services.gitops.username }}"
+    url_password: "{{ release.services.gitops.password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ release.services.gitops.repository }}"
+      default_branch: main
+      private: false
+      auto_init: false
+    status_code: 201
+    timeout: 10
+  when: gitops_repository.status == 404
+  changed_when: true
+  no_log: true
+
+- name: Read the verified seed's main commit without changing history
+  ansible.builtin.command:
+    argv: [git, --git-dir=/opt/labapp/seed/hedgehog-config.git, rev-parse, --verify, refs/heads/main]
+  register: gitops_seed_main
+  changed_when: false
+
+- name: Inspect the existing published main branch
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3001/api/v1/repos/{{ release.services.gitops.organization }}/{{ release.services.gitops.repository }}/branches/main"
+    url_username: "{{ release.services.gitops.username }}"
+    url_password: "{{ release.services.gitops.password }}"
+    force_basic_auth: true
+    status_code: [200, 404]
+    timeout: 10
+  register: gitops_published_main
+  no_log: true
+
+- name: Preserve an already seeded or student-modified repository
+  ansible.builtin.assert:
+    that:
+      - gitops_published_main.status == 404 or gitops_published_main.json.commit.id == gitops_seed_main.stdout | trim
+    fail_msg: Published main differs from the seed; bootstrap will not overwrite student history.
+  no_log: true
+
+- name: Publish initial main using a temporary environment-only credential helper
+  when: gitops_published_main.status == 404
+  block:
+    - name: Create a private runtime directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /run
+        prefix: labapp-gitops-
+      register: gitops_runtime
+
+    - name: Install a credential-free askpass script
+      ansible.builtin.copy:
+        dest: "{{ gitops_runtime.path }}/askpass"
+        owner: root
+        group: root
+        mode: '0700'
+        content: |
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$LABAPP_GIT_USER" ;;
+            *Password*) printf '%s\n' "$LABAPP_GIT_PASSWORD" ;;
+            *) exit 1 ;;
+          esac
+
+    - name: Push the original main history without force or credential URLs
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --signal=TERM
+          - --kill-after=10
+          - '120'
+          - git
+          - --git-dir=/opt/labapp/seed/hedgehog-config.git
+          - -c
+          - credential.helper=
+          - push
+          - "http://127.0.0.1:3001/{{ release.services.gitops.organization }}/{{ release.services.gitops.repository }}.git"
+          - refs/heads/main:refs/heads/main
+      environment:
+        GIT_CONFIG_NOSYSTEM: '1'
+        GIT_CONFIG_GLOBAL: /dev/null
+        GIT_TERMINAL_PROMPT: '0'
+        GIT_ASKPASS: "{{ gitops_runtime.path }}/askpass"
+        LABAPP_GIT_USER: "{{ release.services.gitops.username }}"
+        LABAPP_GIT_PASSWORD: "{{ release.services.gitops.password }}"
+        LC_ALL: C
+      changed_when: true
+      no_log: true
+  always:
+    - name: Remove the temporary askpass directory on success or failure
+      ansible.builtin.file:
+        path: "{{ gitops_runtime.path }}"
+        state: absent
+      when: gitops_runtime.path is defined
+      no_log: true
+
+- name: Register the actual VLAB cluster and course Application
+  ansible.builtin.include_tasks: argocd.yml
+
+- name: Establish the normal student's native ArgoCD CLI session
+  ansible.builtin.include_tasks: student-session.yml

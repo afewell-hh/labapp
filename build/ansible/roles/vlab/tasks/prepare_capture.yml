@@ -1,0 +1,12 @@
+---
+# The image entrypoint calls this only after final reconciliation and its other
+# acceptance checks. Stop nested VMs before the outer GCP image is captured.
+- name: Stop the controlled build VLAB with normal systemd cgroup cleanup
+  ansible.builtin.systemd_service:
+    name: labapp-vlab-build.service
+    state: stopped
+- name: Leave resume enabled but nested VMs stopped for capture
+  ansible.builtin.systemd_service:
+    name: hhfab-vlab-resume.service
+    enabled: true
+    state: stopped

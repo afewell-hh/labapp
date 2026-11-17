@@ -1,0 +1,38 @@
+---
+- name: Stop nested VLAB and enable the prepared resume service
+  ansible.builtin.include_role:
+    name: vlab
+    tasks_from: prepare_capture
+
+- name: Stop management containers before outer disk capture
+  ansible.builtin.systemd_service:
+    name: labapp-management.service
+    state: stopped
+
+- name: Remove tool download inputs
+  ansible.builtin.include_role:
+    name: tool_cache_cleanup
+
+- name: Remove build-only chart inputs and Ansible temporary data
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/cache/labapp-management-charts
+    - /run/labapp-build-registry
+    - /root/.ansible
+    - /home/ubuntu/.ansible
+
+- name: Stop the RDP listener and sessions before removing build identities
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: [xrdp.service, xrdp-sesman.service, labapp-xrdp-identity.service]
+
+- name: Remove only the dedicated XRDP TLS pair and build-time RDP security key
+  ansible.builtin.command: /usr/local/sbin/labapp-xrdp-identity seal
+  changed_when: true
+
+- name: Flush files before the provider stops and captures this builder
+  ansible.builtin.command: /usr/bin/sync
+  changed_when: false

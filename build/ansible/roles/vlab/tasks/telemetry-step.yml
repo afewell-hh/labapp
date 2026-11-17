@@ -1,0 +1,26 @@
+---
+# Run each precondition/dry-run/write once. A later stage cannot mask a failure.
+- name: Select the telemetry stage and clear any previous command result
+  ansible.builtin.set_fact:
+    vlab_telemetry_stage: "{{ telemetry_step.stage }}"
+    vlab_telemetry_command: {}
+
+- name: Execute the bounded native telemetry stage
+  ansible.builtin.command:
+    argv: "{{ ['/usr/bin/timeout', '--kill-after=5s', telemetry_step.bound_seconds | string, '/usr/local/bin/kubectl', '--kubeconfig=/home/ubuntu/hhfab/vlab/kubeconfig', '--request-timeout=' + telemetry_step.request_timeout, '--namespace=fab'] + telemetry_step.arguments }}"
+  become_user: ubuntu
+  register: vlab_telemetry_command
+  changed_when: telemetry_step.stage == 'apply' and vlab_telemetry_command.rc | default(-1) | int == 0
+  failed_when: false
+  ignore_unreachable: true
+  no_log: true
+
+- name: Classify the command or module result without publishing raw output
+  ansible.builtin.set_fact:
+    vlab_telemetry_diagnostic: "{{ vlab_telemetry_command | default({}) | labapp_telemetry_diagnostic }}"
+  no_log: true
+
+- name: Enter failure diagnostics if this telemetry stage did not succeed
+  ansible.builtin.fail:
+    msg: "Telemetry stage {{ telemetry_step.stage }} failed."
+  when: vlab_telemetry_diagnostic.category != 'success'

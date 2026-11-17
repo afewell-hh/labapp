@@ -1,0 +1,38 @@
+---
+- name: Validate archive member and identity
+  ansible.builtin.assert:
+    that:
+      - tool.archive_sha256 is match('^[a-f0-9]{64}$')
+      - tool.member is match('^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$')
+
+- name: Download the checksum-verified release archive
+  ansible.builtin.get_url:
+    url: "{{ tool.url }}"
+    dest: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}.tar.gz"
+    checksum: "sha256:{{ tool.archive_sha256 }}"
+    owner: root
+    group: root
+    mode: '0600'
+    timeout: 30
+    validate_certs: true
+
+- name: Create the private extraction directory
+  ansible.builtin.file:
+    path: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Extract the verified release archive
+  ansible.builtin.unarchive:
+    src: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}.tar.gz"
+    dest: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}"
+    remote_src: true
+    owner: root
+    group: root
+
+- name: Verify and publish the extracted binary
+  ansible.builtin.include_tasks: publish.yml
+  vars:
+    tool_source: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}/{{ tool.member }}"

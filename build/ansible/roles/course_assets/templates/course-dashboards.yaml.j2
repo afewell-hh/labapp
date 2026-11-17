@@ -1,0 +1,13 @@
+{% for dashboard in release.course.dashboards %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: labapp-dashboard-{{ dashboard.uid | lower }}
+  namespace: {{ release.services.monitoring.namespace | to_json }}
+  labels:
+    grafana_dashboard: "1"
+data:
+  {{ dashboard.uid }}.json: |
+    {{ lookup('ansible.builtin.file', role_path + '/files/dashboards/' + dashboard.uid + '.json') | from_json | to_json }}
+{% endfor %}

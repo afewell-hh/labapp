@@ -1,0 +1,18 @@
+#!/bin/bash
+# Runs as root, inside the readiness caller's ORIGINAL outer timeout.
+set -euo pipefail
+unit=${1:?VLAB unit required}
+case "$unit" in
+  labapp-vlab-build.service|hhfab-vlab-resume.service) ;;
+  *) exit 2 ;;
+esac
+while true; do
+  main_pid=$(/usr/bin/systemctl show "$unit" --property=MainPID --value)
+  [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || { echo 'Native VLAB process exited before bridge readiness' >&2; exit 1; }
+  if /usr/sbin/ip link show dev hhbr >/dev/null 2>&1; then
+    /usr/sbin/ip address replace 172.30.0.2/21 dev hhbr
+    /usr/sbin/ip link set dev hhbr up
+    exit 0
+  fi
+  sleep 1
+done

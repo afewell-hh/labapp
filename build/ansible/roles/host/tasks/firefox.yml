@@ -1,0 +1,35 @@
+---
+- name: Install the pinned public Mozilla signing key
+  ansible.builtin.get_url:
+    url: "{{ release.artifacts.mozilla_apt_key.url }}"
+    checksum: "sha256:{{ release.artifacts.mozilla_apt_key.sha256 }}"
+    dest: /etc/apt/keyrings/labapp-mozilla.asc
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Prefer Mozilla Firefox and exclude Ubuntu's Snap transition package
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/labapp-mozilla
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Package: *
+      Pin: origin packages.mozilla.org
+      Pin-Priority: 1000
+
+      Package: firefox*
+      Pin: release o=Ubuntu
+      Pin-Priority: -1
+
+- name: Select the signed Mozilla package repository
+  ansible.builtin.apt_repository:
+    repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/labapp-mozilla.asc] https://packages.mozilla.org/apt mozilla main
+    filename: labapp-mozilla
+    state: present
+
+- name: Install the native course browser
+  ansible.builtin.apt:
+    name: firefox
+    state: present

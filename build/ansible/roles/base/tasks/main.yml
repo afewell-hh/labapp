@@ -1,0 +1,16 @@
+---
+- name: Install base packages and course-native utilities
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - git
+      - jq
+      - openssh-client
+      - python3
+      - tar
+      - unzip
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 60

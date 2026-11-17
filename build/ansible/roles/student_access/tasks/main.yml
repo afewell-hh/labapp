@@ -1,0 +1,60 @@
+---
+- name: Create the private student kubeconfig directory
+  ansible.builtin.file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0700'
+
+- name: Read the actual selected VLAB context
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, --kubeconfig=/home/ubuntu/hhfab/vlab/kubeconfig, config, view, --minify, --raw, --flatten, -o, json]
+  register: student_vlab_kubeconfig
+  changed_when: false
+  no_log: true
+
+- name: Merge the actual VLAB and management contexts
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, config, view, --raw, --flatten, -o, json]
+  environment:
+    KUBECONFIG: /home/ubuntu/hhfab/vlab/kubeconfig:/etc/labapp/management-kubeconfig.yaml
+  register: student_merged_kubeconfig
+  changed_when: false
+  no_log: true
+
+- name: Select the course default and management alias
+  ansible.builtin.set_fact:
+    student_config: "{{ (student_merged_kubeconfig.stdout | from_json) | combine({'current-context': 'vlab', 'contexts': (((student_merged_kubeconfig.stdout | from_json).contexts | rejectattr('name', 'in', ['vlab', 'emc']) | list) + [{'name': 'vlab', 'context': (student_vlab_kubeconfig.stdout | from_json).contexts[0].context}, {'name': 'emc', 'context': ((student_merged_kubeconfig.stdout | from_json).contexts | selectattr('name', 'equalto', 'k3d-k3d-observability') | first).context}])}) }}"
+  no_log: true
+
+- name: Publish the student kubeconfig atomically
+  ansible.builtin.copy:
+    content: "{{ student_config | to_nice_yaml }}"
+    dest: /home/ubuntu/.kube/config
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  no_log: true
+
+- name: Install student Argo session refresh for each VM boot
+  ansible.builtin.copy:
+    src: labapp-student-session
+    dest: /usr/local/libexec/labapp-student-session
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the session refresh boot unit
+  ansible.builtin.copy:
+    src: labapp-student-session.service
+    dest: /etc/systemd/system/labapp-student-session.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable session refresh without repeating the build-time login
+  ansible.builtin.systemd_service:
+    name: labapp-student-session.service
+    daemon_reload: true
+    enabled: true

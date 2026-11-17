@@ -1,0 +1,25 @@
+---
+- name: Hash the binary before publishing it
+  ansible.builtin.stat:
+    path: "{{ tool_source }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: tool_binary
+
+- name: Require the independently pinned binary identity
+  ansible.builtin.assert:
+    that:
+      - tool_binary.stat.isreg | default(false)
+      - not (tool_binary.stat.islnk | default(false))
+      - tool_binary.stat.size | default(0) == tool.binary_size
+      - tool_binary.stat.checksum | default('') == tool.binary_sha256
+    fail_msg: Downloaded input did not yield the expected native binary.
+
+- name: Publish the native binary
+  ansible.builtin.copy:
+    src: "{{ tool_source }}"
+    dest: "/usr/local/bin/{{ tool.name }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: '0755'

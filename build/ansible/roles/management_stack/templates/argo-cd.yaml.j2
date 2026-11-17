@@ -1,0 +1,11 @@
+configs:
+  cm:
+    # Course VMs may stay up across days; boot refresh also renews this session.
+    users.session.duration: {{ release.services.gitops.session_duration | to_json }}
+  params:
+    server.insecure: true
+server:
+  service:
+    type: NodePort
+    nodePortHttp: 30080
+    nodePortHttps: 30443

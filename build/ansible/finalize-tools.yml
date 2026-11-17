@@ -1,0 +1,8 @@
+---
+# Run only after all provisioning that needs downloaded tool inputs is complete.
+- name: Remove owned tool build inputs before image capture
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - tool_cache_cleanup

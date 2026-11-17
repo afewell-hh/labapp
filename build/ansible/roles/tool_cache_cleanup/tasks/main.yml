@@ -1,0 +1,5 @@
+---
+- name: Remove only the tool role's private staging cache
+  ansible.builtin.file:
+    path: /var/cache/labapp-tools
+    state: absent

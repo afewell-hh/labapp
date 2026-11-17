@@ -1,0 +1,61 @@
+---
+- name: Create the student's private native ArgoCD configuration directory
+  ansible.builtin.file:
+    path: /home/ubuntu/.config/argocd
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0700'
+
+- name: Read only the newly deployed ArgoCD initial administrator password
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - --namespace=argocd
+      - get
+      - secret
+      - argocd-initial-admin-secret
+      - -o
+      - jsonpath={.data.password}
+  register: gitops_initial_argocd_password
+  changed_when: false
+  no_log: true
+
+- name: Require a deployed initial password before native login
+  ansible.builtin.assert:
+    that:
+      - gitops_initial_argocd_password.stdout | length > 0
+  no_log: true
+
+- name: Log the student into the real local ArgoCD server
+  become: true
+  become_user: ubuntu
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --signal=TERM
+      - --kill-after=5
+      - '30'
+      - /usr/local/bin/argocd
+      - login
+      - localhost:8080
+      - --plaintext
+      - --username
+      - admin
+      - --password
+      - "{{ gitops_initial_argocd_password.stdout | b64decode }}"
+      - --config
+      - /home/ubuntu/.config/argocd/config
+  environment:
+    HOME: /home/ubuntu
+  no_log: true
+
+- name: Keep the generated student session private
+  ansible.builtin.file:
+    path: /home/ubuntu/.config/argocd/config
+    state: file
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'

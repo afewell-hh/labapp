@@ -1,0 +1,190 @@
+---
+# Release inputs; unresolved fields are not artifact pins or acceptance evidence.
+release:
+  name: r0
+  course:
+    repository: https://github.com/afewell-hh/hh-learn
+    revision: b51cbdb0d22eba59c4493155674805795fe8fe48
+    pathway: Network Like a Hyperscaler
+    acceptance: runnable steps in the approved pinned errata-backed copy as an ordinary student
+    acceptance_contract: https://github.com/afewell-hh/labapp/issues/588#issuecomment-6821190922
+    gitops:
+      application: hedgehog-config
+      repository_path: active
+      prune: true
+      self_heal: true
+    dashboards:
+      - uid: ab831ceb-cf5c-474a-b7e9-83dcd075c218
+        title: Hedgehog Fabric
+        sha256: e7343608903db7c104f05f768999b9debfbc61a60463688bd321ef251d0f17c0
+      - uid: f8a648b9-5510-49ca-9273-952ba6169b7v
+        title: Hedgehog Fabric Platform Stats
+        sha256: 6b9fae72ebf058f895cb64ac2e64d3d304fa5c4c7af40250e2afafd986a3b248
+      - uid: a5e5b12d-b340-4753-8f83-af8d54304822
+        title: Hedgehog Switch Interface Counters
+        sha256: 434fb97403d5d4fb9f438c2ef38bacc73ead3d04bb8e9d8ef634b9510afbec13
+      - uid: c42a51e5-86a8-42a0-b1c9-d1304ae655bv
+        title: Hedgehog Fabric Logs
+        sha256: bb0674619772fa43db639e9fc76300642094c4d1eead87ed6ce6ebeb8ae8376e
+      - uid: fb08315c-cabb-4da7-9db9-2e17278f1781
+        title: Hedgehog Switch Critical Resources
+        sha256: e0d85af5f876a4cfef3d8c78e0d637fe093bf7ff4d5f0a908d10d9f1ee33daca
+      - uid: rYdddlPWv
+        title: Hedgehog mod of Node Exporter Full
+        sha256: d260564737b26823c15f8013f41f7ffa8eca430d686bdf87bc26f44639c7d326
+  platform:
+    distribution: Ubuntu
+    release: '24.04'
+    architecture: x86_64
+    base_image_identity: null
+  gcp:
+    build:
+      machine_type: n2-standard-32
+      min_cpu_platform: Intel Cascade Lake
+      nested_virtualization: true
+      disk_gb: 300
+      zone: null
+    student_acceptance:
+      machine_series: n1
+      machine_type: n1-standard-32
+      zone: us-west1-c
+      disk_gb: 300
+      nested_virtualization: true
+  hedgehog:
+    # hhfab version is authoritative in its vendor_archives record below.
+    fabric_version: '0.96.2'
+    version_overrides: {}
+    wiring_file: "{{ playbook_dir }}/../provision/course-wiring.yaml"
+    wiring_sha256: 3294005892759029ef1a22f6fecc64a01ce5db07c44338a91ce89acdb4af1060
+    ipv4_ranges:
+      - 10.0.0.0/16
+      - 10.10.0.0/16
+      - 10.99.0.0/16
+    conditional_10_20_scenario: null
+    # Preserve official Fabricator 0.43.1 defaults; uname supplies dashboard selectors.
+    fabric_observability:
+      agent:
+        metrics: true
+        metricsInterval: 60
+        logs: true
+      unix:
+        metrics: true
+        metricsInterval: 60
+        metricsCollectors: [cpu, loadavg, meminfo, filesystem, uname]
+        syslog: true
+    observability_targets:
+      prometheus:
+        lab:
+          url: http://172.30.0.2:9090/api/v1/write
+      loki:
+        lab:
+          url: http://172.30.0.2:3100/loki/api/v1/push
+    observability_labels:
+      labapp_release: r0
+  student:
+    # Public course login selected by the owner, not a recovered credential.
+    password: HHLab.Admin!
+  services:
+    provenance: owner-relayed devb inspection, issue 588
+    k3d: '5.7.4'
+    management_k3s: '1.30.4'
+    observed_vlab_kubernetes: '1.34.1'
+    servers: 1
+    agents: 2
+    management:
+      cluster_name: k3d-observability
+      image: rancher/k3s:v1.30.4-k3s1
+      bind_address: 0.0.0.0
+      prometheus_bind_address: 0.0.0.0
+      api_port: 6550
+      storage_root: /var/lib/labapp/management-storage
+    gitea:
+      root_url: http://localhost:3001/
+    gitops:
+      username: student01
+      session_duration: 2160h
+      password: hedgehog123
+      email: student01@labapp.local
+      organization: student
+      repository: hedgehog-config
+    monitoring:
+      namespace: monitoring
+      release_name: kube-prometheus-stack
+      grafana_version: '11.2.1'
+      # Owner-specified public course login, not a recovered private secret.
+      grafana_admin_user: admin
+      grafana_admin_password: admin
+      loki_url: http://loki.monitoring.svc.cluster.local:3100
+    charts:
+      argo-cd: '7.6.12'
+      gitea: '10.4.1'
+      kube-prometheus-stack: '65.2.0'
+      loki: '6.49.0'
+  # Existing reviewed source supplies these real artifact identities.
+  vendor_archives:
+    - name: hhfab
+      version: '0.43.1'
+      provenance: build/provision/hhfab_release.py at 0be780902e921e534cabfdfe11befe0a09ae675f
+      url: https://github.com/githedgehog/fabricator/releases/download/v0.43.1/hhfab-linux-amd64-v0.43.1.tar.gz
+      archive_sha256: b1387342191a329772c2595504ec6ff129eb45980727c1c86d9901ef4d9f37a4
+      member: hhfab-linux-amd64/hhfab
+      binary_sha256: b5c7e0265339b9b95fa1073967bfb6c6fede6086755c85eca24cb80637b04e37
+      binary_size: 170709176
+    - name: helm
+      version: '3.19.4'
+      provenance: build/provision/install-helm.py at 0be780902e921e534cabfdfe11befe0a09ae675f
+      url: https://get.helm.sh/helm-v3.19.4-linux-amd64.tar.gz
+      archive_sha256: 759c656fbd9c11e6a47784ecbeac6ad1eb16a9e76d202e51163ab78504848862
+      member: linux-amd64/helm
+      binary_sha256: ea22096683b9b61005584501e36168a1eadc5b6883a89df299f5a55e4e2dd283
+      binary_size: 60182712
+  vendor_binaries:
+    - name: kubectl
+      version: '1.35.0'
+      provenance: build/provision/install-kubectl.py at 0be780902e921e534cabfdfe11befe0a09ae675f
+      url: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+      binary_sha256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
+      binary_size: 58597560
+    - name: k3d
+      version: '5.7.4'
+      url: https://github.com/k3d-io/k3d/releases/download/v5.7.4/k3d-linux-amd64
+      binary_sha256: 1ac1da365236736a8df8c32107b54aca208384ab1d9a06771443c85ad698a5eb
+      binary_size: 24215704
+    - name: argocd
+      version: '2.12.6'
+      url: https://github.com/argoproj/argo-cd/releases/download/v2.12.6/argocd-linux-amd64
+      binary_sha256: efecedeb09f07b09ad4457467ceb103e1269004f34f7420a531372b13122fd2b
+      binary_size: 169607606
+  artifacts:
+    mozilla_apt_key:
+      url: https://packages.mozilla.org/apt/repo-signing-key.gpg
+      sha256: 3ecc63922b7795eb23fdc449ff9396f9114cb3cf186d6f5b53ad4cc3ebfbb11f
+    microsoft_apt_key:
+      url: https://packages.microsoft.com/keys/microsoft.asc
+      sha256: 2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6
+    course_repository_bundle:
+      file: hedgehog-config-sanitized.bundle
+      sha256: e5e735e2619ec0f393f0936095e8b7685a264e5d4e8cf2ed6aaf3989451579c2
+      branch: main
+      revision: 1deb7a2030e02c12b536605430f11422358ed12b
+    management_charts:
+      - name: kube-prometheus-stack
+        release_name: kube-prometheus-stack
+        namespace: monitoring
+        url: https://github.com/prometheus-community/helm-charts/releases/download/kube-prometheus-stack-65.2.0/kube-prometheus-stack-65.2.0.tgz
+        sha256: fa80a64847ba4e59224554ef57a3d243088d43375a75caffbd4592e34f3923e7
+      - name: loki
+        release_name: loki
+        namespace: monitoring
+        url: https://github.com/grafana/helm-charts/releases/download/helm-loki-6.49.0/loki-6.49.0.tgz
+        sha256: 96db7244b1257000e99b800cc92fdc0702f5805d0de9db237d962b07b24d2cea
+      - name: gitea
+        release_name: gitea
+        namespace: gitea
+        url: oci://registry-1.docker.io/giteacharts/gitea
+        sha256: b2ac71b48f3713ac49bcb927ca463d4d43b0519da9c14a442fd217e2e526da63
+      - name: argo-cd
+        release_name: argocd
+        namespace: argocd
+        url: https://github.com/argoproj/argo-helm/releases/download/argo-cd-7.6.12/argo-cd-7.6.12.tgz
+        sha256: f56d046515cbd60c0e7c117ca66070d0ae5cc21fe48b25dcedad206a6e765e6e

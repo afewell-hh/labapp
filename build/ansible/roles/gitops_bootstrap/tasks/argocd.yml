@@ -1,0 +1,71 @@
+---
+- name: Read only the target VLAB kubeconfig selected by provisioning
+  ansible.builtin.slurp:
+    src: "{{ gitops_vlab_kubeconfig_path }}"
+  register: gitops_vlab_kubeconfig
+  no_log: true
+
+- name: Decode the selected kubeconfig privately
+  ansible.builtin.set_fact:
+    gitops_kube_document: "{{ gitops_vlab_kubeconfig.content | b64decode | from_yaml }}"
+  no_log: true
+
+- name: Select the actual current context
+  ansible.builtin.set_fact:
+    gitops_kube_contexts: "{{ gitops_kube_document.contexts | selectattr('name', 'equalto', gitops_kube_document['current-context']) | list }}"
+  no_log: true
+
+- name: Require one unambiguous selected context
+  ansible.builtin.assert:
+    that:
+      - gitops_kube_contexts | length == 1
+  no_log: true
+
+- name: Select actual cluster and user records
+  ansible.builtin.set_fact:
+    gitops_kube_clusters: "{{ gitops_kube_document.clusters | selectattr('name', 'equalto', gitops_kube_contexts[0].context.cluster) | list }}"
+    gitops_kube_users: "{{ gitops_kube_document.users | selectattr('name', 'equalto', gitops_kube_contexts[0].context.user) | list }}"
+  no_log: true
+
+- name: Require embedded TLS authentication without exec plugins
+  ansible.builtin.assert:
+    that:
+      - gitops_kube_clusters | length == 1
+      - gitops_kube_users | length == 1
+      - gitops_kube_clusters[0].cluster['certificate-authority-data'] | length > 0
+      - "'exec' not in gitops_kube_users[0].user"
+      - "'auth-provider' not in gitops_kube_users[0].user"
+      - "gitops_kube_users[0].user.token is defined or ('client-certificate-data' in gitops_kube_users[0].user and 'client-key-data' in gitops_kube_users[0].user)"
+  no_log: true
+
+- name: Render the native ArgoCD cluster Secret privately
+  ansible.builtin.set_fact:
+    gitops_argocd_cluster_secret: "{{ lookup('ansible.builtin.template', 'cluster-secret.yaml.j2') }}"
+  no_log: true
+
+- name: Register the cluster through the management Kubernetes API
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - apply
+      - --server-side
+      - --field-manager=labapp-gitops
+      - -f
+      - '-'
+    stdin: "{{ gitops_argocd_cluster_secret }}"
+  no_log: true
+
+- name: Apply the native course Application
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - apply
+      - --server-side
+      - --field-manager=labapp-gitops
+      - -f
+      - '-'
+    stdin: "{{ lookup('ansible.builtin.template', 'application.yaml.j2') }}"

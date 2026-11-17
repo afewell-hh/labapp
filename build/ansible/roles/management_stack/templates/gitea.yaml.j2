@@ -1,0 +1,33 @@
+service:
+  http:
+    type: NodePort
+    port: 3000
+    nodePort: 30001
+persistence:
+  enabled: true
+  storageClass: local-path
+  size: 20Gi
+postgresql:
+  enabled: false
+postgresql-ha:
+  enabled: false
+redis:
+  enabled: false
+redis-cluster:
+  enabled: false
+gitea:
+  admin:
+    username: {{ release.services.gitops.username | to_json }}
+    password: {{ release.services.gitops.password | to_json }}
+    email: {{ release.services.gitops.email | to_json }}
+  config:
+    database:
+      DB_TYPE: sqlite3
+    server:
+      ROOT_URL: {{ release.services.gitea.root_url | to_json }}
+    session:
+      PROVIDER: memory
+    cache:
+      ADAPTER: memory
+    queue:
+      TYPE: level
