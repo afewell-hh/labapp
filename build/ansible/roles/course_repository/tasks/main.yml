@@ -1,0 +1,62 @@
+---
+- name: Verify the selected teaching bundle on the controller
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/{{ release.artifacts.course_repository_bundle.file }}"
+    checksum_algorithm: sha256
+    follow: false
+  delegate_to: localhost
+  become: false
+  register: teaching_bundle
+
+- name: Require the release's exact sanitized history
+  ansible.builtin.assert:
+    that:
+      - teaching_bundle.stat.isreg | default(false)
+      - not (teaching_bundle.stat.islnk | default(false))
+      - teaching_bundle.stat.checksum | default('') == release.artifacts.course_repository_bundle.sha256
+
+- name: Create the build seed directory
+  ansible.builtin.file:
+    path: /opt/labapp/seed
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Stage the verified teaching bundle
+  ansible.builtin.copy:
+    src: "{{ release.artifacts.course_repository_bundle.file }}"
+    dest: /opt/labapp/seed/hedgehog-config.bundle
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Clone full teaching history without rewriting commit metadata
+  # The Git module rewrites a local path to file://, which Git rejects for bundles.
+  ansible.builtin.command:
+    argv:
+      - git
+      - clone
+      - --bare
+      - --branch
+      - "{{ release.artifacts.course_repository_bundle.branch }}"
+      - --
+      - /opt/labapp/seed/hedgehog-config.bundle
+      - /opt/labapp/seed/hedgehog-config.git
+    creates: /opt/labapp/seed/hedgehog-config.git/HEAD
+
+- name: Read the seed revision
+  ansible.builtin.command:
+    argv:
+      - git
+      - --git-dir=/opt/labapp/seed/hedgehog-config.git
+      - rev-parse
+      - --verify
+      - "refs/heads/{{ release.artifacts.course_repository_bundle.branch }}^{commit}"
+  changed_when: false
+  register: teaching_revision
+
+- name: Require the selected seed revision
+  ansible.builtin.assert:
+    that:
+      - teaching_revision.stdout == release.artifacts.course_repository_bundle.revision

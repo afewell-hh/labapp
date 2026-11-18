@@ -1,0 +1,26 @@
+# Delta over the course_assets values; explicit local-path persistence.
+grafana:
+  service:
+    type: NodePort
+    nodePort: 30300
+  persistence:
+    enabled: true
+    type: pvc
+    storageClassName: local-path
+    accessModes: [ReadWriteOnce]
+    size: 1Gi
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090
+  prometheusSpec:
+    retention: 7d
+    retentionSize: 6GB
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 8Gi

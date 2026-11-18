@@ -1,0 +1,65 @@
+#!/bin/bash
+# Internal bounded readiness. The caller supplies an outer timeout/systemd cap.
+set -euo pipefail
+work=/home/ubuntu/hhfab
+cache=/home/ubuntu/.cache/hhfab
+export HOME=/home/ubuntu
+require_vlab_process() {
+  local main_pid
+  main_pid=$(/usr/bin/systemctl show labapp-vlab-build.service --property=MainPID --value)
+  [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || { echo 'Native VLAB process exited before readiness' >&2; exit 1; }
+}
+require_vlab_process
+if [[ "${1:-}" == initial ]]; then
+  # Native image build/download precedes bridge creation. Both the root bridge
+  # helper and the following API checks share this process's outer deadline.
+  /usr/bin/sudo -n /usr/local/libexec/labapp-vlab-bridge labapp-vlab-build.service
+fi
+kube=(/usr/local/bin/kubectl --kubeconfig "$work/vlab/kubeconfig" --request-timeout=5s)
+until [[ -s "$work/vlab/kubeconfig" ]] && [[ "$("${kube[@]}" get --raw=/readyz 2>/dev/null)" == ok ]]; do
+  require_vlab_process
+  echo 'Waiting for native VLAB API readiness'
+  sleep 5
+done
+"${kube[@]}" wait --for=condition=Ready node/control-1 --timeout=60s
+if [[ "${1:-}" == final ]]; then
+  # Course commands require all seven generations and the leaf-01 Applied query.
+  # Do not manufacture status, force generations or add a seven-condition gate.
+  until "${kube[@]}" get agents -o json | /usr/bin/jq -e \
+    --slurpfile desired /home/ubuntu/.config/labapp-vlab/observability-patch.json '
+    ($desired[0].spec.config.observability.targets) as $targets |
+    (.items | map(.metadata.name) | sort) ==
+      ["leaf-01","leaf-02","leaf-03","leaf-04","leaf-05","spine-01","spine-02"] and
+    all(.items[];
+      . as $agent |
+      all(($targets.prometheus | to_entries[]);
+        . as $target | $agent.spec.config.alloy.targets.prometheus[$target.key].url == $target.value.url) and
+      all(($targets.loki | to_entries[]);
+        . as $target | $agent.spec.config.alloy.targets.loki[$target.key].url == $target.value.url) and
+      .metadata.generation > 0 and .metadata.generation == .status.lastAppliedGen) and
+    ([.items[] | select(.metadata.name == "leaf-01") | .status.conditions[]? |
+      select(.type == "Applied") | .status] == ["True"])
+  ' >/dev/null; do
+    require_vlab_process
+    echo 'Waiting for declared telemetry targets and actual course reconciliation'
+    sleep 5
+  done
+fi
+require_vlab_process
+/usr/local/bin/hhfab vlab wait-switches --workdir "$work" --cache-dir "$cache"
+# Strict BGP inspection is evidence, not a process-liveness gate. The reference
+# image can report incomplete neighbours after readiness; killing all VMs here
+# prevents students from inspecting or using that lab.
+umask 077
+report_dir=/home/ubuntu/.local/state/labapp
+mkdir -p "$report_dir"
+inspection_exit=0
+/usr/bin/timeout --signal=TERM --kill-after=5s 60 \
+  /usr/local/bin/hhfab vlab inspect-switches --workdir "$work" --cache-dir "$cache" \
+  --strict=true --wait-applied-for 30 > "$report_dir/inspect-${1}.log" 2>&1 || inspection_exit=$?
+inspection_status=FAIL
+[[ "$inspection_exit" == 0 ]] && inspection_status=PASS
+printf '{"check":"inspect-switches","status":"%s","exit_code":%s}\n' \
+  "$inspection_status" "$inspection_exit" > "$report_dir/inspect-${1}.json"
+require_vlab_process
+echo "Native VLAB readiness passed; advisory strict inspection: $inspection_status (exit $inspection_exit)"

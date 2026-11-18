@@ -1,0 +1,199 @@
+---
+# Fresh-builder preparation. Root supplies Docker/KVM, sudo and the transient
+# /run/labapp-build-registry/config.json; this role never handles that secret.
+- name: Require an official release and declared course namespaces
+  ansible.builtin.assert:
+    that:
+      - release.hedgehog.version_overrides == {}
+      - release.hedgehog.ipv4_ranges | length > 0
+      - lookup('ansible.builtin.file', release.hedgehog.wiring_file, rstrip=false) | hash('sha256') == release.hedgehog.wiring_sha256
+
+- name: Create the ubuntu-owned VLAB input and cache directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0700'
+  loop:
+    - /home/ubuntu/.cache
+    - /home/ubuntu/.config
+    - /home/ubuntu/hhfab
+    - /home/ubuntu/.cache/hhfab
+    - /home/ubuntu/.config/labapp-vlab
+
+- name: Create a fresh lab-local SSH identity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -q
+      - -t
+      - ed25519
+      - -N
+      - ''
+      - -f
+      - /home/ubuntu/.config/labapp-vlab/id_ed25519
+    creates: /home/ubuntu/.config/labapp-vlab/id_ed25519
+  become_user: ubuntu
+  no_log: true
+
+- name: Generate stable fresh lab-local join token and password hash
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    directory=/home/ubuntu/.config/labapp-vlab
+    temporary=$(mktemp "$directory/.credentials.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT
+    token=$(openssl rand -hex 32)
+    password_hash=$(openssl rand -hex 24 | openssl passwd -5 -stdin)
+    printf 'join_token: %s\npassword_hash: %s\n' "$token" "$password_hash" > "$temporary"
+    mv -n "$temporary" "$directory/credentials.yaml"
+  args:
+    executable: /bin/bash
+    creates: /home/ubuntu/.config/labapp-vlab/credentials.yaml
+  become_user: ubuntu
+  no_log: true
+
+- name: Read the lab-local credential fields
+  ansible.builtin.slurp:
+    src: /home/ubuntu/.config/labapp-vlab/credentials.yaml
+  register: vlab_credentials_raw
+  no_log: true
+
+- name: Read the lab-local public key
+  ansible.builtin.slurp:
+    src: /home/ubuntu/.config/labapp-vlab/id_ed25519.pub
+  register: vlab_public_key_raw
+  no_log: true
+
+- name: Render initial native Fabricator configuration
+  ansible.builtin.template:
+    src: fab-input.yaml.j2
+    dest: /home/ubuntu/.config/labapp-vlab/fab-input.yaml
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  vars:
+    vlab_credentials: "{{ vlab_credentials_raw.content | b64decode | from_yaml }}"
+    vlab_public_key: "{{ vlab_public_key_raw.content | b64decode | trim }}"
+  no_log: true
+
+- name: Render the course topology with the declared IPv4 ranges
+  ansible.builtin.template:
+    src: wiring.yaml.j2
+    dest: /home/ubuntu/.config/labapp-vlab/wiring.yaml
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+
+- name: Hash the role-owned native input files
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/sha256sum
+      - /home/ubuntu/.config/labapp-vlab/fab-input.yaml
+      - /home/ubuntu/.config/labapp-vlab/wiring.yaml
+  register: vlab_input_hashes
+  changed_when: false
+  no_log: true
+
+- name: Bind the initial inputs without hashing hydrated output
+  ansible.builtin.copy:
+    content: "{{ vlab_input_hashes.stdout }}\n"
+    dest: /home/ubuntu/.config/labapp-vlab/initialized-inputs.sha256
+    force: false
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  no_log: true
+
+- name: Refuse changed release inputs on an existing builder
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/sha256sum
+      - --check
+      - /home/ubuntu/.config/labapp-vlab/initialized-inputs.sha256
+  become_user: ubuntu
+  changed_when: false
+  no_log: true
+
+- name: Initialize native hhfab once on this immutable builder
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/hhfab
+      - init
+      - --workdir
+      - /home/ubuntu/hhfab
+      - --cache-dir
+      - /home/ubuntu/.cache/hhfab
+      - --config
+      - /home/ubuntu/.config/labapp-vlab/fab-input.yaml
+      - --registry-repo
+      - ghcr.io
+      - --registry-prefix
+      - githedgehog
+      - --wiring
+      - /home/ubuntu/.config/labapp-vlab/wiring.yaml
+    creates: /home/ubuntu/hhfab/fab.yaml
+  become_user: ubuntu
+  environment:
+    HOME: /home/ubuntu
+    DOCKER_CONFIG: /run/labapp-build-registry
+
+- name: Validate and hydrate the native course input
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/hhfab
+      - validate
+      - --workdir
+      - /home/ubuntu/hhfab
+      - --cache-dir
+      - /home/ubuntu/.cache/hhfab
+      - --hydrate-mode
+      - if-not-present
+  become_user: ubuntu
+  environment:
+    HOME: /home/ubuntu
+  changed_when: false
+
+- name: Create the internal helper directory
+  ansible.builtin.file:
+    path: /usr/local/libexec
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install essential internal VLAB lifecycle helpers
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/usr/local/libexec/{{ item }}"
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - labapp-vlab-run
+    - labapp-vlab-ready
+    - labapp-vlab-bridge
+
+- name: Install the build and resume service definitions
+  ansible.builtin.template:
+    src: labapp-vlab.service.j2
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - name: labapp-vlab-build.service
+      mode: build
+      seconds: 5400
+    - name: hhfab-vlab-resume.service
+      mode: resume
+      seconds: 900
+
+- name: Start only the controlled build service
+  ansible.builtin.systemd_service:
+    name: labapp-vlab-build.service
+    daemon_reload: true
+    enabled: false
+    state: started
+  when: vlab_start_build | default(true) | bool

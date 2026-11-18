@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Refresh a lab-local student session: a token baked days ago may have expired.
+set -euo pipefail
+export KUBECONFIG=/etc/labapp/management-kubeconfig.yaml
+/usr/local/bin/kubectl --context=k3d-k3d-observability --namespace=argocd \
+  rollout status deployment/argocd-server --timeout=300s >/dev/null
+password=$(/usr/local/bin/kubectl --context=k3d-k3d-observability --namespace=argocd \
+  get secret argocd-initial-admin-secret -o 'jsonpath={.data.password}' | base64 -d)
+test -n "$password"
+trap 'unset password' EXIT
+runuser -u ubuntu -- /usr/bin/env HOME=/home/ubuntu /usr/local/bin/argocd login \
+  localhost:8080 --plaintext --username admin --password "$password" \
+  --config /home/ubuntu/.config/argocd/config >/dev/null
+chmod 0600 /home/ubuntu/.config/argocd/config

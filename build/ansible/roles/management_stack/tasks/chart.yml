@@ -1,0 +1,70 @@
+---
+- name: Download the selected chart with its release checksum
+  ansible.builtin.get_url:
+    url: "{{ chart.url }}"
+    dest: "/var/cache/labapp-management-charts/{{ chart.name }}-{{ release.services.charts[chart.name] }}.tgz"
+    checksum: "sha256:{{ chart.sha256 }}"
+    owner: root
+    group: root
+    mode: '0600'
+    timeout: 30
+    validate_certs: true
+  when: chart.url is match('^https://')
+
+- name: Pull a public OCI chart using native Helm
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/helm
+      - pull
+      - "{{ chart.url }}"
+      - --version
+      - "{{ release.services.charts[chart.name] }}"
+      - --destination
+      - /var/cache/labapp-management-charts
+    creates: "/var/cache/labapp-management-charts/{{ chart.name }}-{{ release.services.charts[chart.name] }}.tgz"
+  when: chart.url is match('^oci://')
+  async: 180
+  poll: 5
+
+- name: Verify actual downloaded chart bytes
+  ansible.builtin.stat:
+    path: "/var/cache/labapp-management-charts/{{ chart.name }}-{{ release.services.charts[chart.name] }}.tgz"
+    checksum_algorithm: sha256
+  register: management_chart_bytes
+
+- name: Require the exact release chart archive
+  ansible.builtin.assert:
+    that:
+      - management_chart_bytes.stat.checksum == chart.sha256
+
+- name: Read actual chart metadata
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/helm
+      - show
+      - chart
+      - "/var/cache/labapp-management-charts/{{ chart.name }}-{{ release.services.charts[chart.name] }}.tgz"
+  register: management_chart_metadata
+  changed_when: false
+
+- name: Require the selected chart name and version
+  ansible.builtin.assert:
+    that:
+      - (management_chart_metadata.stdout | from_yaml).name == chart.name
+      - (management_chart_metadata.stdout | from_yaml).version | string == release.services.charts[chart.name] | string
+
+- name: Install or upgrade the native management release
+  ansible.builtin.command:
+    argv: >-
+      {{ ['/usr/local/bin/helm', 'upgrade', '--install', chart.release_name,
+          '/var/cache/labapp-management-charts/' + chart.name + '-' + release.services.charts[chart.name] + '.tgz',
+          '--kubeconfig', '/etc/labapp/management-kubeconfig.yaml',
+          '--kube-context', 'k3d-k3d-observability', '--namespace', chart.namespace,
+          '--create-namespace', '--wait', '--wait-for-jobs', '--timeout', '600s', '--history-max', '3']
+         + (['--values', '/opt/labapp/management/kube-prometheus-stack-values.yaml',
+             '--values', '/opt/labapp/management/kube-prometheus-stack-runtime.yaml']
+            if chart.name == 'kube-prometheus-stack'
+            else ['--values', '/opt/labapp/management/' + chart.name + '.yaml']) }}
+  async: 660
+  poll: 5
+  no_log: true

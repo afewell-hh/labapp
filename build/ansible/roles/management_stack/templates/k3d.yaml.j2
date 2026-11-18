@@ -1,0 +1,37 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: {{ release.services.management.cluster_name | to_json }}
+servers: {{ release.services.servers }}
+agents: {{ release.services.agents }}
+image: {{ release.services.management.image | to_json }}
+kubeAPI:
+  host: "127.0.0.1"
+  hostIP: "127.0.0.1"
+  hostPort: {{ release.services.management.api_port | string | to_json }}
+volumes:
+{% for node in ['server-0', 'agent-0', 'agent-1'] %}
+  - volume: {{ (release.services.management.storage_root + '/' + node + ':/var/lib/rancher/k3s/storage') | to_json }}
+    nodeFilters:
+      - {{ node | replace('-', ':') | to_json }}
+{% endfor %}
+ports:
+{% for port in [{'host': 3000, 'node': 30300}, {'host': 3001, 'node': 30001}, {'host': 8080, 'node': 30080}] %}
+  - port: {{ (release.services.management.bind_address + ':' + (port.host | string) + ':' + (port.node | string)) | to_json }}
+    nodeFilters: [loadbalancer]
+{% endfor %}
+  - port: {{ (release.services.management.prometheus_bind_address + ':9090:30090') | to_json }}
+    nodeFilters: [loadbalancer]
+  - port: {{ (release.services.management.prometheus_bind_address + ':3100:31000') | to_json }}
+    nodeFilters: [loadbalancer]
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters: ["server:*"]
+  kubeconfig:
+    updateDefaultKubeconfig: false
+    switchCurrentContext: false

@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the course student's local ArgoCD session
+Requires=labapp-management.service
+After=labapp-management.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/labapp-student-session
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target

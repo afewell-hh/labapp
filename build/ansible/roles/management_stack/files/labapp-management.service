@@ -1,0 +1,15 @@
+[Unit]
+Description=Preserved Labapp management cluster
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/k3d cluster start k3d-observability --wait --timeout 300s
+ExecStop=/usr/local/bin/k3d cluster stop k3d-observability
+TimeoutStartSec=330
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

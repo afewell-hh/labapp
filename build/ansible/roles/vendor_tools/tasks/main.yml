@@ -1,0 +1,43 @@
+---
+- name: Validate tool record paths and binary identities
+  ansible.builtin.assert:
+    that:
+      - tool.name is match('^[a-z][a-z0-9-]*$')
+      - tool.version is match('^[A-Za-z0-9][A-Za-z0-9.+-]*$')
+      - tool.url is match('^https://')
+      - tool.binary_sha256 is match('^[a-f0-9]{64}$')
+      - tool.binary_size | int > 0
+  loop: "{{ release.vendor_archives + release.vendor_binaries }}"
+  loop_control:
+    loop_var: tool
+    label: "{{ tool.name }}"
+
+- name: Create a root-owned tool staging directory
+  ansible.builtin.file:
+    path: /var/cache/labapp-tools
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Ensure the native tool installation directory exists
+  ansible.builtin.file:
+    path: /usr/local/bin
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install each manifest-pinned archive
+  ansible.builtin.include_tasks: archive.yml
+  loop: "{{ release.vendor_archives }}"
+  loop_control:
+    loop_var: tool
+    label: "{{ tool.name }} {{ tool.version }}"
+
+- name: Install each manifest-pinned raw binary
+  ansible.builtin.include_tasks: binary.yml
+  loop: "{{ release.vendor_binaries }}"
+  loop_control:
+    loop_var: tool
+    label: "{{ tool.name }} {{ tool.version }}"

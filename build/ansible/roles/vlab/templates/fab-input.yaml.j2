@@ -1,0 +1,65 @@
+---
+# Native Fabricator 0.43 schema, derived from the accepted canonical input.
+# Final observability is applied to the live object after management startup;
+# the built fab.yaml and ISO inputs remain unchanged across resume.
+apiVersion: fabricator.githedgehog.com/v1beta1
+kind: Fabricator
+metadata:
+  name: default
+  namespace: fab
+spec:
+  overrides: {}
+  config:
+    registry:
+      mode: airgap
+    control:
+      joinToken: {{ vlab_credentials.join_token | to_json }}
+      defaultUser:
+        password: {{ vlab_credentials.password_hash | to_json }}
+        authorizedKeys:
+          - {{ vlab_public_key | to_json }}
+      managementSubnet: 172.30.0.0/21
+      controlVIP: 172.30.0.1/32
+      kubeClusterSubnet: 172.28.0.0/16
+      kubeServiceSubnet: 172.29.0.0/16
+      kubeClusterDNS: 172.29.0.10
+      dummySubnet: 172.30.90.0/24
+    fabric:
+      mode: spine-leaf
+      defaultSwitchUsers:
+        admin:
+          role: admin
+          password: {{ vlab_credentials.password_hash | to_json }}
+          authorizedKeys:
+            - {{ vlab_public_key | to_json }}
+        op:
+          role: operator
+          password: {{ vlab_credentials.password_hash | to_json }}
+          authorizedKeys:
+            - {{ vlab_public_key | to_json }}
+      managementDHCPStart: 172.30.4.0
+      managementDHCPEnd: 172.30.7.254
+      spineASN: 65100
+      leafASNStart: 65101
+      leafASNEnd: 65533
+      protocolSubnet: 172.30.8.0/22
+      vtepSubnet: 172.30.12.0/22
+      fabricSubnet: 172.30.128.0/17
+      mclagSessionSubnet: 172.30.95.0/31
+      vpcWorkaroundSubnet: 172.30.96.0/19
+    observability:
+      defaults: none
+---
+apiVersion: fabricator.githedgehog.com/v1beta1
+kind: ControlNode
+metadata:
+  name: control-1
+  namespace: fab
+spec:
+  bootstrap:
+    disk: /dev/sda
+  external:
+    interface: enp2s0
+    ip: dhcp
+  management:
+    interface: enp2s1

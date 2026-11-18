@@ -1,0 +1,51 @@
+---
+- name: Assemble a course-compatible GCP lab image
+  hosts: all
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ release_file }}"
+  vars:
+    gitops_vlab_kubeconfig_path: /home/ubuntu/hhfab/vlab/kubeconfig
+  pre_tasks:
+    - name: Require the selected GCP guest platform and official agent
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version == '24.04'
+          - ansible_architecture == 'x86_64'
+          - release.hedgehog.version_overrides == {}
+  tasks:
+    - name: Provision the complete lab before capture
+      block:
+        - ansible.builtin.include_role:
+            name: base
+        - ansible.builtin.include_role:
+            name: host
+        - ansible.builtin.include_role:
+            name: vendor_tools
+        - ansible.builtin.include_role:
+            name: course_assets
+        - ansible.builtin.include_role:
+            name: course_repository
+        - ansible.builtin.include_role:
+            name: management_stack
+        - ansible.builtin.include_role:
+            name: vlab
+        - ansible.builtin.include_role:
+            name: vlab
+            tasks_from: finalize
+        - ansible.builtin.include_role:
+            name: gitops_bootstrap
+        - ansible.builtin.include_role:
+            name: student_access
+        - ansible.builtin.include_role:
+            name: management_stack
+            tasks_from: verify
+        - ansible.builtin.include_role:
+            name: seal
+      always:
+        - name: Remove the temporary registry credential on success or failure
+          ansible.builtin.file:
+            path: /run/labapp-build-registry
+            state: absent

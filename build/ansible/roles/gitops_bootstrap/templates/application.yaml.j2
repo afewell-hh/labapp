@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ release.course.gitops.application | to_json }}
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{ ('http://gitea-http.gitea.svc.cluster.local:3000/' + release.services.gitops.organization + '/' + release.services.gitops.repository + '.git') | to_json }}
+    targetRevision: main
+    path: {{ release.course.gitops.repository_path | to_json }}
+    directory:
+      recurse: true
+  destination:
+    server: https://172.30.0.1:6443
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: {{ release.course.gitops.prune | bool | to_json }}
+      selfHeal: {{ release.course.gitops.self_heal | bool | to_json }}
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

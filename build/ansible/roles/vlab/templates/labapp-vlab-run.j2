@@ -1,0 +1,32 @@
+#!/bin/bash
+# Internal systemd helper, not a student CLI. Run as the real ubuntu user.
+set -euo pipefail
+work=/home/ubuntu/hhfab
+cache=/home/ubuntu/.cache/hhfab
+case "${1:-}" in
+  build)
+    [[ "${DOCKER_CONFIG:-}" == /run/labapp-build-registry ]]
+    ;;
+  resume)
+    unset DOCKER_CONFIG
+    # Never silently initialize or replace missing prepared state on boot.
+    for path in fab.yaml .registry.yaml include/wiring.yaml vlab/config.yaml vlab/sshkey \
+      result/control--control-1--install/fab.yaml result/control--control-1--install/include.yaml \
+      result/control--control-1--install-usb.iso; do
+      [[ -s "$work/$path" ]] || { echo 'Prepared VLAB input missing; resume refused' >&2; exit 1; }
+    done
+    for vm in control-1 leaf-{01..05} spine-{01..02} server-{01..10}; do
+      for file in os.img efi_code.fd efi_vars.fd; do
+        [[ -s "$work/vlab/vms/$vm/$file" ]] || { echo 'Prepared VM image missing; resume refused' >&2; exit 1; }
+      done
+    done
+    ;;
+  *) echo 'Expected build or resume mode' >&2; exit 2 ;;
+esac
+exec /usr/local/bin/hhfab vlab up --workdir "$work" --cache-dir "$cache" \
+  --hydrate-mode if-not-present --build-mode iso \
+  --controls-restricted=false --servers-restricted=true --auto-upgrade=false \
+  --kill-stale=false --fail-fast=true --ready wait \
+  --control-cpus 6 --control-ram 6144 --control-disk 100 \
+  --server-cpus 2 --server-ram 768 --server-disk 10 \
+  --gateway-cpus 8 --gateway-ram 6144 --gateway-disk 50

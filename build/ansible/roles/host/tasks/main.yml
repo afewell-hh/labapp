@@ -1,0 +1,158 @@
+---
+- name: Install native VM, container and student desktop packages
+  ansible.builtin.apt:
+    name: [acl, bridge-utils, dbus-x11, docker.io, iproute2, iptables, iputils-ping, less, libvirt-daemon-system, openssh-server, openssl, python3-passlib, qemu-system-x86, qemu-utils, socat, sudo, xfce4, xfce4-goodies, xrdp]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the signed package key directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the native Mozilla browser without Snap enrollment
+  ansible.builtin.include_tasks: firefox.yml
+
+- name: Install the pinned public Microsoft signing key for VS Code
+  ansible.builtin.get_url:
+    url: "{{ release.artifacts.microsoft_apt_key.url }}"
+    checksum: "sha256:{{ release.artifacts.microsoft_apt_key.sha256 }}"
+    dest: /etc/apt/keyrings/labapp-microsoft.asc
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Select the signed VS Code package repository
+  ansible.builtin.apt_repository:
+    repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/labapp-microsoft.asc] https://packages.microsoft.com/repos/code stable main
+    filename: labapp-vscode
+    state: present
+
+- name: Install the native course editor
+  ansible.builtin.apt:
+    name: code
+    state: present
+
+- name: Configure the ordinary student account
+  ansible.builtin.user:
+    name: ubuntu
+    shell: /bin/bash
+    groups: [sudo, docker, kvm]
+    append: true
+    password: "{{ release.student.password | password_hash('sha512', 'labappCourseR0') }}"
+    update_password: always
+  no_log: true
+
+- name: Preserve the course RDP password on each new instance
+  ansible.builtin.copy:
+    dest: /etc/cloud/cloud.cfg.d/99-labapp-student.cfg
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Preserve the image's public course login when cloud-init re-runs.
+      system_info:
+        default_user:
+          lock_passwd: false
+
+- name: Permit hhfab's native host setup through sudo
+  ansible.builtin.copy:
+    content: "ubuntu ALL=(ALL) NOPASSWD: ALL\n"
+    dest: /etc/sudoers.d/90-labapp-student
+    owner: root
+    group: root
+    mode: '0440'
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Select the native XFCE RDP session
+  ansible.builtin.copy:
+    content: "xfce4-session\n"
+    dest: /home/ubuntu/.xsession
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Let XRDP read its system TLS key
+  ansible.builtin.user:
+    name: xrdp
+    groups: ssl-cert
+    append: true
+
+- name: Select dedicated per-instance XRDP TLS files
+  ansible.builtin.lineinfile:
+    path: /etc/xrdp/xrdp.ini
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}=/etc/xrdp/instance-tls/{{ item.file }}.pem"
+  loop:
+    - {key: certificate, file: cert}
+    - {key: key_file, file: key}
+
+- name: Install the bounded XRDP instance identity helper
+  ansible.builtin.copy:
+    src: labapp-xrdp-identity.py
+    dest: /usr/local/sbin/labapp-xrdp-identity
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the pre-listener XRDP identity unit
+  ansible.builtin.copy:
+    src: labapp-xrdp-identity.service
+    dest: /etc/systemd/system/labapp-xrdp-identity.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create native XRDP override directories
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop: [xrdp.service, xrdp-sesman.service]
+
+- name: Supervise native XRDP foreground processes directly
+  ansible.builtin.copy:
+    src: "systemd/{{ item }}/10-foreground.conf"
+    dest: "/etc/systemd/system/{{ item }}.d/10-foreground.conf"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: [xrdp.service, xrdp-sesman.service]
+  register: labapp_xrdp_foreground_overrides
+
+- name: Stop stock XRDP processes before loading changed foreground overrides
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: [xrdp.service, xrdp-sesman.service]
+  when: labapp_xrdp_foreground_overrides.changed
+
+- name: Load native XRDP foreground overrides
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: labapp_xrdp_foreground_overrides.changed
+
+
+- name: Enable the native host services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [docker.service, xrdp.service]
+
+- name: Verify nested virtualization is available
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: host_kvm
+
+- name: Require the actual KVM device before VLAB provisioning
+  ansible.builtin.assert:
+    that:
+      - host_kvm.stat.ischr | default(false)
+    fail_msg: The selected builder must expose nested virtualization at /dev/kvm.

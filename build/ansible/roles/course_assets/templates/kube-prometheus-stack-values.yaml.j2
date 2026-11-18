@@ -1,0 +1,35 @@
+# Native chart values. These files still require a management cluster and Helm install.
+grafana:
+  adminUser: {{ release.services.monitoring.grafana_admin_user | to_json }}
+  adminPassword: {{ release.services.monitoring.grafana_admin_password | to_json }}
+  image:
+    tag: {{ release.services.monitoring.grafana_version | to_json }}
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: {{ release.services.monitoring.namespace | to_json }}
+      provider:
+        folder: ""
+        foldersFromFilesStructure: false
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      isDefaultDatasource: true
+      name: Prometheus
+      uid: prometheus
+      alertmanager:
+        enabled: true
+        name: Alertmanager
+        uid: alertmanager
+  additionalDataSources:
+    - name: Loki
+      uid: loki
+      type: loki
+      access: proxy
+      url: {{ release.services.monitoring.loki_url | to_json }}
+      editable: false
+prometheus:
+  prometheusSpec:
+    enableRemoteWriteReceiver: true

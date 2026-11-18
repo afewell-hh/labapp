@@ -1,0 +1,202 @@
+---
+- name: Require explicit management deployment inputs
+  ansible.builtin.assert:
+    that:
+      - release.services.management.cluster_name == 'k3d-observability'
+      - release.services.management.image is match('^rancher/k3s:v[0-9][A-Za-z0-9.+:@_-]*$')
+      - release.services.management.storage_root == '/var/lib/labapp/management-storage'
+      - release.services.management.bind_address is match('^[0-9.]+$')
+      - release.services.management.prometheus_bind_address is match('^[0-9.]+$')
+      - release.services.servers | int == 1
+      - release.services.agents | int == 2
+      - release.artifacts.management_charts | map(attribute='name') | sort | list == ['argo-cd', 'gitea', 'kube-prometheus-stack', 'loki']
+      - release.services.gitea.root_url is match('^https?://')
+    fail_msg: Supply reviewed management image, network, chart and Gitea inputs before deployment.
+
+- name: Verify chart records before deployment
+  ansible.builtin.assert:
+    that:
+      - chart.url is match('^(https://|oci://registry-1.docker.io/giteacharts/)')
+      - chart.sha256 is match('^[a-f0-9]{64}$')
+      - chart.release_name is match('^[a-z][a-z0-9-]*$')
+      - chart.namespace is match('^[a-z][a-z0-9-]*$')
+      - chart.release_name == {'kube-prometheus-stack':'kube-prometheus-stack', 'loki':'loki', 'gitea':'gitea', 'argo-cd':'argocd'}[chart.name]
+      - chart.namespace == {'kube-prometheus-stack':'monitoring', 'loki':'monitoring', 'gitea':'gitea', 'argo-cd':'argocd'}[chart.name]
+  loop: "{{ release.artifacts.management_charts }}"
+  loop_control:
+    loop_var: chart
+    label: "{{ chart.name }}"
+
+- name: Create management configuration and chart cache directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  loop:
+    - /etc/labapp
+    - /var/cache/labapp-management-charts
+
+- name: Create persistent storage for each management node
+  ansible.builtin.file:
+    path: "{{ release.services.management.storage_root }}/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - server-0
+    - agent-0
+    - agent-1
+
+- name: Render native management cluster and chart values
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/opt/labapp/management/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - k3d.yaml
+    - kube-prometheus-stack-runtime.yaml
+    - loki.yaml
+    - loki-telemetry.yaml
+    - gitea.yaml
+    - argo-cd.yaml
+
+- name: Inspect existing k3d cluster names
+  ansible.builtin.command:
+    argv: [/usr/local/bin/k3d, cluster, list, --output, json]
+  register: management_clusters
+  changed_when: false
+
+- name: Determine whether the selected cluster exists
+  ansible.builtin.set_fact:
+    management_exists: "{{ release.services.management.cluster_name in (management_clusters.stdout | from_json | map(attribute='name') | list) }}"
+
+- name: Hash the requested cluster configuration
+  ansible.builtin.stat:
+    path: /opt/labapp/management/k3d.yaml
+    checksum_algorithm: sha256
+  register: management_config
+
+- name: Read an existing cluster's provisioning identity
+  ansible.builtin.slurp:
+    src: /etc/labapp/management-cluster.sha256
+  register: management_identity
+  when: management_exists
+
+- name: Refuse adoption or silent reconfiguration of an existing cluster
+  ansible.builtin.assert:
+    that:
+      - (management_identity.content | b64decode | trim) == management_config.stat.checksum
+    fail_msg: Existing cluster differs from this image recipe; rebuild or explicitly migrate it.
+  when: management_exists
+
+- name: Create the declared native k3d cluster
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3d
+      - cluster
+      - create
+      - --config
+      - /opt/labapp/management/k3d.yaml
+  async: 330
+  poll: 5
+  when: not management_exists
+
+- name: Persist successful cluster provisioning identity
+  ansible.builtin.copy:
+    content: "{{ management_config.stat.checksum }}\n"
+    dest: /etc/labapp/management-cluster.sha256
+    owner: root
+    group: root
+    mode: '0600'
+  when: not management_exists
+
+- name: Start preserved management containers
+  ansible.builtin.command:
+    argv: [/usr/local/bin/k3d, cluster, start, k3d-observability, --wait, --timeout, 300s]
+  async: 330
+  poll: 5
+  changed_when: false
+
+- name: Obtain the management kubeconfig without publishing credentials
+  ansible.builtin.command:
+    argv: [/usr/local/bin/k3d, kubeconfig, get, k3d-observability]
+  register: management_kubeconfig
+  changed_when: false
+  no_log: true
+
+- name: Store the private management kubeconfig
+  ansible.builtin.copy:
+    content: "{{ management_kubeconfig.stdout }}\n"
+    dest: /etc/labapp/management-kubeconfig.yaml
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+
+- name: Wait for management nodes
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - wait
+      - --for=condition=Ready
+      - node
+      - --all
+      - --timeout=300s
+  changed_when: false
+
+- name: Install the selected verified management charts
+  ansible.builtin.include_tasks: chart.yml
+  loop: "{{ release.artifacts.management_charts }}"
+  loop_control:
+    loop_var: chart
+    label: "{{ chart.name }}"
+
+- name: Import the verified course dashboard ConfigMaps
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - apply
+      - --server-side
+      - --field-manager=labapp-course
+      - -f
+      - /opt/labapp/management/course-dashboards.yaml
+  register: management_dashboard_apply
+  changed_when: "'created' in management_dashboard_apply.stdout or 'serverside-applied' in management_dashboard_apply.stdout"
+
+- name: Expose the direct Loki telemetry port through a declarative Service
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - apply
+      - --server-side
+      - --field-manager=labapp-management
+      - -f
+      - /opt/labapp/management/loki-telemetry.yaml
+  register: management_loki_apply
+  changed_when: "'created' in management_loki_apply.stdout or 'serverside-applied' in management_loki_apply.stdout"
+
+- name: Install native management boot and shutdown integration
+  ansible.builtin.copy:
+    src: labapp-management.service
+    dest: /etc/systemd/system/labapp-management.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable and start preserved management cluster boot integration
+  ansible.builtin.systemd_service:
+    name: labapp-management.service
+    daemon_reload: true
+    enabled: true
+    state: started

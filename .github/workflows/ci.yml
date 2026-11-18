@@ -12,6 +12,70 @@ permissions:
   contents: read
 
 jobs:
+  native-r0-source:
+    name: Native R0 helper, Ansible and Packer source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Exercise XRDP identity certificate and file-safety checks
+        run: python3 -B build/ansible/tests/test_xrdp_identity.py -v
+      - name: Install the guest's exact Ansible core package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ansible-core=2.16.3-0ubuntu2
+          version=$(/usr/bin/ansible-playbook --version)
+          [[ "$version" == *'ansible-playbook [core 2.16.3]'* ]]
+          printf '%s\n' "$version"
+      - name: Parse the selected R0 Ansible playbook and roles
+        run: |
+          /usr/bin/ansible-playbook --syntax-check -i 'localhost,' -c local \
+            -e "release_file=$PWD/build/releases/r0.yaml" \
+            build/ansible/image.yml
+          /usr/bin/ansible-playbook --syntax-check -i 'localhost,' -c local \
+            build/ansible/finalize-tools.yml
+      - name: Install checksum-pinned Packer 1.16.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/packer_1.16.2_linux_amd64.zip"
+          curl --fail --silent --show-error --location --retry 2 --max-time 90 \
+            --output "$archive" \
+            https://releases.hashicorp.com/packer/1.16.2/packer_1.16.2_linux_amd64.zip
+          printf '%s  %s\n' \
+            abbfe0cf74985084112659b53e3565f264f70a20914c3b7c4f789f54f61c2414 \
+            "$archive" | sha256sum --check
+          unzip -p "$archive" packer > "$RUNNER_TEMP/packer"
+          chmod 0755 "$RUNNER_TEMP/packer"
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Format and validate Packer with dummy local inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build/packer-gcp
+          packer version
+          packer init .
+          packer fmt -check labapp.pkr.hcl
+          static_dir=$(mktemp -d "$RUNNER_TEMP/labapp-r0-static.XXXXXX")
+          trap 'rm -rf -- "$static_dir"' EXIT
+          : > "$static_dir/dummy-config.json"
+          cat > "$static_dir/static.pkrvars.hcl" <<EOF
+          project_id = "ci-placeholder-project"
+          zone = "us-central1-a"
+          subnetwork = "default"
+          vm_service_account_email = "guest@ci-placeholder-project.iam.gserviceaccount.com"
+          builder_service_account_email = "builder@ci-placeholder-project.iam.gserviceaccount.com"
+          iap_network_tag = "ci-r0-static"
+          source_image = "ubuntu-2404-noble-amd64-v20000101"
+          build_id = "ci-static"
+          ghcr_config_file = "$static_dir/dummy-config.json"
+          EOF
+          packer validate -var-file="$static_dir/static.pkrvars.hcl" -var release=r0 .
+
   pinned-api-fixture:
     name: Pinned public API serializer and typed-default comparison
     runs-on: ubuntu-24.04

@@ -1,0 +1,8 @@
+{% for object in lookup('ansible.builtin.file', release.hedgehog.wiring_file) | from_yaml_all %}
+---
+{% if object.kind == 'IPv4Namespace' and object.metadata.name == 'default' %}
+{{ object | combine({'spec': object.spec | combine({'subnets': release.hedgehog.ipv4_ranges})}) | to_nice_yaml(indent=2) }}
+{% else %}
+{{ object | to_nice_yaml(indent=2) }}
+{% endif %}
+{% endfor %}

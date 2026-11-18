@@ -1,0 +1,23 @@
+---
+# Explicit development component entrypoint, never complete-image acceptance.
+- name: Configure release base packages and verified vendor tools only
+  hosts: all
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ release_file }}"
+  pre_tasks:
+    - name: Require the component platform and official release
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version == '24.04'
+          - ansible_architecture == 'x86_64'
+          - release.vendor_archives | selectattr('name', 'equalto', 'hhfab') | list | length == 1
+          - release.hedgehog.version_overrides == {}
+        fail_msg: These component roles require an official release on Ubuntu 24.04 amd64.
+  roles:
+    - base
+    - vendor_tools
+    - course_assets
+    - course_repository

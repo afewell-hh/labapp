@@ -1,0 +1,1 @@
+{{ {'spec': {'config': {'control': {'observability': none}, 'fabric': {'observability': release.hedgehog.fabric_observability}, 'gateway': {'observability': none}, 'observability': {'defaults': '', 'labels': release.hedgehog.observability_labels | default({}), 'targets': release.hedgehog.observability_targets}}}} | to_json }}

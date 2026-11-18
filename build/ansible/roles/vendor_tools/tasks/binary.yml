@@ -1,0 +1,16 @@
+---
+- name: Download the checksum-verified native binary
+  ansible.builtin.get_url:
+    url: "{{ tool.url }}"
+    dest: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}.bin"
+    checksum: "sha256:{{ tool.binary_sha256 }}"
+    owner: root
+    group: root
+    mode: '0600'
+    timeout: 30
+    validate_certs: true
+
+- name: Verify and publish the downloaded binary
+  ansible.builtin.include_tasks: publish.yml
+  vars:
+    tool_source: "/var/cache/labapp-tools/{{ tool.name }}-{{ tool.version }}.bin"

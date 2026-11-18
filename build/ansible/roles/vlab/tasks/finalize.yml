@@ -1,0 +1,109 @@
+---
+# Include only after both management endpoints and initial VLAB are running.
+- name: Require declared native observability targets
+  ansible.builtin.assert:
+    that:
+      - release.hedgehog.observability_targets.prometheus | length > 0
+      - release.hedgehog.observability_targets.loki | length > 0
+
+- name: Render the final live Fabricator observability patch
+  ansible.builtin.template:
+    src: observability-patch.json.j2
+    dest: /home/ubuntu/.config/labapp-vlab/observability-patch.json
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  no_log: true
+
+# The bare name "fabricator" also expands to a category containing FabNodes.
+# Use the qualified plural for every named Fabricator patch and status query.
+- name: Check admission and apply the final telemetry configuration
+  block:
+    - name: Run each telemetry stage once in order
+      ansible.builtin.include_tasks: telemetry-step.yml
+      loop:
+        - stage: controller_available
+          bound_seconds: 135
+          request_timeout: 130s
+          arguments: [wait, --for=condition=Available, deployment/fabricator-ctrl, --timeout=120s]
+        - stage: webhook_endpoints
+          bound_seconds: 135
+          request_timeout: 130s
+          arguments: [wait, '--for=jsonpath={.subsets[*].addresses[*].ip}', endpoints/fabricator-webhook-service, --timeout=120s]
+        - stage: admission_dry_run
+          bound_seconds: 35
+          request_timeout: 30s
+          arguments: [patch, fabricators.fabricator.githedgehog.com, default, --type=merge, --patch-file=/home/ubuntu/.config/labapp-vlab/observability-patch.json, --dry-run=server, -o, name]
+        - stage: apply
+          bound_seconds: 35
+          request_timeout: 30s
+          arguments: [patch, fabricators.fabricator.githedgehog.com, default, --type=merge, --patch-file=/home/ubuntu/.config/labapp-vlab/observability-patch.json, -o, name]
+      loop_control:
+        loop_var: telemetry_step
+        label: "{{ telemetry_step.stage }}"
+  rescue:
+    - name: Preserve the original failure even when the module returned no rc
+      ansible.builtin.set_fact:
+        telemetry_raw_failure: "{{ vlab_telemetry_command if (vlab_telemetry_command | default({}) | length > 0) else (ansible_failed_result | default({})) }}"
+      no_log: true
+
+    - name: Produce the redacted telemetry failure diagnostic
+      ansible.builtin.set_fact:
+        telemetry_failure: "{{ telemetry_raw_failure | labapp_telemetry_diagnostic }}"
+      no_log: true
+
+    - name: Retain bounded raw failure details privately until builder disposal
+      ansible.builtin.copy:
+        content: "{{ {'stage': vlab_telemetry_stage | default('task_setup'), 'rc': telemetry_raw_failure.rc | default(-1), 'stderr': (telemetry_raw_failure.stderr | default('') | string)[:8192], 'msg': (telemetry_raw_failure.msg | default('') | string)[:8192]} | to_nice_json }}\n"
+        dest: /home/ubuntu/.config/labapp-vlab/telemetry-patch-error.json
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      register: telemetry_private_record
+      ignore_errors: true
+      no_log: true
+
+    - name: Collect bounded cluster status after a telemetry failure
+      ansible.builtin.command:
+        argv: "{{ ['/usr/bin/timeout', '--kill-after=5s', '15', '/usr/local/bin/kubectl', '--kubeconfig=/home/ubuntu/hhfab/vlab/kubeconfig', '--request-timeout=10s', '--namespace=fab', 'get'] + item + ['-o', 'json'] }}"
+      loop:
+        - [pods]
+        - [endpoints]
+        - [fabricators.fabricator.githedgehog.com, default]
+      become_user: ubuntu
+      register: telemetry_cluster_raw
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      no_log: true
+
+    - name: Project only non-secret cluster status
+      ansible.builtin.set_fact:
+        telemetry_failure_report:
+          stage: "{{ vlab_telemetry_stage | default('task_setup') }}"
+          diagnostic: "{{ telemetry_failure }}"
+          private_record_saved: "{{ not (telemetry_private_record.failed | default(true)) }}"
+          cluster: "{{ telemetry_cluster_raw.results | default([]) | labapp_telemetry_cluster_state }}"
+      no_log: true
+
+    - name: Record the redacted failure and cluster status in the controller log
+      ansible.builtin.debug:
+        msg: "{{ telemetry_failure_report }}"
+
+    - name: Stop before reconciliation and capture after a telemetry failure
+      ansible.builtin.fail:
+        msg: "Telemetry stage {{ vlab_telemetry_stage | default('task_setup') }} failed: exit={{ telemetry_failure.rc }} category={{ telemetry_failure.category }}. See the redacted diagnostic above; capture is refused."
+
+- name: Observe actual final reconciliation and the literal course condition
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - --signal=TERM
+      - --kill-after=5s
+      - '600'
+      - /usr/local/libexec/labapp-vlab-ready
+      - final
+  become_user: ubuntu
+  environment:
+    HOME: /home/ubuntu
+  changed_when: false

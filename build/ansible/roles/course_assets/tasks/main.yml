@@ -1,0 +1,33 @@
+---
+- name: Verify each selected course dashboard before rendering
+  ansible.builtin.assert:
+    that:
+      - dashboard.uid is match('^[A-Za-z0-9_-]+$')
+      - lookup('ansible.builtin.file', role_path + '/files/dashboards/' + dashboard.uid + '.json', rstrip=False) | hash('sha256') == dashboard.sha256
+      - dashboard_payload.uid == dashboard.uid
+      - dashboard_payload.title == dashboard.title
+  vars:
+    dashboard_payload: "{{ lookup('ansible.builtin.file', role_path + '/files/dashboards/' + dashboard.uid + '.json') | from_json }}"
+  loop: "{{ release.course.dashboards }}"
+  loop_control:
+    loop_var: dashboard
+    label: "{{ dashboard.title }}"
+
+- name: Create the management configuration directory
+  ansible.builtin.file:
+    path: /opt/labapp/management
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Render native management configuration
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/opt/labapp/management/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - course-dashboards.yaml
+    - kube-prometheus-stack-values.yaml

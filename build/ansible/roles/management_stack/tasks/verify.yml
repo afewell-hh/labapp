@@ -1,0 +1,111 @@
+---
+# Pre-seal integration smoke only; never a full-course acceptance substitute.
+# Each telemetry check has <=18 requests of <=5s plus <=17 five-second delays.
+- name: Observe actual fabric agent series in Prometheus
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9090/api/v1/query?query={{ 'count({__name__=~\"fabric_agent_.*\"})' | urlencode }}"
+    return_content: true
+    status_code: 200
+    timeout: 5
+    use_proxy: false
+  register: management_smoke_prometheus
+  until: >-
+    management_smoke_prometheus.status | default(0) == 200
+    and management_smoke_prometheus.json is defined
+    and management_smoke_prometheus.json.status | default('') == 'success'
+    and management_smoke_prometheus.json.data.resultType | default('') == 'vector'
+    and management_smoke_prometheus.json.data.result | default([]) | length > 0
+    and management_smoke_prometheus.json.data.result[0].value[1] | float > 0
+  retries: 17
+  delay: 5
+  ignore_errors: true
+  no_log: true
+
+- name: Observe an ingested hostname label in Loki
+  ansible.builtin.uri:
+    url: http://127.0.0.1:3100/loki/api/v1/label/hostname/values
+    return_content: true
+    status_code: 200
+    timeout: 5
+    use_proxy: false
+  register: management_smoke_loki
+  until: >-
+    management_smoke_loki.status | default(0) == 200
+    and management_smoke_loki.json is defined
+    and management_smoke_loki.json.status | default('') == 'success'
+    and management_smoke_loki.json.data | default([]) | length > 0
+  retries: 17
+  delay: 5
+  ignore_errors: true
+  no_log: true
+
+- name: Observe course Application synchronization as advisory evidence
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --kubeconfig=/etc/labapp/management-kubeconfig.yaml
+      - --context=k3d-k3d-observability
+      - --request-timeout=5s
+      - --namespace=argocd
+      - get
+      - application
+      - "{{ release.course.gitops.application }}"
+      - -o
+      - jsonpath={.status.sync.status}
+  register: management_smoke_argocd
+  until: management_smoke_argocd.rc == 0 and management_smoke_argocd.stdout | trim == 'Synced'
+  retries: 5
+  delay: 5
+  changed_when: false
+  ignore_errors: true
+  no_log: true
+
+- name: Project smoke results without retaining response bodies or labels
+  ansible.builtin.set_fact:
+    management_smoke_results:
+      prometheus:
+        required: true
+        passed: "{{ not (management_smoke_prometheus.failed | default(true)) }}"
+        http_status: "{{ management_smoke_prometheus.status | default(0) | int }}"
+        attempts: "{{ management_smoke_prometheus.attempts | default(0) | int }}"
+      loki:
+        required: true
+        passed: "{{ not (management_smoke_loki.failed | default(true)) }}"
+        http_status: "{{ management_smoke_loki.status | default(0) | int }}"
+        attempts: "{{ management_smoke_loki.attempts | default(0) | int }}"
+      argocd:
+        required: false
+        passed: "{{ not (management_smoke_argocd.failed | default(true)) }}"
+        status: "{{ (management_smoke_argocd.stdout | default('') | trim) if (management_smoke_argocd.stdout | default('') | trim) in ['Synced', 'OutOfSync', 'Unknown'] else 'Unavailable' }}"
+        attempts: "{{ management_smoke_argocd.attempts | default(0) | int }}"
+
+- name: Create the sanitized build-check directory
+  ansible.builtin.file:
+    path: /var/lib/labapp/build-checks
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Record each bounded smoke outcome
+  ansible.builtin.copy:
+    content: "{{ item.value | to_nice_json }}\n"
+    dest: "/var/lib/labapp/build-checks/{{ item.key }}.json"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ management_smoke_results | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Require actual telemetry ingestion before image capture
+  ansible.builtin.assert:
+    that:
+      - management_smoke_results.prometheus.passed | bool
+      - management_smoke_results.loki.passed | bool
+    fail_msg: Required telemetry smoke failed; sanitized per-check outcomes are in /var/lib/labapp/build-checks.
+
+- name: Report an unsynchronized Application without claiming a course pass
+  ansible.builtin.debug:
+    msg: ArgoCD synchronization advisory did not pass; retain the recorded outcome for course acceptance.
+  when: not (management_smoke_results.argocd.passed | bool)
