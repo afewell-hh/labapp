@@ -172,7 +172,7 @@ build {
   }
 
   error-cleanup-provisioner "shell" {
-    inline          = ["rm -rf -- /run/labapp-build-registry"]
+    script          = "${path.root}/failure-diagnostics.sh"
     execute_command = "sudo -n /bin/bash '{{ .Path }}'"
     timeout         = "1m"
   }
