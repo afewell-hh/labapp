@@ -23,16 +23,20 @@ jobs:
       - name: Exercise XRDP identity certificate and file-safety checks
         run: python3 -B build/ansible/tests/test_xrdp_identity.py -v
       - name: Install the guest's exact Ansible core package
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ansible-core=2.16.3-0ubuntu2
-          ansible-playbook --version
+          version=$(/usr/bin/ansible-playbook --version)
+          [[ "$version" == *'ansible-playbook [core 2.16.3]'* ]]
+          printf '%s\n' "$version"
       - name: Parse the selected R0 Ansible playbook and roles
         run: |
-          ansible-playbook --syntax-check -i 'localhost,' -c local \
+          /usr/bin/ansible-playbook --syntax-check -i 'localhost,' -c local \
             -e "release_file=$PWD/build/releases/r0.yaml" \
             build/ansible/image.yml
-          ansible-playbook --syntax-check -i 'localhost,' -c local \
+          /usr/bin/ansible-playbook --syntax-check -i 'localhost,' -c local \
             build/ansible/finalize-tools.yml
       - name: Install checksum-pinned Packer 1.16.2
         shell: bash
