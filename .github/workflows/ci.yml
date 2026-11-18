@@ -22,6 +22,8 @@ jobs:
           persist-credentials: false
       - name: Exercise XRDP identity certificate and file-safety checks
         run: python3 -B build/ansible/tests/test_xrdp_identity.py -v
+      - name: Verify needrestart defers XRDP service restarts
+        run: python3 -B build/ansible/tests/test_needrestart_override.py
       - name: Install the guest's exact Ansible core package
         shell: bash
         run: |
