@@ -81,9 +81,6 @@ release:
           url: http://172.30.0.2:3100/loki/api/v1/push
     observability_labels:
       labapp_release: r0
-  student:
-    # Public course login selected by the owner, not a recovered credential.
-    password: HHLab.Admin!
   services:
     provenance: owner-relayed devb inspection, issue 588
     k3d: '5.7.4'
@@ -156,12 +153,6 @@ release:
       binary_sha256: efecedeb09f07b09ad4457467ceb103e1269004f34f7420a531372b13122fd2b
       binary_size: 169607606
   artifacts:
-    mozilla_apt_key:
-      url: https://packages.mozilla.org/apt/repo-signing-key.gpg
-      sha256: 3ecc63922b7795eb23fdc449ff9396f9114cb3cf186d6f5b53ad4cc3ebfbb11f
-    microsoft_apt_key:
-      url: https://packages.microsoft.com/keys/microsoft.asc
-      sha256: 2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6
     course_repository_bundle:
       file: hedgehog-config-sanitized.bundle
       sha256: e5e735e2619ec0f393f0936095e8b7685a264e5d4e8cf2ed6aaf3989451579c2

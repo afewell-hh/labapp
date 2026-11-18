@@ -13,7 +13,7 @@ only the declared IPv4 namespace ranges are applied to that topology.
 
 The image playbook provisions, in order:
 
-1. Host packages, Docker/KVM, XFCE/XRDP, VS Code and the ordinary ubuntu account.
+1. Host packages, Docker/KVM, SSH access and the ordinary ubuntu account.
 2. Verified native tools, six course dashboards and the sanitized teaching Git history.
 3. Persistent k3d management services: Gitea, ArgoCD, Prometheus/Grafana and Loki.
 4. Native hhfab VLAB build and readiness, followed by the actual telemetry
@@ -29,25 +29,14 @@ cannot restart a usable lab. Resume uses prepared nested disks and prohibits reb
 the installer inputs. Management containers and volumes persist across stop/start.
 The student's Argo session refreshes on boot and lasts the release-selected
 2160hours (90days), covering course days without a daily login interruption.
-Cloud-init preserves the selected ubuntu password on new clones. Unit
-activation is not a substitute for live readiness. Before sealing, actual
+Unit activation is not a substitute for live readiness. Before sealing, actual
 fabric metrics and a Loki hostname label are required; bounded Argo sync
 results are recorded as advisory evidence under `/var/lib/labapp/build-checks`.
 
-XRDP uses a dedicated TLS identity generated before its listener starts on each
-new VM. Capture removes the builder's dedicated XRDP identity and native RDP
-security key; ordinary reboots retain the VM's generated identity. The Ubuntu
-package's generic snakeoil key remains unused by XRDP and is not removed here.
-The host role keeps unattended security updates enabled but tells needrestart
-to defer XRDP service restarts, which otherwise log off a live student desktop
-when a pending libc update is installed. Deferred XRDP processes retain their
-previously loaded code until a planned restart or VM reboot; the security
-packages still install. Promotion requires a new candidate
-clone to repeat the forced apt-daily-upgrade trigger during an RDP session and
-verify that XRDP stays up, followed by a reconnect and fresh login. The earlier
-per-instance TLS and stop/start checks remain part of the release evidence.
-The self-signed certificate lasts 3650 days; an interrupted pair installation
-fails closed and needs an administrator to remove the incomplete owned pair.
+Students use their own browser for Grafana, Gitea, ArgoCD and Prometheus at the
+VM's public IP, and use SSH for fabric commands. The pinned course describes
+RDP only as an optional alternative; this recipe does not install a desktop or
+RDP service. This removes the public student OS password from the image.
 
 Telemetry finalization waits up to 120 seconds each for `fab/fabricator-ctrl` to
 be Available and `fab/fabricator-webhook-service` to have ready endpoints.
@@ -98,10 +87,10 @@ unchanged-course acceptance remains withheld until the corresponding hh-learn
 corrections land and the resulting curriculum is validated.
 
 The exact Ubuntu base image and zone are explicit Packer caller inputs, retained
-with the build. Ubuntu and VS Code packages resolve through their signed apt
-repositories. The manifest's conditional 10.20 scenario is unresolved; this
+with the build. Ubuntu packages resolve through its signed apt repositories.
+The manifest's conditional 10.20 scenario is unresolved; this
 recipe does not invent missing course scenarios or silently waive failed steps.
-Clone acceptance must check `passwd -S ubuntu` after cloud-init and exercise
-the RDP login. Course `gcloud compute ssh ... --command "kubectl ..."` can use
+Clone acceptance must exercise SSH for the ordinary ubuntu user. Course
+`gcloud compute ssh ... --command "kubectl ..."` can use
 the caller's OS username rather than ubuntu; that user has no provisioned
 kubeconfig. Record the exact user and result during course acceptance.
