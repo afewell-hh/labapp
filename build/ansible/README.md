@@ -38,8 +38,14 @@ XRDP uses a dedicated TLS identity generated before its listener starts on each
 new VM. Capture removes the builder's dedicated XRDP identity and native RDP
 security key; ordinary reboots retain the VM's generated identity. The Ubuntu
 package's generic snakeoil key remains unused by XRDP and is not removed here.
-Promotion requires a live clone check of boot ordering and distinct TLS public
-keys across two clones, plus diagnosis of the observed later RDP logoffs.
+The host role keeps unattended security updates enabled but tells needrestart
+to defer XRDP service restarts, which otherwise log off a live student desktop
+when a pending libc update is installed. Deferred XRDP processes retain their
+previously loaded code until a planned restart or VM reboot; the security
+packages still install. Promotion requires a new candidate
+clone to repeat the forced apt-daily-upgrade trigger during an RDP session and
+verify that XRDP stays up, followed by a reconnect and fresh login. The earlier
+per-instance TLS and stop/start checks remain part of the release evidence.
 The self-signed certificate lasts 3650 days; an interrupted pair installation
 fails closed and needs an administrator to remove the incomplete owned pair.
 

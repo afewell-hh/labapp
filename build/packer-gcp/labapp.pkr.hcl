@@ -118,7 +118,8 @@ source "googlecompute" "labapp" {
   use_internal_ip  = true
   ssh_username     = "ubuntu"
   ssh_timeout      = "10m"
-  state_timeout    = "5m"
+  # googlecompute also uses this limit while registering the captured image.
+  state_timeout = "15m"
   # Set in the instance insertion request, not armed after guest access.
   max_run_duration_in_seconds = 7200
   instance_termination_action = "DELETE"

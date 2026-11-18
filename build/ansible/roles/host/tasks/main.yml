@@ -1,10 +1,27 @@
 ---
 - name: Install native VM, container and student desktop packages
   ansible.builtin.apt:
-    name: [acl, bridge-utils, dbus-x11, docker.io, iproute2, iptables, iputils-ping, less, libvirt-daemon-system, openssh-server, openssl, python3-passlib, qemu-system-x86, qemu-utils, socat, sudo, xfce4, xfce4-goodies, xrdp]
+    name: [acl, bridge-utils, dbus-x11, docker.io, iproute2, iptables, iputils-ping, less, libvirt-daemon-system, needrestart, openssh-server, openssl, python3-passlib, qemu-system-x86, qemu-utils, socat, sudo, xfce4, xfce4-goodies, xrdp]
     state: present
     update_cache: true
     cache_valid_time: 3600
+
+- name: Create the needrestart override directory
+  ansible.builtin.file:
+    path: /etc/needrestart/conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Keep unattended security updates from interrupting XRDP sessions
+  ansible.builtin.copy:
+    src: needrestart-xrdp.conf
+    dest: /etc/needrestart/conf.d/99-labapp-xrdp.conf
+    owner: root
+    group: root
+    mode: '0644'
+    validate: /usr/bin/perl -c %s
 
 - name: Create the signed package key directory
   ansible.builtin.file:
