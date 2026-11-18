@@ -30,8 +30,8 @@ Codex does not document an import mechanism, so this file uses plain links;
 - **Longer-term:** an installer for fresh Ubuntu 24.04 VMs and ongoing course,
   GitOps and observability updates.
 - **Status and plans:** GitHub only. The current lead handoff is #518; R0 build
-  and course evidence is in #588. #145 is historical context. Do not add plan
-  or status files.
+  and course evidence is in #588. The historical #476 hub remains open and
+  forwards to #518; #145 is earlier context. Do not add plan or status files.
 - **Hedgehog docs:** https://docs.hedgehog.cloud/latest/vlab/overview/
 
 ## Lead takeover or crash recovery

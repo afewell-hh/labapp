@@ -21,7 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Exercise XRDP identity certificate and file-safety checks
-        run: python3 -B build/ansible/roles/host/files/test_xrdp_identity.py -v
+        run: python3 -B build/ansible/tests/test_xrdp_identity.py -v
       - name: Install the guest's exact Ansible core package
         run: |
           sudo apt-get update
