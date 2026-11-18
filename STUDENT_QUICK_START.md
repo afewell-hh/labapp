@@ -140,13 +140,6 @@ gcloud compute ssh hedgehog-lab --zone=us-central1-a --command="kubectl -n argoc
 gcloud compute ssh hedgehog-lab --zone=us-central1-a
 ```
 
-### RDP Access (Desktop)
-
-If you prefer a graphical desktop:
-- **Address:** YOUR_VM_IP:3389
-- **Username:** ubuntu
-- **Password:** HHLab.Admin!
-
 ---
 
 ## Check Lab Status
