@@ -89,7 +89,7 @@ gcloud services enable compute.googleapis.com
 gcloud compute instances create hedgehog-lab \
   --zone=us-central1-a \
   --machine-type=n2-standard-32 \
-  --image=hedgehog-vaidc-v20260114 \
+  --image=labapp-candidate-r0-20261119-nodesktop3 \
   --image-project=teched-473722 \
   --boot-disk-size=300GB \
   --boot-disk-type=pd-balanced \
@@ -131,13 +131,13 @@ After deployment (allow 5-10 minutes for services to initialize):
 ### Get ArgoCD Password
 
 ```bash
-gcloud compute ssh hedgehog-lab --zone=us-central1-a --command="kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d && echo"
+gcloud compute ssh ubuntu@hedgehog-lab --zone=us-central1-a --command="kubectl --context=k3d-k3d-observability -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d && echo"
 ```
 
 ### SSH to Your VM
 
 ```bash
-gcloud compute ssh hedgehog-lab --zone=us-central1-a
+gcloud compute ssh ubuntu@hedgehog-lab --zone=us-central1-a
 ```
 
 ---
